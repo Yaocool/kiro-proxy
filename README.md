@@ -240,4 +240,4 @@ see [Startup and debugging](docs/startup-and-debugging.md).
 
 ## License
 
-AGPL-3.0
+MIT

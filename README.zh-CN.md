@@ -223,4 +223,4 @@ cargo test --workspace --all-features --locked
 
 ## 许可
 
-AGPL-3.0
+MIT
