@@ -1,0 +1,4 @@
+{
+  "rust-analyzer.server.path": "rust-analyzer",
+  "rust-analyzer.cargo.features": "all"
+}
