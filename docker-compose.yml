@@ -1,0 +1,19 @@
+services:
+  kamd:
+    build:
+      context: .
+      target: runtime-slim # 支持 runtime-slim 和 runtime-full，runtime-full 支持启用 SSO 浏览器自动登录
+      args:
+        RUST_VERSION: "1.97.1"
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:5580:5580"
+    volumes:
+      - kam-data:/var/lib/kam
+    environment:
+      RUST_LOG: info
+      KAM_HTTP_PORT: "5581"
+      KAM_FORWARD_PORT: "5580"
+
+volumes:
+  kam-data:
