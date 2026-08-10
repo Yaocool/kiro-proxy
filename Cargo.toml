@@ -1,0 +1,82 @@
+[workspace]
+members = [
+    "crates/kam-core",
+    "crates/kam-store",
+    "crates/kam-ipc",
+    "crates/kam-translate",
+    "crates/kam-kiro",
+    "crates/kam-pool",
+    "crates/kam-notify",
+    "crates/kamd",
+    "crates/kam",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.97.1"
+license = "AGPL-3.0"
+
+[workspace.dependencies]
+kam-core = { path = "crates/kam-core" }
+kam-store = { path = "crates/kam-store" }
+kam-ipc = { path = "crates/kam-ipc" }
+kam-translate = { path = "crates/kam-translate" }
+kam-kiro = { path = "crates/kam-kiro" }
+kam-pool = { path = "crates/kam-pool" }
+kam-notify = { path = "crates/kam-notify" }
+anyhow = "=1.0.86"
+thiserror = "=1.0.63"
+serde = { version = "=1.0.209", features = ["derive"] }
+serde_json = "=1.0.127"
+toml = "=0.8.19"
+tokio = { version = "=1.40.0", features = ["full"] }
+tokio-util = { version = "=0.7.11", features = ["rt"] }
+tracing = "=0.1.40"
+tracing-subscriber = { version = "=0.3.18", features = ["env-filter", "json"] }
+clap = { version = "=4.5.16", features = ["derive", "env"] }
+dotenvy = "=0.15.7"
+chromiumoxide = { version = "=0.5.7", default-features = false, features = ["tokio-runtime"] }
+notify = "=6.1.1"
+notify-debouncer-full = "=0.3.2"
+rand = "=0.8.5"
+uuid = { version = "=1.10.0", features = ["v4"] }
+tempfile = "=3.12.0"
+async-stream = "=0.3.5"
+async-trait = "=0.1.82"
+axum = { version = "=0.7.5", features = ["json", "macros"] }
+axum-server = { version = "=0.6.0", features = ["tls-rustls"] }
+base64 = "=0.22.1"
+bytes = "=1.7.1"
+crc32fast = "=1.4.2"
+dashmap = "=6.0.1"
+flate2 = "=1.0.33"
+futures = "=0.3.30"
+hmac = "=0.12.1"
+home = "=0.5.9"
+http = "=1.1.0"
+hyper = "=1.5.2"
+hyper-util = "=0.1.10"
+h2 = "=0.4.7"
+hyper-rustls = { version = "=0.27.2", default-features = false }
+indexmap = { version = "=2.6.0", features = ["serde"] }
+lru = "=0.12.4"
+libc = "=0.2.189"
+reqwest = { version = "=0.12.7", default-features = false, features = ["json", "stream", "rustls-tls"] }
+rustc-hash = "=2.0.0"
+rustls = { version = "=0.23.20", default-features = false, features = ["std", "ring"] }
+rustls-pki-types = "=1.10.1"
+rustls-webpki = { version = "=0.102.8", default-features = false, features = ["ring"] }
+quinn = { version = "=0.11.6", default-features = false }
+quinn-proto = { version = "=0.11.9", default-features = false }
+quinn-udp = { version = "=0.5.9", default-features = false }
+sha2 = "=0.10.8"
+tokio-stream = { version = "=0.1.16", features = ["sync"] }
+tiktoken-rs = "=0.5.9"
+tower = { version = "=0.5.1", features = ["limit", "timeout", "util"] }
+url = "=2.5.2"
+webpki-roots = "=0.26.7"
+zeroize = "=1.8.1"
+proptest = "=1.5.0"
+wiremock = "=0.6.2"
