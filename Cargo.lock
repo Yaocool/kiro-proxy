@@ -1155,7 +1155,7 @@ dependencies = [
 
 [[package]]
 name = "kam"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -1176,7 +1176,7 @@ dependencies = [
 
 [[package]]
 name = "kam-core"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "rand",
  "serde",
@@ -1187,7 +1187,7 @@ dependencies = [
 
 [[package]]
 name = "kam-ipc"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "kam-core",
  "serde",
@@ -1197,7 +1197,7 @@ dependencies = [
 
 [[package]]
 name = "kam-kiro"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1232,7 +1232,7 @@ dependencies = [
 
 [[package]]
 name = "kam-notify"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
  "hmac",
@@ -1249,7 +1249,7 @@ dependencies = [
 
 [[package]]
 name = "kam-pool"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "indexmap",
  "kam-core",
@@ -1268,7 +1268,7 @@ dependencies = [
 
 [[package]]
 name = "kam-store"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1288,7 +1288,7 @@ dependencies = [
 
 [[package]]
 name = "kam-translate"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "base64 0.22.1",
  "kam-core",
@@ -1306,7 +1306,7 @@ dependencies = [
 
 [[package]]
 name = "kamd"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "anyhow",
  "async-stream",
