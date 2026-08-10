@@ -16,16 +16,15 @@
 Thumbs.db
 
 # IDE-local state. Project settings, tasks, and recommended extensions may be shared.
-/.idea/
-/.vscode/*
+.idea/
+.vscode/*
 !/.vscode/settings.json
 !/.vscode/tasks.json
 !/.vscode/extensions.json
 
 # AI-assisted development: local settings, indexes, caches, and session state.
 # Keep shareable project instructions such as AGENTS.md and CLAUDE.md tracked.
-.claude/settings.local.json
-.claude/*.local.json
+.claude/*
 .cursor/
 .windsurf/
 .continue/
