@@ -1,16 +1,23 @@
-# Startup and debugging guide
+# Setup, startup, and debugging guide
 
 [English](startup-and-debugging.md) | [简体中文](startup-and-debugging.zh-CN.md)
 
-This guide covers local development, release binaries, Docker Compose, systemd,
-logs, trace IDs, LLDB, tests, and common startup failures. Unless noted
-otherwise, run commands from the repository root.
+This guide covers first-time setup, local development, release binaries, Docker
+Compose, systemd, logs, trace IDs, LLDB, tests, upgrades, and common startup
+failures. Unless noted otherwise, run commands from the repository root.
 
 ## 1. Prerequisites
 
 The repository pins Rust 1.97.1 and requests `rustfmt`, `clippy`, and
 `rust-analyzer` in `rust-toolchain.toml`. With rustup installed, entering the
 repository selects the correct toolchain automatically.
+
+Choose the prerequisites for the deployment path:
+
+- Docker deployment: Docker Engine and the Compose v2 plugin. Host networking
+  is supported directly on Linux; Docker Desktop requires version 4.34 or newer
+  with host networking enabled.
+- Native build or development: rustup plus a C toolchain and linker.
 
 ```bash
 rustup show active-toolchain
@@ -70,7 +77,7 @@ important process-level variables are:
 Use `config.toml` instead of `.env` for persistent service, pool, model, API-key,
 TLS, notification, and logging configuration.
 
-## 3. Start locally
+## 3. Start locally with native binaries
 
 Run the daemon in development mode:
 
@@ -244,6 +251,11 @@ are reconciled at runtime. The following changes require a daemon restart:
 Log filters, formatting, output paths, pool behavior, model rules, notification
 settings, and TLS certificate contents can otherwise be updated at runtime.
 
+Bootstrap never overwrites an existing `config.toml`. A data directory created
+by an older release may therefore retain `server.host = "127.0.0.1"`. Inspect
+the effective value with `kam config show --effective` and use `kam config edit`
+when the current default of `0.0.0.0` is desired.
+
 `KAM_HTTP_PORT` is a process override. Changing `server.port` does not supersede
 that environment variable until the variable is removed and the daemon is
 restarted.
@@ -284,9 +296,10 @@ record prompts, generated response bodies, or API-key values.
 Build and start the default slim image:
 
 ```bash
-docker compose build --pull
-docker compose up -d
+docker compose config --quiet
+docker compose up -d --build
 docker compose ps
+docker compose exec kamd kam health
 docker compose logs -f kamd
 ```
 
@@ -297,12 +310,26 @@ the container. This mode is supported directly by Docker Engine on Linux. On
 Docker Desktop 4.34 or newer, enable host networking under Settings > Resources
 > Network before starting the stack.
 
+The image sets `KAM_HOME=/var/lib/kam`; Compose mounts the `kam-data` named
+volume there. Do not copy the development `.env.example` into the container or
+bind-mount `.kam-dev`. Change persistent settings through `config.toml` with
+`kam config edit`, or add an explicit Compose environment entry when a
+process-level override is required.
+
 When upgrading an existing bridge-network deployment, recreate this project
 container once so the new network mode takes effect. The named data volume is
 preserved:
 
 ```bash
 docker compose up -d --force-recreate
+```
+
+For normal source upgrades, rebuild in place and keep the named volume:
+
+```bash
+docker compose up -d --build
+docker compose exec kamd kam version
+docker compose exec kamd kam config show --effective
 ```
 
 ### Use `kam` directly on the Docker host
@@ -343,13 +370,23 @@ the command:
 
 ```bash
 docker compose exec kamd kam status
+docker compose exec -T kamd kam account import --stdin < accounts.json
+docker compose exec kamd kam account probe --all
 docker compose exec kamd kam service create --name main
 docker compose exec kamd kam service create --name secondary --port 6000
 docker compose exec kamd kam service list
+docker compose exec kamd kam service apikeys main --show-secret
 docker compose exec kamd kam config show --effective
 docker compose exec kamd sh -c 'ls -lh /var/lib/kam/logs'
 curl -i http://127.0.0.1:5580/health
 curl -i http://127.0.0.1:6000/health
+```
+
+Remove a proxy listener when it is no longer needed. The associated API keys
+remain until they are removed separately:
+
+```bash
+docker compose exec kamd kam service delete secondary --yes
 ```
 
 The default host is `0.0.0.0`, so these listeners are reachable through the

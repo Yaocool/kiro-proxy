@@ -43,16 +43,51 @@ local Kiro application configuration changes.
 The CLI source is located in [`crates/kam`](crates/kam), and the daemon source
 is located in [`crates/kamd`](crates/kamd).
 
-## Quick start
+## Setup
+
+### Docker Compose (recommended for a Linux server)
+
+Docker Engine with the Compose v2 plugin is the shortest production setup. The
+Compose stack builds the slim image, runs `kamd` with host networking, and keeps
+all state in the `kam-data` named volume. Run these commands from the repository
+root:
+
+```bash
+docker compose up -d --build
+docker compose ps
+docker compose logs -f kamd
+```
+
+A fresh daemon exposes only its Unix administration socket. Create the first
+business proxy explicitly and save the API key printed by the command:
+
+```bash
+docker compose exec kamd kam status
+docker compose exec kamd kam service create --name main
+docker compose exec kamd kam service list
+```
+
+Import at least one supported Kiro enterprise SSO account before sending
+generation requests:
+
+```bash
+docker compose exec -T kamd kam account import --stdin < accounts.json
+docker compose exec kamd kam account probe --all
+```
+
+The default listener is `0.0.0.0:5580`. Restrict that port with the host
+firewall or cloud security group; use `--host 127.0.0.1` when the proxy should
+only be reachable from the Docker host. Do not run `docker compose down -v`
+unless the persisted configuration, accounts, usage, and logs should be erased.
+
+### Native build
 
 The pinned Rust 1.97.1 toolchain is selected automatically through
 `rust-toolchain.toml`.
 
 ```bash
-cargo build --release --locked
-
-# Both binaries load this file on every startup.
 cp .env.example .env
+cargo build --release --locked
 
 # First startup creates config.toml, accounts.json, daily.json, and stats.json.
 ./target/release/kamd
@@ -68,10 +103,9 @@ In another terminal:
 ./target/release/kam account list
 ```
 
-A fresh daemon starts only the Unix administration plane. It does not create or
-start a business API proxy. `kam service create` creates and starts one, creates
-its first scoped API key, and prints the plaintext key. You can retrieve only
-that service's keys later with `kam service apikeys main --show-secret`.
+`kam service create` creates and starts a proxy, creates its first scoped API
+key, and prints the plaintext key. You can retrieve that service's keys later
+with `kam service apikeys main --show-secret`.
 
 `kamd` and `kam` search for `.env` from the current directory upward. Existing
 process environment variables take precedence over values in `.env`, so a
@@ -227,9 +261,11 @@ Passwords are accepted only from stdin or a two-column CSV file. Add
 ## Docker and systemd
 
 ```bash
+docker compose up -d --build
+
+# Standalone image builds, when Compose is not used:
 docker build --target runtime-slim -t kamd:slim .
 docker build --target runtime-full -t kamd:full .
-docker compose up -d
 ```
 
 Compose uses host networking so every manually created proxy service is
@@ -239,7 +275,19 @@ restrict proxy ports with the host firewall or cloud security group. Use
 `--host 127.0.0.1` when host-only access is desired. Docker Engine on Linux
 supports host networking directly; Docker Desktop 4.34+ requires it to be
 enabled in Settings. State persists in the `kam-data` volume. The full image
-adds Chromium for SSO.
+adds Chromium for enterprise SSO authentication.
+
+After updating the source, rebuild and recreate the container without deleting
+the named volume:
+
+```bash
+docker compose up -d --build
+docker compose exec kamd kam config show --effective
+```
+
+Existing `config.toml` files are never overwritten. A volume created by an
+older version may still contain `server.host = "127.0.0.1"`; change it with
+`kam config edit` if the new `0.0.0.0` default is desired.
 
 Install the Docker-backed host wrapper once to use `kam` directly without
 typing `docker compose exec`:
@@ -270,8 +318,8 @@ cargo test --workspace --all-features --locked
 
 The project uses Rust edition 2021 with MSRV 1.97.1.
 
-For complete startup, deployment, logging, LLDB, and troubleshooting guidance,
-see [Startup and debugging](docs/startup-and-debugging.md).
+For complete setup, startup, deployment, logging, LLDB, and troubleshooting
+guidance, see [Setup, startup, and debugging](docs/startup-and-debugging.md).
 
 ## License
 

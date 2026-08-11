@@ -37,15 +37,47 @@ API Key 限额、TLS、Webhook、统计和运维 CLI。
 CLI 源码位于 [`crates/kam`](crates/kam)，daemon 源码位于
 [`crates/kamd`](crates/kamd)。
 
-## 快速开始
+## 安装与启动
+
+### Docker Compose（Linux 服务器推荐）
+
+最简生产部署只需要 Docker Engine 和 Compose v2 插件。Compose 会构建 slim 镜像、使用
+host network 启动 `kamd`，并将全部状态保存在 `kam-data` named volume 中。以下命令均在
+仓库根目录执行：
+
+```bash
+docker compose up -d --build
+docker compose ps
+docker compose logs -f kamd
+```
+
+全新 daemon 只开放 Unix 管理 socket，不会自动创建业务代理。显式创建首个 service，并
+立即保存命令输出的 API Key：
+
+```bash
+docker compose exec kamd kam status
+docker compose exec kamd kam service create --name main
+docker compose exec kamd kam service list
+```
+
+发送生成请求前，至少导入一个受支持的 Kiro 企业 SSO 账号：
+
+```bash
+docker compose exec -T kamd kam account import --stdin < accounts.json
+docker compose exec kamd kam account probe --all
+```
+
+默认监听 `0.0.0.0:5580`，应使用宿主机防火墙或云安全组限制该端口；只允许 Docker 宿主机
+访问时增加 `--host 127.0.0.1`。除非确实要清除配置、账号、用量和日志，否则不要执行
+`docker compose down -v`。
+
+### 本地二进制
 
 项目通过 `rust-toolchain.toml` 自动选择固定的 Rust 1.97.1 工具链。
 
 ```bash
-cargo build --release --locked
-
-# 两个二进制每次启动时都会读取该文件。
 cp .env.example .env
+cargo build --release --locked
 
 # 首次启动会创建 config.toml、accounts.json、daily.json 和 stats.json。
 ./target/release/kamd
@@ -61,9 +93,8 @@ cp .env.example .env
 ./target/release/kam account list
 ```
 
-全新 daemon 只启动 Unix 管理面，不会默认创建或启动业务 API 代理服务。
 `kam service create` 会创建并启动服务、为该服务创建首个 API Key，并返回明文 Key。之后可
-使用 `kam service apikeys main --show-secret` 仅查询该服务绑定的明文 Key。
+使用 `kam service apikeys main --show-secret` 查询该 service 绑定的 Key。
 
 `kamd` 和 `kam` 会从当前目录开始向上查找 `.env`。已经存在的进程环境变量优先于
 `.env` 中的同名值，因此仍可做单次启动覆盖：
@@ -211,16 +242,29 @@ kam account add-sso --batch accounts.csv \
 ## Docker 与 systemd
 
 ```bash
+docker compose up -d --build
+
+# 不使用 Compose 时可单独构建镜像：
 docker build --target runtime-slim -t kamd:slim .
 docker build --target runtime-full -t kamd:full .
-docker compose up -d
 ```
 
 Compose 使用 host network，因此手动创建的任意端口代理服务都会立即在 Docker 宿主机
 可访问，无需修改 Compose 或重启容器。服务默认绑定 `0.0.0.0`，应通过宿主机防火墙或云
 安全组限制代理端口；只需宿主机本地访问时可使用 `--host 127.0.0.1`。Linux Docker
 Engine 可直接使用；Docker Desktop 4.34+ 需要在设置中启用 host networking。数据保存
-在 `kam-data` volume，full 镜像额外安装 Chromium。
+在 `kam-data` volume，full 镜像为企业 SSO 认证额外安装 Chromium。
+
+源码更新后，重新构建并创建容器即可，不要删除 named volume：
+
+```bash
+docker compose up -d --build
+docker compose exec kamd kam config show --effective
+```
+
+已有 `config.toml` 永远不会被覆盖。旧版本创建的 volume 可能仍包含
+`server.host = "127.0.0.1"`；如果需要采用新的 `0.0.0.0` 默认值，请使用
+`kam config edit` 修改。
 
 在宿主机安装一次 Docker 包装器后，可直接使用 `kam`，无需再输入 `docker compose exec`：
 
@@ -247,8 +291,8 @@ cargo test --workspace --all-features --locked
 
 项目使用 Rust edition 2021，MSRV 为 1.97.1。
 
-完整的启动、部署、日志、LLDB 和故障排查说明见
-[启动与调试指南](docs/startup-and-debugging.zh-CN.md)。
+完整的安装、启动、部署、日志、LLDB 和故障排查说明见
+[安装、启动与调试指南](docs/startup-and-debugging.zh-CN.md)。
 
 ## 许可
 
