@@ -42,7 +42,11 @@ impl TaskRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         serde_json::json!({
-            "token_refresh":{"interval_ms":config.tasks.token_refresh_interval_ms,"run":runs.get("token_refresh")},
+            "token_refresh":{
+                "interval_ms":config.tasks.token_refresh_interval_ms,
+                "before_expiry_secs":config.effective_token_refresh_before_expiry(),
+                "run":runs.get("token_refresh")
+            },
             "status_check":{"interval_ms":config.tasks.status_check_interval_ms,"run":runs.get("status_check")},
             "stats_persist":{"interval_ms":config.tasks.stats_persist_interval_ms,"run":runs.get("stats_persist")},
             "daily_reset":{"interval_ms":86_400_000u64,"run":runs.get("daily_reset")},
@@ -254,25 +258,33 @@ fn spawn_token_refresh(state: Arc<AppState>, shutdown: CancellationToken) {
                 _ = shutdown.cancelled() => break,
                 _ = tokio::time::sleep(delay) => {
                     let pool = state.pool();
-                    let failures = state.refresh_expiring_tokens(&pool).await;
-                    let failure_count = failures.len();
-                    for (account_id, error) in failures {
-                        warn!(%account_id, %error, "background token refresh failed");
+                    let report = state.refresh_expiring_tokens(&pool).await;
+                    for (account_id, account_name) in &report.refreshed {
+                        info!(%account_id, %account_name, "background token refresh succeeded");
+                    }
+                    for (account_id, account_name, error) in &report.failures {
+                        warn!(%account_id, %account_name, %error, "background token refresh failed");
                         let mut event = WebhookEvent::new(
                             WebhookEventKind::TokenExpired,
                             "Kiro token refresh failed",
                             error.to_string(),
                         );
-                        event.account_id = Some(account_id);
+                        event.account_id = Some(account_id.clone());
                         state.notifier().emit(event);
                     }
-                    if let Err(error) = persist_pool_accounts(&state).await {
-                        warn!(%error, "failed to persist refreshed credentials");
+                    if !report.refreshed.is_empty() {
+                        if let Err(error) = persist_pool_accounts(&state).await {
+                            warn!(%error, "failed to persist refreshed credentials");
+                        }
                     }
-                    state.task_registry.record(
-                        "token_refresh",
-                        format!("ok: {failure_count} failures"),
+                    info!(
+                        checked = report.checked,
+                        eligible = report.eligible,
+                        refreshed = report.refreshed.len(),
+                        failures = report.failures.len(),
+                        "background token refresh check completed"
                     );
+                    state.task_registry.record("token_refresh", report.summary());
                 }
             }
         }
@@ -374,7 +386,12 @@ async fn status_check(state: &Arc<AppState>) -> anyhow::Result<String> {
             }
             Ok(false) => {}
             Err(error) => {
-                debug!(account_id = %account.id, %error, "usage status check failed");
+                debug!(
+                    account_id = %account.id,
+                    account_name = account.display_name(),
+                    %error,
+                    "usage status check failed"
+                );
                 failed += 1;
             }
         }
@@ -402,7 +419,12 @@ async fn status_check(state: &Arc<AppState>) -> anyhow::Result<String> {
                     healthy += 1;
                 }
                 Err(error) => {
-                    warn!(account_id = %account.id, %error, "status model check failed");
+                    warn!(
+                        account_id = %account.id,
+                        account_name = account.display_name(),
+                        %error,
+                        "status model check failed"
+                    );
                     failed += 1;
                 }
             }
@@ -492,9 +514,11 @@ pub async fn run_named(state: &Arc<AppState>, name: &str) -> anyhow::Result<serd
     let result = match name {
         "token_refresh" => {
             let pool = state.pool();
-            let failures = state.refresh_expiring_tokens(&pool).await;
-            persist_pool_accounts(state).await?;
-            format!("ok: {} failures", failures.len())
+            let report = state.refresh_expiring_tokens(&pool).await;
+            if !report.refreshed.is_empty() {
+                persist_pool_accounts(state).await?;
+            }
+            report.summary()
         }
         "stats_persist" => {
             state.meter.persist().await?;

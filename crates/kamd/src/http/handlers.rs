@@ -968,7 +968,10 @@ async fn execute_upstream(
         request_payload.profile_arn.clone_from(&account.profile_arn);
         if account.is_token_expiring(
             now_secs(),
-            state.config.current().upstream.token_refresh_before_expiry,
+            state
+                .config
+                .current()
+                .effective_token_refresh_before_expiry(),
         ) && state
             .refresh_account_token(&pool, &account.id, false)
             .await

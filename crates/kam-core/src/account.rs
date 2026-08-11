@@ -156,6 +156,15 @@ pub struct Account {
 }
 
 impl Account {
+    /// Return the operator-facing account name, preferring a non-empty label.
+    pub fn display_name(&self) -> &str {
+        self.label
+            .as_deref()
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .unwrap_or(&self.email)
+    }
+
     /// 判断 token 是否已进入刷新窗口。
     pub fn is_token_expiring(&self, now: i64, before_secs: i64) -> bool {
         self.credentials.expires_at - now <= before_secs
@@ -218,6 +227,16 @@ mod tests {
         assert!(!account.is_token_expiring(650, 300));
         assert!(account.is_token_expiring(750, 300));
         assert!(account.is_token_expiring(1_500, 300));
+    }
+
+    #[test]
+    fn display_name_prefers_non_empty_label_and_falls_back_to_email() {
+        let mut account = sample_account();
+        assert_eq!(account.display_name(), "a@example.com");
+        account.label = Some("  Enterprise team  ".into());
+        assert_eq!(account.display_name(), "Enterprise team");
+        account.label = Some("   ".into());
+        assert_eq!(account.display_name(), "a@example.com");
     }
 
     #[test]

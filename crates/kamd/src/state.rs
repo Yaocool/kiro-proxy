@@ -22,6 +22,25 @@ use crate::meter::Meter;
 use crate::stats::{ModelCache, StatsStore};
 use crate::tasks::TaskRegistry;
 
+pub struct TokenRefreshReport {
+    pub checked: usize,
+    pub eligible: usize,
+    pub refreshed: Vec<(String, String)>,
+    pub failures: Vec<(String, String, RefreshError)>,
+}
+
+impl TokenRefreshReport {
+    pub fn summary(&self) -> String {
+        format!(
+            "ok: {} checked, {} eligible, {} refreshed, {} failures",
+            self.checked,
+            self.eligible,
+            self.refreshed.len(),
+            self.failures.len()
+        )
+    }
+}
+
 /// 进程内共享状态。
 pub struct AppState {
     /// 当前生效配置。
@@ -100,7 +119,7 @@ impl AppState {
         };
         let kiro = KiroClient::new(current.upstream.clone(), overrides)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-        let refresher = TokenRefresher::new(current.upstream.token_refresh_before_expiry)
+        let refresher = TokenRefresher::new(current.effective_token_refresh_before_expiry())
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let pool = AccountPool::new(accounts.all().to_vec(), current.pool.clone());
         let notifier = Notifier::new(current.webhook.clone(), current.notify.clone(), 1_024);
@@ -269,18 +288,31 @@ impl AppState {
 
     /// Refreshes every expiring account through the same cache-invalidation
     /// path as request-triggered and manual refreshes.
-    pub async fn refresh_expiring_tokens(&self, pool: &AccountPool) -> Vec<(String, RefreshError)> {
-        let before_expiry = self.config.current().upstream.token_refresh_before_expiry;
+    pub async fn refresh_expiring_tokens(&self, pool: &AccountPool) -> TokenRefreshReport {
+        let before_expiry = self
+            .config
+            .current()
+            .effective_token_refresh_before_expiry();
         let accounts = pool.snapshot().await;
-        let mut failures = Vec::new();
+        let mut report = TokenRefreshReport {
+            checked: accounts.len(),
+            eligible: 0,
+            refreshed: Vec::new(),
+            failures: Vec::new(),
+        };
         for account in accounts {
             if account.is_token_expiring(crate::meter::now_secs(), before_expiry) {
-                if let Err(error) = self.refresh_account_token(pool, &account.id, false).await {
-                    failures.push((account.id, error));
+                report.eligible += 1;
+                let account_id = account.id.clone();
+                let account_name = account.display_name().to_owned();
+                match self.refresh_account_token(pool, &account.id, false).await {
+                    Ok(true) => report.refreshed.push((account_id, account_name)),
+                    Ok(false) => {}
+                    Err(error) => report.failures.push((account_id, account_name, error)),
                 }
             }
         }
-        failures
+        report
     }
 
     pub fn install_tls_config(&self, config: axum_server::tls_rustls::RustlsConfig) {
@@ -315,9 +347,9 @@ impl AppState {
         if serde_json::to_string(&previous.pool).ok() != serde_json::to_string(&next.pool).ok() {
             self.pool().update_config(next.pool.clone());
         }
-        if serde_json::to_string(&previous.upstream).ok()
-            != serde_json::to_string(&next.upstream).ok()
-        {
+        let upstream_changed = serde_json::to_string(&previous.upstream).ok()
+            != serde_json::to_string(&next.upstream).ok();
+        if upstream_changed {
             let overrides = EndpointOverrides {
                 codewhisperer_url: std::env::var("KAM_CODEWHISPERER_URL").ok(),
                 amazonq_url: std::env::var("KAM_AMAZONQ_URL").ok(),
@@ -325,7 +357,13 @@ impl AppState {
             if let Ok(client) = KiroClient::new(next.upstream.clone(), overrides) {
                 *write_lock(&self.kiro) = client;
             }
-            if let Ok(refresher) = TokenRefresher::new(next.upstream.token_refresh_before_expiry) {
+        }
+        if previous.upstream.token_refresh_before_expiry
+            != next.upstream.token_refresh_before_expiry
+            || previous.tasks.token_refresh_interval_ms != next.tasks.token_refresh_interval_ms
+        {
+            if let Ok(refresher) = TokenRefresher::new(next.effective_token_refresh_before_expiry())
+            {
                 *write_lock(&self.refresher) = refresher;
             }
         }
@@ -504,5 +542,24 @@ impl BodyGuard {
 impl Drop for BodyGuard {
     fn drop(&mut self) {
         self.budget.current.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+
+#[cfg(test)]
+mod token_refresh_report_tests {
+    use super::TokenRefreshReport;
+
+    #[test]
+    fn summary_distinguishes_checks_from_actual_refreshes() {
+        let report = TokenRefreshReport {
+            checked: 3,
+            eligible: 1,
+            refreshed: vec![("acc_one".into(), "Team account".into())],
+            failures: Vec::new(),
+        };
+        assert_eq!(
+            report.summary(),
+            "ok: 3 checked, 1 eligible, 1 refreshed, 0 failures"
+        );
     }
 }
