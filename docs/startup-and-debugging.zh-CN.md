@@ -1,14 +1,20 @@
-# 启动与调试指南
+# 安装、启动与调试指南
 
 [English](startup-and-debugging.md) | [简体中文](startup-and-debugging.zh-CN.md)
 
-本文覆盖本地开发、release 二进制、Docker Compose、systemd、日志、Trace ID、LLDB、
-测试和常见启动故障。除非特别说明，所有命令都在仓库根目录执行。
+本文覆盖首次安装、本地开发、release 二进制、Docker Compose、systemd、日志、Trace ID、
+LLDB、测试、升级和常见启动故障。除非特别说明，所有命令都在仓库根目录执行。
 
 ## 1. 环境要求
 
 仓库在 `rust-toolchain.toml` 中固定 Rust 1.97.1，并声明安装 `rustfmt`、`clippy` 和
 `rust-analyzer`。安装 rustup 后，进入仓库就会自动选择正确的工具链。
+
+根据部署方式准备环境：
+
+- Docker 部署：Docker Engine 和 Compose v2 插件。Linux 原生支持 host network；Docker
+  Desktop 需要 4.34 或更高版本，并在设置中启用 host networking。
+- 本地构建或开发：rustup，以及 C 工具链和链接器。
 
 ```bash
 rustup show active-toolchain
@@ -65,7 +71,7 @@ cp .env.example .env
 持久化的服务、账号池、模型、API Key、TLS、通知和日志配置应写入 `config.toml`，而不是
 `.env`。
 
-## 3. 本地启动
+## 3. 使用本地二进制启动
 
 以开发模式启动 daemon：
 
@@ -222,6 +228,10 @@ cargo run -p kam -- config reload
 
 日志过滤、格式、输出路径、账号池行为、模型规则、通知配置和 TLS 证书内容可以在运行时更新。
 
+首次初始化永远不会覆盖已有 `config.toml`，因此旧版本创建的数据目录可能仍保留
+`server.host = "127.0.0.1"`。可使用 `kam config show --effective` 检查实际值；需要采用
+当前的 `0.0.0.0` 默认值时，使用 `kam config edit` 修改。
+
 `KAM_HTTP_PORT` 是进程级覆盖。如果该变量仍然存在，修改 `server.port` 不会覆盖它；需要
 删除环境变量并重启 daemon。
 
@@ -259,9 +269,10 @@ cargo run -p kam -- stats --since 1h --by endpoint
 构建并启动默认 slim 镜像：
 
 ```bash
-docker compose build --pull
-docker compose up -d
+docker compose config --quiet
+docker compose up -d --build
 docker compose ps
+docker compose exec kamd kam health
 docker compose logs -f kamd
 ```
 
@@ -270,11 +281,23 @@ Compose 使用 `network_mode: host`，容器内创建的代理监听会直接进
 Docker Engine 可直接使用；Docker Desktop 4.34 及以上版本需要先在 Settings > Resources
 > Network 中启用 host networking。
 
+镜像设置了 `KAM_HOME=/var/lib/kam`，Compose 将 `kam-data` named volume 挂载到该目录。
+不要把开发用 `.env.example` 复制进容器，也不要挂载 `.kam-dev`。持久化设置应通过
+`kam config edit` 修改 `config.toml`；确需进程级覆盖时，在 Compose 中显式增加环境变量。
+
 已有 bridge 网络部署升级后，需要重建一次本项目容器才能应用新网络模式；named volume
 中的数据会保留：
 
 ```bash
 docker compose up -d --force-recreate
+```
+
+日常源码升级只需原地重新构建，并保留 named volume：
+
+```bash
+docker compose up -d --build
+docker compose exec kamd kam version
+docker compose exec kamd kam config show --effective
 ```
 
 ### 在 Docker 宿主机直接使用 `kam`
@@ -313,13 +336,22 @@ kam status
 
 ```bash
 docker compose exec kamd kam status
+docker compose exec -T kamd kam account import --stdin < accounts.json
+docker compose exec kamd kam account probe --all
 docker compose exec kamd kam service create --name main
 docker compose exec kamd kam service create --name secondary --port 6000
 docker compose exec kamd kam service list
+docker compose exec kamd kam service apikeys main --show-secret
 docker compose exec kamd kam config show --effective
 docker compose exec kamd sh -c 'ls -lh /var/lib/kam/logs'
 curl -i http://127.0.0.1:5580/health
 curl -i http://127.0.0.1:6000/health
+```
+
+不再需要某个代理监听时可删除 service；关联 API Key 会继续保留，需另行删除：
+
+```bash
+docker compose exec kamd kam service delete secondary --yes
 ```
 
 服务默认绑定 `0.0.0.0`，可通过 Docker 宿主机的网络接口访问；应使用宿主机防火墙或云
