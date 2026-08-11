@@ -123,10 +123,10 @@ fn automation_script(email: &str, password: &str) -> String {
           }}
           const no = first(['#idBtn_Back']);
           if (no && /stay signed in/i.test(document.body.innerText)) {{ no.click(); return 'kmsi'; }}
-          const allow = first(['button[name="allow"]','[data-testid="allow-button"]','button[value="allow"]','#allow-button','button.awsui-button--primary','#cli_login_button','button[data-analytics="allowButton"]']);
+          const allow = first(['button[name="allow"]','[data-testid="allow-button"]','[data-testid="allow-access-button"]','button[value="allow"]','#allow-button','button.awsui-button--primary','#cli_login_button','button[data-analytics="allowButton"]']);
           if (allow) {{ allow.click(); return 'allow'; }}
           const textAllow = [...document.querySelectorAll('button,input[type="submit"]')]
-            .find(el => visible(el) && /^(allow|authorize|continue|confirm)$/i.test((el.innerText || el.value || '').trim()));
+            .find(el => visible(el) && /^(allow|authorize|allow access|continue|confirm|允许|确认授权)/i.test((el.innerText || el.value || '').trim()));
           if (textAllow) {{ textAllow.click(); return 'allow-text'; }}
           return 'waiting';
         }})()"#

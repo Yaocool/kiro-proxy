@@ -37,7 +37,7 @@ tracing = "=0.1.40"
 tracing-subscriber = { version = "=0.3.18", features = ["env-filter", "json"] }
 clap = { version = "=4.5.16", features = ["derive", "env"] }
 dotenvy = "=0.15.7"
-chromiumoxide = { version = "=0.5.7", default-features = false, features = ["tokio-runtime"] }
+chromiumoxide = { version = "=0.8.0", default-features = false, features = ["tokio-runtime"] }
 notify = "=6.1.1"
 notify-debouncer-full = "=0.3.2"
 rand = "=0.8.5"
@@ -48,7 +48,7 @@ async-trait = "=0.1.82"
 axum = { version = "=0.7.5", features = ["json", "macros"] }
 axum-server = { version = "=0.6.0", features = ["tls-rustls"] }
 base64 = "=0.22.1"
-bytes = "=1.7.1"
+bytes = "=1.9.0"
 crc32fast = "=1.4.2"
 dashmap = "=6.0.1"
 flate2 = "=1.0.33"
