@@ -47,6 +47,8 @@ pub struct AppState {
     pub keepalive: KeepaliveHub,
     pub prompt_cache: PromptCacheTracker,
     pub task_registry: TaskRegistry,
+    /// Dynamically managed API proxy listeners.
+    pub proxy_services: Arc<crate::http::ProxyServiceManager>,
     /// Shared graceful-shutdown token, including automatic quota shutdown.
     pub shutdown: CancellationToken,
     quota_shutdown_started: AtomicBool,
@@ -54,6 +56,7 @@ pub struct AppState {
     pub started_at: Instant,
     config_reloaded_at: AtomicI64,
     account_mutation: tokio::sync::Mutex<()>,
+    config_mutation: tokio::sync::Mutex<()>,
 }
 
 impl AppState {
@@ -124,11 +127,13 @@ impl AppState {
             keepalive: KeepaliveHub::new(),
             prompt_cache: PromptCacheTracker::default(),
             task_registry: TaskRegistry::default(),
+            proxy_services: Arc::new(crate::http::ProxyServiceManager::default()),
             shutdown: CancellationToken::new(),
             quota_shutdown_started: AtomicBool::new(false),
             started_at: Instant::now(),
             config_reloaded_at: AtomicI64::new(0),
             account_mutation: tokio::sync::Mutex::new(()),
+            config_mutation: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -206,6 +211,21 @@ impl AppState {
     /// 串行化账号的「复制、修改、落盘、提交」事务。
     pub async fn lock_account_mutation(&self) -> tokio::sync::MutexGuard<'_, ()> {
         self.account_mutation.lock().await
+    }
+
+    /// Serializes config mutations initiated through the admin API.
+    pub async fn lock_config_mutation(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.config_mutation.lock().await
+    }
+
+    /// Starts, stops, or replaces proxy listeners to match a config snapshot.
+    pub async fn reconcile_proxy_services(
+        self: &Arc<Self>,
+        config: &Config,
+    ) -> Vec<(String, String)> {
+        self.proxy_services
+            .reconcile(Arc::clone(self), &config.proxy_service)
+            .await
     }
 
     /// 管理面 socket 路径。

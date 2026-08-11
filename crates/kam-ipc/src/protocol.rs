@@ -60,6 +60,12 @@ pub mod method {
     pub const APIKEY_LIST: &str = "apikey.list";
     /// 清零 API key 用量。
     pub const APIKEY_RESET_USAGE: &str = "apikey.resetUsage";
+    /// API 代理服务列表。
+    pub const SERVICE_LIST: &str = "service.list";
+    /// 创建 API 代理服务并生成首个 API key。
+    pub const SERVICE_CREATE: &str = "service.create";
+    /// 查询指定 API 代理服务绑定的 API key。
+    pub const SERVICE_APIKEYS: &str = "service.apikeys";
     /// Webhook 列表。
     pub const WEBHOOK_LIST: &str = "webhook.list";
     /// 测试 webhook。
@@ -96,6 +102,9 @@ pub mod method {
         MODELS,
         APIKEY_LIST,
         APIKEY_RESET_USAGE,
+        SERVICE_LIST,
+        SERVICE_CREATE,
+        SERVICE_APIKEYS,
         WEBHOOK_LIST,
         WEBHOOK_TEST,
         WEBHOOK_LOGS,
@@ -226,6 +235,12 @@ pub struct StatusResult {
     pub uptime_secs: u64,
     /// 业务监听地址。
     pub listen: String,
+    /// 已配置的 API 代理服务数。
+    #[serde(default)]
+    pub proxy_service_total: usize,
+    /// 当前运行的 API 代理服务数。
+    #[serde(default)]
+    pub proxy_service_running: usize,
     /// 管理 socket。
     pub admin_socket: String,
     /// 账号总数。
@@ -281,6 +296,89 @@ pub struct StatusResult {
     /// 面向用户的提示。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+}
+
+/// API 代理服务运行视图。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyServiceView {
+    pub id: String,
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub enabled: bool,
+    pub running: bool,
+    #[serde(default)]
+    pub api_key_ids: Vec<String>,
+    pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `service.list` 结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyServiceListResult {
+    pub services: Vec<ProxyServiceView>,
+}
+
+/// `service.create` 参数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyServiceCreateParams {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_format: Option<String>,
+}
+
+/// 创建响应中的 API key 明文。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreatedApiKey {
+    pub id: String,
+    pub name: String,
+    pub key: String,
+}
+
+/// `service.create` 结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyServiceCreateResult {
+    pub service: ProxyServiceView,
+    pub api_key: CreatedApiKey,
+}
+
+/// `service.apikeys` 参数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyServiceApiKeysParams {
+    /// 服务 ID 或名称。
+    pub service: String,
+    /// 是否返回明文密钥。
+    #[serde(default)]
+    pub show_secret: bool,
+}
+
+/// 服务绑定的 API key 视图。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyServiceApiKeyView {
+    pub id: String,
+    pub name: String,
+    pub format: String,
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credits_limit: Option<f64>,
+    /// 仅在显式请求明文时返回。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+/// `service.apikeys` 结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyServiceApiKeysResult {
+    pub service_id: String,
+    pub service_name: String,
+    pub api_keys: Vec<ProxyServiceApiKeyView>,
 }
 
 /// 账号列表项。
@@ -526,6 +624,8 @@ mod tests {
             pid: 42,
             uptime_secs: 5,
             listen: "127.0.0.1:5580".into(),
+            proxy_service_total: 1,
+            proxy_service_running: 1,
             admin_socket: "/run/kam/admin.sock".into(),
             account_total: 0,
             account_enabled: 0,

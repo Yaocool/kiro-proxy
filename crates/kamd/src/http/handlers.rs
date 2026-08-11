@@ -31,6 +31,7 @@ use super::prompt_cache::PromptCacheProfile;
 use super::request_trace_id;
 use super::response::{DecodedResponse, OpenAiToolIdentity, ToolLeakFilter};
 use super::stream::{self, StreamContext, StreamProtocol};
+use super::ServiceHttpState;
 
 const MAX_STATS_MODEL_CHARS: usize = 128;
 const UNKNOWN_STATS_MODEL: &str = "unknown";
@@ -39,17 +40,23 @@ pub async fn root() -> Json<Value> {
     Json(json!({"name":"kiro-proxy","status":"ok","version":env!("CARGO_PKG_VERSION")}))
 }
 
-pub async fn health(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let counts = state.pool().health_counts().await;
+pub async fn health(State(service): State<ServiceHttpState>) -> Json<Value> {
+    let counts = service.app.pool().health_counts().await;
     Json(json!({
-        "status":if counts[0] > 0 || state.with_accounts(|accounts| accounts.is_empty()) {"ok"} else {"degraded"},
+        "status":"ok",
+        "service_id":service.service.id,
+        "service_name":service.service.name,
         "available_accounts":counts[0],"cooling_accounts":counts[1],
         "exhausted_accounts":counts[2],"banned_accounts":counts[3],
-        "uptime_secs":state.uptime_secs()
+        "uptime_secs":service.app.uptime_secs()
     }))
 }
 
-pub async fn claude_messages(State(state): State<Arc<AppState>>, request: Request) -> Response {
+pub async fn claude_messages(
+    State(service): State<ServiceHttpState>,
+    request: Request,
+) -> Response {
+    let state = Arc::clone(&service.app);
     let path = request.uri().path().to_string();
     let trace_id = request_trace_id(&request);
     let started = Instant::now();
@@ -86,7 +93,7 @@ pub async fn claude_messages(State(state): State<Arc<AppState>>, request: Reques
         "client request body read"
     );
     match handle_claude(
-        Arc::clone(&state),
+        service,
         trace_id.clone(),
         path.clone(),
         headers,
@@ -104,7 +111,8 @@ pub async fn claude_messages(State(state): State<Arc<AppState>>, request: Reques
     }
 }
 
-pub async fn openai_chat(State(state): State<Arc<AppState>>, request: Request) -> Response {
+pub async fn openai_chat(State(service): State<ServiceHttpState>, request: Request) -> Response {
+    let state = Arc::clone(&service.app);
     let path = request.uri().path().to_string();
     let trace_id = request_trace_id(&request);
     let started = Instant::now();
@@ -141,7 +149,7 @@ pub async fn openai_chat(State(state): State<Arc<AppState>>, request: Request) -
         "client request body read"
     );
     match handle_openai(
-        Arc::clone(&state),
+        service,
         trace_id.clone(),
         path.clone(),
         headers,
@@ -276,7 +284,7 @@ fn record_failed_request(
 }
 
 async fn handle_claude(
-    state: Arc<AppState>,
+    service: ServiceHttpState,
     trace_id: String,
     path: String,
     headers: HeaderMap,
@@ -284,9 +292,15 @@ async fn handle_claude(
     connection_guard: crate::state::AdmissionGuard,
     admission_guard: crate::state::AdmissionGuard,
 ) -> Result<Response, ApiError> {
+    let state = Arc::clone(&service.app);
     let started = Instant::now();
     enforce_claude_user_agent(&state, &headers)?;
-    let key_id = authenticate(&state, &headers, ErrorFormat::Claude)?;
+    let key_id = authenticate(
+        &state,
+        &service.allowed_api_key_ids,
+        &headers,
+        ErrorFormat::Claude,
+    )?;
     tracing::debug!(
         trace_id = %trace_id,
         protocol = "claude",
@@ -466,7 +480,7 @@ async fn handle_claude(
 }
 
 async fn handle_openai(
-    state: Arc<AppState>,
+    service: ServiceHttpState,
     trace_id: String,
     path: String,
     headers: HeaderMap,
@@ -474,8 +488,14 @@ async fn handle_openai(
     connection_guard: crate::state::AdmissionGuard,
     admission_guard: crate::state::AdmissionGuard,
 ) -> Result<Response, ApiError> {
+    let state = Arc::clone(&service.app);
     let started = Instant::now();
-    let key_id = authenticate(&state, &headers, ErrorFormat::OpenAi)?;
+    let key_id = authenticate(
+        &state,
+        &service.allowed_api_key_ids,
+        &headers,
+        ErrorFormat::OpenAi,
+    )?;
     tracing::debug!(
         trace_id = %trace_id,
         protocol = "openai",
@@ -1691,7 +1711,8 @@ fn request_log(
     }
 }
 
-pub async fn count_tokens(State(state): State<Arc<AppState>>, request: Request) -> Response {
+pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Request) -> Response {
+    let state = Arc::clone(&service.app);
     let path = request.uri().path().to_string();
     let trace_id = request_trace_id(&request);
     let started = Instant::now();
@@ -1715,7 +1736,12 @@ pub async fn count_tokens(State(state): State<Arc<AppState>>, request: Request) 
         let (headers, body, _body_reservations) =
             read_bounded_body(&state, request, ErrorFormat::Claude).await?;
         enforce_claude_user_agent(&state, &headers)?;
-        let key_id = authenticate(&state, &headers, ErrorFormat::Claude)?;
+        let key_id = authenticate(
+            &state,
+            &service.allowed_api_key_ids,
+            &headers,
+            ErrorFormat::Claude,
+        )?;
         tracing::debug!(
             trace_id = %trace_id,
             protocol = "claude_count_tokens",
@@ -1833,9 +1859,15 @@ pub async fn count_tokens(State(state): State<Arc<AppState>>, request: Request) 
     }
 }
 
-pub async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+pub async fn models(State(service): State<ServiceHttpState>, headers: HeaderMap) -> Response {
+    let state = Arc::clone(&service.app);
     let result = async {
-        authenticate(&state, &headers, ErrorFormat::OpenAi)?;
+        authenticate(
+            &state,
+            &service.allowed_api_key_ids,
+            &headers,
+            ErrorFormat::OpenAi,
+        )?;
         let config = state.config.current();
         if !config.models.dynamic_discovery {
             let created = now_secs();
@@ -1878,8 +1910,16 @@ pub async fn models(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     result.unwrap_or_else(IntoResponse::into_response)
 }
 
-pub async fn event_logging(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
-    match authenticate(&state, &headers, ErrorFormat::OpenAi) {
+pub async fn event_logging(
+    State(service): State<ServiceHttpState>,
+    headers: HeaderMap,
+) -> Response {
+    match authenticate(
+        &service.app,
+        &service.allowed_api_key_ids,
+        &headers,
+        ErrorFormat::OpenAi,
+    ) {
         Ok(_) => Json(json!({"status":"ok"})).into_response(),
         Err(error) => error.into_response(),
     }
@@ -1958,6 +1998,7 @@ fn claude_web_tool_names(request: &ClaudeRequest) -> std::collections::HashMap<S
 
 fn authenticate(
     state: &Arc<AppState>,
+    allowed_api_key_ids: &HashSet<String>,
     headers: &HeaderMap,
     format: ErrorFormat,
 ) -> Result<Option<String>, ApiError> {
@@ -1971,12 +2012,23 @@ fn authenticate(
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.strip_prefix("Bearer "))
         });
-    state.meter.authenticate(presented).map_err(|_| {
+    let key_id = state.meter.authenticate(presented).map_err(|_| {
         let mut error = ApiError::new(StatusCode::UNAUTHORIZED, "invalid API key", format);
         error.authenticate = true;
         error.suppress_model_stats = true;
         error
-    })
+    })?;
+    if !allowed_api_key_ids.is_empty()
+        && key_id
+            .as_ref()
+            .is_none_or(|id| !allowed_api_key_ids.contains(id))
+    {
+        let mut error = ApiError::new(StatusCode::UNAUTHORIZED, "invalid API key", format);
+        error.authenticate = true;
+        error.suppress_model_stats = true;
+        return Err(error);
+    }
+    Ok(key_id)
 }
 
 fn enforce_claude_user_agent(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(), ApiError> {

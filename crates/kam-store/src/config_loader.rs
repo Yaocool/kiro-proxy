@@ -73,12 +73,6 @@ impl ConfigHandle {
 /// 返回需要重启才能生效的字段。
 pub fn diff_restart_required(old: &Config, new: &Config) -> Vec<&'static str> {
     let mut fields = Vec::new();
-    if old.server.host != new.server.host {
-        fields.push("server.host");
-    }
-    if old.server.port != new.server.port {
-        fields.push("server.port");
-    }
     if old.admin.socket != new.admin.socket {
         fields.push("admin.socket");
     }
@@ -88,13 +82,11 @@ pub fn diff_restart_required(old: &Config, new: &Config) -> Vec<&'static str> {
     fields
 }
 
-/// 合并一次热重载：热更新字段取新值，监听地址与管理 socket 保留运行值。
+/// 合并一次热重载：热更新字段取新值，管理 socket 与 TLS 监听模式保留运行值。
 ///
 /// 返回的字段列表提示调用方在下次进程重启后，磁盘中的新值才会生效。
 pub fn merge_hot_reload(old: &Config, mut new: Config) -> (Config, Vec<&'static str>) {
     let needs_restart = diff_restart_required(old, &new);
-    new.server.host.clone_from(&old.server.host);
-    new.server.port = old.server.port;
     new.admin.socket.clone_from(&old.admin.socket);
     if old.server.tls.enabled != new.server.tls.enabled {
         new.server.tls = old.server.tls.clone();
@@ -292,10 +284,7 @@ mod tests {
         let handle = ConfigHandle::new(Config::default());
         let mut next = Config::default();
         next.server.port = 7000;
-        assert_eq!(
-            diff_restart_required(&handle.current(), &next),
-            vec!["server.port"]
-        );
+        assert!(diff_restart_required(&handle.current(), &next).is_empty());
         handle.replace(next);
         assert_eq!(handle.current().server.port, 7000);
 
@@ -316,12 +305,12 @@ mod tests {
         mixed.features.enable_prompt_cache = true;
         mixed.log.format = "pretty".into();
         let (merged, restart) = merge_hot_reload(&old, mixed);
-        assert_eq!(merged.server.host, old.server.host);
-        assert_eq!(merged.server.port, old.server.port);
+        assert_eq!(merged.server.host, "0.0.0.0");
+        assert_eq!(merged.server.port, 6000);
         assert_eq!(merged.admin.socket, old.admin.socket);
         assert_eq!(merged.log.format, "pretty");
         assert!(merged.features.enable_prompt_cache);
-        assert_eq!(restart, vec!["server.host", "server.port", "admin.socket"]);
+        assert_eq!(restart, vec!["admin.socket"]);
 
         let mut certificate = Config::default();
         certificate.server.tls.cert = Some("new certificate".into());

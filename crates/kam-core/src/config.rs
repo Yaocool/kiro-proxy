@@ -116,13 +116,13 @@ impl Default for AdaptiveConfig {
     }
 }
 
-/// 入站服务配置。
+/// API 代理服务的共享参数和新建服务默认值。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ServerConfig {
-    /// 监听主机。
+    /// 新建代理服务的默认监听主机。
     pub host: String,
-    /// 监听端口。
+    /// 新建代理服务的默认监听端口。
     pub port: u16,
     /// 是否校验 Claude 客户端 User-Agent。
     pub enforce_user_agent_check: bool,
@@ -651,11 +651,33 @@ pub struct ApiKeyConfig {
     pub credits_limit: Option<f64>,
 }
 
+/// 一个独立的 API 代理监听实例。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProxyServiceConfig {
+    /// 稳定服务 ID。
+    pub id: String,
+    /// 可读名称。
+    pub name: String,
+    /// 监听地址。
+    pub host: String,
+    /// 监听端口。
+    pub port: u16,
+    /// 是否启动监听。
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// 允许访问此服务的 API key ID。
+    #[serde(default)]
+    pub api_key_ids: Vec<String>,
+    /// 创建时间（Unix 秒）。
+    #[serde(default)]
+    pub created_at: i64,
+}
+
 /// 顶层配置。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// 入站服务。
+    /// API 代理服务共享参数和默认值。
     pub server: ServerConfig,
     /// 上游。
     pub upstream: UpstreamConfig,
@@ -686,6 +708,9 @@ pub struct Config {
     /// API key 列表。
     #[serde(default, rename = "api_key")]
     pub api_key: Vec<ApiKeyConfig>,
+    /// API 代理服务列表。默认为空；kamd 只启动管理面。
+    #[serde(default, rename = "proxy_service")]
+    pub proxy_service: Vec<ProxyServiceConfig>,
     /// 模型级 thinking 默认值。
     #[serde(default, rename = "model_thinking_mode")]
     pub model_thinking_mode: BTreeMap<String, bool>,
@@ -715,9 +740,6 @@ impl Config {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.server.port < 1024 {
             return Err(ConfigError::InvalidPort(self.server.port));
-        }
-        if !is_local_host(&self.server.host) && !self.has_enabled_api_key() {
-            return Err(ConfigError::PublicBindWithoutApiKey);
         }
         if self.server.keep_alive_timeout_ms == 0 {
             return invalid_config("server.keep_alive_timeout_ms", "must be greater than zero");
@@ -946,6 +968,64 @@ impl Config {
                 );
             }
         }
+        let mut service_ids = BTreeSet::new();
+        let mut service_names = BTreeSet::new();
+        let mut service_addresses = BTreeSet::new();
+        for (index, service) in self.proxy_service.iter().enumerate() {
+            let field = format!("proxy_service.{index}");
+            if service.id.trim().is_empty() || !service_ids.insert(service.id.as_str()) {
+                return invalid_config(format!("{field}.id"), "must be non-empty and unique");
+            }
+            if service.name.trim().is_empty() || !service_names.insert(service.name.as_str()) {
+                return invalid_config(format!("{field}.name"), "must be non-empty and unique");
+            }
+            if service.host.trim().is_empty() {
+                return invalid_config(format!("{field}.host"), "must not be empty");
+            }
+            if service.port < 1024 {
+                return invalid_config(format!("{field}.port"), "must be between 1024 and 65535");
+            }
+            if service.enabled && !service_addresses.insert((service.host.as_str(), service.port)) {
+                return invalid_config(
+                    format!("{field}.port"),
+                    "enabled services must use unique host and port pairs",
+                );
+            }
+            if service.api_key_ids.is_empty() {
+                return invalid_config(
+                    format!("{field}.api_key_ids"),
+                    "at least one API key is required",
+                );
+            }
+            let mut bound_ids = BTreeSet::new();
+            for key_id in &service.api_key_ids {
+                if !bound_ids.insert(key_id.as_str()) {
+                    return invalid_config(
+                        format!("{field}.api_key_ids"),
+                        "must not contain duplicate IDs",
+                    );
+                }
+                if !api_key_ids.contains(key_id.as_str()) {
+                    return invalid_config(
+                        format!("{field}.api_key_ids"),
+                        format!("references unknown API key ID {key_id}"),
+                    );
+                }
+            }
+            if service.enabled && !is_local_host(&service.host) {
+                let has_enabled_key = self.api_key.iter().any(|key| {
+                    key.enabled
+                        && !key.key.trim().is_empty()
+                        && key
+                            .id
+                            .as_ref()
+                            .is_some_and(|id| service.api_key_ids.contains(id))
+                });
+                if !has_enabled_key {
+                    return Err(ConfigError::PublicBindWithoutApiKey);
+                }
+            }
+        }
         for (index, rule) in self.model_mapping.iter().enumerate() {
             if !matches!(rule.kind.as_str(), "replace" | "alias" | "loadbalance") {
                 return invalid_config(
@@ -1074,11 +1154,11 @@ fn invalid_config<T>(
 /// 首次运行写入的默认配置，每个字段附说明。
 pub const DEFAULT_CONFIG_TOML: &str = r#"# kiro-proxy 配置文件
 # 修改后自动生效（daemon 监听本文件），无需重启。
-# host / port / admin.socket / TLS enabled 模式切换例外，改动需重启。
+# admin.socket / TLS enabled 模式切换例外，改动需重启。
 
 [server]
-host = "127.0.0.1"                 # 非本地地址必须配置 api_key
-port = 5580                        # 1024-65535
+host = "127.0.0.1"                 # kam service create 的默认监听地址
+port = 5580                        # kam service create 的默认端口，1024-65535
 enforce_user_agent_check = true    # 仅作用于 Claude 路由
 max_concurrent_requests = 500      # 超出返回 503 + Retry-After
 keep_alive_timeout_ms = 30000
@@ -1183,6 +1263,20 @@ retention_days = 3
 [admin]
 socket = "/run/kam/admin.sock"
 
+# 首次启动不创建或监听 API 代理服务。使用以下命令创建：
+# kam service create --name main --port 5580
+# 命令会同时生成首个 API key；之后可用以下命令按服务查询明文：
+# kam service apikeys main --show-secret
+
+# [[proxy_service]]
+# id = "svc_..."
+# name = "main"
+# host = "127.0.0.1"
+# port = 5580
+# enabled = true
+# api_key_ids = ["ak_..."]
+# created_at = 0
+
 # [[api_key]]
 # name = "alice"
 # key = "sk-..."
@@ -1269,6 +1363,7 @@ mod tests {
         assert!(config.model_mapping.is_empty());
         assert!(config.webhook.is_empty());
         assert!(config.api_key.is_empty());
+        assert!(config.proxy_service.is_empty());
     }
 
     #[test]
@@ -1326,22 +1421,38 @@ schedule = { start = "09:00", end = "18:00", days = ["mon", "tue"] }
     #[test]
     fn rejects_non_local_host_without_api_key() {
         let mut config = Config::default();
-        config.server.host = "0.0.0.0".into();
+        config.proxy_service.push(ProxyServiceConfig {
+            id: "svc_test".into(),
+            name: "test".into(),
+            host: "0.0.0.0".into(),
+            port: 5580,
+            enabled: true,
+            api_key_ids: vec!["ak_missing".into()],
+            created_at: 0,
+        });
         let error = config.validate().expect_err("public bind must fail");
-        assert!(error.to_string().contains("api key"), "{error}");
+        assert!(error.to_string().contains("API key"), "{error}");
     }
 
     #[test]
     fn accepts_non_local_host_with_enabled_api_key() {
         let mut config = Config::default();
-        config.server.host = "0.0.0.0".into();
         config.api_key.push(ApiKeyConfig {
-            id: None,
+            id: Some("ak_test".into()),
             name: "alice".into(),
             key: "sk-test".into(),
             format: ApiKeyFormat::Sk,
             enabled: true,
             credits_limit: None,
+        });
+        config.proxy_service.push(ProxyServiceConfig {
+            id: "svc_test".into(),
+            name: "test".into(),
+            host: "0.0.0.0".into(),
+            port: 5580,
+            enabled: true,
+            api_key_ids: vec!["ak_test".into()],
+            created_at: 0,
         });
         config.validate().expect("public bind with key must pass");
     }
@@ -1350,7 +1461,23 @@ schedule = { start = "09:00", end = "18:00", days = ["mon", "tue"] }
     fn treats_loopback_hosts_as_local() {
         for host in ["localhost", "127.0.0.1", "::1", "[::1]"] {
             let mut config = Config::default();
-            config.server.host = host.into();
+            config.api_key.push(ApiKeyConfig {
+                id: Some("ak_test".into()),
+                name: "alice".into(),
+                key: "sk-test".into(),
+                format: ApiKeyFormat::Sk,
+                enabled: true,
+                credits_limit: None,
+            });
+            config.proxy_service.push(ProxyServiceConfig {
+                id: "svc_test".into(),
+                name: "test".into(),
+                host: host.into(),
+                port: 5580,
+                enabled: true,
+                api_key_ids: vec!["ak_test".into()],
+                created_at: 0,
+            });
             config
                 .validate()
                 .unwrap_or_else(|error| panic!("{host} should be local: {error}"));
@@ -1360,14 +1487,22 @@ schedule = { start = "09:00", end = "18:00", days = ["mon", "tue"] }
     #[test]
     fn rejects_disabled_api_key_as_public_credential() {
         let mut config = Config::default();
-        config.server.host = "0.0.0.0".into();
         config.api_key.push(ApiKeyConfig {
-            id: None,
+            id: Some("ak_test".into()),
             name: "off".into(),
             key: "sk-test".into(),
             format: ApiKeyFormat::Sk,
             enabled: false,
             credits_limit: None,
+        });
+        config.proxy_service.push(ProxyServiceConfig {
+            id: "svc_test".into(),
+            name: "test".into(),
+            host: "0.0.0.0".into(),
+            port: 5580,
+            enabled: true,
+            api_key_ids: vec!["ak_test".into()],
+            created_at: 0,
         });
         assert!(config.validate().is_err());
     }
