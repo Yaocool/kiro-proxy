@@ -43,6 +43,18 @@ pub fn resolve_dynamic_model(model: &str, available: &[String]) -> Option<String
     if let Some(candidate) = prefixed {
         return Some(candidate.clone());
     }
+    // Some clients put the Claude family after the version
+    // (`claude-4.6-sonnet`) while Kiro returns it before the version
+    // (`claude-sonnet-4.6`). Treat separators and token order as aliases of
+    // the same discovered model, but keep family isolation so Opus, Sonnet,
+    // and Haiku can never resolve across one another.
+    if let Some(candidate) = available
+        .iter()
+        .filter(|candidate| token_model_match(model, candidate))
+        .max_by(|left, right| compare_token_matches(left, right))
+    {
+        return Some(candidate.clone());
+    }
     let family = model_family(model)?;
     available
         .iter()
@@ -52,6 +64,41 @@ pub fn resolve_dynamic_model(model: &str, available: &[String]) -> Option<String
         })
         .max_by(|left, right| compare_version(&left.0, &right.0))
         .map(|(_, candidate)| candidate.clone())
+}
+
+fn model_tokens(model: &str) -> Vec<String> {
+    model
+        .to_ascii_lowercase()
+        .split(|character: char| !character.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty() && *token != "latest" && *token != "model")
+        .map(str::to_owned)
+        .collect()
+}
+
+fn token_model_match(requested: &str, candidate: &str) -> bool {
+    const CLAUDE_FAMILIES: [&str; 3] = ["opus", "sonnet", "haiku"];
+    let requested = model_tokens(requested);
+    let candidate = model_tokens(candidate);
+    if requested.is_empty() || !requested.iter().all(|token| candidate.contains(token)) {
+        return false;
+    }
+    CLAUDE_FAMILIES.iter().all(|family| {
+        requested.iter().any(|token| token == family)
+            == candidate.iter().any(|token| token == family)
+    })
+}
+
+fn compare_token_matches(left: &str, right: &str) -> std::cmp::Ordering {
+    match (model_family(left), model_family(right)) {
+        (Some((left_family, left_version)), Some((right_family, right_version)))
+            if left_family == right_family =>
+        {
+            compare_version(&left_version, &right_version)
+                .then_with(|| right.len().cmp(&left.len()))
+                .then_with(|| left.cmp(right))
+        }
+        _ => right.len().cmp(&left.len()).then_with(|| left.cmp(right)),
+    }
 }
 
 pub fn can_resolve_dynamic_model(model: &str, available: &[String]) -> bool {
@@ -549,5 +596,54 @@ mod tests {
             Some("claude-opus-4-1")
         );
         assert!(resolve_dynamic_model("unrelated-model", &models).is_none());
+    }
+
+    #[test]
+    fn dynamic_model_resolution_accepts_reordered_client_aliases() {
+        let models = vec!["claude-opus-4.6".into(), "claude-sonnet-4.6".into()];
+        assert_eq!(
+            resolve_dynamic_model("claude-4.6-sonnet", &models).as_deref(),
+            Some("claude-sonnet-4.6")
+        );
+        assert_eq!(
+            resolve_dynamic_model("claude-4-6-opus", &models).as_deref(),
+            Some("claude-opus-4.6")
+        );
+        assert!(resolve_dynamic_model("claude-4.6-haiku", &models).is_none());
+        assert_eq!(
+            resolve_dynamic_model(
+                "claude-4.6-sonnet",
+                &["CLAUDE_SONNET_4_6_20260217_V1_0".into()]
+            )
+            .as_deref(),
+            Some("CLAUDE_SONNET_4_6_20260217_V1_0")
+        );
+    }
+
+    #[test]
+    fn explicit_mapping_routes_before_automatic_model_resolution() {
+        let rule = ModelMappingRule {
+            name: "force-opus".into(),
+            enabled: true,
+            kind: "replace".into(),
+            source_models: vec!["claude-4.6-sonnet".into()],
+            target_models: vec!["claude-opus-4.6".into()],
+            priority: 1,
+            weights: None,
+            max_remaining_credit_percent: None,
+            api_key_ids: None,
+            schedule: None,
+        };
+        let route = map_model("claude-4.6-sonnet", &[rule], None, None, "");
+        assert_eq!(route.mapped, "claude-opus-4.6");
+        assert_eq!(route.rule.as_deref(), Some("force-opus"));
+        assert_eq!(
+            resolve_dynamic_model(
+                &route.mapped,
+                &["claude-sonnet-4.6".into(), "claude-opus-4.6".into()]
+            )
+            .as_deref(),
+            Some("claude-opus-4.6")
+        );
     }
 }
