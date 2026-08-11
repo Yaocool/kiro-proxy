@@ -61,6 +61,7 @@ async fn main() -> Result<()> {
     let socket_path = config_handle.current().admin.socket.clone().into();
     let state = Arc::new(AppState::load(paths, config_handle, accounts).await?);
     let reload_state = Arc::clone(&state);
+    let reload_runtime = tokio::runtime::Handle::current();
     let _watcher = spawn_config_watcher_with_hook(
         state.paths.config_file.clone(),
         state.config.clone(),
@@ -68,17 +69,28 @@ async fn main() -> Result<()> {
         Arc::new(move |config| {
             reload_state.apply_runtime_config(config);
             reload_state.mark_config_reloaded(now_secs());
+            let service_state = Arc::clone(&reload_state);
+            let service_config = config.clone();
+            reload_runtime.spawn(async move {
+                let _failures = service_state
+                    .reconcile_proxy_services(&service_config)
+                    .await;
+            });
         }),
     )?;
     let shutdown = state.shutdown.clone();
 
     spawn_signal_handler(Arc::clone(&state), shutdown.clone());
     tasks::spawn(Arc::clone(&state), shutdown.clone());
+    let initial_config = state.config.current();
+    let failures = state.reconcile_proxy_services(&initial_config).await;
+    for (service_id, error) in failures {
+        warn!(%service_id, %error, "configured proxy service is not running");
+    }
     let admin = admin::server::serve(Arc::clone(&state), socket_path, shutdown.clone());
-    let business = http::serve(state, shutdown.clone());
-    let result = tokio::try_join!(admin, business);
+    let result = admin.await;
     shutdown.cancel();
-    result.map(|_| ())
+    result
 }
 
 #[cfg(unix)]
@@ -131,8 +143,12 @@ async fn reload_after_sighup(state: &Arc<AppState>) {
                     warn!(field, "SIGHUP field requires restart to take effect");
                 }
                 state.apply_runtime_config(&next);
-                state.config.replace(next);
+                state.config.replace(next.clone());
                 state.mark_config_reloaded(now_secs());
+                let failures = state.reconcile_proxy_services(&next).await;
+                for (service_id, error) in failures {
+                    warn!(%service_id, %error, "proxy service failed after SIGHUP reload");
+                }
                 info!("configuration reloaded after SIGHUP");
             }
             Err(error) => {

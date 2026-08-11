@@ -108,6 +108,9 @@ enum Command {
     /// API key 管理。
     #[command(name = "apikey", subcommand)]
     ApiKey(crate::commands::runtime::ApiKeyCommand),
+    /// API 代理服务管理。
+    #[command(name = "service", subcommand)]
+    Service(crate::commands::runtime::ServiceCommand),
     /// Webhook 管理。
     #[command(subcommand)]
     Webhook(crate::commands::runtime::WebhookCommand),
@@ -222,13 +225,10 @@ async fn main() -> Result<()> {
         },
         Command::Health => {
             let status: StatusResult = client.call(method::STATUS, serde_json::json!({})).await?;
-            let healthy = status.account_available > 0;
             if cli.json {
-                print_json(&serde_json::json!({"healthy":healthy,"status":status}))?;
-            } else if healthy {
-                println!("ok");
+                print_json(&serde_json::json!({"healthy":true,"status":status}))?;
             } else {
-                anyhow::bail!("kamd is running but no account is currently schedulable");
+                println!("ok");
             }
         }
         Command::Version => {
@@ -427,6 +427,9 @@ async fn main() -> Result<()> {
         Command::ApiKey(command) => {
             crate::commands::runtime::run_apikey(&mut client, command, cli.json).await?;
         }
+        Command::Service(command) => {
+            crate::commands::runtime::run_service(&mut client, command, cli.json).await?;
+        }
         Command::Webhook(command) => {
             crate::commands::runtime::run_webhook(&mut client, command, cli.json).await?;
         }
@@ -451,6 +454,10 @@ fn print_status(status: &StatusResult) {
     println!(
         "监听    {}        管理 {}",
         status.listen, status.admin_socket
+    );
+    println!(
+        "代理    {} 个（{} 运行）",
+        status.proxy_service_total, status.proxy_service_running
     );
     println!(
         "账号    {} 个（{} 可用 / {} 冷却 / {} 额度耗尽 / {} 封禁 / {} 停用）",

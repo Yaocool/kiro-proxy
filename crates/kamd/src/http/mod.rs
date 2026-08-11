@@ -6,7 +6,8 @@ pub(crate) mod prompt_cache;
 mod response;
 pub(crate) mod stream;
 
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
 use axum::extract::{DefaultBodyLimit, State};
@@ -18,6 +19,9 @@ use futures::FutureExt;
 use tracing::Instrument;
 use uuid::Uuid;
 
+use kam_core::config::ProxyServiceConfig;
+use kam_ipc::protocol::ProxyServiceView;
+
 use crate::state::AppState;
 
 pub(crate) const TRACE_ID_HEADER: &str = "x-trace-id";
@@ -25,6 +29,14 @@ pub(crate) const TRACE_ID_HEADER: &str = "x-trace-id";
 #[derive(Clone)]
 pub(crate) struct RequestTrace {
     pub id: String,
+}
+
+/// Router state scoped to one configured proxy service.
+#[derive(Clone)]
+pub(crate) struct ServiceHttpState {
+    pub app: Arc<AppState>,
+    pub service: Arc<ProxyServiceConfig>,
+    pub allowed_api_key_ids: Arc<HashSet<String>>,
 }
 
 pub(crate) fn request_trace_id(request: &axum::extract::Request) -> String {
@@ -35,8 +47,40 @@ pub(crate) fn request_trace_id(request: &axum::extract::Request) -> String {
         .unwrap_or_else(|| format!("trace_{}", Uuid::new_v4().simple()))
 }
 
+#[cfg(test)]
 pub fn router(state: Arc<AppState>) -> Router {
-    let middleware_state = Arc::clone(&state);
+    let config = state.config.current();
+    let service = ProxyServiceConfig {
+        id: "test".into(),
+        name: "test".into(),
+        host: config.server.host.clone(),
+        port: config.server.port,
+        enabled: true,
+        api_key_ids: config
+            .api_key
+            .iter()
+            .filter_map(|key| key.id.clone())
+            .collect(),
+        created_at: 0,
+    };
+    router_for_service(state, service, false)
+}
+
+fn router_for_service(
+    state: Arc<AppState>,
+    service: ProxyServiceConfig,
+    enforce_service_keys: bool,
+) -> Router {
+    let mut allowed_api_key_ids = service.api_key_ids.iter().cloned().collect::<HashSet<_>>();
+    if !enforce_service_keys {
+        allowed_api_key_ids.clear();
+    }
+    let router_state = ServiceHttpState {
+        app: state,
+        service: Arc::new(service),
+        allowed_api_key_ids: Arc::new(allowed_api_key_ids),
+    };
+    let middleware_state = router_state.clone();
     Router::new()
         .route("/", get(handlers::root))
         .route("/health", get(handlers::health))
@@ -90,7 +134,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         ))
         .layer(middleware::from_fn(cors))
         .layer(middleware::from_fn(trace_requests))
-        .with_state(state)
+        .with_state(router_state)
 }
 
 async fn trace_requests(mut request: axum::extract::Request, next: Next) -> Response {
@@ -180,7 +224,7 @@ async fn cors(request: axum::extract::Request, next: Next) -> Response {
 }
 
 async fn keep_alive_headers(
-    State(state): State<Arc<AppState>>,
+    State(state): State<ServiceHttpState>,
     request: axum::extract::Request,
     next: Next,
 ) -> Response {
@@ -191,6 +235,7 @@ async fn keep_alive_headers(
     let mut response = next.run(request).await;
     if http1 {
         let seconds = state
+            .app
             .config
             .current()
             .server
@@ -223,22 +268,132 @@ async fn catch_panics(request: axum::extract::Request, next: Next) -> Response {
     }
 }
 
-pub async fn serve(
-    state: Arc<AppState>,
-    shutdown: tokio_util::sync::CancellationToken,
-) -> anyhow::Result<()> {
-    if std::env::var("KAM_DISABLE_HTTP").as_deref() == Ok("1") {
-        tracing::info!("business HTTP plane disabled by KAM_DISABLE_HTTP");
-        shutdown.cancelled().await;
-        return Ok(());
+struct RunningService {
+    config: ProxyServiceConfig,
+    cancel: tokio_util::sync::CancellationToken,
+    task: tokio::task::JoinHandle<()>,
+    error: Arc<RwLock<Option<String>>>,
+}
+
+/// Reconciles configured proxy listeners independently from the admin plane.
+#[derive(Default)]
+pub struct ProxyServiceManager {
+    reconcile_lock: tokio::sync::Mutex<()>,
+    running: tokio::sync::Mutex<HashMap<String, RunningService>>,
+}
+
+impl ProxyServiceManager {
+    pub async fn reconcile(
+        &self,
+        state: Arc<AppState>,
+        services: &[ProxyServiceConfig],
+    ) -> Vec<(String, String)> {
+        let _reconcile = self.reconcile_lock.lock().await;
+        let desired = services
+            .iter()
+            .filter(|service| service.enabled)
+            .cloned()
+            .map(|service| (service.id.clone(), service))
+            .collect::<HashMap<_, _>>();
+
+        let stopped = {
+            let mut running = self.running.lock().await;
+            let ids = running
+                .iter()
+                .filter_map(|(id, current)| {
+                    desired
+                        .get(id)
+                        .is_none_or(|next| next != &current.config)
+                        .then_some(id.clone())
+                })
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| running.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        for mut service in stopped {
+            service.cancel.cancel();
+            if tokio::time::timeout(Duration::from_secs(10), &mut service.task)
+                .await
+                .is_err()
+            {
+                service.task.abort();
+            }
+        }
+
+        if std::env::var("KAM_DISABLE_HTTP").as_deref() == Ok("1") {
+            if !desired.is_empty() {
+                tracing::info!("proxy services disabled by KAM_DISABLE_HTTP");
+            }
+            return Vec::new();
+        }
+
+        let existing = self
+            .running
+            .lock()
+            .await
+            .keys()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let mut failures = Vec::new();
+        for (id, service) in desired {
+            if existing.contains(&id) {
+                continue;
+            }
+            match start_service(Arc::clone(&state), service.clone()).await {
+                Ok(running) => {
+                    self.running.lock().await.insert(id, running);
+                }
+                Err(error) => {
+                    tracing::error!(service_id = %service.id, %error, "proxy service failed to start");
+                    failures.push((service.id, error.to_string()));
+                }
+            }
+        }
+        failures
     }
+
+    pub async fn views(&self, services: &[ProxyServiceConfig]) -> Vec<ProxyServiceView> {
+        let running = self.running.lock().await;
+        services
+            .iter()
+            .map(|service| {
+                let runtime = running.get(&service.id);
+                let is_running = runtime.is_some_and(|runtime| !runtime.task.is_finished());
+                let error = runtime.and_then(|runtime| read_lock(&runtime.error).clone());
+                ProxyServiceView {
+                    id: service.id.clone(),
+                    name: service.name.clone(),
+                    host: service.host.clone(),
+                    port: service.port,
+                    enabled: service.enabled,
+                    running: is_running,
+                    api_key_ids: service.api_key_ids.clone(),
+                    created_at: service.created_at,
+                    error,
+                }
+            })
+            .collect()
+    }
+}
+
+async fn start_service(
+    state: Arc<AppState>,
+    service: ProxyServiceConfig,
+) -> anyhow::Result<RunningService> {
     let config = state.config.current();
-    let port = std::env::var("KAM_HTTP_PORT")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(config.server.port);
-    if config.server.tls.enabled {
-        let address = resolve_address(&config.server.host, port).await?;
+    let port = effective_port(&config, &service);
+    let address = resolve_address(&service.host, port).await?;
+    let cancel = state.shutdown.child_token();
+    let error = Arc::new(RwLock::new(None));
+    let task_error = Arc::clone(&error);
+    let task_service = service.clone();
+    let service_id = service.id.clone();
+    let service_name = service.name.clone();
+
+    let task = if config.server.tls.enabled {
+        let probe = std::net::TcpListener::bind(address)?;
+        drop(probe);
         let tls =
             if let (Some(cert), Some(key)) = (&config.server.tls.cert, &config.server.tls.key) {
                 axum_server::tls_rustls::RustlsConfig::from_pem(
@@ -255,27 +410,56 @@ pub async fn serve(
                 })?;
                 axum_server::tls_rustls::RustlsConfig::from_pem_file(cert, key).await?
             };
-        let handle = axum_server::Handle::new();
         state.install_tls_config(tls.clone());
+        let handle = axum_server::Handle::new();
         let stop_handle = handle.clone();
+        let stop = cancel.clone();
         tokio::spawn(async move {
-            shutdown.cancelled().await;
-            stop_handle.graceful_shutdown(Some(Duration::from_secs(10)));
-        });
-        tracing::info!(%address, "business HTTPS plane listening");
-        axum_server::bind_rustls(address, tls)
-            .handle(handle)
-            .serve(router(state).into_make_service())
-            .await?;
-        return Ok(());
+            tokio::spawn(async move {
+                stop.cancelled().await;
+                stop_handle.graceful_shutdown(Some(Duration::from_secs(10)));
+            });
+            tracing::info!(%address, %service_id, %service_name, "proxy HTTPS service listening");
+            if let Err(failure) = axum_server::bind_rustls(address, tls)
+                .handle(handle)
+                .serve(router_for_service(state, task_service, true).into_make_service())
+                .await
+            {
+                *write_lock(&task_error) = Some(failure.to_string());
+            }
+        })
+    } else {
+        let listener = tokio::net::TcpListener::bind(address).await?;
+        let serve_cancel = cancel.clone();
+        tokio::spawn(async move {
+            tracing::info!(%address, %service_id, %service_name, "proxy HTTP service listening");
+            if let Err(failure) =
+                axum::serve(listener, router_for_service(state, task_service, true))
+                    .with_graceful_shutdown(serve_cancel.cancelled_owned())
+                    .await
+            {
+                *write_lock(&task_error) = Some(failure.to_string());
+            }
+        })
+    };
+    Ok(RunningService {
+        config: service,
+        cancel,
+        task,
+        error,
+    })
+}
+
+fn effective_port(config: &kam_core::config::Config, service: &ProxyServiceConfig) -> u16 {
+    if service.port == config.server.port {
+        std::env::var("KAM_HTTP_PORT")
+            .ok()
+            .and_then(|value| value.parse::<u16>().ok())
+            .filter(|port| *port > 0)
+            .unwrap_or(service.port)
+    } else {
+        service.port
     }
-    let address = format!("{}:{}", config.server.host, port);
-    let listener = tokio::net::TcpListener::bind(&address).await?;
-    tracing::info!(%address, "business HTTP plane listening");
-    axum::serve(listener, router(state))
-        .with_graceful_shutdown(shutdown.cancelled_owned())
-        .await?;
-    Ok(())
 }
 
 async fn resolve_address(host: &str, port: u16) -> anyhow::Result<std::net::SocketAddr> {
@@ -283,6 +467,16 @@ async fn resolve_address(host: &str, port: u16) -> anyhow::Result<std::net::Sock
         .await?
         .next()
         .ok_or_else(|| anyhow::anyhow!("cannot resolve listen host {host}"))
+}
+
+fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
+    lock.read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
+    lock.write()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 #[cfg(test)]

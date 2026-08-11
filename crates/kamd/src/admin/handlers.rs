@@ -4,10 +4,13 @@ use std::sync::Arc;
 
 use futures::{stream, StreamExt};
 use kam_core::account::Account;
+use kam_core::config::{ApiKeyConfig, ApiKeyFormat, ProxyServiceConfig};
 use kam_core::ids::{new_account_id, new_machine_id};
 use kam_ipc::protocol::*;
 use kam_store::accounts::AccountStore;
 use kam_store::config_loader::{load_config, merge_hot_reload};
+use rand::RngCore;
+use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::state::AppState;
@@ -48,6 +51,9 @@ pub async fn dispatch(state: &Arc<AppState>, request: Request) -> Response {
         method::MODELS => handle_models(state).await,
         method::APIKEY_LIST => to_value(state.meter.list()),
         method::APIKEY_RESET_USAGE => handle_apikey_reset(state, request.params).await,
+        method::SERVICE_LIST => handle_service_list(state).await,
+        method::SERVICE_CREATE => handle_service_create(state, request.params).await,
+        method::SERVICE_APIKEYS => handle_service_apikeys(state, request.params),
         method::WEBHOOK_LIST => handle_webhook_list(state),
         method::WEBHOOK_TEST => handle_webhook_test(state, request.params),
         method::WEBHOOK_LOGS => handle_webhook_logs(state, request.params),
@@ -230,6 +236,20 @@ fn parse_params<T: serde::de::DeserializeOwned>(params: serde_json::Value) -> Re
 
 async fn handle_status(state: &Arc<AppState>) -> Handled {
     let config = state.config.current();
+    let services = state.proxy_services.views(&config.proxy_service).await;
+    let running_services = services
+        .iter()
+        .filter(|service| service.running)
+        .collect::<Vec<_>>();
+    let listen = if running_services.is_empty() {
+        "-".to_string()
+    } else {
+        running_services
+            .iter()
+            .map(|service| format!("{}:{}", service.host, service.port))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
     let (total, enabled) = state.with_accounts(|store| {
         (
             store.len(),
@@ -273,7 +293,9 @@ async fn handle_status(state: &Arc<AppState>) -> Handled {
         version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
         uptime_secs: state.uptime_secs(),
-        listen: format!("{}:{}", config.server.host, config.server.port),
+        listen,
+        proxy_service_total: services.len(),
+        proxy_service_running: running_services.len(),
         admin_socket: state.admin_socket().display().to_string(),
         account_total: total,
         account_enabled: enabled,
@@ -350,8 +372,12 @@ async fn handle_config_reload(state: &Arc<AppState>) -> Handled {
         warn!(field = %field, "configuration field requires restart");
     }
     state.apply_runtime_config(&next);
-    state.config.replace(next);
+    state.config.replace(next.clone());
     state.mark_config_reloaded(now_secs());
+    let failures = state.reconcile_proxy_services(&next).await;
+    for (service_id, error) in failures {
+        warn!(%service_id, %error, "proxy service failed after config reload");
+    }
     to_value(ConfigReloadResult {
         applied: true,
         error: None,
@@ -1100,6 +1126,194 @@ fn handle_webhook_logs(state: &Arc<AppState>, params: serde_json::Value) -> Hand
     to_value(state.notifier().logs(params.tail))
 }
 
+async fn handle_service_list(state: &Arc<AppState>) -> Handled {
+    let config = state.config.current();
+    to_value(ProxyServiceListResult {
+        services: state.proxy_services.views(&config.proxy_service).await,
+    })
+}
+
+fn handle_service_apikeys(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
+    let params: ProxyServiceApiKeysParams = parse_params(params)?;
+    let selector = params.service.trim();
+    if selector.is_empty() {
+        return Err(RpcError::bad_params("service ID or name must not be empty"));
+    }
+    let config = state.config.current();
+    let service = config
+        .proxy_service
+        .iter()
+        .find(|service| service.id == selector || service.name == selector)
+        .ok_or_else(|| RpcError::bad_params(format!("proxy service not found: {selector}")))?;
+    let api_keys = service
+        .api_key_ids
+        .iter()
+        .filter_map(|key_id| {
+            config
+                .api_key
+                .iter()
+                .find(|key| key.id.as_deref() == Some(key_id.as_str()))
+                .map(|key| ProxyServiceApiKeyView {
+                    id: key_id.clone(),
+                    name: key.name.clone(),
+                    format: match key.format {
+                        ApiKeyFormat::Sk => "sk",
+                        ApiKeyFormat::Simple => "simple",
+                        ApiKeyFormat::Token => "token",
+                    }
+                    .to_string(),
+                    enabled: key.enabled,
+                    credits_limit: key.credits_limit,
+                    key: params.show_secret.then(|| key.key.clone()),
+                })
+        })
+        .collect();
+    to_value(ProxyServiceApiKeysResult {
+        service_id: service.id.clone(),
+        service_name: service.name.clone(),
+        api_keys,
+    })
+}
+
+async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
+    let params: ProxyServiceCreateParams = parse_params(params)?;
+    let name = params.name.trim();
+    if name.is_empty() {
+        return Err(RpcError::bad_params("service name must not be empty"));
+    }
+    let _mutation = state.lock_config_mutation().await;
+    let previous = state.config.current().as_ref().clone();
+    if previous
+        .proxy_service
+        .iter()
+        .any(|service| service.name == name)
+    {
+        return Err(RpcError::bad_params(format!(
+            "proxy service name already exists: {name}"
+        )));
+    }
+
+    let format_name = params.api_key_format.as_deref().unwrap_or("sk");
+    let format = match format_name {
+        "sk" => ApiKeyFormat::Sk,
+        "token" => ApiKeyFormat::Token,
+        "simple" => ApiKeyFormat::Simple,
+        other => {
+            return Err(RpcError::bad_params(format!(
+                "unsupported API key format: {other}"
+            )))
+        }
+    };
+    let key = generate_api_key(format);
+    let key_id = api_key_id(&key);
+    let key_name = params
+        .api_key_name
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| format!("{name}-default"));
+    let service = ProxyServiceConfig {
+        id: format!("svc_{}", uuid::Uuid::new_v4().simple()),
+        name: name.to_string(),
+        host: params.host.unwrap_or_else(|| previous.server.host.clone()),
+        port: params.port.unwrap_or(previous.server.port),
+        enabled: true,
+        api_key_ids: vec![key_id.clone()],
+        created_at: now_secs(),
+    };
+    let key_config = ApiKeyConfig {
+        id: Some(key_id.clone()),
+        name: key_name.clone(),
+        key: key.clone(),
+        format,
+        enabled: true,
+        credits_limit: None,
+    };
+
+    let mut next = previous.clone();
+    next.api_key.push(key_config);
+    next.proxy_service.push(service.clone());
+    next.validate()
+        .map_err(|error| RpcError::bad_params(error.to_string()))?;
+
+    let raw = tokio::fs::read(&state.paths.config_file)
+        .await
+        .map_err(|error| RpcError::internal(error.to_string()))?;
+    let output = toml::to_string_pretty(&next)
+        .map_err(|error| RpcError::internal(format!("serialize config: {error}")))?;
+    kam_store::atomic::write_bytes_atomically(
+        &state.paths.config_file,
+        output.as_bytes(),
+        Some(0o600),
+    )
+    .await
+    .map_err(|error| RpcError::internal(error.to_string()))?;
+
+    state.apply_runtime_config(&next);
+    state.config.replace(next.clone());
+    state.mark_config_reloaded(now_secs());
+    let failures = state.reconcile_proxy_services(&next).await;
+    if let Some((_, error)) = failures
+        .into_iter()
+        .find(|(service_id, _)| service_id == &service.id)
+    {
+        let rollback_write =
+            kam_store::atomic::write_bytes_atomically(&state.paths.config_file, &raw, Some(0o600))
+                .await;
+        state.apply_runtime_config(&previous);
+        state.config.replace(previous.clone());
+        let _rollback_failures = state.reconcile_proxy_services(&previous).await;
+        if let Err(rollback_error) = rollback_write {
+            return Err(RpcError::internal(format!(
+                "proxy service failed to start ({error}); config rollback failed: {rollback_error}"
+            )));
+        }
+        return Err(RpcError::bad_params(format!(
+            "proxy service failed to start: {error}"
+        )));
+    }
+
+    let view = state
+        .proxy_services
+        .views(&next.proxy_service)
+        .await
+        .into_iter()
+        .find(|view| view.id == service.id)
+        .ok_or_else(|| RpcError::internal("created proxy service is missing"))?;
+    to_value(ProxyServiceCreateResult {
+        service: view,
+        api_key: CreatedApiKey {
+            id: key_id,
+            name: key_name,
+            key,
+        },
+    })
+}
+
+fn generate_api_key(format: ApiKeyFormat) -> String {
+    let mut bytes = [0_u8; 24];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    let random = bytes.iter().fold(String::new(), |mut output, byte| {
+        use std::fmt::Write as _;
+        let _ = write!(output, "{byte:02x}");
+        output
+    });
+    match format {
+        ApiKeyFormat::Sk => format!("sk-{random}"),
+        ApiKeyFormat::Token => format!("token_{random}"),
+        ApiKeyFormat::Simple => random,
+    }
+}
+
+fn api_key_id(key: &str) -> String {
+    let digest = Sha256::digest(key.as_bytes());
+    digest[..8]
+        .iter()
+        .fold(String::from("ak_"), |mut output, byte| {
+            use std::fmt::Write as _;
+            let _ = write!(output, "{byte:02x}");
+            output
+        })
+}
+
 async fn handle_apikey_reset(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
     let params: AccountRefParams = parse_params(params)?;
     match state.meter.reset_usage(&params.id).await {
@@ -1214,7 +1428,9 @@ mod tests {
         .expect("status");
         assert_eq!(status.account_total, 2);
         assert_eq!(status.account_enabled, 1);
-        assert_eq!(status.listen, "127.0.0.1:5580");
+        assert_eq!(status.listen, "-");
+        assert_eq!(status.proxy_service_total, 0);
+        assert_eq!(status.proxy_service_running, 0);
 
         let (_directory, empty) = state_with(vec![]).await;
         let empty_status: StatusResult = serde_json::from_value(expect_ok(
@@ -1226,6 +1442,96 @@ mod tests {
         ))
         .expect("empty status");
         assert!(empty_status.hint.is_some());
+    }
+
+    #[tokio::test]
+    async fn creating_first_proxy_service_returns_a_scoped_api_key() {
+        let (_directory, state) = state_with(vec![]).await;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port");
+        let port = listener.local_addr().expect("address").port();
+        drop(listener);
+
+        let created: ProxyServiceCreateResult = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(
+                    1,
+                    method::SERVICE_CREATE,
+                    serde_json::json!({"name":"first","port":port}),
+                ),
+            )
+            .await,
+        ))
+        .expect("created service");
+        assert!(created.service.running);
+        assert_eq!(created.service.port, port);
+        assert_eq!(
+            created.service.api_key_ids,
+            vec![created.api_key.id.clone()]
+        );
+        assert!(created.api_key.key.starts_with("sk-"));
+
+        let listed: ProxyServiceListResult = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(2, method::SERVICE_LIST, serde_json::json!({})),
+            )
+            .await,
+        ))
+        .expect("service list");
+        assert_eq!(listed.services.len(), 1);
+        assert!(!serde_json::to_string(&listed)
+            .expect("serialize list")
+            .contains(&created.api_key.key));
+
+        let hidden: ProxyServiceApiKeysResult = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(
+                    3,
+                    method::SERVICE_APIKEYS,
+                    serde_json::json!({"service":"first"}),
+                ),
+            )
+            .await,
+        ))
+        .expect("hidden service API keys");
+        assert_eq!(hidden.service_id, created.service.id);
+        assert_eq!(hidden.api_keys.len(), 1);
+        assert!(hidden.api_keys[0].key.is_none());
+        assert!(!serde_json::to_string(&hidden)
+            .expect("serialize hidden keys")
+            .contains(&created.api_key.key));
+
+        let revealed: ProxyServiceApiKeysResult = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(
+                    4,
+                    method::SERVICE_APIKEYS,
+                    serde_json::json!({
+                        "service":created.service.id,
+                        "show_secret":true
+                    }),
+                ),
+            )
+            .await,
+        ))
+        .expect("revealed service API keys");
+        assert_eq!(
+            revealed.api_keys[0].key.as_deref(),
+            Some(created.api_key.key.as_str())
+        );
+
+        let health: serde_json::Value = reqwest::get(format!("http://127.0.0.1:{port}/health"))
+            .await
+            .expect("health request")
+            .json()
+            .await
+            .expect("health JSON");
+        assert_eq!(health["status"], "ok");
+        assert_eq!(health["available_accounts"], 0);
+        state.shutdown.cancel();
     }
 
     #[tokio::test]
@@ -1294,7 +1600,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_reload_reports_but_does_not_apply_socket_fields() {
+    async fn config_reload_applies_service_defaults_but_not_socket_fields() {
         let (_directory, state) = state_with(vec![]).await;
         tokio::fs::write(
             &state.paths.config_file,
@@ -1311,8 +1617,8 @@ mod tests {
         ))
         .expect("reload");
         assert!(result.applied);
-        assert_eq!(result.needs_restart, vec!["server.port"]);
-        assert_eq!(state.config.current().server.port, 5580);
+        assert!(result.needs_restart.is_empty());
+        assert_eq!(state.config.current().server.port, 6100);
         assert!(state.config.current().features.enable_prompt_cache);
     }
 }

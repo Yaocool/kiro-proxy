@@ -15,6 +15,7 @@ struct Daemon {
     child: Child,
     socket: PathBuf,
     home: tempfile::TempDir,
+    api_key: Option<String>,
 }
 
 impl Daemon {
@@ -36,6 +37,7 @@ impl Daemon {
             child,
             socket,
             home,
+            api_key: None,
         }
     }
 
@@ -48,7 +50,6 @@ impl Daemon {
         let socket = home.path().join("admin.sock");
         let child = Command::new(env!("CARGO_BIN_EXE_kamd"))
             .env("KAM_HOME", home.path())
-            .env("KAM_HTTP_PORT", port.to_string())
             .env("KAM_CODEWHISPERER_URL", upstream_url)
             .env("KAM_AMAZONQ_URL", upstream_url)
             .env("RUST_LOG", "warn")
@@ -58,11 +59,24 @@ impl Daemon {
             .spawn()
             .expect("spawn kamd with HTTP");
         wait_for_socket(&socket).await;
+        let created = expect_ok(
+            rpc_call(
+                &socket,
+                "service.create",
+                serde_json::json!({"name":"e2e","host":"127.0.0.1","port":port}),
+            )
+            .await,
+        );
+        let api_key = created["api_key"]["key"]
+            .as_str()
+            .expect("created API key")
+            .to_string();
         wait_for_http(port).await;
         Self {
             child,
             socket,
             home,
+            api_key: Some(api_key),
         }
     }
 
@@ -260,6 +274,7 @@ async fn inbound_openai_request_runs_through_translation_pool_and_mock_upstream(
 
     let response = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .bearer_auth(daemon.api_key.as_deref().expect("service API key"))
         .json(&serde_json::json!({
             "model": "minimax-m2.5",
             "messages": [{"role":"user", "content":"exercise every layer"}],
@@ -312,7 +327,8 @@ async fn bare_start_creates_files_secures_socket_and_serves_status() {
     assert_eq!(socket_mode, 0o600);
     let status = expect_ok(daemon.call("status", serde_json::json!({})).await);
     assert_eq!(status["account_total"], 0);
-    assert_eq!(status["listen"], "127.0.0.1:5580");
+    assert_eq!(status["listen"], "-");
+    assert_eq!(status["proxy_service_total"], 0);
     assert!(status["hint"].is_string());
     daemon.stop().await;
 }
@@ -411,7 +427,7 @@ async fn config_edit_hot_reloads_and_broken_edit_keeps_service_alive() {
         .expect("break config");
     tokio::time::sleep(Duration::from_millis(1_200)).await;
     let status = expect_ok(daemon.call("status", serde_json::json!({})).await);
-    assert_eq!(status["listen"], "127.0.0.1:5580");
+    assert_eq!(status["listen"], "-");
     daemon.stop().await;
 }
 

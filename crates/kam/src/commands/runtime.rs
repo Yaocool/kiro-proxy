@@ -4,13 +4,51 @@ use anyhow::{anyhow, Context, Result};
 use clap::Subcommand;
 use kam_core::paths::Paths;
 use kam_ipc::protocol::method;
-use kam_ipc::protocol::{ConfigPathResult, ConfigReloadResult, ConfigShowResult};
+use kam_ipc::protocol::{
+    ConfigPathResult, ConfigReloadResult, ConfigShowResult, ProxyServiceApiKeysResult,
+    ProxyServiceCreateResult, ProxyServiceListResult,
+};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 use crate::client::AdminClient;
 use crate::output::{print_json, render_table};
 use crate::ModelMapCommand;
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommand {
+    /// 列出 API 代理服务。
+    #[command(after_help = "示例：\n  kam service list\n  kam --json service list")]
+    List,
+    /// 创建并启动服务，同时生成首个 API key。
+    #[command(
+        after_help = "示例：\n  kam service create --name main\n  kam service create --name team --host 127.0.0.1 --port 5581"
+    )]
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        api_key_name: Option<String>,
+        #[arg(long, default_value = "sk")]
+        api_key_format: String,
+    },
+    /// 查看服务绑定的 API key；明文需要显式授权输出。
+    #[command(
+        name = "apikeys",
+        after_help = "示例：\n  kam service apikeys main\n  kam service apikeys svc_abcd --show-secret"
+    )]
+    ApiKeys {
+        /// 服务 ID 或名称。
+        service: String,
+        /// 输出 API key 明文。注意终端记录和 CI 日志泄露风险。
+        #[arg(long)]
+        show_secret: bool,
+    },
+}
 
 #[derive(Debug, Subcommand)]
 pub enum ApiKeyCommand {
@@ -330,6 +368,137 @@ pub async fn run_apikey(
         }
         ApiKeyCommand::Limit { id, credits } => {
             mutate_key_and_reload(client, &id, "credits_limit", toml::Value::Float(credits)).await
+        }
+    }
+}
+
+pub async fn run_service(
+    client: &mut AdminClient,
+    command: ServiceCommand,
+    json: bool,
+) -> Result<()> {
+    match command {
+        ServiceCommand::List => {
+            let result: ProxyServiceListResult = client
+                .call(method::SERVICE_LIST, serde_json::json!({}))
+                .await?;
+            if json {
+                print_json(&result)?;
+            } else if result.services.is_empty() {
+                println!("暂无 API 代理服务。使用 `kam service create --name <名称>` 创建。");
+            } else {
+                let rows = result
+                    .services
+                    .into_iter()
+                    .map(|service| {
+                        vec![
+                            service.id,
+                            service.name,
+                            format!("{}:{}", service.host, service.port),
+                            if service.running {
+                                "running".into()
+                            } else if service.enabled {
+                                "error".into()
+                            } else {
+                                "disabled".into()
+                            },
+                            service.api_key_ids.len().to_string(),
+                            service.error.unwrap_or_default(),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                println!(
+                    "{}",
+                    render_table(&["ID", "名称", "监听", "状态", "API Keys", "错误"], &rows)
+                );
+            }
+            Ok(())
+        }
+        ServiceCommand::Create {
+            name,
+            host,
+            port,
+            api_key_name,
+            api_key_format,
+        } => {
+            let result: ProxyServiceCreateResult = client
+                .call(
+                    method::SERVICE_CREATE,
+                    serde_json::json!({
+                        "name":name,
+                        "host":host,
+                        "port":port,
+                        "api_key_name":api_key_name,
+                        "api_key_format":api_key_format
+                    }),
+                )
+                .await?;
+            if json {
+                print_json(&result)?;
+            } else {
+                println!(
+                    "已创建并启动 {} ({})，监听 {}:{}",
+                    result.service.id,
+                    result.service.name,
+                    result.service.host,
+                    result.service.port
+                );
+                println!(
+                    "已创建默认 API key {} ({})：\n{}\n可用 `kam service apikeys {} --show-secret` 再次查看。",
+                    result.api_key.id,
+                    result.api_key.name,
+                    result.api_key.key,
+                    result.service.id
+                );
+            }
+            Ok(())
+        }
+        ServiceCommand::ApiKeys {
+            service,
+            show_secret,
+        } => {
+            let result: ProxyServiceApiKeysResult = client
+                .call(
+                    method::SERVICE_APIKEYS,
+                    serde_json::json!({"service":service,"show_secret":show_secret}),
+                )
+                .await?;
+            if json {
+                print_json(&result)?;
+            } else if result.api_keys.is_empty() {
+                println!(
+                    "API 代理服务 {} ({}) 未绑定 API key。",
+                    result.service_id, result.service_name
+                );
+            } else {
+                let rows = result
+                    .api_keys
+                    .into_iter()
+                    .map(|key| {
+                        vec![
+                            key.id,
+                            key.name,
+                            key.format,
+                            if key.enabled { "enabled" } else { "disabled" }.into(),
+                            key.credits_limit
+                                .map(|limit| limit.to_string())
+                                .unwrap_or_else(|| "-".into()),
+                            key.key.unwrap_or_else(|| "<hidden>".into()),
+                        ]
+                    })
+                    .collect::<Vec<_>>();
+                println!(
+                    "{}",
+                    render_table(
+                        &["ID", "名称", "格式", "状态", "Credits 上限", "API Key"],
+                        &rows
+                    )
+                );
+                if !show_secret {
+                    println!("使用 --show-secret 显示明文 API Key。");
+                }
+            }
+            Ok(())
         }
     }
 }
