@@ -749,6 +749,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_model_alias_is_matched_against_discovered_kiro_models() {
+        let pool = AccountPool::new(
+            vec![account("alias", 0.0, SubscriptionKind::Pro)],
+            immediate_config(),
+        );
+        pool.get("alias")
+            .await
+            .expect("account")
+            .set_supported_models(["claude-sonnet-4.6".into()])
+            .await;
+        let lease = pool
+            .acquire("claude-4.6-sonnet", 0.0, &[])
+            .await
+            .expect("client alias should resolve through the discovered catalog");
+        assert_eq!(lease.account().await.id, "alias");
+    }
+
+    #[tokio::test]
     async fn reports_exhaustion_only_when_every_matching_account_is_out_of_credit() {
         let mut exhausted = account("out", 100.0, SubscriptionKind::Pro);
         exhausted.credit_exhausted = true;
