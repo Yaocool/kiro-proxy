@@ -5,9 +5,8 @@ if [ "$#" -gt 0 ]; then
   exec "$@"
 fi
 
-# The daemon deliberately binds loopback when no API key is configured. In a
-# container, publish that loopback listener through a tiny TCP forwarder while
-# Docker still restricts the host-side mapping to 127.0.0.1.
+# Optional compatibility forwarder for bridge-network deployments. The default
+# Compose setup uses host networking and does not set KAM_FORWARD_PORT.
 if [ -n "${KAM_FORWARD_PORT:-}" ]; then
   internal_port="${KAM_HTTP_PORT:-5580}"
   socat "TCP-LISTEN:${KAM_FORWARD_PORT},bind=0.0.0.0,reuseaddr,fork" \
