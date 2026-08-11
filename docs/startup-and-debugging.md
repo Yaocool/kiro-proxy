@@ -120,7 +120,9 @@ cargo run -p kam -- service create --name main
 
 The command creates the service's first scoped API key and prints the plaintext
 key. Use `kam service apikeys main` to inspect key metadata without secrets, or
-add `--show-secret` to retrieve plaintext keys bound only to that service.
+add `--show-secret` to retrieve plaintext keys bound only to that service. The
+default listener is `0.0.0.0`; use `--host 127.0.0.1` when only local access is
+required.
 
 ### Administration-only mode
 
@@ -170,12 +172,13 @@ or manual verification.
 If one has not been created yet, create a proxy and save the returned API key:
 
 ```bash
-kam service create --name main --host 127.0.0.1 --port 5580
+kam service create --name main --port 5580
 kam service list
 kam service apikeys main --show-secret
 ```
 
-The business address is now `http://127.0.0.1:5580`.
+The service now binds to `0.0.0.0:5580`; its local business address is
+`http://127.0.0.1:5580`.
 
 ```bash
 curl -i http://127.0.0.1:5580/health
@@ -205,6 +208,14 @@ unauthenticated public exposure.
 
 Every business HTTP response includes `x-trace-id`. Save that value when
 investigating an error.
+
+Stop and remove a service when it is no longer needed. Its API keys are kept so
+they cannot be deleted accidentally; remove an unused key separately with
+`kam apikey rm <id> --yes`.
+
+```bash
+kam service delete main --yes
+```
 
 ## 6. Configuration and hot reload
 
@@ -341,13 +352,13 @@ curl -i http://127.0.0.1:5580/health
 curl -i http://127.0.0.1:6000/health
 ```
 
-The default host is `127.0.0.1`, so these listeners are reachable only from the
-Docker host. For deliberate remote access, create the service with
-`--host 0.0.0.0` and restrict the port with the host firewall or cloud security
-group. Every created service still requires its scoped API key for business
-requests. Host networking removes network isolation between the container and
-the host, so use the provided bridge compatibility forwarder instead when that
-is unacceptable.
+The default host is `0.0.0.0`, so these listeners are reachable through the
+Docker host's network interfaces. Restrict the ports with the host firewall or
+cloud security group, or create a host-only listener with `--host 127.0.0.1`.
+Every created service still requires its scoped API key for business requests.
+Host networking removes network isolation between the container and the host,
+so use the provided bridge compatibility forwarder instead when that is
+unacceptable.
 
 `docker compose down` keeps the named volume. `docker compose down -v` deletes
 configuration, accounts, statistics, and logs and should be used only when an

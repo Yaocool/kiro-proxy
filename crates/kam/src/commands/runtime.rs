@@ -6,7 +6,7 @@ use kam_core::paths::Paths;
 use kam_ipc::protocol::method;
 use kam_ipc::protocol::{
     ConfigPathResult, ConfigReloadResult, ConfigShowResult, ProxyServiceApiKeysResult,
-    ProxyServiceCreateResult, ProxyServiceListResult,
+    ProxyServiceCreateResult, ProxyServiceDeleteResult, ProxyServiceListResult,
 };
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -35,6 +35,19 @@ pub enum ServiceCommand {
         api_key_name: Option<String>,
         #[arg(long, default_value = "sk")]
         api_key_format: String,
+    },
+    /// 删除并停止服务；关联 API key 保留。
+    #[command(
+        name = "delete",
+        visible_alias = "rm",
+        after_help = "示例：\n  kam service delete main --yes\n  kam service rm svc_abcd --yes"
+    )]
+    Delete {
+        /// 服务 ID 或名称。
+        service: String,
+        /// 确认执行删除。
+        #[arg(long)]
+        yes: bool,
     },
     /// 查看服务绑定的 API key；明文需要显式授权输出。
     #[command(
@@ -449,6 +462,24 @@ pub async fn run_service(
                     result.api_key.name,
                     result.api_key.key,
                     result.service.id
+                );
+            }
+            Ok(())
+        }
+        ServiceCommand::Delete { service, yes } => {
+            require_yes(yes)?;
+            let result: ProxyServiceDeleteResult = client
+                .call(
+                    method::SERVICE_DELETE,
+                    serde_json::json!({"service":service}),
+                )
+                .await?;
+            if json {
+                print_json(&result)?;
+            } else {
+                println!(
+                    "已停止并删除 API 代理服务 {} ({})。关联 API key 未删除。",
+                    result.service_id, result.service_name
                 );
             }
             Ok(())

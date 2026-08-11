@@ -112,7 +112,8 @@ cargo run -p kam -- service create --name main
 ```
 
 该命令会创建服务的首个专属 API Key 并返回明文。使用 `kam service apikeys main` 可查看
-不含明文的 Key 元数据，增加 `--show-secret` 后只返回该服务绑定的明文 Key。
+不含明文的 Key 元数据，增加 `--show-secret` 后只返回该服务绑定的明文 Key。默认监听
+`0.0.0.0`；只需本机访问时使用 `--host 127.0.0.1`。
 
 ### 仅管理面模式
 
@@ -158,12 +159,12 @@ printf '%s\n' "$PASSWORD" | cargo run -p kam -- account add-sso \
 如果尚未创建服务，先创建代理并保存返回的 API Key：
 
 ```bash
-kam service create --name main --host 127.0.0.1 --port 5580
+kam service create --name main --port 5580
 kam service list
 kam service apikeys main --show-secret
 ```
 
-此时业务地址为 `http://127.0.0.1:5580`。
+此时服务绑定 `0.0.0.0:5580`，本机业务地址为 `http://127.0.0.1:5580`。
 
 ```bash
 curl -i http://127.0.0.1:5580/health
@@ -189,6 +190,13 @@ curl -i http://127.0.0.1:5580/v1/models \
 校验会拒绝，以避免意外对公网暴露未鉴权服务。
 
 每个业务 HTTP 响应都包含 `x-trace-id`，排查错误时应先保存这个值。
+
+不再需要某个服务时可停止并删除它。关联 API Key 会保留以避免误删；确认不再使用后，可另行
+执行 `kam apikey rm <id> --yes`。
+
+```bash
+kam service delete main --yes
+```
 
 ## 6. 配置与热重载
 
@@ -314,10 +322,10 @@ curl -i http://127.0.0.1:5580/health
 curl -i http://127.0.0.1:6000/health
 ```
 
-服务默认绑定 `127.0.0.1`，所以只有 Docker 宿主机可以访问。明确需要远程访问时，创建服务
-时增加 `--host 0.0.0.0`，并通过宿主机防火墙或云安全组限制端口。业务请求仍必须携带该
-服务绑定的 API Key。host network 会取消容器与宿主机之间的网络隔离；若无法接受，应改用
-入口脚本保留的 bridge 兼容转发方案。
+服务默认绑定 `0.0.0.0`，可通过 Docker 宿主机的网络接口访问；应使用宿主机防火墙或云
+安全组限制端口，只需本机访问时可指定 `--host 127.0.0.1`。业务请求仍必须携带该服务绑定
+的 API Key。host network 会取消容器与宿主机之间的网络隔离；若无法接受，应改用入口
+脚本保留的 bridge 兼容转发方案。
 
 `docker compose down` 会保留 named volume；`docker compose down -v` 会删除配置、账号、
 统计和日志，只应在明确需要重置时使用。

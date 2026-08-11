@@ -53,6 +53,7 @@ pub async fn dispatch(state: &Arc<AppState>, request: Request) -> Response {
         method::APIKEY_RESET_USAGE => handle_apikey_reset(state, request.params).await,
         method::SERVICE_LIST => handle_service_list(state).await,
         method::SERVICE_CREATE => handle_service_create(state, request.params).await,
+        method::SERVICE_DELETE => handle_service_delete(state, request.params).await,
         method::SERVICE_APIKEYS => handle_service_apikeys(state, request.params),
         method::WEBHOOK_LIST => handle_webhook_list(state),
         method::WEBHOOK_TEST => handle_webhook_test(state, request.params),
@@ -1288,6 +1289,49 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
     })
 }
 
+async fn handle_service_delete(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
+    let params: ProxyServiceDeleteParams = parse_params(params)?;
+    let selector = params.service.trim();
+    if selector.is_empty() {
+        return Err(RpcError::bad_params("service ID or name must not be empty"));
+    }
+
+    let _mutation = state.lock_config_mutation().await;
+    let previous = state.config.current().as_ref().clone();
+    let index = previous
+        .proxy_service
+        .iter()
+        .position(|service| service.id == selector || service.name == selector)
+        .ok_or_else(|| RpcError::bad_params(format!("proxy service not found: {selector}")))?;
+
+    let mut next = previous.clone();
+    let removed = next.proxy_service.remove(index);
+    next.validate()
+        .map_err(|error| RpcError::bad_params(error.to_string()))?;
+    let output = toml::to_string_pretty(&next)
+        .map_err(|error| RpcError::internal(format!("serialize config: {error}")))?;
+    kam_store::atomic::write_bytes_atomically(
+        &state.paths.config_file,
+        output.as_bytes(),
+        Some(0o600),
+    )
+    .await
+    .map_err(|error| RpcError::internal(error.to_string()))?;
+
+    state.apply_runtime_config(&next);
+    state.config.replace(next.clone());
+    state.mark_config_reloaded(now_secs());
+    let failures = state.reconcile_proxy_services(&next).await;
+    for (service_id, error) in failures {
+        warn!(%service_id, %error, "proxy service failed after service deletion");
+    }
+
+    to_value(ProxyServiceDeleteResult {
+        service_id: removed.id,
+        service_name: removed.name,
+    })
+}
+
 fn generate_api_key(format: ApiKeyFormat) -> String {
     let mut bytes = [0_u8; 24];
     rand::thread_rng().fill_bytes(&mut bytes);
@@ -1464,6 +1508,7 @@ mod tests {
         ))
         .expect("created service");
         assert!(created.service.running);
+        assert_eq!(created.service.host, "0.0.0.0");
         assert_eq!(created.service.port, port);
         assert_eq!(
             created.service.api_key_ids,
@@ -1531,6 +1576,37 @@ mod tests {
             .expect("health JSON");
         assert_eq!(health["status"], "ok");
         assert_eq!(health["available_accounts"], 0);
+
+        let deleted: ProxyServiceDeleteResult = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(
+                    5,
+                    method::SERVICE_DELETE,
+                    serde_json::json!({"service":"first"}),
+                ),
+            )
+            .await,
+        ))
+        .expect("deleted service");
+        assert_eq!(deleted.service_id, created.service.id);
+        assert_eq!(deleted.service_name, created.service.name);
+
+        let listed_after_delete: ProxyServiceListResult = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(6, method::SERVICE_LIST, serde_json::json!({})),
+            )
+            .await,
+        ))
+        .expect("service list after delete");
+        assert!(listed_after_delete.services.is_empty());
+        assert!(state
+            .config
+            .current()
+            .api_key
+            .iter()
+            .any(|key| key.id.as_deref() == Some(created.api_key.id.as_str())));
         state.shutdown.cancel();
     }
 

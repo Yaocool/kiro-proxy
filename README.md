@@ -81,8 +81,8 @@ one-off override remains possible:
 KAM_HTTP_PORT=5581 ./target/release/kamd
 ```
 
-After creating `main` with the default settings, its business API listens on
-`http://127.0.0.1:5580`:
+After creating `main` with the default settings, its business API binds to
+`0.0.0.0:5580`; use `http://127.0.0.1:5580` from the same host:
 
 ```text
 POST /v1/messages
@@ -166,9 +166,10 @@ kam --json account export --redact
 kam status
 kam health
 kam service list
-kam service create --name main --host 127.0.0.1 --port 5580
+kam service create --name main --port 5580
 kam service apikeys main
 kam service apikeys main --show-secret
+kam service delete main --yes
 kam account list
 kam account show <id|email>
 kam account tag <id|email> --add prod
@@ -233,10 +234,11 @@ docker compose up -d
 
 Compose uses host networking so every manually created proxy service is
 available on the Docker host immediately, including custom ports; no Compose
-edit or container restart is needed. Services bind to `127.0.0.1` by default.
-Use `--host 0.0.0.0` only when remote access is intentional. Docker Engine on
-Linux supports this directly; Docker Desktop 4.34+ requires host networking to
-be enabled in Settings. State persists in the `kam-data` volume. The full image
+edit or container restart is needed. Services bind to `0.0.0.0` by default, so
+restrict proxy ports with the host firewall or cloud security group. Use
+`--host 127.0.0.1` when host-only access is desired. Docker Engine on Linux
+supports host networking directly; Docker Desktop 4.34+ requires it to be
+enabled in Settings. State persists in the `kam-data` volume. The full image
 adds Chromium for SSO.
 
 Install the Docker-backed host wrapper once to use `kam` directly without
