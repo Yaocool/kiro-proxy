@@ -54,10 +54,16 @@ cp .env.example .env
 在另一个终端运行：
 
 ```bash
+./target/release/kam health
 ./target/release/kam status
+./target/release/kam service create --name main
 ./target/release/kam config path
 ./target/release/kam account list
 ```
+
+全新 daemon 只启动 Unix 管理面，不会默认创建或启动业务 API 代理服务。
+`kam service create` 会创建并启动服务、为该服务创建首个 API Key，并返回明文 Key。之后可
+使用 `kam service apikeys main --show-secret` 仅查询该服务绑定的明文 Key。
 
 `kamd` 和 `kam` 会从当前目录开始向上查找 `.env`。已经存在的进程环境变量优先于
 `.env` 中的同名值，因此仍可做单次启动覆盖：
@@ -66,7 +72,7 @@ cp .env.example .env
 KAM_HTTP_PORT=5581 ./target/release/kamd
 ```
 
-业务 API 默认监听 `http://127.0.0.1:5580`：
+使用默认参数创建 `main` 后，业务 API 监听 `http://127.0.0.1:5580`：
 
 ```text
 POST /v1/messages
@@ -98,8 +104,9 @@ XDG 目录：
 | 日志 | `${XDG_DATA_HOME:-~/.local/share}/kam/logs/` | 按 UTC 日期和级别拆分。 |
 
 首次启动只创建缺失文件，不覆盖已有数据。有效配置修改会自动热重载；TOML 格式错误或校验
-失败时继续使用上一份有效配置。修改 `server.host`、`server.port`、`admin.socket` 或
-HTTP/HTTPS 监听模式需要重启 daemon，其余大部分配置无需重启。
+失败时继续使用上一份有效配置。`server.host` 和 `server.port` 是新建代理服务时使用的
+默认值。修改 `admin.socket` 或共享的 HTTP/HTTPS 监听模式需要重启 daemon；包括代理服务
+列表在内的其余大部分配置无需重启。
 
 外部修改账号文件也会自动载入，损坏的账号数据不会替换内存中的有效快照。账号数较多时，
 可根据存储配置使用 gzip envelope 和增量 sidecar。
@@ -142,6 +149,11 @@ kam --json account export --redact
 
 ```bash
 kam status
+kam health
+kam service list
+kam service create --name main --host 127.0.0.1 --port 5580
+kam service apikeys main
+kam service apikeys main --show-secret
 kam account list
 kam account show <id|email>
 kam account tag <id|email> --add prod
@@ -202,8 +214,22 @@ docker build --target runtime-full -t kamd:full .
 docker compose up -d
 ```
 
-Compose 只在宿主机发布 `127.0.0.1:5580`，数据保存在 `kam-data` volume。full 镜像额外
-安装 Chromium，用于 SSO。
+Compose 使用 host network，因此手动创建的任意端口代理服务都会立即在 Docker 宿主机
+可访问，无需修改 Compose 或重启容器。服务默认绑定 `127.0.0.1`；只有明确需要远程访问时
+才使用 `--host 0.0.0.0`。Linux Docker Engine 可直接使用；Docker Desktop 4.34+ 需要在
+设置中启用 host networking。数据保存在 `kam-data` volume，full 镜像额外安装 Chromium。
+
+在宿主机安装一次 Docker 包装器后，可直接使用 `kam`，无需再输入 `docker compose exec`：
+
+```bash
+sudo ./deploy/install-kam-wrapper.sh
+kam health
+kam service list
+```
+
+包装器通过 Compose 标签自动发现运行中的 daemon，并始终使用容器内与 `kamd` 同版本的
+CLI。当前用户必须有 Docker 权限；同时运行多个 kiro-proxy Compose 项目时，设置
+`KAM_COMPOSE_PROJECT` 选择目标项目。
 
 加固后的服务模板位于 [`deploy/kamd.service`](deploy/kamd.service)。将 `kamd` 和
 `kam` 安装到 `/usr/local/bin`，创建 `kam` 系统用户与用户组，安装 unit 后即可启用服务。

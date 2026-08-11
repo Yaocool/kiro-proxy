@@ -54,8 +54,8 @@ cp .env.example .env
 | 变量 | 作用 |
 | --- | --- |
 | `KAM_HOME` | 将配置、数据、日志和自动生成的管理 socket 放到同一目录。 |
-| `KAM_HTTP_PORT` | 只覆盖当前 daemon 进程的业务 HTTP/HTTPS 监听端口。 |
-| `KAM_DISABLE_HTTP=1` | 关闭业务 HTTP 面，但继续运行 Unix 管理 socket。 |
+| `KAM_HTTP_PORT` | 覆盖端口等于 `server.port` 默认值的已配置代理服务；不会创建服务。 |
+| `KAM_DISABLE_HTTP=1` | 阻止所有已配置代理服务监听，但保留其配置并继续运行 Unix 管理 socket。 |
 | `KAM_ADMIN_SOCKET` | 覆盖 `kam` CLI 连接的 socket，不会重新配置 `kamd`。 |
 | `KAM_CODEWHISPERER_URL` | 在集成测试或受控代理环境中覆盖 CodeWhisperer 上游地址。 |
 | `KAM_AMAZONQ_URL` | 在集成测试或受控代理环境中覆盖 Amazon Q 上游地址。 |
@@ -86,6 +86,8 @@ cargo run -p kamd
 
 ```bash
 cargo run -p kam -- status
+cargo run -p kam -- health
+cargo run -p kam -- service list
 cargo run -p kam -- config path
 cargo run -p kam -- config show --effective
 cargo run -p kam -- account list
@@ -102,9 +104,19 @@ cargo build --release --locked
 同一个管理 socket 只能由一个 daemon 占用。进程崩溃留下的失效 socket 会自动删除；如果
 socket 仍能接受连接，第二个 daemon 不会删除它。
 
+全新 daemon 默认不创建业务 API 代理服务。即使没有账号或代理服务，`kam health` 仍会
+成功，因为应用健康与账号、代理服务的可用性相互独立。需要业务 API 时显式创建：
+
+```bash
+cargo run -p kam -- service create --name main
+```
+
+该命令会创建服务的首个专属 API Key 并返回明文。使用 `kam service apikeys main` 可查看
+不含明文的 Key 元数据，增加 `--show-secret` 后只返回该服务绑定的明文 Key。
+
 ### 仅管理面模式
 
-关闭业务 API，同时保留账号和配置管理：
+阻止所有已配置代理服务监听，同时保留账号和配置管理：
 
 ```bash
 KAM_DISABLE_HTTP=1 cargo run -p kamd
@@ -141,31 +153,40 @@ printf '%s\n' "$PASSWORD" | cargo run -p kam -- account add-sso \
 `kam` 会把管理请求发送给 `kamd`，所以运行中的 daemon 也必须使用 SSO feature 构建，
 不能只构建 CLI。遇到 MFA 或需要手工验证时增加 `--headful`。
 
-## 5. 验证服务
+## 5. 创建并验证代理服务
 
-默认业务地址是 `http://127.0.0.1:5580`。
+如果尚未创建服务，先创建代理并保存返回的 API Key：
+
+```bash
+kam service create --name main --host 127.0.0.1 --port 5580
+kam service list
+kam service apikeys main --show-secret
+```
+
+此时业务地址为 `http://127.0.0.1:5580`。
 
 ```bash
 curl -i http://127.0.0.1:5580/health
 
 curl -i http://127.0.0.1:5580/v1/messages/count_tokens \
+  -H 'authorization: Bearer <key>' \
   -H 'content-type: application/json' \
   -H 'user-agent: claude-cli/1.0 (external, debug)' \
   -d '{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-没有可用上游账号时，`GET /health` 和本地 Token 计数仍然可用。此时生成请求返回 `503`
-属于预期行为。
+没有可用上游账号时，`GET /health` 仍返回 `status: ok`；账号数量只是诊断信息，不参与
+应用健康判断。本地 Token 计数仍需使用服务 API Key。此时生成请求返回 `503` 属于预期行为。
 
-启用 API Key 后需要增加鉴权头：
+所有新建服务都必须使用创建时生成的 API Key：
 
 ```bash
 curl -i http://127.0.0.1:5580/v1/models \
   -H 'authorization: Bearer <key>'
 ```
 
-如果至少没有配置一个已启用的 API Key，`server.host` 绑定到非回环地址会被配置校验拒绝，
-以避免意外对公网暴露未鉴权服务。
+创建或配置监听非回环地址的服务时，该服务必须引用至少一个已启用的 API Key，否则配置
+校验会拒绝，以避免意外对公网暴露未鉴权服务。
 
 每个业务 HTTP 响应都包含 `x-trace-id`，排查错误时应先保存这个值。
 
@@ -185,12 +206,11 @@ daemon 会使用短防抖监听 `config.toml`。有效修改自动应用，TOML 
 cargo run -p kam -- config reload
 ```
 
-以下配置修改需要重启 daemon：
+`server.host` 和 `server.port` 是 `kam service create` 使用的默认值，本身不会创建监听。
+代理服务的新增和地址修改会在运行时自动协调。以下配置修改需要重启 daemon：
 
-- `server.host`；
-- `server.port`；
 - `admin.socket`；
-- 在 HTTP 与 HTTPS 监听模式之间切换。
+- 在共享的 HTTP 与 HTTPS 监听模式之间切换。
 
 日志过滤、格式、输出路径、账号池行为、模型规则、通知配置和 TLS 证书内容可以在运行时更新。
 
@@ -237,16 +257,67 @@ docker compose ps
 docker compose logs -f kamd
 ```
 
-Compose 在宿主机发布 `127.0.0.1:5580`，状态保存在 `kam-data` named volume。容器内
-`kamd` 监听回环端口 5581，`socat` 将容器端口 5580 转发到该端口。这样既保留 daemon
-只监听回环地址的安全约束，也允许 Docker 使用宿主机回环映射。
+Compose 使用 `network_mode: host`，容器内创建的代理监听会直接进入 Docker 宿主机网络
+命名空间。因此任意服务端口创建后立即可用，不需要修改 Compose 或重建容器。Linux 上的
+Docker Engine 可直接使用；Docker Desktop 4.34 及以上版本需要先在 Settings > Resources
+> Network 中启用 host networking。
+
+已有 bridge 网络部署升级后，需要重建一次本项目容器才能应用新网络模式；named volume
+中的数据会保留：
+
+```bash
+docker compose up -d --force-recreate
+```
+
+### 在 Docker 宿主机直接使用 `kam`
+
+Dockerfile 或 Compose 服务无法安全地直接向宿主机 `/usr/local/bin` 安装文件。在宿主机
+执行一次项目提供的安装脚本即可：
+
+```bash
+sudo ./deploy/install-kam-wrapper.sh
+kam health
+kam status
+kam service list
+```
+
+包装器通过容器的 `io.kiro-proxy.role=daemon` 标签发现运行中的 daemon，保留命令退出码、
+透传 stdin，并且只在交互场景分配 TTY。这样既不需要暴露管理 Unix socket，也不存在
+宿主机与容器二进制兼容问题。
+
+安装器默认拒绝覆盖已有命令：
+
+```bash
+sudo ./deploy/install-kam-wrapper.sh --force
+./deploy/install-kam-wrapper.sh --target "$HOME/.local/bin/kam"
+```
+
+当前宿主机用户必须具备 Docker 权限。同时运行多个 kiro-proxy 项目时，可以按 Compose
+项目名或容器选择目标：
+
+```bash
+export KAM_COMPOSE_PROJECT=kiro-proxy
+# 或：export KAM_DOCKER_CONTAINER=<容器名称或ID>
+kam status
+```
+
+全新 volume 需要显式创建代理服务，并保存命令返回的 API Key：
 
 ```bash
 docker compose exec kamd kam status
+docker compose exec kamd kam service create --name main
+docker compose exec kamd kam service create --name secondary --port 6000
+docker compose exec kamd kam service list
 docker compose exec kamd kam config show --effective
 docker compose exec kamd sh -c 'ls -lh /var/lib/kam/logs'
 curl -i http://127.0.0.1:5580/health
+curl -i http://127.0.0.1:6000/health
 ```
+
+服务默认绑定 `127.0.0.1`，所以只有 Docker 宿主机可以访问。明确需要远程访问时，创建服务
+时增加 `--host 0.0.0.0`，并通过宿主机防火墙或云安全组限制端口。业务请求仍必须携带该
+服务绑定的 API Key。host network 会取消容器与宿主机之间的网络隔离；若无法接受，应改用
+入口脚本保留的 bridge 兼容转发方案。
 
 `docker compose down` 会保留 named volume；`docker compose down -v` 会删除配置、账号、
 统计和日志，只应在明确需要重置时使用。
@@ -346,9 +417,10 @@ Wiremock 和端到端测试需要绑定临时回环端口，受限 CI 或沙箱�
 
 ### `Address already in use`
 
-停止占用 5580 的进程，或临时换一个端口：
+创建服务时选择未占用端口，或对配置为默认端口的服务使用进程级覆盖：
 
 ```bash
+kam service create --name main --port 5581
 KAM_HTTP_PORT=5581 cargo run -p kamd
 ```
 
