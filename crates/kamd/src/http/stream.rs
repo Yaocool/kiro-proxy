@@ -18,7 +18,7 @@ use tokio_util::codec::Decoder;
 
 use crate::meter::{now_secs, CreditReservation, UsageRecord};
 use crate::state::AppState;
-use crate::stats::RequestLog;
+use crate::stats::{RequestLog, UpstreamAttemptLog};
 
 use super::prompt_cache::PromptCacheProfile;
 use super::response::{repair_json, DecodedResponse, OpenAiToolIdentity, ToolLeakFilter};
@@ -74,6 +74,9 @@ pub struct StreamContext {
     pub original_model: String,
     pub api_key_id: Option<String>,
     pub kiro_model: String,
+    pub model_path: Vec<String>,
+    pub model_mapping_rule: Option<String>,
+    pub attempts: Vec<UpstreamAttemptLog>,
     pub input_tokens: u64,
     pub estimated_credits: f64,
     pub max_tokens: u32,
@@ -1111,12 +1114,17 @@ async fn finish_accounting(
     }
     let status = if failure.is_some() { 502 } else { 200 };
     let duration_ms = context.started.elapsed().as_millis() as u64;
+    let account = context.lease.account().await;
+    let account_name = account.display_name().to_owned();
     if let Some(error) = failure.as_deref() {
         tracing::error!(
             trace_id = %context.trace_id,
             request_id = %context.request_id,
             account_id = %context.lease.account_id(),
+            account_name,
             endpoint,
+            model_path = %context.model_path.join(" -> "),
+            mapping_rule = context.model_mapping_rule.as_deref().unwrap_or("none"),
             status,
             input_tokens = decoded.usage.input_tokens,
             output_tokens = decoded.usage.output_tokens,
@@ -1130,7 +1138,10 @@ async fn finish_accounting(
             trace_id = %context.trace_id,
             request_id = %context.request_id,
             account_id = %context.lease.account_id(),
+            account_name,
             endpoint,
+            model_path = %context.model_path.join(" -> "),
+            mapping_rule = context.model_mapping_rule.as_deref().unwrap_or("none"),
             status,
             input_tokens = decoded.usage.input_tokens,
             output_tokens = decoded.usage.output_tokens,
@@ -1144,11 +1155,15 @@ async fn finish_accounting(
         trace_id: context.trace_id,
         request_id: context.request_id,
         path: context.path,
-        model: context.model,
+        model: context.mapped_model,
         original_model: context.original_model,
         kiro_model: context.kiro_model,
         account_id: context.lease.account_id(),
+        account_name,
         endpoint,
+        model_path: context.model_path,
+        model_mapping_rule: context.model_mapping_rule,
+        attempts: context.attempts,
         duration_ms,
         status,
         input_tokens: decoded.usage.input_tokens,

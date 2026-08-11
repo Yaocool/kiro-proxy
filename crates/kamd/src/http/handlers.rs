@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::meter::{now_secs, CreditReservation, MeterError, UsageRecord};
 use crate::state::AppState;
-use crate::stats::RequestLog;
+use crate::stats::{RequestLog, UpstreamAttemptLog};
 
 use super::prompt_cache::PromptCacheProfile;
 use super::request_trace_id;
@@ -243,11 +243,20 @@ fn record_failed_request(
     };
     let safe_error = sanitize_error_message(&error.message);
     let duration_ms = started.elapsed().as_millis() as u64;
+    let model_path = error.log_context.model_path.join(" -> ");
     if error.status.is_server_error() {
         tracing::error!(
             trace_id,
             http_path = path,
             model = %model,
+            mapped_model = %error.log_context.mapped_model,
+            kiro_model = %error.log_context.kiro_model,
+            model_path,
+            mapping_rule = error.log_context.model_mapping_rule.as_deref().unwrap_or("none"),
+            account_id = %error.log_context.account_id,
+            account_name = %error.log_context.account_name,
+            endpoint = %error.log_context.endpoint,
+            upstream_attempts = error.log_context.attempts.len(),
             http_status = error.status.as_u16(),
             duration_ms,
             error = %safe_error,
@@ -269,11 +278,19 @@ fn record_failed_request(
         trace_id: trace_id.into(),
         request_id: format!("req_{}", Uuid::new_v4().simple()),
         path: path.into(),
-        model: model.clone(),
+        model: if error.log_context.mapped_model.is_empty() {
+            model.clone()
+        } else {
+            error.log_context.mapped_model.clone()
+        },
         original_model: model,
-        kiro_model: String::new(),
-        account_id: String::new(),
-        endpoint: String::new(),
+        kiro_model: error.log_context.kiro_model.clone(),
+        account_id: error.log_context.account_id.clone(),
+        account_name: error.log_context.account_name.clone(),
+        endpoint: error.log_context.endpoint.clone(),
+        model_path: error.log_context.model_path.clone(),
+        model_mapping_rule: error.log_context.model_mapping_rule.clone(),
+        attempts: error.log_context.attempts.clone(),
         duration_ms,
         status: error.status.as_u16(),
         input_tokens: 0,
@@ -412,7 +429,16 @@ async fn handle_claude(
     );
     drop(body);
     let request_id = format!("msg_{}", Uuid::new_v4().simple());
-    let (lease, upstream, mapped_model, kiro_model, payload) = execute_upstream(
+    let UpstreamExecution {
+        lease,
+        response: upstream,
+        mapped_model,
+        kiro_model,
+        model_path,
+        model_mapping_rule,
+        attempts,
+        payload,
+    } = execute_upstream(
         &state,
         &trace_id,
         &route.mapped,
@@ -440,6 +466,9 @@ async fn handle_claude(
                 original_model: request.model,
                 api_key_id: key_id.clone(),
                 kiro_model,
+                model_path,
+                model_mapping_rule,
+                attempts,
                 input_tokens,
                 estimated_credits: estimate,
                 max_tokens: request.max_tokens,
@@ -471,6 +500,9 @@ async fn handle_claude(
         request,
         mapped_model,
         kiro_model,
+        model_path,
+        model_mapping_rule,
+        attempts,
         input_tokens,
         estimate,
         started,
@@ -609,7 +641,16 @@ async fn handle_openai(
         .and_then(Value::as_bool)
         == Some(true);
     let request_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
-    let (lease, upstream, mapped_model, kiro_model, payload) = execute_upstream(
+    let UpstreamExecution {
+        lease,
+        response: upstream,
+        mapped_model,
+        kiro_model,
+        model_path,
+        model_mapping_rule,
+        attempts,
+        payload,
+    } = execute_upstream(
         &state,
         &trace_id,
         &route.mapped,
@@ -637,6 +678,9 @@ async fn handle_openai(
                 original_model: request.model,
                 api_key_id: key_id.clone(),
                 kiro_model,
+                model_path,
+                model_mapping_rule,
+                attempts,
                 input_tokens,
                 estimated_credits: estimate,
                 max_tokens,
@@ -668,6 +712,9 @@ async fn handle_openai(
         request,
         mapped_model,
         kiro_model,
+        model_path,
+        model_mapping_rule,
+        attempts,
         input_tokens,
         max_tokens,
         estimate,
@@ -819,16 +866,7 @@ async fn execute_upstream(
     default_model: &str,
     estimate: f64,
     payload: &kam_translate::KiroPayload,
-) -> Result<
-    (
-        AccountLease,
-        KiroResponse,
-        String,
-        String,
-        kam_translate::KiroPayload,
-    ),
-    ExecuteError,
-> {
+) -> Result<UpstreamExecution, ExecuteError> {
     let config = state.config.current();
     let pool = state.pool();
     let account_count = pool.snapshot().await.len() as u32;
@@ -840,6 +878,10 @@ async fn execute_upstream(
     let mut request_payload = payload.clone();
     let mut fallback_model = None::<String>;
     let mut attempted_accounts = HashSet::new();
+    let initial_route = map_model(requested_model, &config.model_mapping, key_id, None, "");
+    let mut model_mapping_rule = initial_route.rule;
+    let mut model_path = build_model_path(requested_model, model, "");
+    let mut attempt_logs = Vec::new();
     tracing::info!(
         trace_id,
         requested_model,
@@ -907,15 +949,18 @@ async fn execute_upstream(
             Err(error) => return Err(ExecuteError::Pool(error)),
         };
         let account = lease.account().await;
+        let account_name = account.display_name().to_owned();
         tracing::debug!(
             trace_id,
             attempt = attempt + 1,
             max_attempts = attempts,
             account_id = %account.id,
+            account_name,
             candidate_model = %actual_model,
             "upstream account selected"
         );
         let mut account_model_incompatible = false;
+        let mut available_models = Vec::new();
         if let Some(runtime) = pool.get(&account.id).await {
             let remaining = account
                 .usage
@@ -924,41 +969,75 @@ async fn execute_upstream(
                 .map(|usage| {
                     ((usage.limit - usage.current) / usage.limit * 100.0).clamp(0.0, 100.0)
                 });
-            mapped_model = fallback_model.clone().unwrap_or_else(|| {
-                map_model(
+            if let Some(fallback) = fallback_model.clone() {
+                mapped_model = fallback;
+            } else {
+                let route = map_model(
                     requested_model,
                     &config.model_mapping,
                     key_id,
                     remaining,
                     "",
-                )
-                .mapped
-            });
+                );
+                mapped_model = route.mapped;
+                model_mapping_rule = route.rule;
+            }
+            model_path = build_model_path(requested_model, &mapped_model, "");
             actual_model.clone_from(&mapped_model);
             if let Some(resolved) = runtime.resolve_model(&actual_model).await {
                 actual_model = resolved;
+                push_model_path(&mut model_path, &actual_model);
                 set_payload_model(&mut request_payload, &actual_model);
             } else if runtime.has_model_cache().await {
                 if !default_model.trim().is_empty() {
                     if let Some(resolved) = runtime.resolve_model(default_model).await {
                         actual_model = resolved;
+                        push_model_path(&mut model_path, default_model);
+                        push_model_path(&mut model_path, &actual_model);
                         set_payload_model(&mut request_payload, &actual_model);
                     } else {
                         account_model_incompatible = true;
+                        available_models = runtime.supported_models().await;
                     }
                 } else {
                     account_model_incompatible = true;
+                    available_models = runtime.supported_models().await;
                 }
             } else {
                 set_payload_model(&mut request_payload, &actual_model);
             }
         }
         if account_model_incompatible {
+            let reason = if default_model.trim().is_empty() {
+                format!(
+                    "model '{}' is not present in this account's model cache and no default model is configured",
+                    actual_model
+                )
+            } else {
+                format!(
+                    "model '{}' and default model '{}' are not present in this account's model cache",
+                    actual_model, default_model
+                )
+            };
+            attempt_logs.push(UpstreamAttemptLog {
+                attempt: attempt + 1,
+                account_id: account.id.clone(),
+                account_name: account_name.clone(),
+                model: actual_model.clone(),
+                available_models: available_models.clone(),
+                endpoint: "model-resolution".into(),
+                status: None,
+                error: reason.clone(),
+            });
             tracing::warn!(
                 trace_id,
                 attempt = attempt + 1,
                 account_id = %account.id,
+                account_name,
                 model = %actual_model,
+                model_path = %model_path.join(" -> "),
+                available_models = %available_models.join(","),
+                reason,
                 "account cannot serve resolved model"
             );
             attempted_accounts.insert(account.id);
@@ -991,19 +1070,38 @@ async fn execute_upstream(
                     trace_id,
                     attempt = attempt + 1,
                     account_id = %account.id,
+                    account_name,
                     mapped_model = %mapped_model,
                     kiro_model = %actual_model,
+                    model_path = %model_path.join(" -> "),
+                    mapping_rule = model_mapping_rule.as_deref().unwrap_or("none"),
                     endpoint = %response.endpoint.name,
                     "upstream response accepted"
                 );
                 pool.record_success(&account.id).await;
-                return Ok((lease, response, mapped_model, actual_model, request_payload));
+                return Ok(UpstreamExecution {
+                    lease,
+                    response,
+                    mapped_model,
+                    kiro_model: actual_model,
+                    model_path,
+                    model_mapping_rule,
+                    attempts: attempt_logs,
+                    payload: request_payload,
+                });
             }
             Err(error) if error.is_auth() => {
+                attempt_logs.push(upstream_attempt_log(
+                    attempt + 1,
+                    &account,
+                    &actual_model,
+                    &error,
+                ));
                 tracing::warn!(
                     trace_id,
                     attempt = attempt + 1,
                     account_id = %account.id,
+                    account_name,
                     endpoint = %error.endpoint,
                     upstream_status = error.status.unwrap_or_default(),
                     error = %sanitize_error_message(&error.message),
@@ -1022,27 +1120,39 @@ async fn execute_upstream(
                         .clone_from(&refreshed.profile_arn);
                     match kiro.generate(&refreshed, &request_payload, None).await {
                         Ok(response) => {
+                            let refreshed_name = refreshed.display_name().to_owned();
                             tracing::info!(
                                 trace_id,
                                 attempt = attempt + 1,
                                 account_id = %refreshed.id,
+                                account_name = refreshed_name,
                                 endpoint = %response.endpoint.name,
                                 "upstream authentication retry succeeded"
                             );
                             pool.record_success(&refreshed.id).await;
-                            return Ok((
+                            return Ok(UpstreamExecution {
                                 lease,
-                                response,
                                 mapped_model,
-                                actual_model,
-                                request_payload,
-                            ));
+                                kiro_model: actual_model,
+                                model_path,
+                                model_mapping_rule,
+                                attempts: attempt_logs,
+                                payload: request_payload,
+                                response,
+                            });
                         }
                         Err(retry_error) => {
+                            attempt_logs.push(upstream_attempt_log(
+                                attempt + 1,
+                                &refreshed,
+                                &actual_model,
+                                &retry_error,
+                            ));
                             tracing::warn!(
                                 trace_id,
                                 attempt = attempt + 1,
                                 account_id = %account.id,
+                                account_name,
                                 endpoint = %retry_error.endpoint,
                                 upstream_status = retry_error.status.unwrap_or_default(),
                                 error = %sanitize_error_message(&retry_error.message),
@@ -1069,10 +1179,17 @@ async fn execute_upstream(
                 }
             }
             Err(error) if error.is_quota() && !error.is_throttle() => {
+                attempt_logs.push(upstream_attempt_log(
+                    attempt + 1,
+                    &account,
+                    &actual_model,
+                    &error,
+                ));
                 tracing::warn!(
                     trace_id,
                     attempt = attempt + 1,
                     account_id = %account.id,
+                    account_name,
                     endpoint = %error.endpoint,
                     upstream_status = error.status.unwrap_or_default(),
                     error = %sanitize_error_message(&error.message),
@@ -1106,15 +1223,29 @@ async fn execute_upstream(
                     }
                 }
                 if !config.pool.auto_switch_on_quota_exhausted {
-                    return Err(ExecuteError::Upstream(error));
+                    return Err(dispatch_error(
+                        error,
+                        &mapped_model,
+                        &actual_model,
+                        &model_path,
+                        model_mapping_rule,
+                        attempt_logs,
+                    ));
                 }
                 last_error = Some(error);
             }
             Err(error) if error.is_throttle() => {
+                attempt_logs.push(upstream_attempt_log(
+                    attempt + 1,
+                    &account,
+                    &actual_model,
+                    &error,
+                ));
                 tracing::warn!(
                     trace_id,
                     attempt = attempt + 1,
                     account_id = %account.id,
+                    account_name,
                     endpoint = %error.endpoint,
                     upstream_status = error.status.unwrap_or_default(),
                     error = %sanitize_error_message(&error.message),
@@ -1139,6 +1270,8 @@ async fn execute_upstream(
                             fallback_model = Some(fallback.clone());
                             mapped_model = fallback;
                             actual_model = resolved;
+                            push_model_path(&mut model_path, &mapped_model);
+                            push_model_path(&mut model_path, &actual_model);
                             set_payload_model(&mut request_payload, &actual_model);
                             match kiro.generate(&account, &request_payload, None).await {
                                 Ok(response) => {
@@ -1146,30 +1279,50 @@ async fn execute_upstream(
                                         trace_id,
                                         attempt = attempt + 1,
                                         account_id = %account.id,
+                                        account_name,
                                         fallback_model = %actual_model,
+                                        model_path = %model_path.join(" -> "),
                                         endpoint = %response.endpoint.name,
                                         "upstream model fallback succeeded"
                                     );
                                     pool.record_success(&account.id).await;
-                                    return Ok((
+                                    return Ok(UpstreamExecution {
                                         lease,
-                                        response,
                                         mapped_model,
-                                        actual_model,
-                                        request_payload,
-                                    ));
+                                        kiro_model: actual_model,
+                                        model_path,
+                                        model_mapping_rule,
+                                        attempts: attempt_logs,
+                                        payload: request_payload,
+                                        response,
+                                    });
                                 }
-                                Err(fallback_error) => last_error = Some(fallback_error),
+                                Err(fallback_error) => {
+                                    attempt_logs.push(upstream_attempt_log(
+                                        attempt + 1,
+                                        &account,
+                                        &actual_model,
+                                        &fallback_error,
+                                    ));
+                                    last_error = Some(fallback_error);
+                                }
                             }
                         }
                     }
                 }
             }
             Err(error) if error.is_retriable() => {
+                attempt_logs.push(upstream_attempt_log(
+                    attempt + 1,
+                    &account,
+                    &actual_model,
+                    &error,
+                ));
                 tracing::warn!(
                     trace_id,
                     attempt = attempt + 1,
                     account_id = %account.id,
+                    account_name,
                     endpoint = %error.endpoint,
                     upstream_status = error.status.unwrap_or_default(),
                     error = %sanitize_error_message(&error.message),
@@ -1179,16 +1332,30 @@ async fn execute_upstream(
                 last_error = Some(error);
             }
             Err(error) => {
+                attempt_logs.push(upstream_attempt_log(
+                    attempt + 1,
+                    &account,
+                    &actual_model,
+                    &error,
+                ));
                 tracing::error!(
                     trace_id,
                     attempt = attempt + 1,
                     account_id = %account.id,
+                    account_name,
                     endpoint = %error.endpoint,
                     upstream_status = error.status.unwrap_or_default(),
                     error = %sanitize_error_message(&error.message),
                     "non-retriable upstream request failed"
                 );
-                return Err(ExecuteError::Upstream(error));
+                return Err(dispatch_error(
+                    error,
+                    &mapped_model,
+                    &actual_model,
+                    &model_path,
+                    model_mapping_rule,
+                    attempt_logs,
+                ));
             }
         }
         attempted_accounts.insert(account.id);
@@ -1207,10 +1374,25 @@ async fn execute_upstream(
             tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
         }
     }
-    let error = last_error.unwrap_or(KiroError {
-        status: None,
-        endpoint: "none".into(),
-        message: "all upstream attempts failed".into(),
+    let error = last_error.unwrap_or_else(|| {
+        let model_resolution_failed = !attempt_logs.is_empty()
+            && attempt_logs
+                .iter()
+                .all(|attempt| attempt.endpoint == "model-resolution");
+        KiroError {
+            status: None,
+            endpoint: if model_resolution_failed {
+                "model-resolution"
+            } else {
+                "none"
+            }
+            .into(),
+            message: if model_resolution_failed {
+                format!("no selected account can serve resolved model '{actual_model}'")
+            } else {
+                "all upstream attempts failed".into()
+            },
+        }
     });
     tracing::error!(
         trace_id,
@@ -1218,9 +1400,81 @@ async fn execute_upstream(
         upstream_status = error.status.unwrap_or_default(),
         error = %sanitize_error_message(&error.message),
         attempted_accounts = attempted_accounts.len(),
+        account_id = attempt_logs.last().map(|attempt| attempt.account_id.as_str()).unwrap_or(""),
+        account_name = attempt_logs.last().map(|attempt| attempt.account_name.as_str()).unwrap_or(""),
+        mapped_model,
+        kiro_model = actual_model,
+        model_path = %model_path.join(" -> "),
+        mapping_rule = model_mapping_rule.as_deref().unwrap_or("none"),
         "all upstream attempts failed"
     );
-    Err(ExecuteError::Upstream(error))
+    Err(dispatch_error(
+        error,
+        &mapped_model,
+        &actual_model,
+        &model_path,
+        model_mapping_rule,
+        attempt_logs,
+    ))
+}
+
+fn build_model_path(original: &str, mapped: &str, kiro: &str) -> Vec<String> {
+    let mut path = Vec::new();
+    push_model_path(&mut path, original);
+    push_model_path(&mut path, mapped);
+    push_model_path(&mut path, kiro);
+    path
+}
+
+fn push_model_path(path: &mut Vec<String>, model: &str) {
+    if !model.is_empty() && path.last().is_none_or(|last| last != model) {
+        path.push(model.to_owned());
+    }
+}
+
+fn upstream_attempt_log(
+    attempt: u32,
+    account: &kam_core::account::Account,
+    model: &str,
+    error: &KiroError,
+) -> UpstreamAttemptLog {
+    UpstreamAttemptLog {
+        attempt,
+        account_id: account.id.clone(),
+        account_name: account.display_name().to_owned(),
+        model: model.to_owned(),
+        available_models: Vec::new(),
+        endpoint: error.endpoint.clone(),
+        status: error.status,
+        error: sanitize_error_message(&error.message),
+    }
+}
+
+fn dispatch_error(
+    error: KiroError,
+    mapped_model: &str,
+    kiro_model: &str,
+    model_path: &[String],
+    model_mapping_rule: Option<String>,
+    attempts: Vec<UpstreamAttemptLog>,
+) -> ExecuteError {
+    let (account_id, account_name) = attempts
+        .last()
+        .map(|attempt| (attempt.account_id.clone(), attempt.account_name.clone()))
+        .unwrap_or_default();
+    ExecuteError::Dispatch(DispatchFailure {
+        context: RequestLogContext {
+            account_id,
+            account_name,
+            endpoint: error.endpoint.clone(),
+            mapped_model: mapped_model.to_owned(),
+            kiro_model: kiro_model.to_owned(),
+            model_path: model_path.to_vec(),
+            model_mapping_rule,
+            attempts,
+        },
+        error,
+    })
 }
 
 fn retry_attempt_count(max_retries: u32, account_count: u32) -> u32 {
@@ -1281,9 +1535,38 @@ fn model_family(model: &str) -> Option<(String, Vec<u32>)> {
     (!family.is_empty() && !version.is_empty()).then(|| (family.join("-"), version))
 }
 
+#[derive(Debug, Default)]
+struct RequestLogContext {
+    account_id: String,
+    account_name: String,
+    endpoint: String,
+    mapped_model: String,
+    kiro_model: String,
+    model_path: Vec<String>,
+    model_mapping_rule: Option<String>,
+    attempts: Vec<UpstreamAttemptLog>,
+}
+
+struct DispatchFailure {
+    error: KiroError,
+    context: RequestLogContext,
+}
+
+struct UpstreamExecution {
+    lease: AccountLease,
+    response: KiroResponse,
+    mapped_model: String,
+    kiro_model: String,
+    model_path: Vec<String>,
+    model_mapping_rule: Option<String>,
+    attempts: Vec<UpstreamAttemptLog>,
+    payload: kam_translate::KiroPayload,
+}
+
 enum ExecuteError {
     Pool(PoolError),
     Upstream(KiroError),
+    Dispatch(DispatchFailure),
     Meter(MeterError),
 }
 
@@ -1448,6 +1731,9 @@ async fn nonstream_claude(
     request: ClaudeRequest,
     mapped_model: String,
     kiro_model: String,
+    model_path: Vec<String>,
+    model_mapping_rule: Option<String>,
+    attempts: Vec<UpstreamAttemptLog>,
     input_tokens: u64,
     estimated_credits: f64,
     started: Instant,
@@ -1472,6 +1758,7 @@ async fn nonstream_claude(
         current_round_output_tokens
     };
     let account_id = lease.account_id();
+    let account_name = lease.account().await.display_name().to_owned();
     state
         .prompt_cache
         .apply(&account_id, prompt_cache.as_ref(), &mut decoded.usage);
@@ -1496,7 +1783,11 @@ async fn nonstream_claude(
         &request.model,
         &kiro_model,
         &account_id,
+        &account_name,
         &endpoint,
+        &model_path,
+        model_mapping_rule.as_deref(),
+        attempts,
         started,
         &decoded,
         credits,
@@ -1506,7 +1797,10 @@ async fn nonstream_claude(
         request_id,
         protocol = "claude",
         account_id,
+        account_name,
         endpoint,
+        model_path = %model_path.join(" -> "),
+        mapping_rule = model_mapping_rule.as_deref().unwrap_or("none"),
         input_tokens = decoded.usage.input_tokens,
         output_tokens = decoded.usage.output_tokens,
         credits,
@@ -1535,6 +1829,9 @@ async fn nonstream_openai(
     request: OpenAiRequest,
     mapped_model: String,
     kiro_model: String,
+    model_path: Vec<String>,
+    model_mapping_rule: Option<String>,
+    attempts: Vec<UpstreamAttemptLog>,
     input_tokens: u64,
     max_tokens: u32,
     estimated_credits: f64,
@@ -1560,6 +1857,7 @@ async fn nonstream_openai(
         current_round_output_tokens
     };
     let account_id = lease.account_id();
+    let account_name = lease.account().await.display_name().to_owned();
     state
         .prompt_cache
         .apply(&account_id, prompt_cache.as_ref(), &mut decoded.usage);
@@ -1584,7 +1882,11 @@ async fn nonstream_openai(
         &request.model,
         &kiro_model,
         &account_id,
+        &account_name,
         &endpoint,
+        &model_path,
+        model_mapping_rule.as_deref(),
+        attempts,
         started,
         &decoded,
         credits,
@@ -1594,7 +1896,10 @@ async fn nonstream_openai(
         request_id,
         protocol = "openai",
         account_id,
+        account_name,
         endpoint,
+        model_path = %model_path.join(" -> "),
+        mapping_rule = model_mapping_rule.as_deref().unwrap_or("none"),
         input_tokens = decoded.usage.input_tokens,
         output_tokens = decoded.usage.output_tokens,
         credits,
@@ -1690,7 +1995,11 @@ fn request_log(
     original_model: &str,
     kiro_model: &str,
     account_id: &str,
+    account_name: &str,
     endpoint: &str,
+    model_path: &[String],
+    model_mapping_rule: Option<&str>,
+    attempts: Vec<UpstreamAttemptLog>,
     started: Instant,
     decoded: &DecodedResponse,
     credits: f64,
@@ -1704,7 +2013,11 @@ fn request_log(
         original_model: original_model.into(),
         kiro_model: kiro_model.into(),
         account_id: account_id.into(),
+        account_name: account_name.into(),
         endpoint: endpoint.into(),
+        model_path: model_path.to_vec(),
+        model_mapping_rule: model_mapping_rule.map(str::to_owned),
+        attempts,
         duration_ms: started.elapsed().as_millis() as u64,
         status: 200,
         input_tokens: decoded.usage.input_tokens,
@@ -2202,21 +2515,33 @@ fn upstream_error(error: ExecuteError, format: ErrorFormat) -> ApiError {
         ),
         ExecuteError::Meter(error) => meter_error(error, format),
         ExecuteError::Upstream(error) => {
-            let status = match error.status {
-                Some(413) => StatusCode::PAYLOAD_TOO_LARGE,
-                Some(400) => StatusCode::BAD_REQUEST,
-                Some(401 | 403) => StatusCode::SERVICE_UNAVAILABLE,
-                Some(402 | 429) => StatusCode::TOO_MANY_REQUESTS,
-                _ => StatusCode::BAD_GATEWAY,
-            };
-            let mut output = ApiError::new(status, error.message, format);
-            output.retry_after = matches!(
-                status,
-                StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS
-            );
-            output
+            upstream_api_error(error, RequestLogContext::default(), format)
+        }
+        ExecuteError::Dispatch(failure) => {
+            upstream_api_error(failure.error, failure.context, format)
         }
     }
+}
+
+fn upstream_api_error(
+    error: KiroError,
+    context: RequestLogContext,
+    format: ErrorFormat,
+) -> ApiError {
+    let status = match error.status {
+        Some(413) => StatusCode::PAYLOAD_TOO_LARGE,
+        Some(400) => StatusCode::BAD_REQUEST,
+        Some(401 | 403) => StatusCode::SERVICE_UNAVAILABLE,
+        Some(402 | 429) => StatusCode::TOO_MANY_REQUESTS,
+        _ => StatusCode::BAD_GATEWAY,
+    };
+    let mut output = ApiError::new(status, error.message, format);
+    output.retry_after = matches!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS
+    );
+    output.log_context = Box::new(context);
+    output
 }
 
 struct ApiError {
@@ -2227,6 +2552,7 @@ struct ApiError {
     authenticate: bool,
     retry_after: bool,
     suppress_model_stats: bool,
+    log_context: Box<RequestLogContext>,
 }
 
 impl ApiError {
@@ -2239,6 +2565,7 @@ impl ApiError {
             authenticate: false,
             retry_after: false,
             suppress_model_stats: false,
+            log_context: Box::default(),
         }
     }
 
@@ -2337,6 +2664,15 @@ mod model_tests {
         assert_eq!(retry_attempt_count(3, 50), 4);
         assert_eq!(retry_attempt_count(3, 2), 2);
         assert_eq!(retry_attempt_count(0, 0), 1);
+    }
+
+    #[test]
+    fn model_path_omits_empty_and_duplicate_hops() {
+        assert_eq!(
+            build_model_path("client", "mapped", "kiro"),
+            ["client", "mapped", "kiro"]
+        );
+        assert_eq!(build_model_path("same", "same", ""), ["same"]);
     }
 
     #[test]

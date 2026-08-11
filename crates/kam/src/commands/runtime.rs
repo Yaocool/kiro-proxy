@@ -12,7 +12,7 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 use crate::client::AdminClient;
-use crate::output::{print_json, render_table};
+use crate::output::{format_timestamp, print_json, render_table};
 use crate::ModelMapCommand;
 
 #[derive(Debug, Subcommand)]
@@ -265,20 +265,136 @@ pub async fn show_logs(
             if json {
                 println!("{}", serde_json::to_string(request)?);
             } else {
+                let account = log_account(request);
+                let models = log_model_route(request);
                 println!(
-                    "{} {:>3} {:<18} {:<24} {:>6}ms {}",
-                    request["timestamp"].as_i64().unwrap_or_default(),
+                    "{} {:>3} {:>6}ms account={} model={}",
+                    format_timestamp(request["timestamp"].as_i64().unwrap_or_default()),
                     request["status"].as_u64().unwrap_or_default(),
-                    request["account_id"].as_str().unwrap_or("-"),
-                    request["model"].as_str().unwrap_or("-"),
                     request["duration_ms"].as_u64().unwrap_or_default(),
-                    request["error"].as_str().unwrap_or(""),
+                    account,
+                    models.original,
                 );
+                if let Some(rule) = models.mapping_rule {
+                    println!(
+                        "  mapping rule={} path={} -> {}",
+                        rule, models.original, models.routed
+                    );
+                } else if models.original != models.routed {
+                    println!(
+                        "  fallback_routing path={} -> {}",
+                        models.original, models.routed
+                    );
+                }
+                if models.routed != models.resolved {
+                    println!(
+                        "  auto_resolution path={} -> {}",
+                        models.routed, models.resolved
+                    );
+                }
+                println!(
+                    "  request path={} endpoint={} trace={} request_id={}",
+                    request["path"].as_str().unwrap_or("-"),
+                    request["endpoint"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("-"),
+                    request["trace_id"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("-"),
+                    request["request_id"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("-"),
+                );
+                if let Some(error) = request["error"].as_str().filter(|value| !value.is_empty()) {
+                    println!("  error: {error}");
+                }
+                for attempt in request["attempts"].as_array().into_iter().flatten() {
+                    let status = attempt["status"]
+                        .as_u64()
+                        .map(|status| status.to_string())
+                        .unwrap_or_else(|| "-".into());
+                    let available_models = attempt["available_models"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let available_models = if available_models.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" available_models=[{available_models}]")
+                    };
+                    println!(
+                        "  attempt={} account={} model={} endpoint={} upstream_status={} error={}{}",
+                        attempt["attempt"].as_u64().unwrap_or_default(),
+                        log_account(attempt),
+                        attempt["model"]
+                            .as_str()
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or("-"),
+                        attempt["endpoint"]
+                            .as_str()
+                            .filter(|value| !value.is_empty())
+                            .unwrap_or("-"),
+                        status,
+                        attempt["error"].as_str().unwrap_or(""),
+                        available_models,
+                    );
+                }
             }
         }
         if !follow {
             return Ok(());
         }
+    }
+}
+
+fn log_account(value: &serde_json::Value) -> String {
+    let id = value["account_id"]
+        .as_str()
+        .filter(|value| !value.is_empty());
+    let name = value["account_name"]
+        .as_str()
+        .filter(|value| !value.is_empty());
+    match (name, id) {
+        (Some(name), Some(id)) if name != id => format!("{name} ({id})"),
+        (Some(name), _) => name.to_owned(),
+        (_, Some(id)) => id.to_owned(),
+        _ => "-".into(),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct LogModelRoute<'a> {
+    original: &'a str,
+    routed: &'a str,
+    resolved: &'a str,
+    mapping_rule: Option<&'a str>,
+}
+
+fn log_model_route(request: &serde_json::Value) -> LogModelRoute<'_> {
+    let original = request["original_model"]
+        .as_str()
+        .filter(|model| !model.is_empty())
+        .or_else(|| request["model"].as_str())
+        .unwrap_or("-");
+    let routed = request["model"]
+        .as_str()
+        .filter(|model| !model.is_empty())
+        .unwrap_or(original);
+    let resolved = request["kiro_model"]
+        .as_str()
+        .filter(|model| !model.is_empty())
+        .unwrap_or(routed);
+    LogModelRoute {
+        original,
+        routed,
+        resolved,
+        mapping_rule: request["model_mapping_rule"].as_str(),
     }
 }
 
@@ -869,4 +985,44 @@ pub fn print_topic(topic: &str) -> Result<()> {
     };
     println!("{text}");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_account_prefers_name_and_keeps_id_for_diagnostics() {
+        let value = serde_json::json!({
+            "account_id": "acc_deadbeef",
+            "account_name": "Enterprise team"
+        });
+        assert_eq!(log_account(&value), "Enterprise team (acc_deadbeef)");
+        assert_eq!(log_account(&serde_json::json!({})), "-");
+    }
+
+    #[test]
+    fn log_model_route_distinguishes_mapping_from_automatic_resolution() {
+        let automatic = serde_json::json!({
+            "original_model": "claude-4.6-sonnet",
+            "model": "claude-4.6-sonnet",
+            "kiro_model": "claude-sonnet-4.6"
+        });
+        assert_eq!(
+            log_model_route(&automatic),
+            LogModelRoute {
+                original: "claude-4.6-sonnet",
+                routed: "claude-4.6-sonnet",
+                resolved: "claude-sonnet-4.6",
+                mapping_rule: None,
+            }
+        );
+        let forced = serde_json::json!({
+            "original_model": "claude-4.6-sonnet",
+            "model": "claude-opus-4.6",
+            "kiro_model": "claude-opus-4.6",
+            "model_mapping_rule": "force-opus"
+        });
+        assert_eq!(log_model_route(&forced).mapping_rule, Some("force-opus"));
+    }
 }

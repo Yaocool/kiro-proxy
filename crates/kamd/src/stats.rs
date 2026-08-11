@@ -10,6 +10,25 @@ use serde::{Deserialize, Serialize};
 const MAX_DIMENSION_KEYS: usize = 1_024;
 const OTHER_DIMENSION: &str = "other";
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct UpstreamAttemptLog {
+    pub attempt: u32,
+    #[serde(default)]
+    pub account_id: String,
+    #[serde(default)]
+    pub account_name: String,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_models: Vec<String>,
+    #[serde(default)]
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<u16>,
+    #[serde(default)]
+    pub error: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestLog {
     pub timestamp: i64,
@@ -17,11 +36,24 @@ pub struct RequestLog {
     pub trace_id: String,
     pub request_id: String,
     pub path: String,
+    /// Model after an explicit `model_mapping` rule or runtime fallback.
     pub model: String,
+    /// Model name received from the client.
     pub original_model: String,
+    /// Account-discovered Kiro model ID after automatic alias resolution.
     pub kiro_model: String,
     pub account_id: String,
+    #[serde(default)]
+    pub account_name: String,
     pub endpoint: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Full route for diagnostics; `model_mapping_rule` is set only for an
+    /// explicit operator-configured mapping.
+    pub model_path: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_mapping_rule: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attempts: Vec<UpstreamAttemptLog>,
     pub duration_ms: u64,
     pub status: u16,
     pub input_tokens: u64,
@@ -408,7 +440,11 @@ mod tests {
             original_model: "client".into(),
             kiro_model: "kiro".into(),
             account_id: "acc_test".into(),
+            account_name: "Team account".into(),
             endpoint: "amazonq".into(),
+            model_path: vec!["client".into(), "mapped".into(), "kiro".into()],
+            model_mapping_rule: Some("primary".into()),
+            attempts: Vec::new(),
             duration_ms: 10,
             status,
             input_tokens: 1,
@@ -416,6 +452,21 @@ mod tests {
             credits: 0.1,
             error: (status >= 400).then(|| "failed".into()),
         }
+    }
+
+    #[test]
+    fn legacy_request_logs_default_new_diagnostic_fields() {
+        let mut value = serde_json::to_value(request("req-old", 42, 502)).expect("serialize");
+        let object = value.as_object_mut().expect("request object");
+        object.remove("account_name");
+        object.remove("model_path");
+        object.remove("model_mapping_rule");
+        object.remove("attempts");
+        let decoded: RequestLog = serde_json::from_value(value).expect("deserialize legacy log");
+        assert!(decoded.account_name.is_empty());
+        assert!(decoded.model_path.is_empty());
+        assert!(decoded.model_mapping_rule.is_none());
+        assert!(decoded.attempts.is_empty());
     }
 
     #[test]
