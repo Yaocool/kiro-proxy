@@ -59,8 +59,8 @@ important process-level variables are:
 | Variable | Purpose |
 | --- | --- |
 | `KAM_HOME` | Places configuration, data, logs, and the generated admin socket below one directory. |
-| `KAM_HTTP_PORT` | Overrides only the business HTTP/HTTPS listening port for this daemon process. |
-| `KAM_DISABLE_HTTP=1` | Disables the business HTTP plane while leaving the Unix administration socket running. |
+| `KAM_HTTP_PORT` | Overrides a configured proxy service port that matches the `server.port` default; it does not create a service. |
+| `KAM_DISABLE_HTTP=1` | Prevents configured proxy services from listening while leaving their configuration and the Unix administration socket intact. |
 | `KAM_ADMIN_SOCKET` | Overrides the socket used by the `kam` CLI; it does not reconfigure `kamd`. |
 | `KAM_CODEWHISPERER_URL` | Overrides the CodeWhisperer upstream URL for integration tests or controlled proxies. |
 | `KAM_AMAZONQ_URL` | Overrides the Amazon Q upstream URL for integration tests or controlled proxies. |
@@ -91,6 +91,8 @@ Use another terminal for the CLI. It loads the same `.env` automatically:
 
 ```bash
 cargo run -p kam -- status
+cargo run -p kam -- health
+cargo run -p kam -- service list
 cargo run -p kam -- config path
 cargo run -p kam -- config show --effective
 cargo run -p kam -- account list
@@ -108,10 +110,22 @@ Only one daemon may own a given administration socket. A stale socket left by a
 crashed process is removed automatically; a socket accepting connections is not
 deleted by a second daemon.
 
+A fresh daemon intentionally starts with no business API proxy. `kam health`
+still returns success because daemon health is independent of account and proxy
+service availability. Create a service explicitly when it is needed:
+
+```bash
+cargo run -p kam -- service create --name main
+```
+
+The command creates the service's first scoped API key and prints the plaintext
+key. Use `kam service apikeys main` to inspect key metadata without secrets, or
+add `--show-secret` to retrieve plaintext keys bound only to that service.
+
 ### Administration-only mode
 
-Disable the public business API while keeping account and configuration
-administration available:
+Prevent all configured proxy services from listening while keeping account and
+configuration administration available:
 
 ```bash
 KAM_DISABLE_HTTP=1 cargo run -p kamd
@@ -151,33 +165,43 @@ printf '%s\n' "$PASSWORD" | cargo run -p kam -- account add-sso \
 not only the CLI, must have been built with SSO support. Use `--headful` for MFA
 or manual verification.
 
-## 5. Verify the service
+## 5. Create and verify a proxy service
 
-The default business address is `http://127.0.0.1:5580`.
+If one has not been created yet, create a proxy and save the returned API key:
+
+```bash
+kam service create --name main --host 127.0.0.1 --port 5580
+kam service list
+kam service apikeys main --show-secret
+```
+
+The business address is now `http://127.0.0.1:5580`.
 
 ```bash
 curl -i http://127.0.0.1:5580/health
 
 curl -i http://127.0.0.1:5580/v1/messages/count_tokens \
+  -H 'authorization: Bearer <key>' \
   -H 'content-type: application/json' \
   -H 'user-agent: claude-cli/1.0 (external, debug)' \
   -d '{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hello"}]}'
 ```
 
-`GET /health` and local token counting work before an upstream account is
-available. A generation request returning `503` is expected when no account is
-schedulable.
+`GET /health` returns `status: ok` even before an upstream account is available;
+account counts are diagnostics, not application-health criteria. Local token
+counting still requires the service API key. A generation request returning
+`503` is expected when no account is schedulable.
 
-When API keys are enabled, add an authorization header:
+Every newly created service requires its generated API key:
 
 ```bash
 curl -i http://127.0.0.1:5580/v1/models \
   -H 'authorization: Bearer <key>'
 ```
 
-Binding `server.host` to a non-loopback address is rejected unless at least one
-enabled API key is configured. This validation prevents accidental unauthenticated
-public exposure.
+Creating or configuring a service on a non-loopback address is rejected unless
+that service references at least one enabled API key. This prevents accidental
+unauthenticated public exposure.
 
 Every business HTTP response includes `x-trace-id`. Save that value when
 investigating an error.
@@ -199,12 +223,12 @@ You can also trigger reload explicitly:
 cargo run -p kam -- config reload
 ```
 
-The following changes require a daemon restart:
+`server.host` and `server.port` are defaults used by `kam service create`; they
+do not create a listener themselves. Proxy service additions and address changes
+are reconciled at runtime. The following changes require a daemon restart:
 
-- `server.host`;
-- `server.port`;
 - `admin.socket`;
-- switching the listener between HTTP and HTTPS.
+- switching the shared listener mode between HTTP and HTTPS.
 
 Log filters, formatting, output paths, pool behavior, model rules, notification
 settings, and TLS certificate contents can otherwise be updated at runtime.
@@ -255,17 +279,75 @@ docker compose ps
 docker compose logs -f kamd
 ```
 
-Compose publishes `127.0.0.1:5580` on the host and stores state in the
-`kam-data` named volume. Inside the container, `kamd` listens on loopback port
-5581 and `socat` forwards container port 5580 to it. This preserves the daemon's
-loopback-only safety rule while allowing Docker's host-side loopback mapping.
+Compose uses `network_mode: host`. A proxy listener created inside the container
+therefore binds directly in the Docker host's network namespace. Arbitrary
+service ports become available immediately without editing Compose or recreating
+the container. This mode is supported directly by Docker Engine on Linux. On
+Docker Desktop 4.34 or newer, enable host networking under Settings > Resources
+> Network before starting the stack.
+
+When upgrading an existing bridge-network deployment, recreate this project
+container once so the new network mode takes effect. The named data volume is
+preserved:
+
+```bash
+docker compose up -d --force-recreate
+```
+
+### Use `kam` directly on the Docker host
+
+Docker cannot safely install files into the host's `/usr/local/bin` from a
+Dockerfile or Compose service. Install the provided wrapper once on the host:
+
+```bash
+sudo ./deploy/install-kam-wrapper.sh
+kam health
+kam status
+kam service list
+```
+
+The wrapper locates the running daemon by the `io.kiro-proxy.role=daemon`
+container label, preserves command exit codes, forwards stdin, and allocates a
+TTY only for interactive use. This keeps the admin Unix socket private and
+avoids host/container binary compatibility problems.
+
+The installer refuses to overwrite an existing command by default:
+
+```bash
+sudo ./deploy/install-kam-wrapper.sh --force
+./deploy/install-kam-wrapper.sh --target "$HOME/.local/bin/kam"
+```
+
+The current host user must be allowed to access Docker. When more than one
+kiro-proxy stack is running, select one by Compose project or container:
+
+```bash
+export KAM_COMPOSE_PROJECT=kiro-proxy
+# Or: export KAM_DOCKER_CONTAINER=<container-name-or-id>
+kam status
+```
+
+On a fresh volume, explicitly create the proxy and save the API key printed by
+the command:
 
 ```bash
 docker compose exec kamd kam status
+docker compose exec kamd kam service create --name main
+docker compose exec kamd kam service create --name secondary --port 6000
+docker compose exec kamd kam service list
 docker compose exec kamd kam config show --effective
 docker compose exec kamd sh -c 'ls -lh /var/lib/kam/logs'
 curl -i http://127.0.0.1:5580/health
+curl -i http://127.0.0.1:6000/health
 ```
+
+The default host is `127.0.0.1`, so these listeners are reachable only from the
+Docker host. For deliberate remote access, create the service with
+`--host 0.0.0.0` and restrict the port with the host firewall or cloud security
+group. Every created service still requires its scoped API key for business
+requests. Host networking removes network isolation between the container and
+the host, so use the provided bridge compatibility forwarder instead when that
+is unacceptable.
 
 `docker compose down` keeps the named volume. `docker compose down -v` deletes
 configuration, accounts, statistics, and logs and should be used only when an
@@ -371,9 +453,11 @@ must allow local port binding.
 
 ### `Address already in use`
 
-Stop the process using port 5580 or temporarily choose another port:
+Choose a free port when creating the service, or use the process override for a
+service configured with the default port:
 
 ```bash
+kam service create --name main --port 5581
 KAM_HTTP_PORT=5581 cargo run -p kamd
 ```
 

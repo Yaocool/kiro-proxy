@@ -61,10 +61,17 @@ cp .env.example .env
 In another terminal:
 
 ```bash
+./target/release/kam health
 ./target/release/kam status
+./target/release/kam service create --name main
 ./target/release/kam config path
 ./target/release/kam account list
 ```
+
+A fresh daemon starts only the Unix administration plane. It does not create or
+start a business API proxy. `kam service create` creates and starts one, creates
+its first scoped API key, and prints the plaintext key. You can retrieve only
+that service's keys later with `kam service apikeys main --show-secret`.
 
 `kamd` and `kam` search for `.env` from the current directory upward. Existing
 process environment variables take precedence over values in `.env`, so a
@@ -74,7 +81,8 @@ one-off override remains possible:
 KAM_HTTP_PORT=5581 ./target/release/kamd
 ```
 
-The default business API listens on `http://127.0.0.1:5580`:
+After creating `main` with the default settings, its business API listens on
+`http://127.0.0.1:5580`:
 
 ```text
 POST /v1/messages
@@ -108,9 +116,10 @@ under one directory. Without `KAM_HOME`, XDG locations are used:
 
 On first startup, missing files are created without overwriting existing data.
 Valid configuration changes are hot-reloaded. Invalid TOML or validation
-failures leave the last valid configuration active. Changes to `server.host`,
-`server.port`, `admin.socket`, or the HTTP/HTTPS listening mode require a daemon
-restart; most other fields apply without one.
+failures leave the last valid configuration active. `server.host` and
+`server.port` are defaults for newly created proxy services. Changes to
+`admin.socket` or the shared HTTP/HTTPS listening mode require a daemon restart;
+most other fields, including the proxy service list, apply without one.
 
 External account-file changes are also reloaded. Corrupt account data never
 replaces the valid in-memory snapshot. Large account stores can use a gzip
@@ -155,6 +164,11 @@ kam --json account export --redact
 
 ```bash
 kam status
+kam health
+kam service list
+kam service create --name main --host 127.0.0.1 --port 5580
+kam service apikeys main
+kam service apikeys main --show-secret
 kam account list
 kam account show <id|email>
 kam account tag <id|email> --add prod
@@ -217,8 +231,27 @@ docker build --target runtime-full -t kamd:full .
 docker compose up -d
 ```
 
-The Compose configuration publishes only `127.0.0.1:5580` on the host and
-persists data in the `kam-data` volume. The full image adds Chromium for SSO.
+Compose uses host networking so every manually created proxy service is
+available on the Docker host immediately, including custom ports; no Compose
+edit or container restart is needed. Services bind to `127.0.0.1` by default.
+Use `--host 0.0.0.0` only when remote access is intentional. Docker Engine on
+Linux supports this directly; Docker Desktop 4.34+ requires host networking to
+be enabled in Settings. State persists in the `kam-data` volume. The full image
+adds Chromium for SSO.
+
+Install the Docker-backed host wrapper once to use `kam` directly without
+typing `docker compose exec`:
+
+```bash
+sudo ./deploy/install-kam-wrapper.sh
+kam health
+kam service list
+```
+
+The wrapper discovers the running daemon through its Compose label and always
+uses the CLI version bundled with that container. It requires permission to use
+Docker. Set `KAM_COMPOSE_PROJECT` when multiple kiro-proxy Compose projects are
+running.
 
 A hardened service template is available at
 [`deploy/kamd.service`](deploy/kamd.service). Install `kamd` and `kam` under
