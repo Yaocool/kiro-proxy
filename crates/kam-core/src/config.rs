@@ -194,7 +194,7 @@ pub struct UpstreamConfig {
     pub agent_mode: AgentMode,
     /// 最大重试次数。
     pub max_retries: u32,
-    /// 提前刷新 token 的秒数。
+    /// 期望提前刷新 token 的秒数。实际值还会受定时扫描间隔的安全下限约束。
     pub token_refresh_before_expiry: i64,
     /// 双连接池参数。
     pub pool: UpstreamPoolConfig,
@@ -206,7 +206,7 @@ impl Default for UpstreamConfig {
             preferred_endpoint: None,
             agent_mode: AgentMode::Vibe,
             max_retries: 3,
-            token_refresh_before_expiry: 300,
+            token_refresh_before_expiry: 900,
             pool: UpstreamPoolConfig::default(),
         }
     }
@@ -736,6 +736,21 @@ impl Config {
             .any(|key| key.enabled && !key.key.trim().is_empty())
     }
 
+    /// 返回运行时实际使用的 token 提前刷新窗口。
+    ///
+    /// 定时扫描可能在临界点前刚好跳过一个 token，因此窗口至少为扫描间隔的
+    /// 两倍，且不低于 10 分钟。这也保证旧配置中的 300 秒不会导致刷新过晚。
+    pub fn effective_token_refresh_before_expiry(&self) -> i64 {
+        const MINIMUM_LEAD_SECS: u64 = 600;
+
+        let configured = u64::try_from(self.upstream.token_refresh_before_expiry).unwrap_or(0);
+        let scan_interval_secs = self.tasks.token_refresh_interval_ms.div_ceil(1_000);
+        let effective = configured
+            .max(scan_interval_secs.saturating_mul(2))
+            .max(MINIMUM_LEAD_SECS);
+        i64::try_from(effective).unwrap_or(i64::MAX)
+    }
+
     /// 校验配置。
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.server.port < 1024 {
@@ -1179,7 +1194,8 @@ p99_recover_ms = 100
 # preferred_endpoint = "amazonq"
 agent_mode = "vibe"
 max_retries = 3
-token_refresh_before_expiry = 300
+# 默认提前 15 分钟；运行时不低于扫描间隔的 2 倍和 10 分钟
+token_refresh_before_expiry = 900
 
 [upstream.pool]
 http_max_connections = 128
@@ -1350,7 +1366,8 @@ mod tests {
         assert_eq!(config.upstream.pool.http_pipelining, 5);
         assert_eq!(config.upstream.pool.stream_max_connections, 256);
         assert_eq!(config.upstream.pool.http_max_connections, 128);
-        assert_eq!(config.upstream.token_refresh_before_expiry, 300);
+        assert_eq!(config.upstream.token_refresh_before_expiry, 900);
+        assert_eq!(config.effective_token_refresh_before_expiry(), 900);
         assert_eq!(config.context.max_input_tokens, 200_000);
         assert_eq!(config.context.safe_input_ratio, 0.95);
         assert_eq!(config.context.compact_safe_input_ratio, 0.99);
@@ -1390,6 +1407,17 @@ mod tests {
         let parsed: Config = toml::from_str("").expect("empty toml must parse");
         assert_eq!(parsed.server.port, 5580);
         assert_eq!(parsed.pool.max_concurrent_per_account, 50);
+    }
+
+    #[test]
+    fn token_refresh_lead_has_a_safe_runtime_floor() {
+        let mut config = Config::default();
+        config.upstream.token_refresh_before_expiry = 300;
+        config.tasks.token_refresh_interval_ms = 300_000;
+        assert_eq!(config.effective_token_refresh_before_expiry(), 600);
+
+        config.tasks.token_refresh_interval_ms = 600_001;
+        assert_eq!(config.effective_token_refresh_before_expiry(), 1_202);
     }
 
     #[test]
