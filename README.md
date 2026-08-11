@@ -7,6 +7,12 @@ Chat Completions compatible APIs on top of Kiro upstream services. It includes
 multi-account scheduling, automatic token refresh, endpoint failover, model
 mapping, API-key quotas, TLS, webhooks, statistics, and an operations CLI.
 
+> [!IMPORTANT]
+> Account support is limited to Kiro enterprise accounts authenticated through
+> the enterprise's SSO integration (AWS IAM Identity Center/IdC). All other
+> account and authentication types, including personal and social-login
+> accounts, are not supported.
+
 This repository intentionally does not include a GUI, KProxy MITM support, or
 local Kiro application configuration changes.
 
@@ -16,7 +22,7 @@ local Kiro application configuration changes.
 - OpenAI-compatible `/v1/chat/completions` and `/v1/models` endpoints.
 - Weighted multi-account scheduling with per-account concurrency limits,
   cooldowns, quota tracking, and model compatibility checks.
-- Automatic IdC and social-account token refresh with per-account singleflight.
+- Automatic enterprise IdC/SSO token refresh with per-account singleflight.
 - Account-aware Amazon Q and CodeWhisperer endpoint selection with bounded,
   in-memory availability caches.
 - Dynamic model discovery, model aliases, replacements, load balancing, and
@@ -159,9 +165,12 @@ External account-file changes are also reloaded. Corrupt account data never
 replaces the valid in-memory snapshot. Large account stores can use a gzip
 envelope plus incremental sidecar updates according to the storage settings.
 
-## Import accounts
+## Import enterprise SSO accounts
 
-Import existing credentials from a JSON file or stdin:
+Only credentials issued to a Kiro enterprise account through its organization
+SSO may be imported. Importing a credential does not make personal, social-login,
+or any other account type compatible. Import supported credentials from a JSON
+file or stdin:
 
 ```bash
 kam account import --file accounts.json
@@ -237,11 +246,12 @@ kam tasks run status_check
 All commands support the global `--json` option. Run `kam --help` or a
 subcommand's `--help` for the authoritative option list.
 
-## SSO build
+## Enterprise SSO authentication
 
-The default slim build supports credential import and does not include
-Chromium. Build `kamd` with the `sso` feature to enable IAM Identity Center
-browser automation:
+The default slim build supports importing existing Kiro enterprise SSO
+credentials and does not include Chromium. Build `kamd` with the `sso` feature
+to authenticate a supported enterprise account through its IAM Identity Center
+login flow:
 
 ```bash
 cargo build --release --locked -p kamd --features sso
@@ -257,6 +267,7 @@ kam account add-sso --batch accounts.csv \
 
 Passwords are accepted only from stdin or a two-column CSV file. Add
 `--headful` when MFA or an upstream page change requires manual interaction.
+This flow does not add support for non-enterprise or non-SSO accounts.
 
 ## Docker and systemd
 

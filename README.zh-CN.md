@@ -6,6 +6,10 @@
 OpenAI Chat Completions 的 API，并包含多账号调度、自动 Token 刷新、端点切换、模型映射、
 API Key 限额、TLS、Webhook、统计和运维 CLI。
 
+> [!IMPORTANT]
+> 本项目仅支持通过企业 SSO（AWS IAM Identity Center/IdC）认证的 Kiro 企业账号。
+> 其他所有账号和认证类型均不支持，包括个人账号和社交登录账号。
+
 本仓库不包含 GUI、KProxy MITM 或本机 Kiro 应用配置修改功能。
 
 ## 主要能力
@@ -13,7 +17,7 @@ API Key 限额、TLS、Webhook、统计和运维 CLI。
 - 兼容 Claude 的 `/v1/messages` 和 `/v1/messages/count_tokens` 端点。
 - 兼容 OpenAI 的 `/v1/chat/completions` 和 `/v1/models` 端点。
 - 带单账号并发限制、冷却、额度追踪和模型兼容检查的多账号加权调度。
-- IdC 与社交账号 Token 自动刷新，并对同一账号做 singleflight 防并发刷新。
+- Kiro 企业账号的 IdC/SSO Token 自动刷新，并对同一账号做 singleflight 防并发刷新。
 - 根据账号选择 Amazon Q 或 CodeWhisperer，使用有界的进程内可用性缓存。
 - 动态模型发现，以及模型别名、替换、负载均衡和降级规则。
 - 通过 Unix socket 和 `kam` CLI 管理，不依赖浏览器界面。
@@ -143,9 +147,10 @@ XDG 目录：
 外部修改账号文件也会自动载入，损坏的账号数据不会替换内存中的有效快照。账号数较多时，
 可根据存储配置使用 gzip envelope 和增量 sidecar。
 
-## 导入账号
+## 导入企业 SSO 账号
 
-从 JSON 文件或 stdin 导入现有凭证：
+只能导入由组织 SSO 签发给 Kiro 企业账号的凭证。导入操作不会让个人账号、社交登录账号或
+其他账号类型变为可用。从 JSON 文件或 stdin 导入受支持的凭证：
 
 ```bash
 kam account import --file accounts.json
@@ -219,10 +224,10 @@ kam tasks run status_check
 
 所有命令都支持全局 `--json`，权威参数列表以 `kam --help` 和各子命令的 `--help` 为准。
 
-## SSO 构建
+## 企业 SSO 认证
 
-默认 slim 构建支持凭证导入，不包含 Chromium。为 `kamd` 启用 `sso` feature 后，可以使用
-IAM Identity Center 浏览器自动登录：
+默认 slim 构建支持导入已有的 Kiro 企业 SSO 凭证，不包含 Chromium。为 `kamd` 启用
+`sso` feature 后，可以通过企业 IAM Identity Center 登录流程认证受支持的账号：
 
 ```bash
 cargo build --release --locked -p kamd --features sso
@@ -237,7 +242,7 @@ kam account add-sso --batch accounts.csv \
 ```
 
 密码只从 stdin 或两列 CSV 文件读取。遇到 MFA 或上游页面变化需要手工操作时，增加
-`--headful`。
+`--headful`。该流程不会增加对非企业账号或非 SSO 认证方式的支持。
 
 ## Docker 与 systemd
 
