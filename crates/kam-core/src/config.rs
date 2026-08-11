@@ -141,7 +141,7 @@ pub struct ServerConfig {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
-            host: "127.0.0.1".into(),
+            host: "0.0.0.0".into(),
             port: 5580,
             enforce_user_agent_check: true,
             max_concurrent_requests: 500,
@@ -1157,7 +1157,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# kiro-proxy 配置文件
 # admin.socket / TLS enabled 模式切换例外，改动需重启。
 
 [server]
-host = "127.0.0.1"                 # kam service create 的默认监听地址
+host = "0.0.0.0"                   # kam service create 的默认监听地址
 port = 5580                        # kam service create 的默认端口，1024-65535
 enforce_user_agent_check = true    # 仅作用于 Claude 路由
 max_concurrent_requests = 500      # 超出返回 503 + Retry-After
@@ -1271,7 +1271,7 @@ socket = "/run/kam/admin.sock"
 # [[proxy_service]]
 # id = "svc_..."
 # name = "main"
-# host = "127.0.0.1"
+# host = "0.0.0.0"
 # port = 5580
 # enabled = true
 # api_key_ids = ["ak_..."]
@@ -1309,7 +1309,7 @@ mod tests {
     #[test]
     fn defaults_match_the_spec() {
         let config = Config::default();
-        assert_eq!(config.server.host, "127.0.0.1");
+        assert_eq!(config.server.host, "0.0.0.0");
         assert_eq!(config.server.port, 5580);
         assert!(config.server.enforce_user_agent_check);
         assert_eq!(config.server.max_concurrent_requests, 500);

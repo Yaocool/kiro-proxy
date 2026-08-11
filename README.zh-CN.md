@@ -72,7 +72,8 @@ cp .env.example .env
 KAM_HTTP_PORT=5581 ./target/release/kamd
 ```
 
-使用默认参数创建 `main` 后，业务 API 监听 `http://127.0.0.1:5580`：
+使用默认参数创建 `main` 后，业务 API 绑定 `0.0.0.0:5580`；在本机可通过
+`http://127.0.0.1:5580` 访问：
 
 ```text
 POST /v1/messages
@@ -151,9 +152,10 @@ kam --json account export --redact
 kam status
 kam health
 kam service list
-kam service create --name main --host 127.0.0.1 --port 5580
+kam service create --name main --port 5580
 kam service apikeys main
 kam service apikeys main --show-secret
+kam service delete main --yes
 kam account list
 kam account show <id|email>
 kam account tag <id|email> --add prod
@@ -215,9 +217,10 @@ docker compose up -d
 ```
 
 Compose 使用 host network，因此手动创建的任意端口代理服务都会立即在 Docker 宿主机
-可访问，无需修改 Compose 或重启容器。服务默认绑定 `127.0.0.1`；只有明确需要远程访问时
-才使用 `--host 0.0.0.0`。Linux Docker Engine 可直接使用；Docker Desktop 4.34+ 需要在
-设置中启用 host networking。数据保存在 `kam-data` volume，full 镜像额外安装 Chromium。
+可访问，无需修改 Compose 或重启容器。服务默认绑定 `0.0.0.0`，应通过宿主机防火墙或云
+安全组限制代理端口；只需宿主机本地访问时可使用 `--host 127.0.0.1`。Linux Docker
+Engine 可直接使用；Docker Desktop 4.34+ 需要在设置中启用 host networking。数据保存
+在 `kam-data` volume，full 镜像额外安装 Chromium。
 
 在宿主机安装一次 Docker 包装器后，可直接使用 `kam`，无需再输入 `docker compose exec`：
 

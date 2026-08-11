@@ -64,6 +64,8 @@ pub mod method {
     pub const SERVICE_LIST: &str = "service.list";
     /// 创建 API 代理服务并生成首个 API key。
     pub const SERVICE_CREATE: &str = "service.create";
+    /// 删除 API 代理服务。
+    pub const SERVICE_DELETE: &str = "service.delete";
     /// 查询指定 API 代理服务绑定的 API key。
     pub const SERVICE_APIKEYS: &str = "service.apikeys";
     /// Webhook 列表。
@@ -104,6 +106,7 @@ pub mod method {
         APIKEY_RESET_USAGE,
         SERVICE_LIST,
         SERVICE_CREATE,
+        SERVICE_DELETE,
         SERVICE_APIKEYS,
         WEBHOOK_LIST,
         WEBHOOK_TEST,
@@ -347,6 +350,20 @@ pub struct CreatedApiKey {
 pub struct ProxyServiceCreateResult {
     pub service: ProxyServiceView,
     pub api_key: CreatedApiKey,
+}
+
+/// `service.delete` 参数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyServiceDeleteParams {
+    /// 服务 ID 或名称。
+    pub service: String,
+}
+
+/// `service.delete` 结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyServiceDeleteResult {
+    pub service_id: String,
+    pub service_name: String,
 }
 
 /// `service.apikeys` 参数。
