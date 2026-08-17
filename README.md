@@ -13,7 +13,7 @@ mapping, API-key quotas, TLS, webhooks, statistics, and an operations CLI.
 > account and authentication types, including personal and social-login
 > accounts, are not supported.
 
-This repository intentionally does not include a GUI, KProxy MITM support, or
+This repository intentionally does not include a GUI, MITM support, or
 local Kiro application configuration changes.
 
 ## Highlights
@@ -54,9 +54,9 @@ is located in [`crates/kproxyd`](crates/kproxyd).
 ### Docker Compose (recommended for a Linux server)
 
 Docker Engine with the Compose v2 plugin is the shortest production setup. The
-Compose stack builds the slim image, runs `kproxyd` with host networking, and keeps
-all state in the `kproxy-data` named volume. Run these commands from the repository
-root:
+Compose stack builds the full image with all features and Chromium enabled by
+default, runs `kproxyd` with host networking, and keeps all state in the `kproxy-data`
+named volume. Run these commands from the repository root:
 
 ```bash
 docker compose up -d --build
@@ -212,7 +212,7 @@ kproxy service list
 kproxy service create --name main --port 5580
 kproxy service apikeys main
 kproxy service apikeys main --show-secret
-kproxy service delete main --yes
+kproxy service delete main
 kproxy account list
 kproxy account show <id|email>
 kproxy account tag <id|email> --add prod
@@ -221,7 +221,7 @@ kproxy account refresh <id|email>
 kproxy account refresh --all
 kproxy account probe --all
 kproxy account regen-machine-id <id|email>
-kproxy account rm <id|email> --yes
+kproxy account rm <id|email>
 
 kproxy config show --effective
 kproxy config path
@@ -233,38 +233,63 @@ kproxy diagnose endpoints
 kproxy diagnose account --all -c 4 --timeout 45s
 kproxy subscriptions
 kproxy models --mapped
+kproxy model-map add --name low-credit --source 'claude-opus-*' --target claude-sonnet-4.6 --below-credits-percent 10
+kproxy model-map edit low-credit --below-credits-percent 15
+kproxy model-map delete low-credit
 kproxy model-map test claude-opus-4
 
 kproxy apikey list
-kproxy webhook test --all
-kproxy stats --since 1h --by endpoint
+kproxy apikey list --detail
+kproxy webhook add --name alerts --kind dingtalk --url https://example/hook --event token-expired
+kproxy webhook edit alerts --event token-expired --event quota-exhausted
+kproxy webhook delete alerts
+kproxy stats --since 1h
+kproxy stats --detail --since 1h --by endpoint
 kproxy logs -f --level warn
 kproxy tasks
 kproxy tasks run status_check
+kproxy help
 ```
 
 All commands support the global `--json` option. Run `kproxy --help` or a
 subcommand's `--help` for the authoritative option list.
+Destructive commands have no `--yes` bypass and require an interactive `y` or
+`yes` confirmation. Running bare `kproxy` prints the main help; `kproxy help` lists
+the available topic guides.
+
+`kproxy stats` reports aggregate operational traffic, success, token, credit, and
+latency metrics; it does not replace per-request logs. Its default output is a
+compact summary. Add `--detail` for grouped counters and recent requests.
+
+Dynamic model discovery runs immediately at daemon startup, again when accounts
+change, and thereafter when the model-cache TTL expires. The one-minute account
+status task refreshes usage only and does not duplicate model-list requests.
 
 ## Enterprise SSO authentication
 
-The default slim build supports importing existing Kiro enterprise SSO
-credentials and does not include Chromium. Build `kproxyd` with the `sso` feature
-to authenticate a supported enterprise account through its IAM Identity Center
-login flow:
+The default `kproxyd` build and Docker Compose enable all features, including the
+Chromium-based enterprise IAM Identity Center login. First set a global start
+URL with `kproxy config edit`:
 
-```bash
-cargo build --release --locked -p kproxyd --features sso
-
-printf '%s\n' "$PASSWORD" | kproxy account add-sso \
-  --email user@example.com \
-  --start-url https://example.awsapps.com/start \
-  --password-stdin
-
-kproxy account add-sso --batch accounts.csv \
-  --start-url https://example.awsapps.com/start -c 1
+```toml
+[sso]
+start_url = "https://example.awsapps.com/start"
 ```
 
+Manual account additions can then omit `--start-url`:
+
+```bash
+printf '%s\n' "$PASSWORD" | kproxy account add-sso \
+  --email user@example.com \
+  --password-stdin
+
+kproxy account add-sso --batch accounts.csv -c 1
+```
+
+Use `--start-url` to override the global value for one login. When a smaller
+binary without browser SSO is explicitly desired, build with
+`cargo build --workspace --no-default-features` or select Docker's
+`runtime-slim` target.
 Passwords are accepted only from stdin or a two-column CSV file. Add
 `--headful` when MFA or an upstream page change requires manual interaction.
 This flow does not add support for non-enterprise or non-SSO accounts.
@@ -274,9 +299,11 @@ This flow does not add support for non-enterprise or non-SSO accounts.
 ```bash
 docker compose up -d --build
 
-# Standalone image builds, when Compose is not used:
-docker build --target runtime-slim -t kproxyd:slim .
-docker build --target runtime-full -t kproxyd:full .
+# The standalone default is also the full image:
+docker build -t kiro-proxy:latest .
+# Select slim only when browser SSO is not needed:
+docker build --target runtime-slim -t kiro-proxy:slim .
+docker build --target runtime-full -t kiro-proxy:full .
 ```
 
 Compose uses host networking so every manually created proxy service is
@@ -317,7 +344,9 @@ running.
 A hardened service template is available at
 [`deploy/kproxyd.service`](deploy/kproxyd.service). Install `kproxyd` and `kproxy` under
 `/usr/local/bin`, create the `kproxy` system user and group, install the unit, and
-then enable the service.
+then enable the service. Browser SSO additionally requires Chrome or Chromium on
+the host; the provided unit keeps user namespaces and executable JIT memory
+available for Chromium while retaining the other process hardening controls.
 
 ## Development
 
