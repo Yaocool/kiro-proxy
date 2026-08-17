@@ -132,7 +132,10 @@ async fn wait_for_http(port: u16) {
         {
             return;
         }
-        assert!(Instant::now() < deadline, "kproxyd HTTP plane did not start");
+        assert!(
+            Instant::now() < deadline,
+            "kproxyd HTTP plane did not start"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
@@ -295,9 +298,13 @@ async fn inbound_openai_request_runs_through_translation_pool_and_mock_upstream(
 
     let received = mock.received_requests().await.expect("received requests");
     assert!(!received.is_empty());
-    for request in received {
-        let payload: serde_json::Value =
-            serde_json::from_slice(&request.body).expect("translated Kiro JSON");
+    let generation_payloads = received
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+        .filter(|payload| payload.get("conversationState").is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(generation_payloads.len(), 1);
+    for payload in generation_payloads {
         assert_eq!(
             payload["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
             "minimax-m2.5"

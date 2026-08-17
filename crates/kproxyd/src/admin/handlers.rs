@@ -372,13 +372,15 @@ async fn handle_config_reload(state: &Arc<AppState>) -> Handled {
     for field in &needs_restart {
         warn!(field = %field, "configuration field requires restart");
     }
-    state.apply_runtime_config(&next);
-    state.config.replace(next.clone());
-    state.mark_config_reloaded(now_secs());
-    let failures = state.reconcile_proxy_services(&next).await;
-    for (service_id, error) in failures {
-        warn!(%service_id, %error, "proxy service failed after config reload");
+    if let Err(error) = state.apply_config_transaction(&next).await {
+        warn!(%error, "configuration reload rolled back");
+        return to_value(ConfigReloadResult {
+            applied: false,
+            error: Some(error),
+            needs_restart,
+        });
     }
+    state.mark_config_reloaded(now_secs());
     to_value(ConfigReloadResult {
         applied: true,
         error: None,
@@ -535,6 +537,7 @@ where
     let pool_accounts = next.all().to_vec();
     state.replace_accounts(next);
     state.pool().replace_accounts(pool_accounts).await;
+    state.request_model_refresh();
     Ok(result)
 }
 
@@ -1696,5 +1699,53 @@ mod tests {
         assert!(result.needs_restart.is_empty());
         assert_eq!(state.config.current().server.port, 6100);
         assert!(state.config.current().features.enable_prompt_cache);
+    }
+
+    #[tokio::test]
+    async fn config_reload_rolls_back_when_proxy_listener_cannot_start() {
+        let (_directory, state) = state_with(vec![]).await;
+        let occupied = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("occupied port");
+        let port = occupied.local_addr().expect("address").port();
+        let mut next = state.config.current().as_ref().clone();
+        next.api_key.push(ApiKeyConfig {
+            id: Some("ak_reload".into()),
+            name: "reload".into(),
+            key: "sk-reload".into(),
+            format: ApiKeyFormat::Sk,
+            enabled: true,
+            credits_limit: None,
+        });
+        next.proxy_service.push(ProxyServiceConfig {
+            id: "svc_reload".into(),
+            name: "reload".into(),
+            host: "127.0.0.1".into(),
+            port,
+            enabled: true,
+            api_key_ids: vec!["ak_reload".into()],
+            created_at: 0,
+        });
+        tokio::fs::write(
+            &state.paths.config_file,
+            toml::to_string_pretty(&next).expect("serialize"),
+        )
+        .await
+        .expect("write config");
+
+        let result: ConfigReloadResult = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(1, method::CONFIG_RELOAD, serde_json::json!({})),
+            )
+            .await,
+        ))
+        .expect("reload result");
+
+        assert!(!result.applied);
+        assert!(result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("svc_reload")));
+        assert!(state.config.current().proxy_service.is_empty());
+        assert!(state.config.current().api_key.is_empty());
     }
 }

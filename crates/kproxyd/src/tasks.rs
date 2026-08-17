@@ -10,6 +10,8 @@ use tracing::{debug, info, warn};
 
 use crate::state::AppState;
 
+const PROXY_SERVICE_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
+
 #[derive(Debug, Clone, serde::Serialize, Default)]
 pub struct TaskRun {
     pub last_run_at: Option<i64>,
@@ -51,6 +53,7 @@ impl TaskRegistry {
             "stats_persist":{"interval_ms":config.tasks.stats_persist_interval_ms,"run":runs.get("stats_persist")},
             "daily_reset":{"interval_ms":86_400_000u64,"run":runs.get("daily_reset")},
             "model_cache_refresh":{"interval_ms":config.models.cache_ttl_ms,"run":runs.get("model_cache_refresh")},
+            "proxy_service_reconcile":{"interval_ms":PROXY_SERVICE_RECONCILE_INTERVAL.as_millis() as u64,"run":runs.get("proxy_service_reconcile")},
             "health_recheck":{"interval_ms":config.pool.cooldown.quota_reset_ms,"run":runs.get("health_recheck")}
         })
     }
@@ -62,6 +65,7 @@ pub fn spawn(state: Arc<AppState>, shutdown: CancellationToken) {
     spawn_adaptive_admission(Arc::clone(&state), shutdown.clone());
     spawn_model_refresh(Arc::clone(&state), shutdown.clone());
     spawn_status_check(Arc::clone(&state), shutdown.clone());
+    spawn_proxy_service_reconcile(Arc::clone(&state), shutdown.clone());
     spawn_health_recheck(Arc::clone(&state), shutdown.clone());
     spawn_daily_reset(Arc::clone(&state), shutdown.clone());
     spawn_persistence(state, shutdown);
@@ -185,16 +189,40 @@ fn spawn_health_recheck(state: Arc<AppState>, shutdown: CancellationToken) {
 fn spawn_model_refresh(state: Arc<AppState>, shutdown: CancellationToken) {
     tokio::spawn(async move {
         loop {
+            let result = refresh_models(&state).await;
+            state.task_registry.record(
+                "model_cache_refresh",
+                result.unwrap_or_else(|error| error.to_string()),
+            );
             let delay =
                 Duration::from_millis(state.config.current().models.cache_ttl_ms.max(60_000));
             tokio::select! {
                 _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(delay) => {
-                    let result = refresh_models(&state).await;
-                    state.task_registry.record(
-                        "model_cache_refresh",
-                        result.unwrap_or_else(|error| error.to_string()),
-                    );
+                _ = tokio::time::sleep(delay) => {}
+                _ = state.wait_for_model_refresh() => {}
+            }
+        }
+    });
+}
+
+fn spawn_proxy_service_reconcile(state: Arc<AppState>, shutdown: CancellationToken) {
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(PROXY_SERVICE_RECONCILE_INTERVAL) => {
+                    let _mutation = state.lock_config_mutation().await;
+                    let config = state.config.current();
+                    let failures = state.reconcile_proxy_services(&config).await;
+                    let result = if failures.is_empty() {
+                        "ok".to_string()
+                    } else {
+                        for (service_id, error) in &failures {
+                            warn!(%service_id, %error, "proxy service supervisor restart failed");
+                        }
+                        format!("{} restart failures", failures.len())
+                    };
+                    state.task_registry.record("proxy_service_reconcile", result);
                 }
             }
         }
@@ -378,13 +406,14 @@ async fn status_check(state: &Arc<AppState>) -> anyhow::Result<String> {
     let mut healthy = 0;
     let mut failed = 0;
     for mut account in accounts.into_iter().filter(|account| account.enabled) {
-        match refresh_account_usage(state, &pool, &account.id).await {
+        let status_ok = match refresh_account_usage(state, &pool, &account.id).await {
             Ok(true) => {
                 if let Some(runtime) = pool.get(&account.id).await {
                     account = runtime.account.read().await.clone();
                 }
+                true
             }
-            Ok(false) => {}
+            Ok(false) => true,
             Err(error) => {
                 debug!(
                     account_id = %account.id,
@@ -392,9 +421,9 @@ async fn status_check(state: &Arc<AppState>) -> anyhow::Result<String> {
                     %error,
                     "usage status check failed"
                 );
-                failed += 1;
+                false
             }
-        }
+        };
         if let Some(usage) = &account.usage {
             if usage.limit > 0.0 {
                 let remaining = (100.0 - usage.percent_used).clamp(0.0, 100.0);
@@ -408,28 +437,10 @@ async fn status_check(state: &Arc<AppState>) -> anyhow::Result<String> {
                 state.notifier().emit(event);
             }
         }
-        if state.config.current().models.dynamic_discovery {
-            match state.kiro().list_models(&account).await {
-                Ok(models) => {
-                    if let Some(runtime) = pool.get(&account.id).await {
-                        runtime
-                            .set_supported_models(models.iter().map(|model| model.model_id.clone()))
-                            .await;
-                    }
-                    healthy += 1;
-                }
-                Err(error) => {
-                    warn!(
-                        account_id = %account.id,
-                        account_name = account.display_name(),
-                        %error,
-                        "status model check failed"
-                    );
-                    failed += 1;
-                }
-            }
-        } else {
+        if status_ok {
             healthy += 1;
+        } else {
+            failed += 1;
         }
     }
     persist_pool_accounts(state).await?;
@@ -527,6 +538,22 @@ pub async fn run_named(state: &Arc<AppState>, name: &str) -> anyhow::Result<serd
         }
         "model_cache_refresh" => refresh_models(state).await?,
         "status_check" => status_check(state).await?,
+        "proxy_service_reconcile" => {
+            let _mutation = state.lock_config_mutation().await;
+            let config = state.config.current();
+            let failures = state.reconcile_proxy_services(&config).await;
+            if !failures.is_empty() {
+                anyhow::bail!(
+                    "proxy service restart failed: {}",
+                    failures
+                        .into_iter()
+                        .map(|(service_id, error)| format!("{service_id}: {error}"))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                );
+            }
+            "ok".into()
+        }
         "daily_reset" => {
             state.meter.reset_daily().await?;
             "ok".into()

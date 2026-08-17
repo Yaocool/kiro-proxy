@@ -56,6 +56,7 @@ pub struct AppState {
     pub tokenizer: TokenCountCache,
     pub stats: Arc<StatsStore>,
     pub models: Arc<ModelCache>,
+    model_refresh: tokio::sync::Notify,
     refresher: RwLock<TokenRefresher>,
     tls_config: RwLock<Option<axum_server::tls_rustls::RustlsConfig>>,
     runtime_handle: Option<tokio::runtime::Handle>,
@@ -136,6 +137,7 @@ impl AppState {
             tokenizer: TokenCountCache::new(512).map_err(anyhow::Error::msg)?,
             stats,
             models: Arc::new(ModelCache::default()),
+            model_refresh: tokio::sync::Notify::new(),
             refresher: RwLock::new(refresher),
             tls_config: RwLock::new(None),
             runtime_handle: tokio::runtime::Handle::try_current().ok(),
@@ -225,6 +227,17 @@ impl AppState {
         for account_id in invalidated_ids {
             endpoint_cache.clear_account(&account_id);
         }
+        self.request_model_refresh();
+    }
+
+    /// 请求模型发现任务尽快刷新，不绕过任务自身的 singleflight 保护。
+    pub fn request_model_refresh(&self) {
+        self.model_refresh.notify_one();
+    }
+
+    /// 等待账号或运维操作触发一次模型目录刷新。
+    pub async fn wait_for_model_refresh(&self) {
+        self.model_refresh.notified().await;
     }
 
     /// 串行化账号的「复制、修改、落盘、提交」事务。
@@ -245,6 +258,38 @@ impl AppState {
         self.proxy_services
             .reconcile(Arc::clone(self), &config.proxy_service)
             .await
+    }
+
+    /// 事务化应用热配置；任一代理监听启动失败时恢复上一份运行配置。
+    pub async fn apply_config_transaction(self: &Arc<Self>, next: &Config) -> Result<(), String> {
+        let _mutation = self.lock_config_mutation().await;
+        let previous = self.runtime_config_snapshot();
+        self.config.replace(next.clone());
+        self.apply_runtime_config(next);
+        let failures = self.reconcile_proxy_services(next).await;
+        if failures.is_empty() {
+            return Ok(());
+        }
+
+        let apply_error = format_service_failures(&failures);
+        self.config.replace(previous.clone());
+        self.apply_runtime_config(&previous);
+        let rollback_failures = self.reconcile_proxy_services(&previous).await;
+        if rollback_failures.is_empty() {
+            Err(format!(
+                "proxy service apply failed; previous config restored: {apply_error}"
+            ))
+        } else {
+            Err(format!(
+                "proxy service apply failed ({apply_error}); rollback also failed: {}",
+                format_service_failures(&rollback_failures)
+            ))
+        }
+    }
+
+    /// 获取最后一次完整应用到运行时组件的配置快照。
+    pub fn runtime_config_snapshot(&self) -> Config {
+        read_lock(&self.runtime_config).clone()
     }
 
     /// 管理面 socket 路径。
@@ -431,6 +476,14 @@ impl AppState {
         self.admission.set_maximum(next);
         next
     }
+}
+
+fn format_service_failures(failures: &[(String, String)]) -> String {
+    failures
+        .iter()
+        .map(|(service_id, error)| format!("{service_id}: {error}"))
+        .collect::<Vec<_>>()
+        .join("; ")
 }
 
 pub struct AdmissionGate {

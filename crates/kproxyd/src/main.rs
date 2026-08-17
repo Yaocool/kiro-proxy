@@ -67,15 +67,11 @@ async fn main() -> Result<()> {
         state.config.clone(),
         CONFIG_DEBOUNCE,
         Arc::new(move |config| {
-            reload_state.apply_runtime_config(config);
-            reload_state.mark_config_reloaded(now_secs());
-            let service_state = Arc::clone(&reload_state);
-            let service_config = config.clone();
-            reload_runtime.spawn(async move {
-                let _failures = service_state
-                    .reconcile_proxy_services(&service_config)
-                    .await;
-            });
+            reload_runtime.block_on(async {
+                reload_state.apply_config_transaction(config).await?;
+                reload_state.mark_config_reloaded(now_secs());
+                Ok(())
+            })
         }),
     )?;
     let shutdown = state.shutdown.clone();
@@ -142,14 +138,15 @@ async fn reload_after_sighup(state: &Arc<AppState>) {
                 for field in needs_restart {
                     warn!(field, "SIGHUP field requires restart to take effect");
                 }
-                state.apply_runtime_config(&next);
-                state.config.replace(next.clone());
-                state.mark_config_reloaded(now_secs());
-                let failures = state.reconcile_proxy_services(&next).await;
-                for (service_id, error) in failures {
-                    warn!(%service_id, %error, "proxy service failed after SIGHUP reload");
+                match state.apply_config_transaction(&next).await {
+                    Ok(()) => {
+                        state.mark_config_reloaded(now_secs());
+                        info!("configuration reloaded after SIGHUP");
+                    }
+                    Err(error) => {
+                        warn!(%error, "SIGHUP config apply failed; previous config restored")
+                    }
                 }
-                info!("configuration reloaded after SIGHUP");
             }
             Err(error) => {
                 warn!(error = %error, "SIGHUP config validation failed; keeping old config")
