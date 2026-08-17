@@ -313,7 +313,10 @@ restrict proxy ports with the host firewall or cloud security group. Use
 `--host 127.0.0.1` when host-only access is desired. Docker Engine on Linux
 supports host networking directly; Docker Desktop 4.34+ requires it to be
 enabled in Settings. State persists in the `kproxy-data` volume. The full image
-adds Chromium for enterprise SSO authentication.
+adds Chromium for enterprise SSO authentication. Its browser is pinned to the
+official `r1566079` snapshot used by the CDP definitions in `chromiumoxide
+0.9.1`, so a routine image rebuild cannot silently upgrade the protocol. Update
+and test both pins together when adopting browser security updates.
 
 Docker reuses persistent Cargo registry and target caches across source updates.
 Full-image builds compile the all-features binaries only once and serialize that

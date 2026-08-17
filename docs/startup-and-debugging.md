@@ -445,10 +445,12 @@ unacceptable.
 configuration, accounts, statistics, and logs and should be used only when an
 intentional reset is required.
 
-The default Docker target is `runtime-full`; it installs Chromium, enables all
-features, and sets the container-specific no-sandbox flag. Change the Compose
-target to `runtime-slim` and rebuild only when browser SSO is explicitly not
-needed.
+The default Docker target is `runtime-full`; it installs the official Chromium
+snapshot `r1566079`, enables all features, and sets the container-specific
+no-sandbox flag. The snapshot is the exact revision used by the CDP definitions
+in `chromiumoxide 0.9.1`; update and test both pins together instead of allowing
+an OS package upgrade to change CDP independently. Change the Compose target to
+`runtime-slim` and rebuild only when browser SSO is explicitly not needed.
 
 BuildKit keeps Cargo registry and target caches between builds. The full target
 builds only the all-features binaries and waits for that release build before

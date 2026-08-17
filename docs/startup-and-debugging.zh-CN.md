@@ -400,9 +400,10 @@ docker compose exec kproxyd kproxy service delete secondary
 `docker compose down` 会保留 named volume；`docker compose down -v` 会删除配置、账号、
 统计和日志，只应在明确需要重置时使用。
 
-默认 Docker target 是 `runtime-full`，会安装 Chromium、启用全部 feature，并设置容器专用
-的 no-sandbox 标志。只有明确不需要浏览器 SSO 时，才把 Compose target 改为
-`runtime-slim` 后重新构建。
+默认 Docker target 是 `runtime-full`，会安装固定的 Chromium 官方快照 `r1566079`、启用
+全部 feature，并设置容器专用的 no-sandbox 标志。该快照正是 `chromiumoxide 0.9.1` 的
+CDP 定义所使用的 revision；升级时应同时更新并测试二者，不能让操作系统包单独改变 CDP
+协议。只有明确不需要浏览器 SSO 时，才把 Compose target 改为 `runtime-slim` 后重新构建。
 
 BuildKit 会跨构建保留 Cargo registry 和 target 缓存。full target 只构建 all-features
 二进制，并在 release 构建完成后才执行未命中的 Chromium 安装层，从而限制小规格宿主机的

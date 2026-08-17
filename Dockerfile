@@ -48,10 +48,32 @@ USER root
 # installation. Its stable contents preserve the Chromium package layer cache
 # when only application source code changes.
 COPY --from=builder-full /out/build-ready /tmp/kproxy-build-ready
+ENV KPROXY_CHROMIUM_REVISION=1566079
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        chromium fonts-liberation \
-    && rm -rf /var/lib/apt/lists/* /tmp/kproxy-build-ready
+        ca-certificates curl unzip \
+        fonts-liberation \
+        libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 \
+        libcairo2 libcups2 libcurl4 libdbus-1-3 libexpat1 libgbm1 \
+        libglib2.0-0 libgtk-3-0 libnspr4 libnss3 libpango-1.0-0 \
+        libudev1 libvulkan1 libx11-6 libxcb1 libxcomposite1 \
+        libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 \
+        wget xdg-utils \
+    && curl --fail --location --retry 3 \
+        --output /tmp/chromium-linux.zip \
+        "https://storage.googleapis.com/chromium-browser-snapshots/Linux_x64/${KPROXY_CHROMIUM_REVISION}/chrome-linux.zip" \
+    && echo "eafeca49c07daab07d3b8749872811f889e10d44186ebd75771b2fde4e09bca6  /tmp/chromium-linux.zip" \
+        | sha256sum --check --strict \
+    && unzip -q /tmp/chromium-linux.zip -d /opt \
+    && mv /opt/chrome-linux /opt/chromium \
+    && find /opt/chromium -type f -name '*.pak.info' -delete \
+    && find /opt/chromium/locales -type f ! -name 'en-US.pak' -delete \
+    && ln -s /opt/chromium/chrome /usr/local/bin/chromium \
+    && chromium --version \
+    && rm -rf \
+        /var/lib/apt/lists/* \
+        /tmp/chromium-linux.zip \
+        /tmp/kproxy-build-ready
 COPY --from=builder-full /out/kproxy /usr/local/bin/kproxy
 COPY --from=builder-full /out/kproxyd /usr/local/bin/kproxyd
 ENV KPROXY_CHROMIUM_NO_SANDBOX=1

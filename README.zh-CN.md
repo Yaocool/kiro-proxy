@@ -282,7 +282,9 @@ Compose 使用 host network，因此手动创建的任意端口代理服务都�
 可访问，无需修改 Compose 或重启容器。服务默认绑定 `0.0.0.0`，应通过宿主机防火墙或云
 安全组限制代理端口；只需宿主机本地访问时可使用 `--host 127.0.0.1`。Linux Docker
 Engine 可直接使用；Docker Desktop 4.34+ 需要在设置中启用 host networking。数据保存
-在 `kproxy-data` volume，full 镜像为企业 SSO 认证额外安装 Chromium。
+在 `kproxy-data` volume，full 镜像为企业 SSO 认证额外安装 Chromium。浏览器固定为
+`chromiumoxide 0.9.1` 的 CDP 定义所使用的官方 `r1566079` 快照，普通镜像重建不会再静默
+升级协议。后续采用浏览器安全更新时，应同时更新并测试这两个固定版本。
 
 Docker 会在源码更新后复用持久化的 Cargo registry 和 target 构建缓存。full 镜像只编译
 一次 all-features 二进制，并让首次 Chromium 安装在 Rust release 构建完成后再执行，避免
