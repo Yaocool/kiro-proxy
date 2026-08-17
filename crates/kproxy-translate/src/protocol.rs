@@ -48,6 +48,10 @@ pub struct ClaudeTool {
     pub strict: Option<bool>,
     #[serde(default)]
     pub input_examples: Option<Vec<Value>>,
+    /// Anthropic Tool Search hint. Deferred definitions stay in the request
+    /// catalog but are not loaded into the model context until discovered.
+    #[serde(default)]
+    pub defer_loading: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

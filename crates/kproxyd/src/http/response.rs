@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use kproxy_kiro::{KiroEvent, UsageInfo};
+use kproxy_translate::ClaudeToolSearchTrace;
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +15,7 @@ pub struct DecodedResponse {
     pub text: String,
     pub reasoning: String,
     pub tools: BTreeMap<String, ToolBuffer>,
+    pub tool_searches: Vec<ClaudeToolSearchTrace>,
     pub usage: UsageInfo,
 }
 
@@ -376,6 +378,33 @@ impl DecodedResponse {
         }
         if !self.text.is_empty() {
             content.push(json!({"type":"text","text":self.text}));
+        }
+        for search in &self.tool_searches {
+            content.push(json!({
+                "type":"server_tool_use",
+                "id":search.id,
+                "name":search.name,
+                "input":search.input
+            }));
+            let result = if let Some(error) = &search.error {
+                json!({
+                    "type":"tool_search_tool_result_error",
+                    "error_code":error.code,
+                    "error_message":error.message
+                })
+            } else {
+                json!({
+                    "type":"tool_search_tool_search_result",
+                    "tool_references":search.references.iter().map(|name| json!({
+                        "type":"tool_reference","tool_name":name
+                    })).collect::<Vec<_>>()
+                })
+            };
+            content.push(json!({
+                "type":"tool_search_tool_result",
+                "tool_use_id":search.id,
+                "content":result
+            }));
         }
         for tool in self.tools.values() {
             content.push(json!({
@@ -786,6 +815,28 @@ mod tests {
             openai["choices"][0]["message"]["reasoning_content"],
             "thought"
         );
+    }
+
+    #[test]
+    fn claude_response_preserves_tool_search_reference_blocks() {
+        let decoded = DecodedResponse {
+            tool_searches: vec![ClaudeToolSearchTrace {
+                id: "srvtoolu_1".into(),
+                name: "tool_search_tool_regex".into(),
+                input: json!({"pattern":"github"}),
+                references: vec!["mcp__github__list_issues".into()],
+                error: None,
+            }],
+            ..DecodedResponse::default()
+        };
+        let response = decoded.claude_json("msg", "model", 100, 1, None);
+        assert_eq!(response["content"][0]["type"], "server_tool_use");
+        assert_eq!(response["content"][1]["type"], "tool_search_tool_result");
+        assert_eq!(
+            response["content"][1]["content"]["tool_references"][0]["tool_name"],
+            "mcp__github__list_issues"
+        );
+        assert_eq!(response["stop_reason"], "end_turn");
     }
 
     #[test]

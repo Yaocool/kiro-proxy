@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::collections::HashSet;
 
 use crate::{
     ClaudeRequest, KiroAssistantMessage, KiroConversationState, KiroCurrentMessage,
@@ -9,10 +10,11 @@ use super::common::{
     content_text, context, enhance_system, extract_images, extract_tool_results, inference,
     kiro_tool, system_text, tool_name,
 };
+use super::tool_search::{is_tool_search_tool, tool_search_kiro_tool};
 use super::TranslationOptions;
 
 pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> KiroPayload {
-    let selected_tools = select_tools(request);
+    let selected_tools = claude_loaded_tools(request);
     let mut documentation = Vec::new();
     let tools = selected_tools
         .iter()
@@ -36,6 +38,10 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
                             "required":["url"]
                         }),
                     ),
+                    _ if is_tool_search_tool(tool) => {
+                        return tool_search_kiro_tool(tool)
+                            .expect("validated Tool Search definition")
+                    }
                     _ => (
                         tool.name.as_str(),
                         tool_description(tool),
@@ -54,6 +60,14 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
     }
     if !documentation.is_empty() {
         system = join_nonempty(&system, &documentation.join("\n\n"));
+    }
+    if request.tools.iter().any(|tool| tool.defer_loading)
+        && selected_tools.iter().any(|tool| is_tool_search_tool(tool))
+    {
+        system = join_nonempty(
+            &system,
+            "Deferred tools are available through the tool search tool. When the required tool is not loaded, call tool search by itself; use the optional limit when more than the default five matches are needed. The proxy will load the matching tool definitions and continue the same assistant turn.",
+        );
     }
     system = join_nonempty(&system, &tool_choice_directive(request, &tools));
 
@@ -145,7 +159,7 @@ fn tool_description(tool: &crate::ClaudeTool) -> String {
     join_nonempty(&tool.description, &format!("Input examples:\n{examples}"))
 }
 
-fn select_tools(request: &ClaudeRequest) -> Vec<&crate::ClaudeTool> {
+pub fn claude_loaded_tools(request: &ClaudeRequest) -> Vec<&crate::ClaudeTool> {
     match request
         .tool_choice
         .as_ref()
@@ -163,8 +177,66 @@ fn select_tools(request: &ClaudeRequest) -> Vec<&crate::ClaudeTool> {
                 .filter(|tool| Some(tool.name.as_str()) == selected)
                 .collect()
         }
-        _ => request.tools.iter().collect(),
+        _ => {
+            let discovered = discovered_tool_names(request);
+            request
+                .tools
+                .iter()
+                .filter(|tool| {
+                    !tool.defer_loading
+                        || is_tool_search_tool(tool)
+                        || discovered.contains(tool.name.as_str())
+                })
+                .collect()
+        }
     }
+}
+
+fn discovered_tool_names(request: &ClaudeRequest) -> HashSet<&str> {
+    let mut discovered = HashSet::new();
+    for message in &request.messages {
+        let Some(blocks) = message.content.as_array() else {
+            continue;
+        };
+        for block in blocks {
+            match block.get("type").and_then(Value::as_str) {
+                Some("tool_use") => {
+                    if let Some(name) = block.get("name").and_then(Value::as_str) {
+                        discovered.insert(name);
+                    }
+                }
+                Some("tool_search_tool_result") => {
+                    if let Some(references) = block
+                        .pointer("/content/tool_references")
+                        .and_then(Value::as_array)
+                    {
+                        for reference in references {
+                            if let Some(name) = reference.get("tool_name").and_then(Value::as_str) {
+                                discovered.insert(name);
+                            }
+                        }
+                    }
+                }
+                Some("tool_result") => {
+                    if let Some(references) = block.get("content").and_then(Value::as_array) {
+                        for reference in references {
+                            if reference.get("type").and_then(Value::as_str)
+                                == Some("tool_reference")
+                            {
+                                if let Some(name) =
+                                    reference.get("tool_name").and_then(Value::as_str)
+                                {
+                                    discovered.insert(name);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    discovered
 }
 
 fn assistant_parts(content: &Value) -> (String, Vec<KiroToolUse>) {
@@ -423,5 +495,65 @@ mod tests {
             .expect("context")
             .tool_results[0];
         assert_eq!(result.content[0].text, "(image result attached)");
+    }
+
+    #[test]
+    fn deferred_tools_stay_out_of_kiro_until_referenced() {
+        let mut request: ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-sonnet-4-5",
+            "max_tokens":256,
+            "messages":[{"role":"user","content":"inspect the issue"}],
+            "tools":[
+                {"type":"tool_search_tool_regex_20251119","name":"tool_search_tool_regex"},
+                {"name":"Read","description":"Read a file","input_schema":{"type":"object"}},
+                {"name":"mcp__github__list_issues","description":"List issues","input_schema":{"type":"object"},"defer_loading":true}
+            ]
+        }))
+        .expect("request");
+        let options = TranslationOptions::new("dynamic-sonnet", "AI_EDITOR");
+        let payload = claude_to_kiro(&request, &options);
+        let tools = &payload
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .expect("context")
+            .tools;
+        assert_eq!(tools.len(), 2);
+        assert!(tools
+            .iter()
+            .any(|tool| { tool.tool_specification.name == "tool_search_tool_regex" }));
+        assert!(!tools
+            .iter()
+            .any(|tool| { tool.tool_specification.name == "mcp__github__list_issues" }));
+
+        request.messages.insert(
+            0,
+            crate::ClaudeMessage {
+                role: "assistant".into(),
+                content: serde_json::json!([{
+                    "type":"tool_search_tool_result",
+                    "tool_use_id":"srvtoolu_1",
+                    "content":{
+                        "type":"tool_search_tool_search_result",
+                        "tool_references":[{
+                            "type":"tool_reference","tool_name":"mcp__github__list_issues"
+                        }]
+                    }
+                }]),
+            },
+        );
+        let payload = claude_to_kiro(&request, &options);
+        let tools = &payload
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .expect("context")
+            .tools;
+        assert_eq!(tools.len(), 3);
+        assert!(tools
+            .iter()
+            .any(|tool| { tool.tool_specification.name == "mcp__github__list_issues" }));
     }
 }

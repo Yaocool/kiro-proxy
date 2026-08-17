@@ -7,7 +7,9 @@ use lru::LruCache;
 use sha2::{Digest, Sha256};
 use tiktoken_rs::{cl100k_base, CoreBPE};
 
-use crate::{KiroAssistantMessage, KiroHistoryMessage, KiroPayload, KiroUserInputMessage};
+use crate::{
+    ClaudeTool, KiroAssistantMessage, KiroHistoryMessage, KiroPayload, KiroUserInputMessage,
+};
 
 const MIN_CACHE_CHARS: usize = 512;
 const MESSAGE_OVERHEAD_TOKENS: usize = 8;
@@ -120,6 +122,49 @@ impl TokenCountCache {
             total = total.saturating_add(self.count(segment).await?);
         }
         Ok(total.max(1))
+    }
+
+    /// Estimates only loaded tool definitions as serialized in the Kiro
+    /// request. Deferred Claude tools are intentionally absent from this value.
+    pub async fn estimate_kiro_tools(&self, payload: &KiroPayload) -> Result<usize, String> {
+        let mut segments = Vec::new();
+        let mut fixed = 0usize;
+        for message in &payload.conversation_state.history {
+            if let Some(user) = &message.user_input_message {
+                collect_tools(user, &mut segments, &mut fixed);
+            }
+        }
+        collect_tools(
+            &payload
+                .conversation_state
+                .current_message
+                .user_input_message,
+            &mut segments,
+            &mut fixed,
+        );
+        let mut total = fixed;
+        for segment in segments {
+            total = total.saturating_add(self.count(segment).await?);
+        }
+        Ok(total)
+    }
+
+    /// Estimates full Claude definitions before long documentation is moved
+    /// into the Kiro system prompt and descriptions are replaced by markers.
+    pub async fn estimate_claude_tools(&self, tools: &[&ClaudeTool]) -> Result<usize, String> {
+        let mut total = tools.len().saturating_mul(TOOL_SCHEMA_OVERHEAD_TOKENS);
+        for tool in tools {
+            total = total.saturating_add(self.count(tool.name.clone()).await?);
+            total = total.saturating_add(self.count(tool.description.clone()).await?);
+            total = total.saturating_add(self.count(tool.input_schema.to_string()).await?);
+            if let Some(examples) = &tool.input_examples {
+                total = total.saturating_add(
+                    self.count(serde_json::to_string(examples).unwrap_or_default())
+                        .await?,
+                );
+            }
+        }
+        Ok(total)
     }
 
     /// Replaces complete oldest conversation turns with a bounded extractive
@@ -342,12 +387,7 @@ fn collect_user_message(
         *fixed = fixed.saturating_add(image_tokens);
     }
     if let Some(context) = &message.user_input_message_context {
-        for tool in &context.tools {
-            *fixed = fixed.saturating_add(TOOL_SCHEMA_OVERHEAD_TOKENS);
-            segments.push(tool.tool_specification.name.clone());
-            segments.push(tool.tool_specification.description.clone());
-            segments.push(tool.tool_specification.input_schema.json.to_string());
-        }
+        collect_tools(message, segments, fixed);
         for result in &context.tool_results {
             *fixed = fixed.saturating_add(TOOL_RESULT_OVERHEAD_TOKENS);
             segments.push(result.tool_use_id.clone());
@@ -361,6 +401,18 @@ fn collect_user_message(
                     .join("\n"),
             );
         }
+    }
+}
+
+fn collect_tools(message: &KiroUserInputMessage, segments: &mut Vec<String>, fixed: &mut usize) {
+    let Some(context) = &message.user_input_message_context else {
+        return;
+    };
+    for tool in &context.tools {
+        *fixed = fixed.saturating_add(TOOL_SCHEMA_OVERHEAD_TOKENS);
+        segments.push(tool.tool_specification.name.clone());
+        segments.push(tool.tool_specification.description.clone());
+        segments.push(tool.tool_specification.input_schema.json.to_string());
     }
 }
 

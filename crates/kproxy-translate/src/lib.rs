@@ -16,7 +16,9 @@ pub use error::{error_envelope, sanitize_error_message, ErrorFormat};
 pub use protocol::*;
 pub use tokenizer::{ContextCompactionStats, TokenCountCache, TokenCountStats};
 pub use translate::{
-    auto_continue_payload, claude_to_kiro, openai_to_kiro, tool_name, TranslationOptions,
-    SIGNATURE_PLACEHOLDER,
+    auto_continue_payload, claude_loaded_tools, claude_to_kiro, is_tool_search_tool,
+    is_tool_search_type, openai_to_kiro, tool_name, tool_search_continue_payload,
+    tool_search_kiro_tool, ClaudeToolSearchCatalog, ClaudeToolSearchError, ClaudeToolSearchOutcome,
+    ClaudeToolSearchTrace, TranslationOptions, SIGNATURE_PLACEHOLDER,
 };
 pub use validate::{validate_claude, validate_openai, ValidationError};

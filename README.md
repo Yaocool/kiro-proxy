@@ -135,6 +135,28 @@ GET  /health
 Claude aliases `/messages` and `/anthropic/v1/messages` are also available.
 OpenAI aliases `/chat/completions` and `/models` are supported as well.
 
+### Claude Code MCP Tool Search
+
+Claude Code loads every MCP schema up front when `ANTHROPIC_BASE_URL` points to
+a third-party proxy unless Tool Search is explicitly enabled. For large MCP
+catalogs, start Claude Code with:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:5580 ENABLE_TOOL_SEARCH=true claude
+```
+
+`kiro-proxy` accepts Anthropic `defer_loading`, regex/BM25 Tool Search, and
+`tool_reference` history blocks. Because Kiro has no native Tool Search server
+tool, the proxy executes the search locally, exposes at most five matching
+definitions by default (or the requested `limit`, from 1 to 10,000) to Kiro,
+and continues the same response. Deferred definitions remain outside the Kiro
+context and payload until discovered.
+
+The generated `[context]` configuration also bounds loaded tool definitions
+with `max_tool_input_tokens` and the serialized Kiro request with
+`max_upstream_payload_bytes`. Oversized requests fail locally with an explicit
+413 instead of an opaque upstream error.
+
 ## Configuration and files
 
 Use `.env` for startup-path selection and temporary process overrides. Use

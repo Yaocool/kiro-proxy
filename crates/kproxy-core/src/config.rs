@@ -420,6 +420,10 @@ pub struct ContextConfig {
     pub safe_input_ratio: f64,
     /// compact 请求安全比例。
     pub compact_safe_input_ratio: f64,
+    /// 单次 Kiro 请求中工具定义允许占用的最大估算 token。
+    pub max_tool_input_tokens: u32,
+    /// 单次序列化 Kiro 请求的最大字节数。
+    pub max_upstream_payload_bytes: usize,
 }
 
 impl Default for ContextConfig {
@@ -428,6 +432,8 @@ impl Default for ContextConfig {
             max_input_tokens: 200_000,
             safe_input_ratio: 0.95,
             compact_safe_input_ratio: 0.99,
+            max_tool_input_tokens: 32_000,
+            max_upstream_payload_bytes: 8 * 1024 * 1024,
         }
     }
 }
@@ -926,8 +932,23 @@ impl Config {
                 "error and quota thresholds must be greater than zero",
             );
         }
-        if self.context.max_input_tokens == 0 {
-            return invalid_config("context.max_input_tokens", "must be greater than zero");
+        for (field, value) in [
+            (
+                "context.max_input_tokens",
+                self.context.max_input_tokens as usize,
+            ),
+            (
+                "context.max_tool_input_tokens",
+                self.context.max_tool_input_tokens as usize,
+            ),
+            (
+                "context.max_upstream_payload_bytes",
+                self.context.max_upstream_payload_bytes,
+            ),
+        ] {
+            if value == 0 {
+                return invalid_config(field, "must be greater than zero");
+            }
         }
         if self.models.dynamic_discovery && self.models.cache_ttl_ms == 0 {
             return invalid_config("models.cache_ttl_ms", "must be greater than zero");
@@ -1274,6 +1295,8 @@ stats_persist_interval_ms = 60000
 max_input_tokens = 200000
 safe_input_ratio = 0.95
 compact_safe_input_ratio = 0.99
+max_tool_input_tokens = 32000
+max_upstream_payload_bytes = 8388608
 
 [storage]
 compression_threshold = 100
@@ -1390,6 +1413,8 @@ mod tests {
         assert_eq!(config.context.max_input_tokens, 200_000);
         assert_eq!(config.context.safe_input_ratio, 0.95);
         assert_eq!(config.context.compact_safe_input_ratio, 0.99);
+        assert_eq!(config.context.max_tool_input_tokens, 32_000);
+        assert_eq!(config.context.max_upstream_payload_bytes, 8 * 1024 * 1024);
         assert_eq!(config.notify.low_credit_threshold_percent, 10.0);
         assert_eq!(config.notify.max_notifications, 5);
         assert_eq!(config.storage.compression_threshold, 100);
