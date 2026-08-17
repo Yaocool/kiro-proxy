@@ -2,7 +2,7 @@
 ARG RUST_VERSION=1.97.1
 FROM rust:${RUST_VERSION}-bookworm AS builder-base
 WORKDIR /src
-ARG CARGO_BUILD_JOBS=2
+ARG CARGO_BUILD_JOBS=1
 ENV CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates

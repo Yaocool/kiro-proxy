@@ -318,7 +318,7 @@ adds Chromium for enterprise SSO authentication.
 Docker reuses persistent Cargo registry and target caches across source updates.
 Full-image builds compile the all-features binaries only once and serialize that
 release build with the initial Chromium installation to avoid exhausting smaller
-hosts. Cargo parallelism defaults to two jobs; override it only when the builder
+hosts. Cargo parallelism defaults to one job; override it only when the builder
 has enough memory, for example `CARGO_BUILD_JOBS=4 docker compose build`.
 
 After updating the source, rebuild and recreate the container without deleting

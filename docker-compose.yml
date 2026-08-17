@@ -10,7 +10,7 @@ services:
         RUST_VERSION: "1.97.1"
         # Keep release builds responsive on smaller hosts; override through
         # CARGO_BUILD_JOBS when more parallelism is safe.
-        CARGO_BUILD_JOBS: "${CARGO_BUILD_JOBS:-2}"
+        CARGO_BUILD_JOBS: "${CARGO_BUILD_JOBS:-1}"
     # Share the host network so proxy services created on arbitrary ports become
     # reachable from the host immediately, without recreating the container.
     network_mode: host
