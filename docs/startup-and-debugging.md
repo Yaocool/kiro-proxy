@@ -450,6 +450,12 @@ features, and sets the container-specific no-sandbox flag. Change the Compose
 target to `runtime-slim` and rebuild only when browser SSO is explicitly not
 needed.
 
+BuildKit keeps Cargo registry and target caches between builds. The full target
+builds only the all-features binaries and waits for that release build before
+performing an uncached Chromium installation, which bounds peak memory and disk
+pressure on smaller hosts. Compose defaults `CARGO_BUILD_JOBS` to `2`; increase
+it only on a builder with sufficient memory.
+
 ## 9. systemd
 
 Build release binaries and install them with the provided unit:
