@@ -1,14 +1,14 @@
 [workspace]
 members = [
-    "crates/kam-core",
-    "crates/kam-store",
-    "crates/kam-ipc",
-    "crates/kam-translate",
-    "crates/kam-kiro",
-    "crates/kam-pool",
-    "crates/kam-notify",
-    "crates/kamd",
-    "crates/kam",
+    "crates/kproxy-core",
+    "crates/kproxy-store",
+    "crates/kproxy-ipc",
+    "crates/kproxy-translate",
+    "crates/kproxy-kiro",
+    "crates/kproxy-pool",
+    "crates/kproxy-notify",
+    "crates/kproxyd",
+    "crates/kproxy",
 ]
 resolver = "2"
 
@@ -19,13 +19,13 @@ rust-version = "1.97.1"
 license = "MIT"
 
 [workspace.dependencies]
-kam-core = { path = "crates/kam-core" }
-kam-store = { path = "crates/kam-store" }
-kam-ipc = { path = "crates/kam-ipc" }
-kam-translate = { path = "crates/kam-translate" }
-kam-kiro = { path = "crates/kam-kiro" }
-kam-pool = { path = "crates/kam-pool" }
-kam-notify = { path = "crates/kam-notify" }
+kproxy-core = { path = "crates/kproxy-core" }
+kproxy-store = { path = "crates/kproxy-store" }
+kproxy-ipc = { path = "crates/kproxy-ipc" }
+kproxy-translate = { path = "crates/kproxy-translate" }
+kproxy-kiro = { path = "crates/kproxy-kiro" }
+kproxy-pool = { path = "crates/kproxy-pool" }
+kproxy-notify = { path = "crates/kproxy-notify" }
 anyhow = "=1.0.86"
 thiserror = "=1.0.63"
 serde = { version = "=1.0.209", features = ["derive"] }

@@ -2,7 +2,7 @@
 /target/
 **/*.rs.bk
 *.pdb
-.kam-dev/
+.kproxy-dev/
 
 # Local environment files (keep documented templates in version control)
 .env

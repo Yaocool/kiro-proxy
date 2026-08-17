@@ -1073,17 +1073,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "kam"
+name = "kproxy"
 version = "0.0.2"
 dependencies = [
  "anyhow",
  "clap",
  "futures",
- "kam-core",
- "kam-ipc",
- "kam-kiro",
- "kam-store",
- "kam-translate",
+ "kproxy-core",
+ "kproxy-ipc",
+ "kproxy-kiro",
+ "kproxy-store",
+ "kproxy-translate",
  "rand 0.8.5",
  "serde",
  "serde_json",
@@ -1094,7 +1094,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kam-core"
+name = "kproxy-core"
 version = "0.0.2"
 dependencies = [
  "rand 0.8.5",
@@ -1105,17 +1105,17 @@ dependencies = [
 ]
 
 [[package]]
-name = "kam-ipc"
+name = "kproxy-ipc"
 version = "0.0.2"
 dependencies = [
- "kam-core",
+ "kproxy-core",
  "serde",
  "serde_json",
  "thiserror 1.0.63",
 ]
 
 [[package]]
-name = "kam-kiro"
+name = "kproxy-kiro"
 version = "0.0.2"
 dependencies = [
  "base64 0.22.1",
@@ -1125,8 +1125,8 @@ dependencies = [
  "futures",
  "http",
  "hyper-rustls",
- "kam-core",
- "kam-translate",
+ "kproxy-core",
+ "kproxy-translate",
  "quinn",
  "quinn-proto",
  "quinn-udp",
@@ -1150,12 +1150,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "kam-notify"
+name = "kproxy-notify"
 version = "0.0.2"
 dependencies = [
  "base64 0.22.1",
  "hmac",
- "kam-core",
+ "kproxy-core",
  "reqwest",
  "serde",
  "serde_json",
@@ -1167,14 +1167,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "kam-pool"
+name = "kproxy-pool"
 version = "0.0.2"
 dependencies = [
  "indexmap",
- "kam-core",
- "kam-kiro",
- "kam-store",
- "kam-translate",
+ "kproxy-core",
+ "kproxy-kiro",
+ "kproxy-store",
+ "kproxy-translate",
  "rand 0.8.5",
  "reqwest",
  "serde",
@@ -1186,14 +1186,14 @@ dependencies = [
 ]
 
 [[package]]
-name = "kam-store"
+name = "kproxy-store"
 version = "0.0.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
  "dotenvy",
  "flate2",
- "kam-core",
+ "kproxy-core",
  "notify",
  "notify-debouncer-full",
  "serde",
@@ -1206,11 +1206,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "kam-translate"
+name = "kproxy-translate"
 version = "0.0.2"
 dependencies = [
  "base64 0.22.1",
- "kam-core",
+ "kproxy-core",
  "libc",
  "lru",
  "proptest",
@@ -1224,7 +1224,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "kamd"
+name = "kproxyd"
 version = "0.0.2"
 dependencies = [
  "anyhow",
@@ -1241,13 +1241,13 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
- "kam-core",
- "kam-ipc",
- "kam-kiro",
- "kam-notify",
- "kam-pool",
- "kam-store",
- "kam-translate",
+ "kproxy-core",
+ "kproxy-ipc",
+ "kproxy-kiro",
+ "kproxy-notify",
+ "kproxy-pool",
+ "kproxy-store",
+ "kproxy-translate",
  "rand 0.8.5",
  "reqwest",
  "serde",
