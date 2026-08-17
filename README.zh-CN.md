@@ -286,7 +286,7 @@ Engine 可直接使用；Docker Desktop 4.34+ 需要在设置中启用 host netw
 
 Docker 会在源码更新后复用持久化的 Cargo registry 和 target 构建缓存。full 镜像只编译
 一次 all-features 二进制，并让首次 Chromium 安装在 Rust release 构建完成后再执行，避免
-小规格宿主机被同时进行的两个重任务压垮。Cargo 默认使用两个并行任务；只有在构建机内存
+小规格宿主机被同时进行的两个重任务压垮。Cargo 默认使用一个编译任务；只有在构建机内存
 充足时才应提高，例如 `CARGO_BUILD_JOBS=4 docker compose build`。
 
 源码更新后，重新构建并创建容器即可，不要删除 named volume：

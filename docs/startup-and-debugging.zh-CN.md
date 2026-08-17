@@ -406,7 +406,7 @@ docker compose exec kproxyd kproxy service delete secondary
 
 BuildKit 会跨构建保留 Cargo registry 和 target 缓存。full target 只构建 all-features
 二进制，并在 release 构建完成后才执行未命中的 Chromium 安装层，从而限制小规格宿主机的
-峰值内存和磁盘压力。Compose 默认把 `CARGO_BUILD_JOBS` 设为 `2`；只有构建机内存充足时
+峰值内存和磁盘压力。Compose 默认把 `CARGO_BUILD_JOBS` 设为 `1`；只有构建机内存充足时
 才应提高。
 
 ## 9. systemd
