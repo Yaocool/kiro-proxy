@@ -9,7 +9,7 @@ use crate::{ClaudeRequest, OpenAiRequest};
 pub const MAX_SCHEMA_DEPTH: usize = 64;
 pub const MAX_SCHEMA_NODES: usize = 50_000;
 pub const MAX_TOOL_DOC_CHARS: usize = 512_000;
-pub const MAX_TOOLS: usize = 128;
+pub const MAX_TOOLS: usize = 256;
 pub const MAX_TOOL_NAME_CHARS: usize = 1_024;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -937,6 +937,28 @@ mod tests {
             thinking: None,
             context_management: None,
         }
+    }
+
+    fn tool(index: usize) -> ClaudeTool {
+        ClaudeTool {
+            r#type: None,
+            name: format!("tool_{index}"),
+            description: String::new(),
+            input_schema: serde_json::json!({"type":"object"}),
+            cache_control: None,
+            strict: None,
+            input_examples: None,
+        }
+    }
+
+    #[test]
+    fn enforces_tool_count_boundary() {
+        let mut input = request();
+        input.tools = (0..MAX_TOOLS).map(tool).collect();
+        validate_claude(&input).expect("maximum tool count should be accepted");
+
+        input.tools.push(tool(MAX_TOOLS));
+        assert_eq!(validate_claude(&input), Err(ValidationError::TooManyTools));
     }
 
     #[test]
