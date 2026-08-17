@@ -32,7 +32,17 @@ pub fn sanitize_error_message(message: &str) -> String {
     {
         return "service unavailable".into();
     }
-    if lower.contains("prompt is too long") || lower.contains("context length exceeded") {
+    if lower.contains("prompt is too long")
+        || lower.contains("context length exceeded")
+        || lower.contains("input is too long")
+        || lower.contains("context window") && lower.contains("exceed")
+    {
+        if let Some((actual, maximum)) = context_token_counts(message, &lower) {
+            // Claude Code recognizes this stable shape and can explain how far
+            // the request exceeded the context window. Only numeric values are
+            // retained, so arbitrary upstream text is never reflected.
+            return format!("prompt is too long: {actual} tokens > {maximum}");
+        }
         return "prompt is too long: context length exceeded".into();
     }
     if is_quota_error(&lower) {
@@ -63,6 +73,23 @@ pub fn sanitize_error_message(message: &str) -> String {
         return "Service temporarily unavailable, please retry".into();
     }
     redact_endpoint_names(message)
+}
+
+fn context_token_counts(message: &str, lower: &str) -> Option<(u64, u64)> {
+    if !(lower.contains("tokens >")
+        || lower.contains("tokens exceeds")
+        || lower.contains("input tokens exceed"))
+    {
+        return None;
+    }
+    let numbers = message
+        .split(|character: char| !character.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .filter_map(|part| part.parse::<u64>().ok())
+        .collect::<Vec<_>>();
+    let maximum = *numbers.last()?;
+    let actual = *numbers.get(numbers.len().checked_sub(2)?)?;
+    Some((actual, maximum))
 }
 
 fn is_quota_error(lower: &str) -> bool {
@@ -141,9 +168,14 @@ fn replace_ascii_case_insensitive(message: &str, needle: &str, replacement: &str
     output
 }
 
-pub fn error_envelope(format: ErrorFormat, status: u16, message: &str) -> Value {
+pub fn error_envelope(
+    format: ErrorFormat,
+    status: u16,
+    message: &str,
+    request_id: Option<&str>,
+) -> Value {
     let safe = sanitize_error_message(message);
-    match format {
+    let mut envelope = match format {
         ErrorFormat::Claude => json!({
             "type": "error",
             "error": {"type": claude_error_type(status), "message": safe}
@@ -151,15 +183,22 @@ pub fn error_envelope(format: ErrorFormat, status: u16, message: &str) -> Value 
         ErrorFormat::OpenAi => json!({
             "error": {"message": safe, "type": openai_error_type(status), "code": Value::Null}
         }),
+    };
+    if let Some(request_id) = request_id.filter(|request_id| !request_id.is_empty()) {
+        envelope["request_id"] = json!(request_id);
     }
+    envelope
 }
 
 fn claude_error_type(status: u16) -> &'static str {
     match status {
-        400 | 405 | 413 | 422 => "invalid_request_error",
+        400 | 405 | 422 => "invalid_request_error",
         401 | 403 => "authentication_error",
         404 => "not_found_error",
+        408 | 504 => "timeout_error",
+        413 => "request_too_large",
         429 => "rate_limit_error",
+        500 | 502 => "api_error",
         _ => "overloaded_error",
     }
 }
@@ -236,6 +275,43 @@ mod tests {
                 "API error 400: Service temporarily unavailable: prompt is too long; context length exceeded"
             ),
             "prompt is too long: context length exceeded"
+        );
+        assert_eq!(
+            sanitize_error_message(
+                "prompt is too long for resolved model claude-sonnet-4.6: 196000 input tokens exceeds 190000"
+            ),
+            "prompt is too long: 196000 tokens > 190000"
+        );
+    }
+
+    #[test]
+    fn claude_error_envelopes_preserve_request_ids_and_protocol_types() {
+        let context = error_envelope(
+            ErrorFormat::Claude,
+            400,
+            "prompt is too long: 196000 tokens > 190000",
+            Some("trace_context"),
+        );
+        assert_eq!(context["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            context["error"]["message"],
+            "prompt is too long: 196000 tokens > 190000"
+        );
+        assert_eq!(context["request_id"], "trace_context");
+
+        let too_large = error_envelope(
+            ErrorFormat::Claude,
+            413,
+            "request body exceeds the limit",
+            None,
+        );
+        assert_eq!(too_large["error"]["type"], "request_too_large");
+
+        let upstream = error_envelope(ErrorFormat::Claude, 502, "Internal Server Error", None);
+        assert_eq!(upstream["error"]["type"], "api_error");
+        assert_eq!(
+            upstream["error"]["message"],
+            "Upstream service error, please retry later"
         );
     }
 

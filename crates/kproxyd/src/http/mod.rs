@@ -5,6 +5,7 @@ pub(crate) use handlers::fallback_models;
 pub(crate) mod prompt_cache;
 mod response;
 pub(crate) mod stream;
+mod usage;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -25,6 +26,7 @@ use kproxy_ipc::protocol::ProxyServiceView;
 use crate::state::AppState;
 
 pub(crate) const TRACE_ID_HEADER: &str = "x-trace-id";
+pub(crate) const REQUEST_ID_HEADER: &str = "request-id";
 
 #[derive(Clone)]
 pub(crate) struct RequestTrace {
@@ -183,9 +185,14 @@ async fn trace_requests(mut request: axum::extract::Request, next: Next) -> Resp
         );
     }
     if let Ok(value) = axum::http::HeaderValue::from_str(&trace_id) {
-        response
-            .headers_mut()
-            .insert(axum::http::HeaderName::from_static(TRACE_ID_HEADER), value);
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static(TRACE_ID_HEADER),
+            value.clone(),
+        );
+        response.headers_mut().insert(
+            axum::http::HeaderName::from_static(REQUEST_ID_HEADER),
+            value,
+        );
     }
     response
 }
@@ -218,7 +225,7 @@ async fn cors(request: axum::extract::Request, next: Next) -> Response {
     );
     headers.insert(
         axum::http::header::ACCESS_CONTROL_EXPOSE_HEADERS,
-        axum::http::HeaderValue::from_static(TRACE_ID_HEADER),
+        axum::http::HeaderValue::from_static("x-trace-id, request-id"),
     );
     response
 }
@@ -253,6 +260,7 @@ async fn keep_alive_headers(
 }
 
 async fn catch_panics(request: axum::extract::Request, next: Next) -> Response {
+    let request_id = request_trace_id(&request);
     match std::panic::AssertUnwindSafe(next.run(request))
         .catch_unwind()
         .await
@@ -261,7 +269,9 @@ async fn catch_panics(request: axum::extract::Request, next: Next) -> Response {
         Err(_) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
-                "error":{"type":"server_error","message":"Internal server error"}
+                "type": "error",
+                "error":{"type":"api_error","message":"Internal server error"},
+                "request_id": request_id
             })),
         )
             .into_response(),
@@ -547,11 +557,67 @@ mod tests {
                 .to_str()
                 .expect("trace header text")
                 .to_owned();
+            assert_eq!(
+                response
+                    .headers()
+                    .get(REQUEST_ID_HEADER)
+                    .expect("request id header"),
+                trace_id.as_str()
+            );
             assert!(trace_id.starts_with("trace_"));
             assert_eq!(trace_id.len(), 38);
             trace_ids.push(trace_id);
         }
         assert_ne!(trace_ids[0], trace_ids[1]);
+    }
+
+    #[tokio::test]
+    async fn context_limit_errors_are_self_contained_for_intermediate_relays() {
+        let mut config = Config::default();
+        config.context.max_input_tokens = 128;
+        config.context.safe_input_ratio = 1.0;
+        let (_directory, state) = test_state(config).await;
+        let response = router(state)
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::USER_AGENT, "claude-cli/2.1.220 (external, test)")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "claude-sonnet-4.6",
+                            "max_tokens": 1,
+                            "stream": true,
+                            "messages": [{"role": "user", "content": "long ".repeat(500)}]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let request_id = response
+            .headers()
+            .get(REQUEST_ID_HEADER)
+            .expect("request id header")
+            .to_str()
+            .expect("request id header text")
+            .to_owned();
+        assert_eq!(
+            response
+                .headers()
+                .get(TRACE_ID_HEADER)
+                .expect("trace id header"),
+            request_id.as_str()
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert_eq!(body["request_id"], request_id);
+        let message = body["error"]["message"].as_str().expect("message");
+        assert!(message.starts_with("prompt is too long: "));
+        assert!(message.ends_with(" tokens > 128"));
     }
 
     #[tokio::test]
@@ -797,5 +863,119 @@ mod tests {
             .await
             .expect("invalid");
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn count_tokens_applies_existing_compaction_without_triggering_a_new_one() {
+        let (_directory, state) = test_state(Config::default()).await;
+        let old_context = "old context ".repeat(30_000);
+        let request = serde_json::json!({
+            "model":"model",
+            "messages":[
+                {"role":"user","content":old_context.clone()},
+                {"role":"assistant","content":[
+                    {"type":"compaction","content":"durable summary"},
+                    {"type":"text","text":"continued response"}
+                ]},
+                {"role":"user","content":"new request"}
+            ],
+            "context_management":{"edits":[{
+                "type":"compact_20260112",
+                "trigger":{"type":"input_tokens","value":50_000}
+            }]}
+        });
+        let counted = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/v1/messages/count_tokens")
+                    .header(header::USER_AGENT, "claude-cli/1.0 (external, test)")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(request.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("count");
+        assert_eq!(counted.status(), StatusCode::OK);
+        let counted = body_json(counted).await;
+        assert!(
+            counted["context_management"]["original_input_tokens"]
+                .as_u64()
+                .expect("original")
+                > counted["input_tokens"].as_u64().expect("effective")
+        );
+
+        let trigger_only = serde_json::json!({
+            "model":"model",
+            "messages":[{"role":"user","content":old_context}],
+            "context_management":{"edits":[{
+                "type":"compact_20260112",
+                "trigger":{"type":"input_tokens","value":50_000}
+            }]}
+        });
+        let counted = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/v1/messages/count_tokens")
+                    .header(header::USER_AGENT, "claude-cli/1.0 (external, test)")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(trigger_only.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("count");
+        let counted = body_json(counted).await;
+        assert_eq!(
+            counted["context_management"]["original_input_tokens"],
+            counted["input_tokens"]
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_restarts_a_finished_proxy_listener() {
+        let (_directory, state) = test_state(Config::default()).await;
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port");
+        let port = probe.local_addr().expect("address").port();
+        drop(probe);
+        let service = ProxyServiceConfig {
+            id: "svc_restart".into(),
+            name: "restart".into(),
+            host: "127.0.0.1".into(),
+            port,
+            enabled: true,
+            api_key_ids: Vec::new(),
+            created_at: 0,
+        };
+        let finished = tokio::spawn(async {});
+        while !finished.is_finished() {
+            tokio::task::yield_now().await;
+        }
+        state.proxy_services.running.lock().await.insert(
+            service.id.clone(),
+            RunningService {
+                config: service.clone(),
+                cancel: tokio_util::sync::CancellationToken::new(),
+                task: finished,
+                error: Arc::new(RwLock::new(Some("accept loop failed".into()))),
+            },
+        );
+
+        let failures = state
+            .proxy_services
+            .reconcile(Arc::clone(&state), std::slice::from_ref(&service))
+            .await;
+        assert!(failures.is_empty(), "{failures:?}");
+        let views = state
+            .proxy_services
+            .views(std::slice::from_ref(&service))
+            .await;
+        assert!(views[0].running);
+        let health = reqwest::get(format!("http://127.0.0.1:{port}/health"))
+            .await
+            .expect("restarted listener");
+        assert_eq!(health.status(), StatusCode::OK);
+
+        state.shutdown.cancel();
+        state
+            .proxy_services
+            .reconcile(Arc::clone(&state), &[])
+            .await;
     }
 }

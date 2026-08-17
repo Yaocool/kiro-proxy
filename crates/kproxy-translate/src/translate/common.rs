@@ -32,6 +32,7 @@ pub fn content_text(content: &Value) -> String {
                 Some("text") | Some("thinking") | Some("compaction") => block
                     .get("text")
                     .or_else(|| block.get("thinking"))
+                    .or_else(|| block.get("content"))
                     .and_then(Value::as_str),
                 _ => None,
             })
@@ -42,28 +43,47 @@ pub fn content_text(content: &Value) -> String {
 }
 
 pub fn extract_images(content: &Value) -> Vec<KiroImage> {
-    content
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|block| {
-            let source = block.get("source")?;
-            if block.get("type")?.as_str()? != "image" || source.get("type")?.as_str()? != "base64"
-            {
-                return None;
+    let mut images = Vec::new();
+    collect_claude_images(content, &mut images);
+    images
+}
+
+fn collect_claude_images(content: &Value, images: &mut Vec<KiroImage>) {
+    let Some(blocks) = content.as_array() else {
+        return;
+    };
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("image") => {
+                if let Some(image) = claude_image(block) {
+                    images.push(image);
+                }
             }
-            let media = source.get("media_type")?.as_str()?;
-            let format = media.strip_prefix("image/").unwrap_or(media);
-            let bytes = source.get("data")?.as_str()?.to_string();
-            base64::engine::general_purpose::STANDARD
-                .decode(&bytes)
-                .ok()?;
-            Some(KiroImage {
-                format: format.into(),
-                source: KiroImageSource { bytes },
-            })
-        })
-        .collect()
+            Some("tool_result") => {
+                if let Some(content) = block.get("content") {
+                    collect_claude_images(content, images);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn claude_image(block: &Value) -> Option<KiroImage> {
+    let source = block.get("source")?;
+    if source.get("type")?.as_str()? != "base64" {
+        return None;
+    }
+    let media = source.get("media_type")?.as_str()?;
+    let format = media.strip_prefix("image/").unwrap_or(media);
+    let bytes = source.get("data")?.as_str()?.to_string();
+    base64::engine::general_purpose::STANDARD
+        .decode(&bytes)
+        .ok()?;
+    Some(KiroImage {
+        format: format.into(),
+        source: KiroImageSource { bytes },
+    })
 }
 
 pub fn extract_openai_images(content: &Value) -> Vec<KiroImage> {
@@ -113,10 +133,23 @@ pub fn extract_tool_results(content: &Value) -> Vec<KiroToolResult> {
         .filter_map(|block| {
             let tool_use_id = block.get("tool_use_id")?.as_str()?.to_string();
             let result = block.get("content").map(content_text).unwrap_or_default();
+            let has_images = block
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|blocks| {
+                    blocks
+                        .iter()
+                        .any(|block| block.get("type").and_then(Value::as_str) == Some("image"))
+                });
             Some(KiroToolResult {
                 content: vec![KiroText {
                     text: if result.is_empty() {
-                        "(empty result)".into()
+                        if has_images {
+                            "(image result attached)"
+                        } else {
+                            "(empty result)"
+                        }
+                        .into()
                     } else {
                         result
                     },

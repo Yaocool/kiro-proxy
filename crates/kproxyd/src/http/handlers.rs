@@ -13,10 +13,13 @@ use futures::StreamExt;
 use kproxy_kiro::{KiroError, KiroResponse};
 use kproxy_notify::{WebhookEvent, WebhookEventKind};
 use kproxy_pool::{AccountLease, PoolError};
-use kproxy_translate::model::{apply_adaptive_thinking, map_model, thinking_enabled_for_model};
+use kproxy_translate::model::{
+    apply_adaptive_thinking, map_model, resolve_dynamic_model, thinking_enabled_for_model,
+};
 use kproxy_translate::{
-    claude_to_kiro, error_envelope, openai_to_kiro, sanitize_error_message, validate_claude,
-    validate_openai, ClaudeRequest, ErrorFormat, OpenAiRequest, TranslationOptions,
+    apply_compaction_boundary, claude_to_kiro, compact_trigger_tokens, error_envelope,
+    openai_to_kiro, sanitize_error_message, validate_claude, validate_openai, ClaudeRequest,
+    ErrorFormat, OpenAiRequest, TranslationOptions,
 };
 use rand::Rng;
 use serde_json::{json, Value};
@@ -31,6 +34,7 @@ use super::prompt_cache::PromptCacheProfile;
 use super::request_trace_id;
 use super::response::{DecodedResponse, OpenAiToolIdentity, ToolLeakFilter};
 use super::stream::{self, StreamContext, StreamProtocol};
+use super::usage::{fallback_credits, fill_missing_usage};
 use super::ServiceHttpState;
 
 const MAX_STATS_MODEL_CHARS: usize = 128;
@@ -65,7 +69,7 @@ pub async fn claude_messages(
         None => {
             let error = ApiError::overloaded(ErrorFormat::Claude);
             record_failed_request(&state, &trace_id, &path, "", started, &error);
-            return error.into_response();
+            return error.with_request_id(&trace_id).into_response();
         }
     };
     let admission_guard = match state.admission.try_acquire() {
@@ -73,7 +77,7 @@ pub async fn claude_messages(
         None => {
             let error = ApiError::overloaded(ErrorFormat::Claude);
             record_failed_request(&state, &trace_id, &path, "", started, &error);
-            return error.into_response();
+            return error.with_request_id(&trace_id).into_response();
         }
     };
     let (headers, body, _body_reservations) =
@@ -81,7 +85,7 @@ pub async fn claude_messages(
             Ok(body) => body,
             Err(error) => {
                 record_failed_request(&state, &trace_id, &path, "", started, &error);
-                return error.into_response();
+                return error.with_request_id(&trace_id).into_response();
             }
         };
     let model = request_model_hint(&body);
@@ -106,7 +110,7 @@ pub async fn claude_messages(
         Ok(response) => response,
         Err(error) => {
             record_failed_request(&state, &trace_id, &path, &model, started, &error);
-            error.into_response()
+            error.with_request_id(&trace_id).into_response()
         }
     }
 }
@@ -121,7 +125,7 @@ pub async fn openai_chat(State(service): State<ServiceHttpState>, request: Reque
         None => {
             let error = ApiError::overloaded(ErrorFormat::OpenAi);
             record_failed_request(&state, &trace_id, &path, "", started, &error);
-            return error.into_response();
+            return error.with_request_id(&trace_id).into_response();
         }
     };
     let admission_guard = match state.admission.try_acquire() {
@@ -129,7 +133,7 @@ pub async fn openai_chat(State(service): State<ServiceHttpState>, request: Reque
         None => {
             let error = ApiError::overloaded(ErrorFormat::OpenAi);
             record_failed_request(&state, &trace_id, &path, "", started, &error);
-            return error.into_response();
+            return error.with_request_id(&trace_id).into_response();
         }
     };
     let (headers, body, _body_reservations) =
@@ -137,7 +141,7 @@ pub async fn openai_chat(State(service): State<ServiceHttpState>, request: Reque
             Ok(body) => body,
             Err(error) => {
                 record_failed_request(&state, &trace_id, &path, "", started, &error);
-                return error.into_response();
+                return error.with_request_id(&trace_id).into_response();
             }
         };
     let model = request_model_hint(&body);
@@ -162,7 +166,7 @@ pub async fn openai_chat(State(service): State<ServiceHttpState>, request: Reque
         Ok(response) => response,
         Err(error) => {
             record_failed_request(&state, &trace_id, &path, &model, started, &error);
-            error.into_response()
+            error.with_request_id(&trace_id).into_response()
         }
     }
 }
@@ -267,6 +271,10 @@ fn record_failed_request(
             trace_id,
             http_path = path,
             model = %model,
+            mapped_model = %error.log_context.mapped_model,
+            kiro_model = %error.log_context.kiro_model,
+            model_path,
+            mapping_rule = error.log_context.model_mapping_rule.as_deref().unwrap_or("none"),
             http_status = error.status.as_u16(),
             duration_ms,
             error = %safe_error,
@@ -360,6 +368,8 @@ async fn handle_claude(
                 .is_some_and(|kind| kind.starts_with("web_search") || kind.starts_with("web_fetch"))
         });
     }
+    let compact_trigger = compact_trigger_tokens(request.context_management.as_ref());
+    let compact_boundary_applied = apply_compaction_boundary(&mut request);
     let web_tool_names = claude_web_tool_names(&request);
     let route = map_model(
         &request.model,
@@ -370,11 +380,7 @@ async fn handle_claude(
     );
     let mut options = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
     options.enhance_system_prompt = config.features.enhance_system_prompt;
-    options.compact_mode = request.context_management.is_some()
-        || headers
-            .get("anthropic-beta")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.to_ascii_lowercase().contains("compact"));
+    options.compact_mode = compact_trigger.is_some();
     let mut payload = claude_to_kiro(&request, &options);
     let thinking_limit = model_token_limit(&state, &route.mapped, false)
         .unwrap_or(config.features.max_thinking_budget_tokens)
@@ -393,7 +399,7 @@ async fn handle_claude(
         budget_tokens = decision.budget_tokens,
         "adaptive thinking decision"
     );
-    let input_tokens = state
+    let mut input_tokens = state
         .tokenizer
         .estimate_kiro_payload(&payload)
         .await
@@ -404,6 +410,37 @@ async fn handle_claude(
                 ErrorFormat::Claude,
             )
         })? as u64;
+    let mut compacted = compact_boundary_applied;
+    let mut compaction_summary = None;
+    let effective_compact_trigger =
+        compact_trigger.map(|trigger| trigger.min(context_maximum(&state, false, &route.mapped)));
+    if let Some(trigger) = effective_compact_trigger.filter(|trigger| input_tokens >= *trigger) {
+        let target = compact_target_tokens(&state, &route.mapped, trigger);
+        let stats = state
+            .tokenizer
+            .compact_kiro_payload(&mut payload, target as usize)
+            .await
+            .map_err(|error| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error,
+                    ErrorFormat::Claude,
+                )
+            })?;
+        input_tokens = stats.compacted_tokens as u64;
+        compacted |= stats.removed_messages > 0;
+        compaction_summary = stats
+            .summary
+            .map(|summary| append_current_request_to_compaction(summary, &request));
+        tracing::info!(
+            trace_id = %trace_id,
+            original_input_tokens = stats.original_tokens,
+            compacted_input_tokens = stats.compacted_tokens,
+            removed_messages = stats.removed_messages,
+            target_tokens = target,
+            "request context compacted"
+        );
+    }
     let prompt_cache = config
         .features
         .enable_prompt_cache
@@ -412,8 +449,8 @@ async fn handle_claude(
     enforce_context(
         &state,
         input_tokens,
-        options.compact_mode,
-        &request.model,
+        compacted,
+        &route.mapped,
         ErrorFormat::Claude,
     )?;
     let estimate = estimated_credits(input_tokens, request.max_tokens, &config.pool);
@@ -446,6 +483,8 @@ async fn handle_claude(
         key_id.as_deref(),
         &config.features.default_model_id,
         estimate,
+        input_tokens,
+        compacted,
         &payload,
     )
     .await
@@ -470,6 +509,8 @@ async fn handle_claude(
                 model_mapping_rule,
                 attempts,
                 input_tokens,
+                compact: compacted,
+                compaction_summary,
                 estimated_credits: estimate,
                 max_tokens: request.max_tokens,
                 started,
@@ -507,6 +548,7 @@ async fn handle_claude(
         estimate,
         started,
         prompt_cache,
+        compaction_summary,
     )
     .await
 }
@@ -617,7 +659,7 @@ async fn handle_openai(
         &state,
         input_tokens,
         false,
-        &request.model,
+        &route.mapped,
         ErrorFormat::OpenAi,
     )?;
     let estimate = estimated_credits(input_tokens, max_tokens, &config.pool);
@@ -658,6 +700,8 @@ async fn handle_openai(
         key_id.as_deref(),
         &config.features.default_model_id,
         estimate,
+        input_tokens,
+        false,
         &payload,
     )
     .await
@@ -682,6 +726,8 @@ async fn handle_openai(
                 model_mapping_rule,
                 attempts,
                 input_tokens,
+                compact: false,
+                compaction_summary: None,
                 estimated_credits: estimate,
                 max_tokens,
                 started,
@@ -865,6 +911,8 @@ async fn execute_upstream(
     key_id: Option<&str>,
     default_model: &str,
     estimate: f64,
+    input_tokens: u64,
+    compact: bool,
     payload: &kproxy_translate::KiroPayload,
 ) -> Result<UpstreamExecution, ExecuteError> {
     let config = state.config.current();
@@ -1044,6 +1092,9 @@ async fn execute_upstream(
             drop(lease);
             continue;
         }
+        if let Err(limit) = check_context_limit(state, input_tokens, compact, &actual_model) {
+            return Err(ExecuteError::ContextLimit(limit));
+        }
         request_payload.profile_arn.clone_from(&account.profile_arn);
         if account.is_token_expiring(
             now_secs(),
@@ -1196,11 +1247,9 @@ async fn execute_upstream(
                     "upstream quota error"
                 );
                 pool.record_quota_error(&account.id).await;
-                if pool
-                    .get(&account.id)
-                    .await
-                    .is_some_and(|runtime| runtime.health() == kproxy_pool::AccountHealth::Exhausted)
-                {
+                if pool.get(&account.id).await.is_some_and(|runtime| {
+                    runtime.health() == kproxy_pool::AccountHealth::Exhausted
+                }) {
                     if let Err(persist_error) = crate::tasks::persist_pool_accounts(state).await {
                         tracing::error!(
                             trace_id,
@@ -1506,7 +1555,10 @@ pub(super) fn set_payload_model(payload: &mut kproxy_translate::KiroPayload, mod
     }
 }
 
-pub(super) fn find_model_fallback(model: &str, models: &[kproxy_kiro::ModelInfo]) -> Option<String> {
+pub(super) fn find_model_fallback(
+    model: &str,
+    models: &[kproxy_kiro::ModelInfo],
+) -> Option<String> {
     let (family, version) = model_family(model)?;
     models
         .iter()
@@ -1568,6 +1620,13 @@ enum ExecuteError {
     Upstream(KiroError),
     Dispatch(DispatchFailure),
     Meter(MeterError),
+    ContextLimit(ContextLimitError),
+}
+
+pub(super) struct ContextLimitError {
+    model: String,
+    input_tokens: u64,
+    maximum: u64,
 }
 
 async fn collect_nonstream_rounds(
@@ -1633,6 +1692,7 @@ async fn collect_nonstream_rounds(
                     message,
                 })
             })?;
+            fill_missing_usage(state, &mut decoded, &payload).await;
             accumulated_text.push_str(&decoded.text);
             accumulated_reasoning.push_str(&decoded.reasoning);
             decoded.text = accumulated_text;
@@ -1659,6 +1719,7 @@ async fn collect_nonstream_rounds(
                 message,
             })
         })?;
+        fill_missing_usage(state, &mut decoded, &payload).await;
         let uses = decoded
             .tools
             .values()
@@ -1734,10 +1795,11 @@ async fn nonstream_claude(
     model_path: Vec<String>,
     model_mapping_rule: Option<String>,
     attempts: Vec<UpstreamAttemptLog>,
-    input_tokens: u64,
+    _input_tokens: u64,
     estimated_credits: f64,
     started: Instant,
     prompt_cache: Option<PromptCacheProfile>,
+    compaction_summary: Option<String>,
 ) -> Result<Response, ApiError> {
     let (mut decoded, endpoint, current_round_output_tokens) = collect_nonstream_rounds(
         &state,
@@ -1751,7 +1813,6 @@ async fn nonstream_claude(
     .await
     .map_err(|error| upstream_error(error, ErrorFormat::Claude))?;
     decoded.restore_tool_names(&claude_web_tool_names(&request));
-    normalize_usage(&mut decoded, input_tokens);
     let current_round_output_tokens = if current_round_output_tokens == 0 {
         decoded.usage.output_tokens
     } else {
@@ -1762,7 +1823,7 @@ async fn nonstream_claude(
     state
         .prompt_cache
         .apply(&account_id, prompt_cache.as_ref(), &mut decoded.usage);
-    let credits = credits(&decoded);
+    let credits = credits(&state, &kiro_model, &decoded);
     lease.settle_credits(credits).await;
     reservation
         .settle(usage_record(
@@ -1812,6 +1873,7 @@ async fn nonstream_claude(
         &request.model,
         request.max_tokens,
         current_round_output_tokens,
+        compaction_summary.as_deref(),
     ))
     .into_response())
 }
@@ -1832,7 +1894,7 @@ async fn nonstream_openai(
     model_path: Vec<String>,
     model_mapping_rule: Option<String>,
     attempts: Vec<UpstreamAttemptLog>,
-    input_tokens: u64,
+    _input_tokens: u64,
     max_tokens: u32,
     estimated_credits: f64,
     started: Instant,
@@ -1850,7 +1912,6 @@ async fn nonstream_openai(
     )
     .await
     .map_err(|error| upstream_error(error, ErrorFormat::OpenAi))?;
-    normalize_usage(&mut decoded, input_tokens);
     let current_round_output_tokens = if current_round_output_tokens == 0 {
         decoded.usage.output_tokens
     } else {
@@ -1861,7 +1922,7 @@ async fn nonstream_openai(
     state
         .prompt_cache
         .apply(&account_id, prompt_cache.as_ref(), &mut decoded.usage);
-    let credits = credits(&decoded);
+    let credits = credits(&state, &kiro_model, &decoded);
     lease.settle_credits(credits).await;
     reservation
         .settle(usage_record(
@@ -1939,21 +2000,16 @@ fn openai_tool_identities(
         .collect()
 }
 
-fn normalize_usage(decoded: &mut DecodedResponse, input_tokens: u64) {
-    if decoded.usage.input_tokens == 0 {
-        decoded.usage.input_tokens = input_tokens;
-    }
-    if decoded.usage.output_tokens == 0 {
-        decoded.usage.output_tokens =
-            ((decoded.text.len() + decoded.reasoning.len()) as u64 / 4).max(1);
-    }
-}
-
-fn credits(decoded: &DecodedResponse) -> f64 {
+fn credits(state: &Arc<AppState>, model: &str, decoded: &DecodedResponse) -> f64 {
     if decoded.usage.credits > 0.0 {
         decoded.usage.credits
     } else {
-        (decoded.usage.input_tokens + decoded.usage.output_tokens) as f64 / 1_000.0
+        fallback_credits(
+            state,
+            model,
+            decoded.usage.input_tokens,
+            decoded.usage.output_tokens,
+        )
     }
 }
 
@@ -2037,7 +2093,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         None => {
             let error = ApiError::overloaded(ErrorFormat::Claude);
             record_failed_request(&state, &trace_id, &path, "", started, &error);
-            return error.into_response();
+            return error.with_request_id(&trace_id).into_response();
         }
     };
     let _admission_guard = match state.admission.try_acquire() {
@@ -2045,7 +2101,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         None => {
             let error = ApiError::overloaded(ErrorFormat::Claude);
             record_failed_request(&state, &trace_id, &path, "", started, &error);
-            return error.into_response();
+            return error.with_request_id(&trace_id).into_response();
         }
     };
     let result = async {
@@ -2113,10 +2169,28 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
                 })
             });
         }
-        let route = map_model(&request.model, &config.model_mapping, None, None, "");
+        let compact_trigger = compact_trigger_tokens(request.context_management.as_ref());
+        let route = map_model(
+            &request.model,
+            &config.model_mapping,
+            key_id.as_deref(),
+            None,
+            "",
+        );
         let mut normal = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
         normal.enhance_system_prompt = config.features.enhance_system_prompt;
-        let original_payload = claude_to_kiro(&request, &normal);
+        normal.compact_mode = compact_trigger.is_some();
+        let mut original_payload = claude_to_kiro(&request, &normal);
+        let thinking_limit = model_token_limit(&state, &route.mapped, false)
+            .unwrap_or(config.features.max_thinking_budget_tokens)
+            .min(config.features.max_thinking_budget_tokens);
+        apply_adaptive_thinking(
+            &mut original_payload,
+            request.thinking.as_ref(),
+            thinking_enabled_for_model(&request.model, &config.model_thinking_mode),
+            config.features.adaptive_thinking,
+            thinking_limit,
+        );
         let original_input_tokens = state
             .tokenizer
             .estimate_kiro_payload(&original_payload)
@@ -2128,16 +2202,19 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
                     ErrorFormat::Claude,
                 )
             })?;
-        let compact = request.context_management.is_some()
-            || headers
-                .get("anthropic-beta")
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value.to_ascii_lowercase().contains("compact"));
-        let input_tokens = if compact {
-            normal.compact_mode = true;
+        let boundary_applied = apply_compaction_boundary(&mut request);
+        let input_tokens = if boundary_applied {
+            let mut effective_payload = claude_to_kiro(&request, &normal);
+            apply_adaptive_thinking(
+                &mut effective_payload,
+                request.thinking.as_ref(),
+                thinking_enabled_for_model(&request.model, &config.model_thinking_mode),
+                config.features.adaptive_thinking,
+                thinking_limit,
+            );
             state
                 .tokenizer
-                .estimate_kiro_payload(&claude_to_kiro(&request, &normal))
+                .estimate_kiro_payload(&effective_payload)
                 .await
                 .map_err(|error| {
                     ApiError::new(
@@ -2150,8 +2227,10 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             original_input_tokens
         };
         let mut response = json!({"input_tokens":input_tokens});
-        if compact {
-            response["context_management"] = json!({"original_input_tokens":original_input_tokens});
+        if compact_trigger.is_some() {
+            response["context_management"] = json!({
+                "original_input_tokens":original_input_tokens
+            });
         }
         tracing::info!(
             trace_id = %trace_id,
@@ -2159,7 +2238,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             model = %request.model,
             input_tokens,
             original_input_tokens,
-            compact,
+            compaction_boundary_applied = boundary_applied,
             duration_ms = started.elapsed().as_millis() as u64,
             "client token-count response completed"
         );
@@ -2170,7 +2249,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         Ok(response) => response,
         Err(error) => {
             record_failed_request(&state, &trace_id, &path, "", started, &error);
-            error.into_response()
+            error.with_request_id(&trace_id).into_response()
         }
     }
 }
@@ -2377,6 +2456,43 @@ fn enforce_context(
     model: &str,
     format: ErrorFormat,
 ) -> Result<(), ApiError> {
+    if let Err(limit) = check_context_limit(state, input_tokens, compact, model) {
+        let mut error = ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "prompt is too long: {} tokens > {}",
+                limit.input_tokens, limit.maximum
+            ),
+            format,
+        );
+        error.log_context.mapped_model = limit.model.clone();
+        error.log_context.kiro_model = limit.model.clone();
+        error.log_context.model_path = vec![limit.model];
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+pub(super) fn check_context_limit(
+    state: &Arc<AppState>,
+    input_tokens: u64,
+    compact: bool,
+    model: &str,
+) -> Result<(), ContextLimitError> {
+    let maximum = context_maximum(state, compact, model);
+    if input_tokens > maximum {
+        Err(ContextLimitError {
+            model: model.to_owned(),
+            input_tokens,
+            maximum,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn context_maximum(state: &Arc<AppState>, compact: bool, model: &str) -> u64 {
     let context = &state.config.current().context;
     let ratio = if compact {
         context.compact_safe_input_ratio
@@ -2384,31 +2500,70 @@ fn enforce_context(
         context.safe_input_ratio
     };
     let model_maximum = model_token_limit(state, model, true).unwrap_or(context.max_input_tokens);
-    let maximum = (f64::from(model_maximum) * ratio) as u64;
-    if input_tokens > maximum {
-        Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "prompt is too long: context length exceeded",
-            format,
-        ))
+    (f64::from(model_maximum) * ratio) as u64
+}
+
+fn compact_target_tokens(state: &Arc<AppState>, model: &str, trigger: u64) -> u64 {
+    // Leave meaningful room for subsequent tool turns rather than compacting
+    // to just below the trigger and immediately repeating the operation.
+    trigger
+        .saturating_mul(3)
+        .checked_div(4)
+        .unwrap_or(trigger)
+        .min(context_maximum(state, true, model))
+        .max(1)
+}
+
+fn append_current_request_to_compaction(mut summary: String, request: &ClaudeRequest) -> String {
+    let Some(content) = request
+        .messages
+        .iter()
+        .rev()
+        .find(|message| message.role == "user")
+        .map(|message| &message.content)
+    else {
+        return summary;
+    };
+    let text = match content {
+        Value::String(text) => text.clone(),
+        other => other.to_string(),
+    };
+    let characters = text.chars().collect::<Vec<_>>();
+    let text = if characters.len() > 4_096 {
+        format!(
+            "{} … [current message compressed] … {}",
+            characters[..3_000].iter().collect::<String>(),
+            characters[characters.len() - 1_000..]
+                .iter()
+                .collect::<String>()
+        )
     } else {
-        Ok(())
-    }
+        text
+    };
+    summary.push_str("\n\n[Current user message]\n");
+    summary.push_str(&text);
+    summary
+}
+
+pub(super) fn resolved_model_info(
+    state: &Arc<AppState>,
+    model: &str,
+) -> Option<kproxy_kiro::ModelInfo> {
+    let config = state.config.current();
+    let (models, _) = state.models.get(config.models.cache_ttl_ms);
+    let available = models
+        .iter()
+        .map(|candidate| candidate.model_id.clone())
+        .collect::<Vec<_>>();
+    let resolved = resolve_dynamic_model(model, &available)?;
+    models
+        .into_iter()
+        .find(|candidate| candidate.model_id.eq_ignore_ascii_case(&resolved))
 }
 
 fn model_token_limit(state: &Arc<AppState>, model: &str, input: bool) -> Option<u32> {
-    let config = state.config.current();
-    let (models, _) = state.models.get(config.models.cache_ttl_ms);
-    let requested = normalize_model(model);
-    models
-        .iter()
-        .find(|candidate| {
-            let candidate = normalize_model(&candidate.model_id);
-            candidate == requested
-                || candidate.starts_with(&requested)
-                || requested.starts_with(&candidate)
-        })
-        .and_then(|model| model.token_limits.as_ref())
+    resolved_model_info(state, model)
+        .and_then(|model| model.token_limits)
         .and_then(|limits| {
             if input {
                 limits.max_input_tokens
@@ -2416,16 +2571,6 @@ fn model_token_limit(state: &Arc<AppState>, model: &str, input: bool) -> Option<
                 limits.max_output_tokens
             }
         })
-}
-
-fn normalize_model(model: &str) -> String {
-    model
-        .to_ascii_lowercase()
-        .replace(['.', '_'], "-")
-        .split('-')
-        .filter(|part| !part.is_empty())
-        .collect::<Vec<_>>()
-        .join("-")
 }
 
 fn estimated_credits(
@@ -2514,6 +2659,20 @@ fn upstream_error(error: ExecuteError, format: ErrorFormat) -> ApiError {
             format,
         ),
         ExecuteError::Meter(error) => meter_error(error, format),
+        ExecuteError::ContextLimit(limit) => {
+            let mut error = ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "prompt is too long: {} tokens > {}",
+                    limit.input_tokens, limit.maximum
+                ),
+                format,
+            );
+            error.log_context.mapped_model = limit.model.clone();
+            error.log_context.kiro_model = limit.model.clone();
+            error.log_context.model_path = vec![limit.model];
+            error
+        }
         ExecuteError::Upstream(error) => {
             upstream_api_error(error, RequestLogContext::default(), format)
         }
@@ -2530,18 +2689,45 @@ fn upstream_api_error(
 ) -> ApiError {
     let status = match error.status {
         Some(413) => StatusCode::PAYLOAD_TOO_LARGE,
-        Some(400) => StatusCode::BAD_REQUEST,
+        Some(400) if upstream_bad_request_is_actionable(&error.message) => StatusCode::BAD_REQUEST,
+        // kproxy already validates the public request and enforces its context
+        // window before dispatch. A remaining opaque upstream 400 (including
+        // an empty body or "Internal Server Error") is an integration/upstream
+        // failure, not an actionable Claude Code request error.
+        Some(400) => StatusCode::BAD_GATEWAY,
         Some(401 | 403) => StatusCode::SERVICE_UNAVAILABLE,
         Some(402 | 429) => StatusCode::TOO_MANY_REQUESTS,
         _ => StatusCode::BAD_GATEWAY,
     };
-    let mut output = ApiError::new(status, error.message, format);
+    let message = if error.message.trim().is_empty() {
+        "Upstream service error, please retry later".to_owned()
+    } else {
+        error.message
+    };
+    let mut output = ApiError::new(status, message, format);
     output.retry_after = matches!(
         status,
-        StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS
     );
     output.log_context = Box::new(context);
     output
+}
+
+fn upstream_bad_request_is_actionable(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    [
+        "prompt is too long",
+        "context length exceeded",
+        "input is too long",
+        "maximum context",
+        "invalid request",
+        "validationexception",
+        "validation error",
+        "malformed request",
+        "unsupported model",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
 }
 
 struct ApiError {
@@ -2552,6 +2738,7 @@ struct ApiError {
     authenticate: bool,
     retry_after: bool,
     suppress_model_stats: bool,
+    request_id: Option<String>,
     log_context: Box<RequestLogContext>,
 }
 
@@ -2565,6 +2752,7 @@ impl ApiError {
             authenticate: false,
             retry_after: false,
             suppress_model_stats: false,
+            request_id: None,
             log_context: Box::default(),
         }
     }
@@ -2590,6 +2778,11 @@ impl ApiError {
         error.allow = Some(allow);
         error
     }
+
+    fn with_request_id(mut self, request_id: &str) -> Self {
+        self.request_id = Some(request_id.to_owned());
+        self
+    }
 }
 
 impl IntoResponse for ApiError {
@@ -2597,9 +2790,21 @@ impl IntoResponse for ApiError {
         let status = self.status;
         let mut response = (
             status,
-            Json(error_envelope(self.format, status.as_u16(), &self.message)),
+            Json(error_envelope(
+                self.format,
+                status.as_u16(),
+                &self.message,
+                self.request_id.as_deref(),
+            )),
         )
             .into_response();
+        if let Some(request_id) = self.request_id.as_deref() {
+            if let Ok(value) = HeaderValue::from_str(request_id) {
+                response
+                    .headers_mut()
+                    .insert(header::HeaderName::from_static("request-id"), value);
+            }
+        }
         if let Some(allow) = self.allow {
             response
                 .headers_mut()
@@ -2624,6 +2829,44 @@ mod model_tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
 
     use super::*;
+
+    #[tokio::test]
+    async fn context_limits_use_the_resolved_kiro_model_alias() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = kproxy_core::paths::Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        let accounts = kproxy_store::accounts::AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("accounts");
+        let state = Arc::new(AppState::new(
+            paths,
+            kproxy_store::config_loader::ConfigHandle::new(kproxy_core::config::Config::default()),
+            accounts,
+        ));
+        state.models.finish_refresh(vec![kproxy_kiro::ModelInfo {
+            model_id: "claude-sonnet-4.6".into(),
+            model_name: String::new(),
+            description: String::new(),
+            rate_multiplier: None,
+            token_limits: Some(kproxy_kiro::client::TokenLimits {
+                max_input_tokens: Some(100_000),
+                max_output_tokens: Some(16_384),
+            }),
+        }]);
+
+        assert_eq!(
+            model_token_limit(&state, "claude-4.6-sonnet", true),
+            Some(100_000)
+        );
+        assert!(check_context_limit(&state, 96_000, false, "claude-4.6-sonnet").is_err());
+    }
 
     #[test]
     fn fallback_chooses_the_highest_lower_model_in_the_same_family() {
@@ -2664,6 +2907,33 @@ mod model_tests {
         assert_eq!(retry_attempt_count(3, 50), 4);
         assert_eq!(retry_attempt_count(3, 2), 2);
         assert_eq!(retry_attempt_count(0, 0), 1);
+    }
+
+    #[test]
+    fn opaque_upstream_bad_requests_are_reported_as_gateway_failures() {
+        for message in ["Internal Server Error", "", "{}"] {
+            let error = upstream_api_error(
+                KiroError {
+                    status: Some(400),
+                    endpoint: "test".into(),
+                    message: message.into(),
+                },
+                RequestLogContext::default(),
+                ErrorFormat::Claude,
+            );
+            assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{message:?}");
+        }
+
+        let actionable = upstream_api_error(
+            KiroError {
+                status: Some(400),
+                endpoint: "test".into(),
+                message: "prompt is too long: 200001 tokens > 200000".into(),
+            },
+            RequestLogContext::default(),
+            ErrorFormat::Claude,
+        );
+        assert_eq!(actionable.status, StatusCode::BAD_REQUEST);
     }
 
     #[test]
