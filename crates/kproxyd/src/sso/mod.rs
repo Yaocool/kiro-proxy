@@ -69,6 +69,7 @@ pub async fn login(request: SsoLoginRequest) -> Result<Credentials> {
 
 #[cfg(feature = "sso")]
 async fn login_full(request: SsoLoginRequest) -> Result<Credentials> {
+    tracing::info!(region = %request.region, headful = request.headful, "starting SSO login");
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let port = listener.local_addr()?.port();
     let redirect_uri = format!("http://127.0.0.1:{port}/oauth/callback");
@@ -78,6 +79,7 @@ async fn login_full(request: SsoLoginRequest) -> Result<Credentials> {
         .timeout(Duration::from_secs(30))
         .build()?;
     let registered = register_client(&client, &oidc, &redirect_uri, &request.start_url).await?;
+    tracing::info!(region = %request.region, "SSO OIDC client registered");
     let verifier = random_urlsafe(32);
     let challenge = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .encode(Sha256::digest(verifier.as_bytes()));
@@ -99,13 +101,15 @@ async fn login_full(request: SsoLoginRequest) -> Result<Credentials> {
         request.headful,
     )
     .await?;
-    let callback = tokio::time::timeout(
+    let callback_result = tokio::time::timeout(
         Duration::from_secs(120),
         wait_for_callback(listener, &state),
     )
-    .await
-    .map_err(|_| anyhow!("SSO login timed out after 120 seconds"))??;
+    .await;
     session.close().await;
+    let callback =
+        callback_result.map_err(|_| anyhow!("SSO login timed out after 120 seconds"))??;
+    tracing::info!(region = %request.region, "SSO authorization callback received");
     let tokens = exchange_code(
         &client,
         &oidc,
@@ -115,6 +119,7 @@ async fn login_full(request: SsoLoginRequest) -> Result<Credentials> {
         &verifier,
     )
     .await?;
+    tracing::info!(region = %request.region, "SSO authorization-code exchange completed");
     Ok(Credentials {
         access_token: tokens.access_token,
         refresh_token: Some(tokens.refresh_token),

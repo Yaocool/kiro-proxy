@@ -39,13 +39,16 @@ impl BrowserSession {
             .context("unable to launch Chromium; install Chrome/Chromium or use a full image")?;
         let handler = tokio::spawn(async move {
             while let Some(event) = events.next().await {
-                if event.is_err() {
-                    break;
+                if let Err(error) = event {
+                    tracing::warn!(%error, "Chromium event stream stopped");
+                    return;
                 }
             }
+            tracing::debug!("Chromium event stream closed");
         });
         browser.start_incognito_context().await?;
         let page = browser.new_page(authorize_url).await?;
+        tracing::info!(headful, "Chromium SSO browser launched");
         let cancel = CancellationToken::new();
         let injector = spawn_injector(page, email, password, cancel.clone())?;
         Ok(Self {
@@ -59,7 +62,30 @@ impl BrowserSession {
     pub async fn close(&mut self) {
         self.cancel.cancel();
         self.injector.abort();
-        let _ = self.browser.close().await;
+        if let Err(error) = self.browser.close().await {
+            tracing::warn!(%error, "unable to close Chromium cleanly; killing it");
+            if let Some(Err(error)) = self.browser.kill().await {
+                tracing::warn!(%error, "unable to kill Chromium after close failure");
+            }
+        } else {
+            match tokio::time::timeout(std::time::Duration::from_secs(10), self.browser.wait())
+                .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "unable to wait for Chromium; killing it");
+                    if let Some(Err(error)) = self.browser.kill().await {
+                        tracing::warn!(%error, "unable to kill Chromium after wait failure");
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!("Chromium did not exit within 10 seconds; killing it");
+                    if let Some(Err(error)) = self.browser.kill().await {
+                        tracing::warn!(%error, "unable to kill Chromium after exit timeout");
+                    }
+                }
+            }
+        }
         self.handler.abort();
     }
 }
@@ -83,11 +109,34 @@ fn spawn_injector(
     let script = automation_script(&email, &password);
     Ok(tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(600));
+        let mut last_action: Option<String> = None;
+        let mut evaluate_error_logged = false;
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
                 _ = interval.tick() => {
-                    let _ = page.evaluate(script.clone()).await;
+                    match page.evaluate(script.clone()).await {
+                        Ok(result) => {
+                            evaluate_error_logged = false;
+                            if let Ok(action) = result.into_value::<String>() {
+                                if last_action.as_deref() != Some(action.as_str()) {
+                                    if let Some(stage) = action.strip_prefix("waiting:") {
+                                        tracing::info!(%stage, "SSO browser automation waiting");
+                                    } else {
+                                        tracing::info!(%action, "SSO browser automation advanced");
+                                    }
+                                    last_action = Some(action);
+                                }
+                            }
+                        }
+                        Err(error) if !evaluate_error_logged => {
+                            // A navigation can briefly invalidate the execution context. Log the
+                            // first failure and keep polling so the next page can continue login.
+                            tracing::warn!(%error, "SSO browser automation step failed");
+                            evaluate_error_logged = true;
+                        }
+                        Err(_) => {}
+                    }
                 }
             }
         }
@@ -128,7 +177,15 @@ fn automation_script(email: &str, password: &str) -> String {
           const textAllow = [...document.querySelectorAll('button,input[type="submit"]')]
             .find(el => visible(el) && /^(allow|authorize|allow access|continue|confirm|允许|确认授权)/i.test((el.innerText || el.value || '').trim()));
           if (textAllow) {{ textAllow.click(); return 'allow-text'; }}
-          return 'waiting';
+          const visibleInputs = [...document.querySelectorAll('input')].filter(visible);
+          const hasOtp = visibleInputs.some(el =>
+            /otp|code|verification|one.?time/i.test(`${{el.name}} ${{el.id}} ${{el.autocomplete}}`));
+          const hasAlert = [...document.querySelectorAll('[role="alert"],.error,.error-message')]
+            .some(visible);
+          if (hasOtp) return 'waiting:mfa';
+          if (hasAlert) return 'waiting:error';
+          if (visibleInputs.length) return 'waiting:unrecognized-input';
+          return 'waiting:page';
         }})()"#
     )
 }
