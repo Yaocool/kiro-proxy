@@ -361,8 +361,12 @@ impl DecodedResponse {
         model: &str,
         max_tokens: u32,
         current_round_output_tokens: u64,
+        compaction_summary: Option<&str>,
     ) -> Value {
         let mut content = Vec::new();
+        if let Some(summary) = compaction_summary {
+            content.push(json!({"type":"compaction","content":summary}));
+        }
         if !self.reasoning.is_empty() {
             content.push(json!({
                 "type":"thinking",
@@ -388,11 +392,16 @@ impl DecodedResponse {
         } else {
             "end_turn"
         };
+        let uncached_input_tokens = self
+            .usage
+            .input_tokens
+            .saturating_sub(self.usage.cache_read_tokens)
+            .saturating_sub(self.usage.cache_write_tokens);
         json!({
             "id":id,"type":"message","role":"assistant","content":content,
             "model":model,"stop_reason":stop,"stop_sequence":Value::Null,
             "usage":{
-                "input_tokens":self.usage.input_tokens,
+                "input_tokens":uncached_input_tokens,
                 "output_tokens":self.usage.output_tokens,
                 "cache_creation_input_tokens":self.usage.cache_write_tokens,
                 "cache_read_input_tokens":self.usage.cache_read_tokens
@@ -476,6 +485,7 @@ impl DecodedResponse {
 
 fn merge_usage(output: &mut UsageInfo, value: &Value) {
     let uncached = find_number(value, &["uncachedInputTokens"]);
+    let total_input = find_number(value, &["inputTokens", "input_tokens"]);
     let cache_read = find_number(
         value,
         &[
@@ -494,13 +504,17 @@ fn merge_usage(output: &mut UsageInfo, value: &Value) {
             "cache_write_tokens",
         ],
     );
-    if uncached.is_some() || cache_read.is_some() || cache_write.is_some() {
-        output.input_tokens = uncached
-            .unwrap_or_default()
-            .saturating_add(cache_read.unwrap_or_default())
-            .saturating_add(cache_write.unwrap_or_default());
-    } else if let Some(input) = find_number(value, &["inputTokens", "input_tokens"]) {
-        output.input_tokens = input;
+    let cache_tokens = cache_read
+        .unwrap_or_default()
+        .saturating_add(cache_write.unwrap_or_default());
+    if let Some(uncached) = uncached {
+        output.input_tokens = uncached.saturating_add(cache_tokens);
+    } else if let Some(input) = total_input {
+        // Kiro's generic inputTokens field is the total prompt size. Cache
+        // counters describe subsets of it and must not be added again.
+        output.input_tokens = input.max(cache_tokens);
+    } else if cache_tokens > 0 {
+        output.input_tokens = cache_tokens;
     }
     output.output_tokens =
         find_number(value, &["outputTokens", "output_tokens"]).unwrap_or(output.output_tokens);
@@ -743,7 +757,7 @@ mod tests {
             },
             ..DecodedResponse::default()
         };
-        let claude = decoded.claude_json("msg", "model", 50, 10);
+        let claude = decoded.claude_json("msg", "model", 50, 10, None);
         assert_eq!(claude["stop_reason"], "end_turn");
         let tagged = decoded.openai_json(
             "chat",
@@ -793,6 +807,53 @@ mod tests {
         assert_eq!(decoded.usage.cache_write_tokens, 5);
         assert_eq!(decoded.usage.output_tokens, 7);
         assert_eq!(decoded.usage.credits, 1.25);
+        let response = decoded.claude_json("msg", "model", 100, 7, None);
+        assert_eq!(response["usage"]["input_tokens"], 10);
+        assert_eq!(response["usage"]["cache_read_input_tokens"], 20);
+        assert_eq!(response["usage"]["cache_creation_input_tokens"], 5);
+    }
+
+    #[test]
+    fn usage_does_not_add_cache_subsets_to_generic_total_input() {
+        let mut decoded = DecodedResponse::default();
+        decoded
+            .push(KiroEvent::MessageMetadata {
+                usage: json!({"messageMetadataEvent":{"tokenUsage":{
+                    "inputTokens":100,
+                    "cacheReadInputTokens":60,
+                    "cacheWriteInputTokens":10,
+                    "outputTokens":20
+                }}}),
+            })
+            .expect("usage");
+
+        assert_eq!(decoded.usage.input_tokens, 100);
+        let response = decoded.claude_json("msg", "model", 100, 20, None);
+        assert_eq!(response["usage"]["input_tokens"], 30);
+        assert_eq!(response["usage"]["cache_read_input_tokens"], 60);
+        assert_eq!(response["usage"]["cache_creation_input_tokens"], 10);
+    }
+
+    #[test]
+    fn claude_compaction_block_precedes_the_continued_response() {
+        let decoded = DecodedResponse {
+            text: "continued answer".into(),
+            ..DecodedResponse::default()
+        };
+        let response = decoded.claude_json(
+            "msg",
+            "model",
+            100,
+            10,
+            Some("compacted conversation summary"),
+        );
+
+        assert_eq!(response["content"][0]["type"], "compaction");
+        assert_eq!(
+            response["content"][0]["content"],
+            "compacted conversation summary"
+        );
+        assert_eq!(response["content"][1]["type"], "text");
     }
 
     #[test]

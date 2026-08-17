@@ -14,12 +14,9 @@ use super::TranslationOptions;
 pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> KiroPayload {
     let selected_tools = select_tools(request);
     let mut documentation = Vec::new();
-    let tools = if options.compact_mode {
-        Vec::new()
-    } else {
-        selected_tools
-            .iter()
-            .map(|tool| {
+    let tools = selected_tools
+        .iter()
+        .map(|tool| {
                 let (name, description, schema) = match tool.r#type.as_deref() {
                     Some(kind) if kind.starts_with("web_search") => (
                         "web_search",
@@ -48,11 +45,10 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
                 let (tool, docs) = kiro_tool(name, &description, &schema);
                 documentation.extend(docs);
                 tool
-            })
-            .collect::<Vec<_>>()
-    };
+        })
+        .collect::<Vec<_>>();
     let mut system = system_text(request.system.as_ref());
-    if options.enhance_system_prompt && !options.compact_mode {
+    if options.enhance_system_prompt {
         let has_write = selected_tools.iter().any(|tool| is_write_tool(&tool.name));
         system = enhance_system(system, has_write);
     }
@@ -82,17 +78,7 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
                 text = join_nonempty(&pending_system, &text);
                 pending_system.clear();
                 let images = extract_images(&message.content);
-                let mut results = extract_tool_results(&message.content);
-                if options.compact_mode {
-                    for result in &mut results {
-                        for content in &mut result.content {
-                            if content.text.chars().count() > 4_096 {
-                                content.text =
-                                    "(tool result omitted during context compaction)".into();
-                            }
-                        }
-                    }
-                }
+                let results = extract_tool_results(&message.content);
                 if last {
                     current.content = nonempty(text, !results.is_empty());
                     current.images = images;
@@ -277,12 +263,17 @@ fn inject_system(
     history: &mut [KiroHistoryMessage],
     current: &mut KiroUserInputMessage,
     system: &str,
-    _options: &TranslationOptions,
+    options: &TranslationOptions,
 ) {
     if system.trim().is_empty() {
         return;
     }
-    if let Some(first) = history
+    if options.compact_mode {
+        // A compactable request may drop old history after translation. Keep
+        // the system prompt on the current turn so compaction can never remove
+        // the caller's governing instructions.
+        current.content = join_nonempty(system, &current.content);
+    } else if let Some(first) = history
         .iter_mut()
         .find_map(|item| item.user_input_message.as_mut())
     {
@@ -397,5 +388,40 @@ mod tests {
             .expect("assistant")
             .tool_uses[0];
         assert_eq!(history_tool.name, "web_search");
+    }
+
+    #[test]
+    fn tool_result_images_are_forwarded_with_a_textual_pairing_marker() {
+        let request: ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-sonnet-4",
+            "max_tokens":256,
+            "messages":[
+                {"role":"assistant","content":[{
+                    "type":"tool_use","id":"tool_1","name":"screenshot","input":{}
+                }]},
+                {"role":"user","content":[{
+                    "type":"tool_result","tool_use_id":"tool_1","content":[{
+                        "type":"image","source":{
+                            "type":"base64","media_type":"image/png","data":"aGVsbG8="
+                        }
+                    }]
+                }]}
+            ]
+        }))
+        .expect("request");
+        let payload = claude_to_kiro(
+            &request,
+            &TranslationOptions::new("dynamic-sonnet", "AI_EDITOR"),
+        );
+        let current = payload
+            .conversation_state
+            .current_message
+            .user_input_message;
+        assert_eq!(current.images.len(), 1);
+        let result = &current
+            .user_input_message_context
+            .expect("context")
+            .tool_results[0];
+        assert_eq!(result.content[0].text, "(image result attached)");
     }
 }

@@ -22,6 +22,7 @@ use crate::stats::{RequestLog, UpstreamAttemptLog};
 
 use super::prompt_cache::PromptCacheProfile;
 use super::response::{repair_json, DecodedResponse, OpenAiToolIdentity, ToolLeakFilter};
+use super::usage::{fallback_credits, fill_missing_usage, produced_output};
 
 #[derive(Clone)]
 pub struct KeepaliveHub {
@@ -78,6 +79,8 @@ pub struct StreamContext {
     pub model_mapping_rule: Option<String>,
     pub attempts: Vec<UpstreamAttemptLog>,
     pub input_tokens: u64,
+    pub compact: bool,
+    pub compaction_summary: Option<String>,
     pub estimated_credits: f64,
     pub max_tokens: u32,
     pub started: Instant,
@@ -124,6 +127,13 @@ pub fn response(
         let mut accumulated_usage = kproxy_kiro::UsageInfo::default();
         let mut claude = ClaudeState::new(context.request_id.clone(), context.model.clone(), context.input_tokens);
         claude.openai_include_usage = context.include_usage_chunk;
+        if matches!(protocol, StreamProtocol::Claude) {
+            if let Some(summary) = context.compaction_summary.as_deref() {
+                for data in claude.compaction(summary) {
+                    yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                }
+            }
+        }
         let created = now_secs();
         let mut failed = None;
         let mut data_started = false;
@@ -342,25 +352,44 @@ pub fn response(
                     if let Some(fallback) =
                         super::handlers::find_model_fallback(&context.kiro_model, &models)
                     {
-                        fallback_model = Some(fallback.clone());
-                        context.mapped_model.clone_from(&fallback);
-                        context.kiro_model.clone_from(&fallback);
-                        super::handlers::set_payload_model(&mut payload, &fallback);
-                        let account = context.lease.account().await;
-                        match context.state.kiro().generate(&account, &payload, None).await {
-                            Ok(retry) => {
-                                let (next_endpoint, next_response, next_permit) = retry.into_parts();
-                                endpoint = next_endpoint.name.to_string();
-                                source = next_response.bytes_stream();
-                                upstream_permit = next_permit;
-                                buffer.clear();
-                                decoder = EventStreamDecoder;
-                                decoded = DecodedResponse::default();
-                                failed = None;
-                                pre_data_retries += 1;
-                                continue 'rounds;
+                        let fits_context = super::handlers::check_context_limit(
+                            &context.state,
+                            context.input_tokens,
+                            context.compact,
+                            &fallback,
+                        )
+                        .is_ok();
+                        if !fits_context {
+                            tracing::warn!(
+                                trace_id = %context.trace_id,
+                                request_id = %context.request_id,
+                                fallback_model = %fallback,
+                                input_tokens = context.input_tokens,
+                                "skipping stream model fallback because its context window is too small"
+                            );
+                        }
+                        if fits_context {
+                            fallback_model = Some(fallback.clone());
+                            context.mapped_model.clone_from(&fallback);
+                            context.kiro_model.clone_from(&fallback);
+                            super::handlers::set_payload_model(&mut payload, &fallback);
+                            let account = context.lease.account().await;
+                            match context.state.kiro().generate(&account, &payload, None).await {
+                                Ok(retry) => {
+                                    let (next_endpoint, next_response, next_permit) =
+                                        retry.into_parts();
+                                    endpoint = next_endpoint.name.to_string();
+                                    source = next_response.bytes_stream();
+                                    upstream_permit = next_permit;
+                                    buffer.clear();
+                                    decoder = EventStreamDecoder;
+                                    decoded = DecodedResponse::default();
+                                    failed = None;
+                                    pre_data_retries += 1;
+                                    continue 'rounds;
+                                }
+                                Err(error) => failed = Some(error.to_string()),
                             }
-                            Err(error) => failed = Some(error.to_string()),
                         }
                     }
                 }
@@ -468,6 +497,25 @@ pub fn response(
                                 incompatible = true;
                             }
                         }
+                        if !incompatible
+                            && super::handlers::check_context_limit(
+                                &context.state,
+                                context.input_tokens,
+                                context.compact,
+                                &context.kiro_model,
+                            )
+                            .is_err()
+                        {
+                            incompatible = true;
+                            tracing::warn!(
+                                trace_id = %context.trace_id,
+                                request_id = %context.request_id,
+                                account_id = %account.id,
+                                resolved_model = %context.kiro_model,
+                                input_tokens = context.input_tokens,
+                                "skipping stream retry account because resolved model context is too small"
+                            );
+                        }
                         }
                         if incompatible {
                             attempted_accounts.insert(account.id);
@@ -513,6 +561,7 @@ pub fn response(
                 break 'rounds;
             }
             pre_data_retries = 0;
+            fill_missing_usage(&context.state, &mut decoded, &payload).await;
             let should_continue = !client_has_tools
                 && !decoded.tools.is_empty()
                 && auto_round < context.auto_continue_rounds;
@@ -622,7 +671,7 @@ pub fn response(
             }
         }
         drop(upstream_permit);
-        finish_accounting(context, endpoint, decoded, failed).await;
+        finish_accounting(context, endpoint, decoded, failed, &payload).await;
     };
     // A bounded bridge supplies backpressure and ensures a client that stops
     // reading cannot hold an account lease forever.
@@ -932,6 +981,22 @@ impl ClaudeState {
         }
         output
     }
+
+    fn compaction(&mut self, content: &str) -> Vec<String> {
+        let mut output = Vec::new();
+        let index = self.switch_block(
+            &mut output,
+            "compaction",
+            json!({"type":"compaction","content":Value::Null}),
+        );
+        output.push(sse(&json!({
+            "type":"content_block_delta","index":index,
+            "delta":{"type":"compaction_delta","content":content}
+        })));
+        output.push(sse(&json!({"type":"content_block_stop","index":index})));
+        self.block = None;
+        output
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1045,6 +1110,7 @@ async fn finish_accounting(
     endpoint: String,
     mut decoded: DecodedResponse,
     failure: Option<String>,
+    payload: &KiroPayload,
 ) {
     if failure.is_none() {
         context
@@ -1053,21 +1119,8 @@ async fn finish_accounting(
             .record_success(&context.lease.account_id())
             .await;
     }
-    let produced_output = !decoded.text.is_empty()
-        || !decoded.reasoning.is_empty()
-        || !decoded.tools.is_empty()
-        || decoded.usage.output_tokens > 0
-        || decoded.usage.credits > 0.0;
-    if decoded.usage.input_tokens == 0 {
-        decoded.usage.input_tokens = context.input_tokens;
-    }
-    if decoded.usage.output_tokens == 0 {
-        decoded.usage.output_tokens = if failure.is_some() && !produced_output {
-            0
-        } else {
-            ((decoded.text.len() + decoded.reasoning.len()) as u64 / 4).max(1)
-        };
-    }
+    let produced_output = produced_output(&decoded);
+    fill_missing_usage(&context.state, &mut decoded, payload).await;
     context.state.prompt_cache.apply(
         &context.lease.account_id(),
         context.prompt_cache.as_ref(),
@@ -1078,7 +1131,12 @@ async fn finish_accounting(
     } else if decoded.usage.credits > 0.0 {
         decoded.usage.credits
     } else {
-        (decoded.usage.input_tokens + decoded.usage.output_tokens) as f64 / 1_000.0
+        fallback_credits(
+            &context.state,
+            &context.kiro_model,
+            decoded.usage.input_tokens,
+            decoded.usage.output_tokens,
+        )
     };
     context.lease.settle_credits(credits).await;
     if let Err(error) = context
@@ -1221,6 +1279,23 @@ mod tests {
         assert_eq!(joined.matches("\"type\":\"thinking\"").count(), 1);
         assert_eq!(joined.matches("signature_delta").count(), 1);
         assert!(joined.contains(kproxy_translate::SIGNATURE_PLACEHOLDER));
+    }
+
+    #[test]
+    fn compaction_stream_block_is_emitted_before_text() {
+        let mut state = ClaudeState::new("msg_test".into(), "model".into(), 10);
+        let mut output = state.compaction("summary");
+        output.extend(state.event(&KiroEvent::AssistantResponse {
+            content: "answer".into(),
+        }));
+        let joined = output.join("");
+
+        assert_eq!(joined.matches("event: message_start").count(), 1);
+        assert!(joined.contains("compaction_delta"));
+        assert!(
+            joined.find("compaction_delta").expect("compaction")
+                < joined.find("text_delta").expect("text")
+        );
     }
 
     #[test]

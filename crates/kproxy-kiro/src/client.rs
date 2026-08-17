@@ -889,6 +889,14 @@ fn metadata_headers(
 async fn response_error(response: Response, endpoint: &EndpointDefinition) -> KiroError {
     let status = response.status();
     let text = response.text().await.unwrap_or_else(|_| status.to_string());
+    let text = if text.trim().is_empty() {
+        format!(
+            "upstream returned HTTP {} without an error message",
+            status.as_u16()
+        )
+    } else {
+        text
+    };
     KiroError {
         status: Some(status.as_u16()),
         endpoint: endpoint.name.into(),

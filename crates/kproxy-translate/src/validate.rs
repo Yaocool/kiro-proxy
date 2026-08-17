@@ -1,5 +1,6 @@
 //! Request validation and bounded tool-schema traversal.
 
+use base64::Engine as _;
 use serde_json::Value;
 use thiserror::Error;
 
@@ -40,10 +41,16 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
     if request.max_tokens == 0 {
         return Err(ValidationError::InvalidMaxTokens);
     }
-    for message in &request.messages {
+    validate_claude_system(request.system.as_ref())?;
+    for (index, message) in request.messages.iter().enumerate() {
         if !matches!(message.role.as_str(), "user" | "assistant" | "system") {
             return Err(ValidationError::InvalidRole(message.role.clone()));
         }
+        validate_claude_content(
+            &message.content,
+            &message.role,
+            format!("messages.{index}.content"),
+        )?;
     }
     if request.tools.len() > MAX_TOOLS {
         return Err(ValidationError::TooManyTools);
@@ -155,6 +162,305 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
         }
     }
     validate_thinking(request.thinking.as_ref())?;
+    validate_context_management(request.context_management.as_ref())?;
+    Ok(())
+}
+
+fn validate_claude_system(value: Option<&Value>) -> Result<(), ValidationError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    match value {
+        Value::String(_) => Ok(()),
+        Value::Array(blocks) => {
+            for (index, block) in blocks.iter().enumerate() {
+                if block.get("type").and_then(Value::as_str) != Some("text")
+                    || !block.get("text").is_some_and(Value::is_string)
+                {
+                    return invalid(format!("system.{index}"), "expected a text content block");
+                }
+            }
+            Ok(())
+        }
+        _ => invalid("system", "expected a string or content array"),
+    }
+}
+
+fn validate_claude_content(
+    content: &Value,
+    role: &str,
+    field: String,
+) -> Result<(), ValidationError> {
+    match content {
+        Value::String(_) => return Ok(()),
+        Value::Array(blocks) => {
+            for (index, block) in blocks.iter().enumerate() {
+                validate_claude_block(block, role, format!("{field}.{index}"), false)?;
+            }
+            return Ok(());
+        }
+        _ => {}
+    }
+    invalid(field, "expected a string or content array")
+}
+
+fn validate_claude_block(
+    block: &Value,
+    role: &str,
+    field: String,
+    tool_result_content: bool,
+) -> Result<(), ValidationError> {
+    let Some(kind) = block.get("type").and_then(Value::as_str) else {
+        return invalid(format!("{field}.type"), "is required");
+    };
+    match kind {
+        "text" => {
+            if !block.get("text").is_some_and(Value::is_string) {
+                return invalid(format!("{field}.text"), "expected a string");
+            }
+        }
+        "image" => {
+            if role != "user" {
+                return invalid(format!("{field}.type"), "image blocks require a user role");
+            }
+            validate_claude_image(block, &field)?;
+        }
+        "tool_result" if !tool_result_content => {
+            if role != "user" {
+                return invalid(
+                    format!("{field}.type"),
+                    "tool_result blocks require a user role",
+                );
+            }
+            if block
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return invalid(format!("{field}.tool_use_id"), "is required");
+            }
+            if block
+                .get("is_error")
+                .is_some_and(|value| !value.is_boolean())
+            {
+                return invalid(format!("{field}.is_error"), "expected a boolean");
+            }
+            match block.get("content") {
+                Some(Value::String(_)) => {}
+                Some(Value::Array(blocks)) => {
+                    for (index, nested) in blocks.iter().enumerate() {
+                        validate_claude_block(
+                            nested,
+                            "user",
+                            format!("{field}.content.{index}"),
+                            true,
+                        )?;
+                    }
+                }
+                _ => {
+                    return invalid(
+                        format!("{field}.content"),
+                        "expected a string or an array of text/image blocks",
+                    )
+                }
+            }
+        }
+        "tool_use" if !tool_result_content => {
+            if role != "assistant" {
+                return invalid(
+                    format!("{field}.type"),
+                    "tool_use blocks require an assistant role",
+                );
+            }
+            for name in ["id", "name"] {
+                if block
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    return invalid(format!("{field}.{name}"), "is required");
+                }
+            }
+            if !block.get("input").is_some_and(Value::is_object) {
+                return invalid(format!("{field}.input"), "expected an object");
+            }
+        }
+        "thinking" if !tool_result_content => {
+            if role != "assistant" || !block.get("thinking").is_some_and(Value::is_string) {
+                return invalid(
+                    format!("{field}.thinking"),
+                    "thinking blocks require an assistant role and string content",
+                );
+            }
+        }
+        "compaction" if !tool_result_content => {
+            if role != "assistant" || !block.get("content").is_some_and(Value::is_string) {
+                return invalid(
+                    format!("{field}.content"),
+                    "compaction blocks require an assistant role and string content",
+                );
+            }
+        }
+        "document" => {
+            return invalid(
+                format!("{field}.type"),
+                "document blocks are not supported by the Kiro upstream",
+            )
+        }
+        _ => {
+            return invalid(
+                format!("{field}.type"),
+                format!("unsupported Claude content block '{kind}'"),
+            )
+        }
+    }
+    Ok(())
+}
+
+fn validate_claude_image(block: &Value, field: &str) -> Result<(), ValidationError> {
+    let source = block.get("source").unwrap_or(&Value::Null);
+    if source.get("type").and_then(Value::as_str) != Some("base64") {
+        return invalid(
+            format!("{field}.source.type"),
+            "only base64 images are supported",
+        );
+    }
+    if !source
+        .get("media_type")
+        .and_then(Value::as_str)
+        .is_some_and(|media| {
+            matches!(
+                media,
+                "image/jpeg" | "image/png" | "image/gif" | "image/webp"
+            )
+        })
+    {
+        return invalid(
+            format!("{field}.source.media_type"),
+            "expected image/jpeg, image/png, image/gif, or image/webp",
+        );
+    }
+    let Some(data) = source.get("data").and_then(Value::as_str) else {
+        return invalid(format!("{field}.source.data"), "expected a string");
+    };
+    if base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .is_err()
+    {
+        return invalid(format!("{field}.source.data"), "invalid base64 image data");
+    }
+    Ok(())
+}
+
+fn validate_context_management(value: Option<&Value>) -> Result<(), ValidationError> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let Some(object) = value.as_object() else {
+        return invalid("context_management", "expected an object");
+    };
+    if object.keys().any(|key| key != "edits") {
+        return invalid("context_management", "only the edits field is supported");
+    }
+    let Some(edits) = object.get("edits").and_then(Value::as_array) else {
+        return invalid("context_management.edits", "expected an array");
+    };
+    if edits.is_empty() {
+        return invalid("context_management.edits", "must not be empty");
+    }
+    for (index, edit) in edits.iter().enumerate() {
+        let Some(edit) = edit.as_object() else {
+            return invalid(
+                format!("context_management.edits.{index}"),
+                "expected an object",
+            );
+        };
+        if edit.get("type").and_then(Value::as_str) != Some("compact_20260112") {
+            return invalid(
+                format!("context_management.edits.{index}.type"),
+                "only compact_20260112 is supported",
+            );
+        }
+        if edit.keys().any(|key| {
+            !matches!(
+                key.as_str(),
+                "type" | "trigger" | "pause_after_compaction" | "instructions"
+            )
+        }) {
+            return invalid(
+                format!("context_management.edits.{index}"),
+                "contains an unsupported field",
+            );
+        }
+        if edit
+            .get("pause_after_compaction")
+            .is_some_and(|value| !value.is_boolean())
+        {
+            return invalid(
+                format!("context_management.edits.{index}.pause_after_compaction"),
+                "expected a boolean",
+            );
+        }
+        if edit.get("pause_after_compaction").and_then(Value::as_bool) == Some(true) {
+            return invalid(
+                format!("context_management.edits.{index}.pause_after_compaction"),
+                "pausing after compaction is not supported by the Kiro upstream",
+            );
+        }
+        if edit
+            .get("instructions")
+            .is_some_and(|value| !value.is_string())
+        {
+            return invalid(
+                format!("context_management.edits.{index}.instructions"),
+                "expected a string",
+            );
+        }
+        if edit
+            .get("instructions")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return invalid(
+                format!("context_management.edits.{index}.instructions"),
+                "custom compaction instructions are not supported by the Kiro upstream",
+            );
+        }
+        if let Some(trigger) = edit.get("trigger") {
+            let Some(trigger) = trigger.as_object() else {
+                return invalid(
+                    format!("context_management.edits.{index}.trigger"),
+                    "expected an object",
+                );
+            };
+            if trigger.get("type").and_then(Value::as_str) != Some("input_tokens") {
+                return invalid(
+                    format!("context_management.edits.{index}.trigger.type"),
+                    "expected input_tokens",
+                );
+            }
+            let minimum = crate::MIN_COMPACT_TRIGGER_TOKENS;
+            if trigger
+                .get("value")
+                .and_then(Value::as_u64)
+                .is_none_or(|value| value < minimum)
+            {
+                return invalid(
+                    format!("context_management.edits.{index}.trigger.value"),
+                    format!("must be an integer of at least {minimum}"),
+                );
+            }
+            if trigger
+                .keys()
+                .any(|key| !matches!(key.as_str(), "type" | "value"))
+            {
+                return invalid(
+                    format!("context_management.edits.{index}.trigger"),
+                    "contains an unsupported field",
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -674,6 +980,52 @@ mod tests {
             .expect_err("strict")
             .to_string()
             .contains("strict"));
+    }
+
+    #[test]
+    fn validates_supported_compaction_configuration() {
+        let mut input = request();
+        input.context_management = Some(serde_json::json!({"edits":[{
+            "type":"compact_20260112",
+            "trigger":{"type":"input_tokens","value":75_000},
+            "pause_after_compaction":false
+        }]}));
+        validate_claude(&input).expect("supported compact configuration");
+
+        input.context_management = Some(serde_json::json!({"edits":[{
+            "type":"clear_tool_uses_20250919"
+        }]}));
+        assert!(validate_claude(&input)
+            .expect_err("unsupported context edit")
+            .to_string()
+            .contains("compact_20260112"));
+    }
+
+    #[test]
+    fn validates_nested_tool_result_images_and_rejects_unsupported_blocks() {
+        let mut input = request();
+        input.messages[0].content = serde_json::json!([{
+            "type":"tool_result","tool_use_id":"tool_1","content":[{
+                "type":"image","source":{
+                    "type":"base64","media_type":"image/png","data":"aGVsbG8="
+                }
+            }]
+        }]);
+        validate_claude(&input).expect("nested image");
+
+        input.messages[0].content = serde_json::json!([{
+            "type":"document","source":{"type":"base64","data":"aGVsbG8="}
+        }]);
+        assert!(validate_claude(&input)
+            .expect_err("document")
+            .to_string()
+            .contains("not supported"));
+
+        input.messages[0].content = serde_json::json!([{"type":"future_block"}]);
+        assert!(validate_claude(&input)
+            .expect_err("unknown block")
+            .to_string()
+            .contains("unsupported Claude content block"));
     }
 
     #[test]
