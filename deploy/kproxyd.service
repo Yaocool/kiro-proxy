@@ -32,9 +32,10 @@ ProtectKernelTunables=true
 ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
-RestrictNamespaces=true
 LockPersonality=true
-MemoryDenyWriteExecute=true
+# Chromium SSO uses a user-namespace sandbox and V8 JIT executable memory.
+# Keep these capabilities available while the remaining unit hardening contains
+# the unprivileged kproxy process.
 CapabilityBoundingSet=
 AmbientCapabilities=
 SystemCallArchitectures=native
