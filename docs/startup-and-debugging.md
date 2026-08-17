@@ -25,17 +25,17 @@ rustc --version
 cargo --version
 ```
 
-Build the normal workspace:
+The default build enables all features, including Chromium SSO:
 
 ```bash
 cargo build --workspace --locked
 ```
 
-The standard `kproxyd` binary does not include Chromium. To compile browser-based
-IAM Identity Center login support:
+Disable default features only when browser login is explicitly unnecessary and
+a smaller binary is preferred:
 
 ```bash
-cargo build -p kproxyd --features sso --locked
+cargo build --workspace --no-default-features --locked
 ```
 
 ## 2. Environment loading
@@ -161,18 +161,27 @@ cargo run -p kproxy -- account probe --all
 cargo run -p kproxy -- models
 ```
 
-For a build with the `sso` feature, IAM Identity Center login is also available:
+The default build includes IAM Identity Center login. First set the global start
+URL in `config.toml` (for example through `kproxy config edit`):
+
+```toml
+[sso]
+start_url = "https://example.awsapps.com/start"
+```
+
+Manual account additions can then omit `--start-url`:
 
 ```bash
 printf '%s\n' "$PASSWORD" | cargo run -p kproxy -- account add-sso \
   --email user@example.com \
-  --start-url https://example.awsapps.com/start \
   --password-stdin
 ```
 
-`kproxy` sends this administration request to `kproxyd`; therefore the running daemon,
-not only the CLI, must have been built with SSO support. Use `--headful` for MFA
-or manual verification.
+Use `--start-url` to override the global value for one login. `kproxy` sends the
+administration request to `kproxyd`, so browser login is unavailable if the daemon
+was explicitly built with `--no-default-features`. Use `--headful` for MFA or
+manual verification. Only organization SSO for Kiro enterprise accounts is
+supported; personal, social-login, and other authentication types are not.
 
 ## 5. Create and verify a proxy service
 
@@ -216,13 +225,16 @@ unauthenticated public exposure.
 Every business HTTP response includes `x-trace-id`. Save that value when
 investigating an error.
 
-Stop and remove a service when it is no longer needed. Its API keys are kept so
-they cannot be deleted accidentally; remove an unused key separately with
-`kproxy apikey rm <id> --yes`.
+Stop and remove a service when it is no longer needed. API keys used only by
+that service are deleted with it. Keys shared with another proxy service are
+retained.
 
 ```bash
-kproxy service delete main --yes
+kproxy service delete main
 ```
+
+Destructive commands such as deletion and usage reset have no `--yes` bypass;
+enter `y` or `yes` in an interactive terminal to confirm them.
 
 ## 6. Configuration and hot reload
 
@@ -250,6 +262,32 @@ are reconciled at runtime. The following changes require a daemon restart:
 
 Log filters, formatting, output paths, pool behavior, model rules, notification
 settings, and TLS certificate contents can otherwise be updated at runtime.
+
+Webhooks and model mappings can be created, edited, and deleted directly from
+the CLI. Each command validates the result, writes it atomically, and hot
+reloads the daemon:
+
+```bash
+kproxy webhook add --name alerts --kind dingtalk --url https://example/hook --event token-expired
+kproxy webhook edit alerts --event token-expired --event quota-exhausted
+kproxy webhook delete alerts
+
+kproxy model-map add --name low-credit --source 'claude-opus-*' \
+  --target claude-sonnet-4.6 --below-credits-percent 10
+kproxy model-map edit low-credit --below-credits-percent 15
+kproxy model-map test claude-opus-4.6 --remaining-credits-percent 8
+kproxy model-map delete low-credit
+```
+
+A mapping with `--below-credits-percent` is evaluated against each selected
+account's remaining credits. With no schedule it is active all day: it matches
+below the threshold and stops matching automatically after the monthly quota
+recovers above that threshold.
+
+Automatic model discovery is separate from explicit model mapping. It runs once
+at daemon startup, is triggered again after account changes, and then follows
+`models.cache_ttl_ms`. The account `status_check` task refreshes usage data only;
+it does not issue a second set of model-list requests.
 
 Bootstrap never overwrites an existing `config.toml`. A data directory created
 by an older release may therefore retain `server.host = "127.0.0.1"`. Inspect
@@ -285,15 +323,21 @@ Or follow records through the administration API:
 
 ```bash
 cargo run -p kproxy -- logs -f --level warn
-cargo run -p kproxy -- stats --since 1h --by endpoint
+cargo run -p kproxy -- stats --since 1h
+cargo run -p kproxy -- stats --detail --since 1h --by endpoint
 ```
+
+`kproxy stats` reports aggregate request, success, token, credit, and latency
+metrics. The default is a compact summary; `--detail` adds recent requests and
+grouping by model/account/apikey/endpoint. Use `kproxy logs` and trace IDs for
+individual failures.
 
 For more detail, set `RUST_LOG` or `log.level` to `debug` or `trace`. Logs do not
 record prompts, generated response bodies, or API-key values.
 
 ## 8. Docker Compose
 
-Build and start the default slim image:
+Build and start the default full image with all features and Chromium SSO:
 
 ```bash
 docker compose config --quiet
@@ -382,11 +426,11 @@ curl -i http://127.0.0.1:5580/health
 curl -i http://127.0.0.1:6000/health
 ```
 
-Remove a proxy listener when it is no longer needed. The associated API keys
-remain until they are removed separately:
+Remove a proxy listener when it is no longer needed. Its exclusive API keys are
+deleted with it, while keys shared with another service are retained:
 
 ```bash
-docker compose exec kproxyd kproxy service delete secondary --yes
+docker compose exec kproxyd kproxy service delete secondary
 ```
 
 The default host is `0.0.0.0`, so these listeners are reachable through the
@@ -401,9 +445,10 @@ unacceptable.
 configuration, accounts, statistics, and logs and should be used only when an
 intentional reset is required.
 
-The default Docker target is `runtime-slim`. Change the Compose target to
-`runtime-full` and rebuild when browser SSO is needed. The full image installs
-Chromium and sets the container-specific no-sandbox flag.
+The default Docker target is `runtime-full`; it installs Chromium, enables all
+features, and sets the container-specific no-sandbox flag. Change the Compose
+target to `runtime-slim` and rebuild only when browser SSO is explicitly not
+needed.
 
 ## 9. systemd
 
@@ -432,9 +477,15 @@ sudo systemctl reload kproxyd
 Reload sends `SIGHUP`. Restart-required settings still need
 `sudo systemctl restart kproxyd`.
 
-The unit's default hardening is appropriate for the slim proxy. Browser SSO may
-require a dedicated unit with carefully reviewed relaxations for Chromium,
-particularly `RestrictNamespaces` and `MemoryDenyWriteExecute`.
+Install Chrome or Chromium on the host before using `kproxy account add-sso`.
+The provided unit supports the default full build: it intentionally leaves user
+namespaces and executable JIT memory available for Chromium, while retaining
+`NoNewPrivileges`, filesystem protection, an empty capability set, and the other
+hardening controls. If the host kernel disables unprivileged user namespaces,
+prefer enabling them. As a last-resort compatibility override, set
+`KPROXY_CHROMIUM_NO_SANDBOX=1` with `systemctl edit kproxyd`; this disables
+Chromium's own sandbox and should only be used after reviewing the host's
+isolation boundary.
 
 ## 10. VS Code and LLDB
 

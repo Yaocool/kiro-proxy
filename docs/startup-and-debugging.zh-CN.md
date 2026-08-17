@@ -22,16 +22,16 @@ rustc --version
 cargo --version
 ```
 
-构建普通 workspace：
+默认构建启用全部 feature，其中包括 Chromium SSO：
 
 ```bash
 cargo build --workspace --locked
 ```
 
-标准 `kproxyd` 不包含 Chromium。如需使用基于浏览器的 IAM Identity Center 登录：
+只有明确不需要浏览器登录并希望缩小二进制时，才关闭默认 feature：
 
 ```bash
-cargo build -p kproxyd --features sso --locked
+cargo build --workspace --no-default-features --locked
 ```
 
 ## 2. 环境变量加载
@@ -148,17 +148,26 @@ cargo run -p kproxy -- account probe --all
 cargo run -p kproxy -- models
 ```
 
-启用 `sso` feature 后，还可以使用 IAM Identity Center 登录：
+默认构建已经包含 IAM Identity Center 登录。先在 `config.toml` 中设置全局 start URL
+（可用 `kproxy config edit`）：
+
+```toml
+[sso]
+start_url = "https://example.awsapps.com/start"
+```
+
+之后手动添加账号时可省略 `--start-url`：
 
 ```bash
 printf '%s\n' "$PASSWORD" | cargo run -p kproxy -- account add-sso \
   --email user@example.com \
-  --start-url https://example.awsapps.com/start \
   --password-stdin
 ```
 
-`kproxy` 会把管理请求发送给 `kproxyd`，所以运行中的 daemon 也必须使用 SSO feature 构建，
-不能只构建 CLI。遇到 MFA 或需要手工验证时增加 `--headful`。
+单次登录仍可用 `--start-url` 覆盖全局值。`kproxy` 会把管理请求发送给 `kproxyd`，所以若显式
+使用 `--no-default-features` 构建 daemon，浏览器登录不可用。遇到 MFA 或需要手工验证时
+增加 `--headful`。只支持 Kiro 企业账号的组织 SSO，个人账号、社交登录和其他认证类型均
+不支持。
 
 ## 5. 创建并验证代理服务
 
@@ -197,12 +206,14 @@ curl -i http://127.0.0.1:5580/v1/models \
 
 每个业务 HTTP 响应都包含 `x-trace-id`，排查错误时应先保存这个值。
 
-不再需要某个服务时可停止并删除它。关联 API Key 会保留以避免误删；确认不再使用后，可另行
-执行 `kproxy apikey rm <id> --yes`。
+不再需要某个服务时可停止并删除它。删除服务时会同时删除仅由该服务使用的
+API Key；仍被其他服务引用的共享 API Key 会保留。
 
 ```bash
-kproxy service delete main --yes
+kproxy service delete main
 ```
+
+删除、重置用量等破坏性命令不支持 `--yes` 跳过确认，必须在交互终端输入 `y` 或 `yes`。
 
 ## 6. 配置与热重载
 
@@ -227,6 +238,27 @@ cargo run -p kproxy -- config reload
 - 在共享的 HTTP 与 HTTPS 监听模式之间切换。
 
 日志过滤、格式、输出路径、账号池行为、模型规则、通知配置和 TLS 证书内容可以在运行时更新。
+
+Webhook 和模型映射可直接通过 CLI 新增、编辑、删除，命令会校验配置、原子写入并热重载：
+
+```bash
+kproxy webhook add --name alerts --kind dingtalk --url https://example/hook --event token-expired
+kproxy webhook edit alerts --event token-expired --event quota-exhausted
+kproxy webhook delete alerts
+
+kproxy model-map add --name low-credit --source 'claude-opus-*' \
+  --target claude-sonnet-4.6 --below-credits-percent 10
+kproxy model-map edit low-credit --below-credits-percent 15
+kproxy model-map test claude-opus-4.6 --remaining-credits-percent 8
+kproxy model-map delete low-credit
+```
+
+带 `--below-credits-percent` 的映射按每个选中账号的剩余 Credits 判断。未配置 schedule 时
+默认全天生效；剩余额度低于阈值时命中，次月额度恢复到阈值以上后自动停止命中。
+
+模型自动探测与显式模型映射彼此独立。自动探测在 daemon 启动时执行一次、账号变化后再次
+触发，之后遵循 `models.cache_ttl_ms`；账号 `status_check` 任务只刷新额度，不会再发起一轮
+模型列表请求。
 
 首次初始化永远不会覆盖已有 `config.toml`，因此旧版本创建的数据目录可能仍保留
 `server.host = "127.0.0.1"`。可使用 `kproxy config show --effective` 检查实际值；需要采用
@@ -258,15 +290,20 @@ rg 'trace_f028' .kproxy-dev/logs/
 
 ```bash
 cargo run -p kproxy -- logs -f --level warn
-cargo run -p kproxy -- stats --since 1h --by endpoint
+cargo run -p kproxy -- stats --since 1h
+cargo run -p kproxy -- stats --detail --since 1h --by endpoint
 ```
+
+`kproxy stats` 用于查看请求量、成功率、Tokens、Credits 和延迟等聚合运维指标。默认只显示
+紧凑汇总，`--detail` 才显示最近请求和按 model/account/apikey/endpoint 的分组统计；逐条
+故障信息仍应使用 `kproxy logs` 和 Trace ID。
 
 需要更多细节时，将 `RUST_LOG` 或 `log.level` 调整为 `debug` 或 `trace`。日志不会记录
 提示词、生成的回复正文或 API Key 值。
 
 ## 8. Docker Compose
 
-构建并启动默认 slim 镜像：
+构建并启动默认 full 镜像（启用全部 feature 并包含 Chromium SSO）：
 
 ```bash
 docker compose config --quiet
@@ -348,10 +385,11 @@ curl -i http://127.0.0.1:5580/health
 curl -i http://127.0.0.1:6000/health
 ```
 
-不再需要某个代理监听时可删除 service；关联 API Key 会继续保留，需另行删除：
+不再需要某个代理监听时可删除 service；其专用 API Key 会同时删除，被其他服务共享的
+API Key 则会保留：
 
 ```bash
-docker compose exec kproxyd kproxy service delete secondary --yes
+docker compose exec kproxyd kproxy service delete secondary
 ```
 
 服务默认绑定 `0.0.0.0`，可通过 Docker 宿主机的网络接口访问；应使用宿主机防火墙或云
@@ -362,8 +400,9 @@ docker compose exec kproxyd kproxy service delete secondary --yes
 `docker compose down` 会保留 named volume；`docker compose down -v` 会删除配置、账号、
 统计和日志，只应在明确需要重置时使用。
 
-默认 Docker target 是 `runtime-slim`。需要浏览器 SSO 时，把 Compose target 改为
-`runtime-full` 后重新构建。full 镜像会安装 Chromium，并设置容器专用的 no-sandbox 标志。
+默认 Docker target 是 `runtime-full`，会安装 Chromium、启用全部 feature，并设置容器专用
+的 no-sandbox 标志。只有明确不需要浏览器 SSO 时，才把 Compose target 改为
+`runtime-slim` 后重新构建。
 
 ## 9. systemd
 
@@ -391,8 +430,12 @@ sudo systemctl reload kproxyd
 
 reload 会发送 `SIGHUP`。需要重启的配置仍要执行 `sudo systemctl restart kproxyd`。
 
-unit 默认的加固选项适合 slim 代理。浏览器 SSO 建议使用单独的 unit，并谨慎评估 Chromium
-需要的放宽项，尤其是 `RestrictNamespaces` 和 `MemoryDenyWriteExecute`。
+使用 `kproxy account add-sso` 前还要在宿主机安装 Chrome 或 Chromium。提供的 unit 支持
+默认 full 构建：它会为 Chromium 保留用户命名空间和 JIT 可执行内存，同时继续启用
+`NoNewPrivileges`、文件系统保护、空 capability 集合等加固项。如果宿主机内核禁用了非特权
+用户命名空间，优先在系统层启用；最后的兼容手段是通过 `systemctl edit kproxyd` 设置
+`KPROXY_CHROMIUM_NO_SANDBOX=1`。该选项会关闭 Chromium 自身的 sandbox，只应在评估宿主机
+隔离边界后使用。
 
 ## 10. VS Code 与 LLDB
 

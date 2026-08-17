@@ -10,7 +10,7 @@ API Key 限额、TLS、Webhook、统计和运维 CLI。
 > 本项目仅支持通过企业 SSO（AWS IAM Identity Center/IdC）认证的 Kiro 企业账号。
 > 其他所有账号和认证类型均不支持，包括个人账号和社交登录账号。
 
-本仓库不包含 GUI、KProxy MITM 或本机 Kiro 应用配置修改功能。
+本仓库不包含 GUI、MITM 或本机 Kiro 应用配置修改功能。
 
 ## 主要能力
 
@@ -45,8 +45,9 @@ CLI 源码位于 [`crates/kproxy`](crates/kproxy)，daemon 源码位于
 
 ### Docker Compose（Linux 服务器推荐）
 
-最简生产部署只需要 Docker Engine 和 Compose v2 插件。Compose 会构建 slim 镜像、使用
-host network 启动 `kproxyd`，并将全部状态保存在 `kproxy-data` named volume 中。以下命令均在
+最简生产部署只需要 Docker Engine 和 Compose v2 插件。Compose 默认构建启用全部 feature
+且包含 Chromium 的 full 镜像，使用 host network 启动 `kproxyd`，并将全部状态保存在
+`kproxy-data` named volume 中。以下命令均在
 仓库根目录执行：
 
 ```bash
@@ -191,7 +192,7 @@ kproxy service list
 kproxy service create --name main --port 5580
 kproxy service apikeys main
 kproxy service apikeys main --show-secret
-kproxy service delete main --yes
+kproxy service delete main
 kproxy account list
 kproxy account show <id|email>
 kproxy account tag <id|email> --add prod
@@ -200,7 +201,7 @@ kproxy account refresh <id|email>
 kproxy account refresh --all
 kproxy account probe --all
 kproxy account regen-machine-id <id|email>
-kproxy account rm <id|email> --yes
+kproxy account rm <id|email>
 
 kproxy config show --effective
 kproxy config path
@@ -212,35 +213,56 @@ kproxy diagnose endpoints
 kproxy diagnose account --all -c 4 --timeout 45s
 kproxy subscriptions
 kproxy models --mapped
+kproxy model-map add --name low-credit --source 'claude-opus-*' --target claude-sonnet-4.6 --below-credits-percent 10
+kproxy model-map edit low-credit --below-credits-percent 15
+kproxy model-map delete low-credit
 kproxy model-map test claude-opus-4
 
 kproxy apikey list
-kproxy webhook test --all
-kproxy stats --since 1h --by endpoint
+kproxy apikey list --detail
+kproxy webhook add --name alerts --kind dingtalk --url https://example/hook --event token-expired
+kproxy webhook edit alerts --event token-expired --event quota-exhausted
+kproxy webhook delete alerts
+kproxy stats --since 1h
+kproxy stats --detail --since 1h --by endpoint
 kproxy logs -f --level warn
 kproxy tasks
 kproxy tasks run status_check
+kproxy help
 ```
 
 所有命令都支持全局 `--json`，权威参数列表以 `kproxy --help` 和各子命令的 `--help` 为准。
+破坏性操作不提供 `--yes` 跳过选项，执行时必须交互输入 `y` 或 `yes` 二次确认。直接执行
+`kproxy` 会显示总帮助，`kproxy help` 会列出可用的主题帮助。
+
+`kproxy stats` 用于查看代理流量、成功率、Token、Credits 和延迟等聚合运维指标，不替代逐条
+请求日志。默认只输出紧凑汇总；增加 `--detail` 后才输出分组统计和最近请求。
+
+动态模型探测会在 daemon 启动时立即执行、账号变化时再次触发，之后按模型缓存 TTL 刷新。
+每分钟的账号状态任务只刷新额度信息，不再重复请求模型列表。
 
 ## 企业 SSO 认证
 
-默认 slim 构建支持导入已有的 Kiro 企业 SSO 凭证，不包含 Chromium。为 `kproxyd` 启用
-`sso` feature 后，可以通过企业 IAM Identity Center 登录流程认证受支持的账号：
+`kproxyd` 的默认构建和 Docker Compose 都启用全部 feature，包含企业 IAM Identity Center
+登录所需的 SSO 支持。先用 `kproxy config edit` 设置全局 start URL：
 
-```bash
-cargo build --release --locked -p kproxyd --features sso
-
-printf '%s\n' "$PASSWORD" | kproxy account add-sso \
-  --email user@example.com \
-  --start-url https://example.awsapps.com/start \
-  --password-stdin
-
-kproxy account add-sso --batch accounts.csv \
-  --start-url https://example.awsapps.com/start -c 1
+```toml
+[sso]
+start_url = "https://example.awsapps.com/start"
 ```
 
+然后手动添加账号时无需重复传 `--start-url`：
+
+```bash
+printf '%s\n' "$PASSWORD" | kproxy account add-sso \
+  --email user@example.com \
+  --password-stdin
+
+kproxy account add-sso --batch accounts.csv -c 1
+```
+
+单次登录仍可用 `--start-url` 覆盖全局值。若明确需要更小且不含浏览器 SSO 的二进制，可用
+`cargo build --workspace --no-default-features` 或 Docker 的 `runtime-slim` target。
 密码只从 stdin 或两列 CSV 文件读取。遇到 MFA 或上游页面变化需要手工操作时，增加
 `--headful`。该流程不会增加对非企业账号或非 SSO 认证方式的支持。
 
@@ -249,9 +271,11 @@ kproxy account add-sso --batch accounts.csv \
 ```bash
 docker compose up -d --build
 
-# 不使用 Compose 时可单独构建镜像：
-docker build --target runtime-slim -t kproxyd:slim .
-docker build --target runtime-full -t kproxyd:full .
+# 不使用 Compose 时，默认镜像同样是 full：
+docker build -t kiro-proxy:latest .
+# 明确不需要浏览器 SSO 时可选择 slim：
+docker build --target runtime-slim -t kiro-proxy:slim .
+docker build --target runtime-full -t kiro-proxy:full .
 ```
 
 Compose 使用 host network，因此手动创建的任意端口代理服务都会立即在 Docker 宿主机
@@ -285,6 +309,8 @@ CLI。当前用户必须有 Docker 权限；同时运行多个 kiro-proxy Compos
 
 加固后的服务模板位于 [`deploy/kproxyd.service`](deploy/kproxyd.service)。将 `kproxyd` 和
 `kproxy` 安装到 `/usr/local/bin`，创建 `kproxy` 系统用户与用户组，安装 unit 后即可启用服务。
+浏览器 SSO 还要求宿主机安装 Chrome 或 Chromium；unit 会为 Chromium 保留用户命名空间与
+JIT 可执行内存，同时继续启用其余进程加固项。
 
 ## 开发
 
