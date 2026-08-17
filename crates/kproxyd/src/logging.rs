@@ -60,20 +60,19 @@ pub fn init(config: &LogConfig, default_file_path: PathBuf) -> Result<()> {
 }
 
 pub fn reload_level(level: &str) -> Result<()> {
-    let handle = FILTER_HANDLE
+    let handle: &FilterHandle = FILTER_HANDLE
         .get()
-        .context("tracing filter reload handle is unavailable")?;
-    handle
-        .reload(EnvFilter::new(level))
-        .context("reload tracing filter")
+        .ok_or_else(|| anyhow::anyhow!("tracing filter reload handle is unavailable"))?;
+    FilterHandle::reload(handle, EnvFilter::new(level))
+        .map_err(|error| anyhow::anyhow!("reload tracing filter: {error}"))
 }
 
 /// Atomically switches level, formatter, and the partitioned file destination.
 pub fn reload_config(config: &LogConfig) -> Result<()> {
     reload_level(&config.level)?;
-    let runtime = LOG_RUNTIME
+    let runtime: &RuntimeLogConfig = LOG_RUNTIME
         .get()
-        .context("runtime log configuration is unavailable")?;
+        .ok_or_else(|| anyhow::anyhow!("runtime log configuration is unavailable"))?;
     runtime.file.reconfigure(config)?;
     runtime
         .json
