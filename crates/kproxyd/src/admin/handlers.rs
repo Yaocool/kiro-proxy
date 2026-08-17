@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use futures::{stream, StreamExt};
 use kproxy_core::account::Account;
-use kproxy_core::config::{ApiKeyConfig, ApiKeyFormat, ProxyServiceConfig};
+use kproxy_core::config::{ApiKeyConfig, ApiKeyFormat, Config, ProxyServiceConfig};
 use kproxy_core::ids::{new_account_id, new_machine_id};
 use kproxy_ipc::protocol::*;
 use kproxy_store::accounts::AccountStore;
@@ -985,6 +985,8 @@ async fn handle_pool(state: &Arc<AppState>, params: serde_json::Value) -> Handle
 
 #[derive(serde::Deserialize, Default)]
 struct StatsParams {
+    #[serde(default)]
+    detail: bool,
     recent: Option<usize>,
     since_secs: Option<u64>,
     by: Option<String>,
@@ -999,6 +1001,9 @@ fn handle_stats(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
         parse_params(params)?
     };
     if params.by.as_deref() == Some("apikey") {
+        if !params.detail {
+            return Err(RpcError::bad_params("stats grouping requires detail=true"));
+        }
         return to_value(serde_json::json!({"by_apikey":state.meter.list()}));
     }
     let cutoff = params
@@ -1019,6 +1024,12 @@ fn handle_stats(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
         });
     }
     let percentiles = stats.percentiles();
+    if !params.detail {
+        return to_value(serde_json::json!({
+            "summary":stats.total,
+            "latency":{"p50_ms":percentiles.0,"p95_ms":percentiles.1,"p99_ms":percentiles.2}
+        }));
+    }
     let grouped = match params.by.as_deref() {
         Some("account") => serde_json::to_value(&stats.by_account),
         Some("endpoint") => serde_json::to_value(&stats.by_endpoint),
@@ -1091,7 +1102,7 @@ fn handle_webhook_test(state: &Arc<AppState>, params: serde_json::Value) -> Hand
     let event = WebhookEvent::new(
         WebhookEventKind::ServiceDegraded,
         "kiro-proxy webhook test",
-        "This is a test notification from kproxy.",
+        "This is a test notification from kiro-proxy.",
     );
     let notifier = state.notifier();
     let queued = match params.name.as_deref() {
@@ -1259,9 +1270,12 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
         .into_iter()
         .find(|(service_id, _)| service_id == &service.id)
     {
-        let rollback_write =
-            kproxy_store::atomic::write_bytes_atomically(&state.paths.config_file, &raw, Some(0o600))
-                .await;
+        let rollback_write = kproxy_store::atomic::write_bytes_atomically(
+            &state.paths.config_file,
+            &raw,
+            Some(0o600),
+        )
+        .await;
         state.apply_runtime_config(&previous);
         state.config.replace(previous.clone());
         let _rollback_failures = state.reconcile_proxy_services(&previous).await;
@@ -1309,6 +1323,8 @@ async fn handle_service_delete(state: &Arc<AppState>, params: serde_json::Value)
 
     let mut next = previous.clone();
     let removed = next.proxy_service.remove(index);
+    let (deleted_api_key_ids, retained_api_key_ids) =
+        remove_unshared_service_api_keys(&mut next, &removed);
     next.validate()
         .map_err(|error| RpcError::bad_params(error.to_string()))?;
     let output = toml::to_string_pretty(&next)
@@ -1332,7 +1348,39 @@ async fn handle_service_delete(state: &Arc<AppState>, params: serde_json::Value)
     to_value(ProxyServiceDeleteResult {
         service_id: removed.id,
         service_name: removed.name,
+        deleted_api_key_ids,
+        retained_api_key_ids,
     })
+}
+
+fn remove_unshared_service_api_keys(
+    config: &mut Config,
+    removed: &ProxyServiceConfig,
+) -> (Vec<String>, Vec<String>) {
+    let is_still_referenced = |key_id: &str| {
+        config
+            .proxy_service
+            .iter()
+            .any(|service| service.api_key_ids.iter().any(|id| id == key_id))
+    };
+    let retained = removed
+        .api_key_ids
+        .iter()
+        .filter(|key_id| is_still_referenced(key_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    let deleted = removed
+        .api_key_ids
+        .iter()
+        .filter(|key_id| !is_still_referenced(key_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    config.api_key.retain(|key| {
+        key.id
+            .as_ref()
+            .is_none_or(|key_id| !deleted.contains(key_id))
+    });
+    (deleted, retained)
 }
 
 fn generate_api_key(format: ApiKeyFormat) -> String {
@@ -1492,6 +1540,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stats_default_is_compact_and_detail_restores_recent_requests() {
+        let (_directory, state) = state_with(vec![]).await;
+        state.stats.record(crate::stats::RequestLog {
+            timestamp: now_secs(),
+            trace_id: "trace_stats".into(),
+            request_id: "req_stats".into(),
+            path: "/v1/messages".into(),
+            model: "claude-sonnet-4.6".into(),
+            original_model: "claude-4.6-sonnet".into(),
+            kiro_model: "claude-sonnet-4.6".into(),
+            account_id: "acc_stats".into(),
+            account_name: "Enterprise stats".into(),
+            endpoint: "codewhisperer".into(),
+            model_path: vec!["claude-4.6-sonnet".into(), "claude-sonnet-4.6".into()],
+            model_mapping_rule: None,
+            attempts: Vec::new(),
+            duration_ms: 25,
+            status: 200,
+            input_tokens: 120,
+            output_tokens: 30,
+            credits: 0.5,
+            error: None,
+        });
+
+        let compact = expect_ok(
+            dispatch(
+                &state,
+                Request::new(1, method::STATS, serde_json::json!({})),
+            )
+            .await,
+        );
+        assert_eq!(compact["summary"]["requests"], 1);
+        assert_eq!(compact["latency"]["p50_ms"], 25);
+        assert!(compact.get("stats").is_none());
+        assert!(compact.get("grouped").is_none());
+
+        let detail = expect_ok(
+            dispatch(
+                &state,
+                Request::new(
+                    2,
+                    method::STATS,
+                    serde_json::json!({"detail":true,"recent":20,"by":"model"}),
+                ),
+            )
+            .await,
+        );
+        assert_eq!(
+            detail["stats"]["recent_requests"][0]["account_name"],
+            "Enterprise stats"
+        );
+        assert_eq!(detail["grouped"]["claude-sonnet-4.6"]["requests"], 1);
+    }
+
+    #[tokio::test]
     async fn creating_first_proxy_service_returns_a_scoped_api_key() {
         let (_directory, state) = state_with(vec![]).await;
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port");
@@ -1594,6 +1697,9 @@ mod tests {
         .expect("deleted service");
         assert_eq!(deleted.service_id, created.service.id);
         assert_eq!(deleted.service_name, created.service.name);
+        assert_eq!(deleted.deleted_api_key_ids.len(), 1);
+        assert_eq!(deleted.deleted_api_key_ids[0], created.api_key.id);
+        assert!(deleted.retained_api_key_ids.is_empty());
 
         let listed_after_delete: ProxyServiceListResult = serde_json::from_value(expect_ok(
             dispatch(
@@ -1604,13 +1710,73 @@ mod tests {
         ))
         .expect("service list after delete");
         assert!(listed_after_delete.services.is_empty());
-        assert!(state
+        assert!(!state
             .config
             .current()
             .api_key
             .iter()
             .any(|key| key.id.as_deref() == Some(created.api_key.id.as_str())));
+        assert!(state
+            .meter
+            .authenticate(Some(&created.api_key.key))
+            .expect("empty key registry permits unauthenticated requests")
+            .is_none());
+        let persisted = tokio::fs::read_to_string(&state.paths.config_file)
+            .await
+            .expect("persisted config");
+        assert!(!persisted.contains(&created.api_key.id));
+        assert!(!persisted.contains(&created.api_key.key));
         state.shutdown.cancel();
+    }
+
+    #[test]
+    fn service_key_cleanup_preserves_keys_shared_with_other_services() {
+        let exclusive = ApiKeyConfig {
+            id: Some("ak_exclusive".into()),
+            name: "exclusive".into(),
+            key: "sk-exclusive".into(),
+            format: ApiKeyFormat::Sk,
+            enabled: true,
+            credits_limit: None,
+        };
+        let shared = ApiKeyConfig {
+            id: Some("ak_shared".into()),
+            name: "shared".into(),
+            key: "sk-shared".into(),
+            format: ApiKeyFormat::Sk,
+            enabled: true,
+            credits_limit: None,
+        };
+        let removed = ProxyServiceConfig {
+            id: "svc_removed".into(),
+            name: "removed".into(),
+            host: "127.0.0.1".into(),
+            port: 5580,
+            enabled: true,
+            api_key_ids: vec!["ak_exclusive".into(), "ak_shared".into()],
+            created_at: 0,
+        };
+        let remaining = ProxyServiceConfig {
+            id: "svc_remaining".into(),
+            name: "remaining".into(),
+            host: "127.0.0.1".into(),
+            port: 5581,
+            enabled: true,
+            api_key_ids: vec!["ak_shared".into()],
+            created_at: 0,
+        };
+        let mut config = Config {
+            api_key: vec![exclusive, shared],
+            proxy_service: vec![remaining],
+            ..Config::default()
+        };
+
+        let (deleted, retained) = remove_unshared_service_api_keys(&mut config, &removed);
+
+        assert_eq!(deleted, ["ak_exclusive"]);
+        assert_eq!(retained, ["ak_shared"]);
+        assert_eq!(config.api_key.len(), 1);
+        assert_eq!(config.api_key[0].id.as_deref(), Some("ak_shared"));
     }
 
     #[tokio::test]

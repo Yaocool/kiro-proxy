@@ -517,6 +517,14 @@ impl Default for AdminConfig {
     }
 }
 
+/// IAM Identity Center SSO defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SsoConfig {
+    /// Default IAM Identity Center start URL used by manual account login.
+    pub start_url: String,
+}
+
 fn default_socket_path() -> String {
     default_socket_path_from(
         std::env::var("KPROXY_HOME").ok().as_deref(),
@@ -699,6 +707,8 @@ pub struct Config {
     pub log: LogConfig,
     /// 管理面。
     pub admin: AdminConfig,
+    /// IAM Identity Center SSO defaults.
+    pub sso: SsoConfig,
     /// 模型映射列表。
     #[serde(default, rename = "model_mapping")]
     pub model_mapping: Vec<ModelMappingRule>,
@@ -942,6 +952,11 @@ impl Config {
         }
         if !matches!(self.log.format.as_str(), "json" | "pretty") {
             return invalid_config("log.format", "expected json or pretty");
+        }
+        if !self.sso.start_url.trim().is_empty()
+            && !self.sso.start_url.trim().starts_with("https://")
+        {
+            return invalid_config("sso.start_url", "must use https://");
         }
         if self.log.max_file_size_mb == 0 || self.log.retention_days == 0 {
             return invalid_config(
@@ -1279,6 +1294,10 @@ retention_days = 3
 [admin]
 socket = "/run/kproxy/admin.sock"
 
+[sso]
+# 手动添加企业账号时的默认 IAM Identity Center start URL
+start_url = ""
+
 # 首次启动不创建或监听 API 代理服务。使用以下命令创建：
 # kproxy service create --name main --port 5580
 # 命令会同时生成首个 API key；之后可用以下命令按服务查询明文：
@@ -1378,6 +1397,7 @@ mod tests {
         assert_eq!(config.log.max_file_size_mb, 100);
         assert_eq!(config.log.retention_days, 3);
         assert!(config.model_mapping.is_empty());
+        assert!(config.sso.start_url.is_empty());
         assert!(config.webhook.is_empty());
         assert!(config.api_key.is_empty());
         assert!(config.proxy_service.is_empty());
@@ -1407,6 +1427,19 @@ mod tests {
         let parsed: Config = toml::from_str("").expect("empty toml must parse");
         assert_eq!(parsed.server.port, 5580);
         assert_eq!(parsed.pool.max_concurrent_per_account, 50);
+    }
+
+    #[test]
+    fn sso_start_url_requires_https_when_configured() {
+        let mut config = Config::default();
+        config.sso.start_url = "http://example.awsapps.com/start".into();
+        let error = config
+            .validate()
+            .expect_err("HTTP SSO URL must be rejected");
+        assert!(error.to_string().contains("sso.start_url"), "{error}");
+
+        config.sso.start_url = "https://example.awsapps.com/start".into();
+        config.validate().expect("HTTPS SSO URL must be accepted");
     }
 
     #[test]
@@ -1561,6 +1594,9 @@ schedule = { start = "09:00", end = "18:00", days = ["mon", "tue"] }
             default_socket_path_from(None, Some("/run/user/1000")),
             "/run/user/1000/kproxy/admin.sock"
         );
-        assert_eq!(default_socket_path_from(None, None), "/run/kproxy/admin.sock");
+        assert_eq!(
+            default_socket_path_from(None, None),
+            "/run/kproxy/admin.sock"
+        );
     }
 }

@@ -92,7 +92,10 @@ mod tests {
         let paths = Paths::from_env_values(Some("/custom/kproxy"), None, None, Some("/home/u"));
         assert_eq!(paths.config_dir, PathBuf::from("/custom/kproxy"));
         assert_eq!(paths.data_dir, PathBuf::from("/custom/kproxy"));
-        assert_eq!(paths.config_file, PathBuf::from("/custom/kproxy/config.toml"));
+        assert_eq!(
+            paths.config_file,
+            PathBuf::from("/custom/kproxy/config.toml")
+        );
         assert_eq!(
             paths.accounts_file,
             PathBuf::from("/custom/kproxy/accounts.json")

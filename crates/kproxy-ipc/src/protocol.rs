@@ -364,6 +364,12 @@ pub struct ProxyServiceDeleteParams {
 pub struct ProxyServiceDeleteResult {
     pub service_id: String,
     pub service_name: String,
+    /// Removed API key IDs that were exclusive to the deleted service.
+    #[serde(default)]
+    pub deleted_api_key_ids: Vec<String>,
+    /// API key IDs retained because another proxy service still references them.
+    #[serde(default)]
+    pub retained_api_key_ids: Vec<String>,
 }
 
 /// `service.apikeys` 参数。

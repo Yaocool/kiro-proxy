@@ -5,7 +5,7 @@ use clap::Subcommand;
 use kproxy_core::account::Account;
 use kproxy_core::ids::{new_account_id, new_machine_id};
 use kproxy_ipc::protocol::{
-    method, AccountDetail, AccountImportResult, AccountListResult, AccountSummary,
+    method, AccountDetail, AccountImportResult, AccountListResult, AccountSummary, ConfigShowResult,
 };
 
 use crate::client::AdminClient;
@@ -68,8 +68,9 @@ pub enum AccountCommand {
     AddSso {
         #[arg(long)]
         email: Option<String>,
+        /// IAM Identity Center start URL；未提供时读取 [sso].start_url。
         #[arg(long)]
-        start_url: String,
+        start_url: Option<String>,
         #[arg(long, default_value = "us-east-1")]
         region: String,
         /// 必须显式声明，从标准输入读取一行密码；密码不会进入命令行历史。
@@ -91,7 +92,7 @@ pub enum AccountCommand {
         #[arg(long, value_name = "PATH")]
         file: String,
         #[arg(long)]
-        start_url: String,
+        start_url: Option<String>,
         #[arg(long, default_value = "us-east-1")]
         region: String,
         /// 同时启动的登录数；默认串行，降低提供商风控概率。
@@ -102,14 +103,11 @@ pub enum AccountCommand {
     },
     /// 删除账号。
     #[command(
-        long_about = "删除账号。\n\n示例：\n  kproxy account rm acc_7f3a2b1c --yes\n  kproxy account rm user@example.com --yes"
+        long_about = "删除账号，执行前需输入 y 或 yes 确认。\n\n示例：\n  kproxy account rm acc_7f3a2b1c\n  kproxy account rm user@example.com"
     )]
     Rm {
         /// 账号 ID 或邮箱。
         id: String,
-        /// 跳过确认。
-        #[arg(long)]
-        yes: bool,
     },
     /// 启用账号。
     #[command(
@@ -159,7 +157,9 @@ pub enum AccountCommand {
         all: bool,
     },
     /// 探测账号可用端点与模型。
-    #[command(after_help = "示例：\n  kproxy account probe acc_7f3a2b1c\n  kproxy account probe --all")]
+    #[command(
+        after_help = "示例：\n  kproxy account probe acc_7f3a2b1c\n  kproxy account probe --all"
+    )]
     Probe {
         id: Option<String>,
         #[arg(long, conflicts_with = "id")]
@@ -372,6 +372,7 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             concurrency,
             headful,
         } => {
+            let start_url = resolve_start_url(client, start_url.as_deref()).await?;
             if let Some(file) = batch {
                 run_sso_batch(
                     client,
@@ -415,6 +416,7 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             concurrency,
             headful,
         } => {
+            let start_url = resolve_start_url(client, start_url.as_deref()).await?;
             run_sso_batch(
                 client,
                 &file,
@@ -426,8 +428,8 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             )
             .await?;
         }
-        AccountCommand::Rm { id, yes } => {
-            if !yes && !confirm(&format!("确认删除账号 {id}？")).await? {
+        AccountCommand::Rm { id } => {
+            if !crate::commands::confirm(&format!("确认删除账号 {id}？")).await? {
                 println!("已取消");
                 return Ok(());
             }
@@ -524,6 +526,31 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
         }
     }
     Ok(())
+}
+
+async fn resolve_start_url(client: &mut AdminClient, explicit: Option<&str>) -> Result<String> {
+    if let Some(url) = explicit.map(str::trim).filter(|url| !url.is_empty()) {
+        return validate_start_url(url);
+    }
+    let show: ConfigShowResult = client
+        .call(method::CONFIG_SHOW, serde_json::json!({}))
+        .await?;
+    let config: kproxy_core::config::Config =
+        serde_json::from_value(show.effective_json).context("daemon 返回的生效配置无效")?;
+    let configured = config.sso.start_url.trim();
+    if configured.is_empty() {
+        return Err(anyhow!(
+            "需提供 --start-url，或在配置文件中设置 [sso].start_url"
+        ));
+    }
+    validate_start_url(configured)
+}
+
+fn validate_start_url(url: &str) -> Result<String> {
+    if !url.starts_with("https://") {
+        return Err(anyhow!("SSO start URL 必须使用 https://"));
+    }
+    Ok(url.to_owned())
 }
 
 fn require_id_or_all(id: Option<&str>, all: bool) -> Result<()> {
@@ -709,23 +736,6 @@ fn parse_csv_line(line: &str) -> Result<Vec<String>> {
         return Err(anyhow!("未闭合的引号"));
     }
     Ok(fields)
-}
-
-async fn confirm(prompt: &str) -> Result<bool> {
-    use std::io::Write;
-    use tokio::io::{AsyncBufReadExt, BufReader};
-
-    print!("{prompt} [y/N] ");
-    let _flush_result = std::io::stdout().flush();
-    let mut line = String::new();
-    BufReader::new(tokio::io::stdin())
-        .read_line(&mut line)
-        .await
-        .context("读取确认输入失败")?;
-    Ok(matches!(
-        line.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
 }
 
 fn print_detail(detail: &AccountDetail) {
