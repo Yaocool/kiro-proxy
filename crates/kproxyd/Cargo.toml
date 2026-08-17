@@ -6,7 +6,7 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-default = []
+default = ["sso"]
 sso = ["dep:chromiumoxide"]
 
 [[bin]]

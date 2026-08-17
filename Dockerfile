@@ -4,10 +4,10 @@ FROM rust:${RUST_VERSION}-bookworm AS builder-slim
 WORKDIR /src
 COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY crates ./crates
-RUN cargo build --release --locked --workspace
+RUN cargo build --release --locked --workspace --no-default-features
 
 FROM builder-slim AS builder-full
-RUN cargo build --release --locked -p kproxyd --features sso
+RUN cargo build --release --locked --workspace --all-features
 
 FROM debian:bookworm-slim AS runtime-base
 RUN apt-get update \
@@ -37,4 +37,4 @@ COPY --from=builder-full /src/target/release/kproxyd /usr/local/bin/kproxyd
 ENV KPROXY_CHROMIUM_NO_SANDBOX=1
 USER kproxy:kproxy
 
-FROM runtime-slim AS final
+FROM runtime-full AS final

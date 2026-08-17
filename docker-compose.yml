@@ -1,8 +1,11 @@
+name: kiro-proxy
+
 services:
   kproxyd:
+    image: kiro-proxy:latest
     build:
       context: .
-      target: runtime-slim # 支持 runtime-slim 和 runtime-full，runtime-full 支持启用 SSO 浏览器自动登录
+      target: runtime-full # 默认包含全部 feature 和 SSO 浏览器；可显式改为 runtime-slim
       args:
         RUST_VERSION: "1.97.1"
     # Share the host network so proxy services created on arbitrary ports become

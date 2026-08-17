@@ -156,7 +156,7 @@ async fn register_client(
     let response = client
         .post(format!("{oidc}/client/register"))
         .json(&RegistrationRequest {
-            client_name: "Kiro Account Manager",
+            client_name: "kiro-proxy",
             client_type: "public",
             scopes: SCOPES,
             grant_types: ["authorization_code", "refresh_token"],
@@ -286,7 +286,7 @@ async fn write_callback_response(
 ) -> Result<()> {
     let reason = if status == 200 { "OK" } else { "Bad Request" };
     let body = format!(
-        "<!doctype html><meta charset=utf-8><title>Kiro login</title><style>body{{font:16px system-ui;max-width:680px;margin:15vh auto;padding:2rem}}</style><h1>Kiro Account Manager</h1><p>{message}</p>"
+        "<!doctype html><meta charset=utf-8><title>kiro-proxy login</title><style>body{{font:16px system-ui;max-width:680px;margin:15vh auto;padding:2rem}}</style><h1>kiro-proxy</h1><p>{message}</p>"
     );
     let response = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\nCache-Control: no-store\r\n\r\n{body}",
