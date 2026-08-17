@@ -13,6 +13,9 @@ use tracing::{error, info, warn};
 
 use crate::atomic::{is_missing, read_to_string_with_retry};
 
+/// Synchronous runtime validation/application hook used by the file watcher.
+pub type ConfigApplyHook = Arc<dyn Fn(&Config) -> std::result::Result<(), String> + Send + Sync>;
+
 /// 一次重载的结果。
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReloadOutcome {
@@ -115,15 +118,18 @@ pub fn spawn_config_watcher(
     handle: ConfigHandle,
     debounce: Duration,
 ) -> Result<ConfigWatcher> {
-    spawn_config_watcher_with_hook(path, handle, debounce, Arc::new(|_| {}))
+    spawn_config_watcher_with_hook(path, handle, debounce, Arc::new(|_| Ok(())))
 }
 
-/// 启动配置监听，并在成功应用后同步通知运行时组件。
+/// 启动配置监听，并在提交配置前同步通知运行时组件。
+///
+/// hook 返回错误时保留原配置，避免文件解析成功但运行时监听启动失败后仍
+/// 把新配置报告为已应用。
 pub fn spawn_config_watcher_with_hook(
     path: PathBuf,
     handle: ConfigHandle,
     debounce: Duration,
-    hook: Arc<dyn Fn(&Config) + Send + Sync>,
+    hook: ConfigApplyHook,
 ) -> Result<ConfigWatcher> {
     let watch_target = path
         .parent()
@@ -198,11 +204,7 @@ pub fn spawn_config_watcher_with_hook(
     })
 }
 
-fn apply_reload(
-    path: &Path,
-    handle: &ConfigHandle,
-    hook: &Arc<dyn Fn(&Config) + Send + Sync>,
-) -> ReloadOutcome {
+fn apply_reload(path: &Path, handle: &ConfigHandle, hook: &ConfigApplyHook) -> ReloadOutcome {
     let raw = match std::fs::read_to_string(path) {
         Ok(raw) => raw,
         Err(read_error) => {
@@ -239,8 +241,15 @@ fn apply_reload(
             "config field requires restart to take effect"
         );
     }
+    if let Err(apply_error) = hook(&next) {
+        error!(error = %apply_error, "runtime config apply failed; keeping current config");
+        return ReloadOutcome {
+            applied: false,
+            error: Some(apply_error),
+            needs_restart,
+        };
+    }
     handle.replace(next);
-    hook(&handle.current());
     info!(path = %path.display(), "config reloaded");
     ReloadOutcome {
         applied: true,
@@ -326,6 +335,20 @@ mod tests {
         let (mode, restart) = merge_hot_reload(&old, mode);
         assert_eq!(restart, vec!["server.tls.enabled"]);
         assert!(!mode.server.tls.enabled);
+    }
+
+    #[test]
+    fn runtime_hook_failure_keeps_previous_config() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("config.toml");
+        std::fs::write(&path, "[server]\nport = 6100\n").expect("edit");
+        let handle = ConfigHandle::new(Config::default());
+        let hook: ConfigApplyHook = Arc::new(|_| Err("listener bind failed".into()));
+        let outcome = apply_reload(&path, &handle, &hook);
+
+        assert!(!outcome.applied);
+        assert_eq!(outcome.error.as_deref(), Some("listener bind failed"));
+        assert_eq!(handle.current().server.port, 5580);
     }
 
     #[tokio::test]

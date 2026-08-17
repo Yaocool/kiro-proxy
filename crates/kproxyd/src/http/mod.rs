@@ -301,10 +301,9 @@ impl ProxyServiceManager {
             let ids = running
                 .iter()
                 .filter_map(|(id, current)| {
-                    desired
-                        .get(id)
-                        .is_none_or(|next| next != &current.config)
-                        .then_some(id.clone())
+                    (current.task.is_finished()
+                        || desired.get(id).is_none_or(|next| next != &current.config))
+                    .then_some(id.clone())
                 })
                 .collect::<Vec<_>>();
             ids.into_iter()
@@ -312,6 +311,17 @@ impl ProxyServiceManager {
                 .collect::<Vec<_>>()
         };
         for mut service in stopped {
+            if service.task.is_finished() && desired.contains_key(&service.config.id) {
+                let error = read_lock(&service.error)
+                    .clone()
+                    .unwrap_or_else(|| "listener task exited unexpectedly".into());
+                tracing::warn!(
+                    service_id = %service.config.id,
+                    service_name = %service.config.name,
+                    %error,
+                    "proxy service stopped; scheduling restart"
+                );
+            }
             service.cancel.cancel();
             if tokio::time::timeout(Duration::from_secs(10), &mut service.task)
                 .await
@@ -483,7 +493,7 @@ fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Method, Request, StatusCode};
-    use kproxy_core::config::{ApiKeyConfig, ApiKeyFormat, Config};
+    use kproxy_core::config::{ApiKeyConfig, ApiKeyFormat, Config, ProxyServiceConfig};
     use kproxy_core::paths::Paths;
     use kproxy_store::accounts::AccountStore;
     use kproxy_store::config_loader::ConfigHandle;
