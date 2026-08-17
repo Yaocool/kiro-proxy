@@ -122,6 +122,24 @@ GET  /health
 同时支持 Claude 别名 `/messages`、`/anthropic/v1/messages`，以及 OpenAI 别名
 `/chat/completions`、`/models`。
 
+### Claude Code MCP Tool Search
+
+当 `ANTHROPIC_BASE_URL` 指向第三方代理时，Claude Code 默认会关闭 Tool Search，并在请求中
+一次性加载全部 MCP schema。MCP 工具较多时，应显式启用：
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:5580 ENABLE_TOOL_SEARCH=true claude
+```
+
+`kiro-proxy` 现已兼容 Anthropic 的 `defer_loading`、regex/BM25 Tool Search 和
+`tool_reference` 历史块。由于 Kiro 没有原生 Tool Search server tool，代理会在本地执行搜索，
+默认向 Kiro 暴露最多 5 个匹配定义，也支持搜索请求通过 `limit` 指定 1–10000 个结果，并在
+同一个响应中继续生成；未命中的 deferred schema 不会进入 Kiro 上下文或上游 payload。
+
+自动生成的 `[context]` 配置还通过 `max_tool_input_tokens` 限制已加载工具的估算 token，
+并通过 `max_upstream_payload_bytes` 限制序列化后的 Kiro 请求大小。超限请求会在本地返回明确的
+413，而不是留给上游返回不透明错误。
+
 ## 配置与文件
 
 `.env` 用于启动路径选择和临时进程级覆盖；`config.toml` 用于持久化服务、账号池、模型、

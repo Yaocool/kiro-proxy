@@ -15,9 +15,10 @@ use kproxy_notify::{WebhookEvent, WebhookEventKind};
 use kproxy_pool::{AccountLease, PoolError};
 use kproxy_translate::model::{apply_adaptive_thinking, map_model, thinking_enabled_for_model};
 use kproxy_translate::{
-    apply_compaction_boundary, claude_to_kiro, compact_trigger_tokens, error_envelope,
-    openai_to_kiro, sanitize_error_message, validate_claude, validate_openai, ClaudeRequest,
-    ErrorFormat, OpenAiRequest, TranslationOptions,
+    apply_compaction_boundary, claude_loaded_tools, claude_to_kiro, compact_trigger_tokens,
+    error_envelope, openai_to_kiro, sanitize_error_message, tool_search_continue_payload,
+    validate_claude, validate_openai, ClaudeRequest, ClaudeToolSearchCatalog, ErrorFormat,
+    KiroToolUse, OpenAiRequest, TranslationOptions,
 };
 use rand::Rng;
 use serde_json::{json, Value};
@@ -444,6 +445,41 @@ async fn handle_claude(
         .enable_prompt_cache
         .then(|| state.prompt_cache.claude_profile(&request, input_tokens))
         .flatten();
+    let full_tool_tokens = state
+        .tokenizer
+        .estimate_claude_tools(&claude_loaded_tools(&request))
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error,
+                ErrorFormat::Claude,
+            )
+        })? as u64;
+    // Move the deferred catalog out of the public request after translation so
+    // a large MCP catalog has only one in-memory owner during upstream work.
+    let tool_search = ClaudeToolSearchCatalog::take_from_request(&mut request);
+    let tool_tokens = (state
+        .tokenizer
+        .estimate_kiro_tools(&payload)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error,
+                ErrorFormat::Claude,
+            )
+        })? as u64)
+        .max(full_tool_tokens);
+    let payload_bytes = serialized_payload_bytes(&payload, ErrorFormat::Claude)?;
+    enforce_payload_budget(
+        &state,
+        tool_tokens,
+        payload_bytes,
+        loaded_tool_count(&payload),
+        tool_search.is_some(),
+        ErrorFormat::Claude,
+    )?;
     enforce_context(
         &state,
         input_tokens,
@@ -459,6 +495,10 @@ async fn handle_claude(
         requested_model = %request.model,
         mapped_model = %route.mapped,
         input_tokens,
+        tool_tokens,
+        payload_bytes,
+        loaded_tool_count = loaded_tool_count(&payload),
+        deferred_tool_count = tool_search.as_ref().map_or(0, ClaudeToolSearchCatalog::deferred_len),
         estimated_credits = estimate,
         "upstream request prepared"
     );
@@ -521,6 +561,7 @@ async fn handle_claude(
                 thinking_output_format: config.features.thinking_output_format,
                 include_usage_chunk: false,
                 web_tool_names,
+                tool_search,
                 openai_tools: std::collections::HashMap::new(),
                 _connection_guard: connection_guard,
                 _admission_guard: admission_guard,
@@ -543,10 +584,13 @@ async fn handle_claude(
         model_mapping_rule,
         attempts,
         input_tokens,
+        compacted,
         estimate,
         started,
         prompt_cache,
         compaction_summary,
+        tool_search,
+        web_tool_names,
     )
     .await
 }
@@ -653,6 +697,26 @@ async fn handle_openai(
         .enable_prompt_cache
         .then(|| state.prompt_cache.openai_profile(&request, input_tokens))
         .flatten();
+    let tool_tokens = state
+        .tokenizer
+        .estimate_kiro_tools(&payload)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error,
+                ErrorFormat::OpenAi,
+            )
+        })? as u64;
+    let payload_bytes = serialized_payload_bytes(&payload, ErrorFormat::OpenAi)?;
+    enforce_payload_budget(
+        &state,
+        tool_tokens,
+        payload_bytes,
+        loaded_tool_count(&payload),
+        false,
+        ErrorFormat::OpenAi,
+    )?;
     enforce_context(
         &state,
         input_tokens,
@@ -668,6 +732,9 @@ async fn handle_openai(
         requested_model = %request.model,
         mapped_model = %route.mapped,
         input_tokens,
+        tool_tokens,
+        payload_bytes,
+        loaded_tool_count = loaded_tool_count(&payload),
         max_tokens,
         estimated_credits = estimate,
         "upstream request prepared"
@@ -738,6 +805,7 @@ async fn handle_openai(
                 thinking_output_format: config.features.thinking_output_format,
                 include_usage_chunk,
                 web_tool_names: std::collections::HashMap::new(),
+                tool_search: None,
                 openai_tools,
                 _connection_guard: connection_guard,
                 _admission_guard: admission_guard,
@@ -1622,11 +1690,12 @@ enum ExecuteError {
 }
 
 pub(super) struct ContextLimitError {
-    model: String,
-    input_tokens: u64,
-    maximum: u64,
+    pub(super) model: String,
+    pub(super) input_tokens: u64,
+    pub(super) maximum: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn collect_nonstream_rounds(
     state: &Arc<AppState>,
     trace_id: &str,
@@ -1635,7 +1704,10 @@ async fn collect_nonstream_rounds(
     estimated_credits: f64,
     mut upstream: KiroResponse,
     mut payload: kproxy_translate::KiroPayload,
+    compact: bool,
+    tool_search: Option<&ClaudeToolSearchCatalog>,
 ) -> Result<(DecodedResponse, String, u64), ExecuteError> {
+    const MAX_TOOL_SEARCH_ROUNDS: u32 = 8;
     let config = state.config.current();
     let client_has_tools = payload
         .conversation_state
@@ -1648,7 +1720,9 @@ async fn collect_nonstream_rounds(
     let mut accumulated_usage = kproxy_kiro::UsageInfo::default();
     let mut accumulated_text = String::new();
     let mut accumulated_reasoning = String::new();
+    let mut accumulated_searches = Vec::new();
     let mut round = 0;
+    let mut search_round = 0;
     loop {
         let (endpoint_definition, response, _upstream_permit) = upstream.into_parts();
         let endpoint = endpoint_definition.name.to_string();
@@ -1679,22 +1753,188 @@ async fn collect_nonstream_rounds(
                 })
             })?;
         }
+        decoded.validate_tool_inputs().map_err(|message| {
+            ExecuteError::Upstream(KiroError {
+                status: None,
+                endpoint: endpoint.clone(),
+                message,
+            })
+        })?;
+        fill_missing_usage(state, &mut decoded, &payload).await;
+
+        let search_key = tool_search.and_then(|catalog| {
+            decoded
+                .tools
+                .iter()
+                .find(|(_, tool)| catalog.is_search_tool(&tool.name))
+                .map(|(id, _)| id.clone())
+        });
+        if let (Some(catalog), Some(search_key)) = (tool_search, search_key) {
+            if search_round >= MAX_TOOL_SEARCH_ROUNDS {
+                return Err(ExecuteError::Upstream(KiroError {
+                    status: None,
+                    endpoint,
+                    message: format!(
+                        "Tool Search exceeded the {MAX_TOOL_SEARCH_ROUNDS}-round proxy limit"
+                    ),
+                }));
+            }
+            let search = decoded
+                .tools
+                .remove(&search_key)
+                .expect("Tool Search buffer exists");
+            let search_use = KiroToolUse {
+                tool_use_id: search.id,
+                name: search.name,
+                input: super::response::repair_json(&search.input),
+            };
+            let outcome = catalog.search(&search_use);
+            let documentation_tokens = state
+                .tokenizer
+                .count(outcome.documentation.join("\n\n"))
+                .await
+                .map_err(|message| {
+                    ExecuteError::Upstream(KiroError {
+                        status: None,
+                        endpoint: endpoint.clone(),
+                        message,
+                    })
+                })? as u64;
+            tracing::info!(
+                trace_id,
+                account_id = %lease.account_id(),
+                endpoint,
+                search_tool = %outcome.trace.name,
+                search_round = search_round + 1,
+                matched_tools = outcome.trace.references.len(),
+                search_error = outcome.trace.error.is_some(),
+                "proxy Tool Search executed"
+            );
+            accumulated_searches.push(outcome.trace.clone());
+            if !decoded.tools.is_empty() {
+                accumulated_text.push_str(&decoded.text);
+                accumulated_reasoning.push_str(&decoded.reasoning);
+                decoded.text = accumulated_text;
+                decoded.reasoning = accumulated_reasoning;
+                decoded.tool_searches = accumulated_searches;
+                let current_round_output_tokens = decoded.usage.output_tokens;
+                merge_round_usage(&mut decoded.usage, &accumulated_usage);
+                return Ok((decoded, endpoint, current_round_output_tokens));
+            }
+
+            let round_text = std::mem::take(&mut decoded.text);
+            accumulated_text.push_str(&round_text);
+            accumulated_reasoning.push_str(&std::mem::take(&mut decoded.reasoning));
+            payload = tool_search_continue_payload(&payload, &round_text, search_use, &outcome);
+            merge_round_usage(&mut accumulated_usage, &decoded.usage);
+            decoded = DecodedResponse::default();
+            let next_input_tokens = state
+                .tokenizer
+                .estimate_kiro_payload(&payload)
+                .await
+                .map_err(|message| {
+                    ExecuteError::Upstream(KiroError {
+                        status: None,
+                        endpoint: endpoint.clone(),
+                        message,
+                    })
+                })? as u64;
+            let next_tool_tokens = (state
+                .tokenizer
+                .estimate_kiro_tools(&payload)
+                .await
+                .map_err(|message| {
+                    ExecuteError::Upstream(KiroError {
+                        status: None,
+                        endpoint: endpoint.clone(),
+                        message,
+                    })
+                })? as u64)
+                .saturating_add(documentation_tokens);
+            let next_payload_bytes = serde_json::to_vec(&payload)
+                .map_err(|error| {
+                    ExecuteError::Upstream(KiroError {
+                        status: None,
+                        endpoint: endpoint.clone(),
+                        message: error.to_string(),
+                    })
+                })?
+                .len();
+            let next_loaded_tools = loaded_tool_count(&payload);
+            if next_loaded_tools > kproxy_translate::validate::MAX_TOOLS {
+                return Err(ExecuteError::Upstream(KiroError {
+                    status: Some(413),
+                    endpoint,
+                    message: format!(
+                        "too many loaded tools after Tool Search: {next_loaded_tools} > {}",
+                        kproxy_translate::validate::MAX_TOOLS
+                    ),
+                }));
+            }
+            if next_tool_tokens > u64::from(config.context.max_tool_input_tokens) {
+                return Err(ExecuteError::Upstream(KiroError {
+                    status: Some(413),
+                    endpoint,
+                    message: format!(
+                        "loaded tool definitions are too large after Tool Search: {next_tool_tokens} estimated tokens > {}",
+                        config.context.max_tool_input_tokens
+                    ),
+                }));
+            }
+            if next_payload_bytes > config.context.max_upstream_payload_bytes {
+                return Err(ExecuteError::Upstream(KiroError {
+                    status: Some(413),
+                    endpoint,
+                    message: format!(
+                        "translated upstream payload is too large after Tool Search: {next_payload_bytes} bytes > {}",
+                        config.context.max_upstream_payload_bytes
+                    ),
+                }));
+            }
+            let model = payload
+                .conversation_state
+                .current_message
+                .user_input_message
+                .model_id
+                .clone();
+            check_context_limit(state, next_input_tokens, compact, &model)
+                .map_err(ExecuteError::ContextLimit)?;
+            tracing::debug!(
+                trace_id,
+                input_tokens = next_input_tokens,
+                tool_tokens = next_tool_tokens,
+                payload_bytes = next_payload_bytes,
+                loaded_tool_count = next_loaded_tools,
+                "Tool Search continuation prepared"
+            );
+            if let Err(error) = reservation.extend(estimated_credits) {
+                if matches!(error, MeterError::DailyLimitExceeded) {
+                    trigger_quota_shutdown(
+                        state,
+                        "The service daily credit limit was reached during Tool Search",
+                    );
+                }
+                return Err(ExecuteError::Meter(error));
+            }
+            let account = lease.account().await;
+            upstream = state
+                .kiro()
+                .generate(&account, &payload, None)
+                .await
+                .map_err(ExecuteError::Upstream)?;
+            search_round += 1;
+            continue;
+        }
+
         if client_has_tools
             || decoded.tools.is_empty()
             || round >= config.features.auto_continue_rounds.min(30)
         {
-            decoded.validate_tool_inputs().map_err(|message| {
-                ExecuteError::Upstream(KiroError {
-                    status: None,
-                    endpoint: endpoint.clone(),
-                    message,
-                })
-            })?;
-            fill_missing_usage(state, &mut decoded, &payload).await;
             accumulated_text.push_str(&decoded.text);
             accumulated_reasoning.push_str(&decoded.reasoning);
             decoded.text = accumulated_text;
             decoded.reasoning = accumulated_reasoning;
+            decoded.tool_searches = accumulated_searches;
             let current_round_output_tokens = decoded.usage.output_tokens;
             merge_round_usage(&mut decoded.usage, &accumulated_usage);
             tracing::debug!(
@@ -1710,14 +1950,6 @@ async fn collect_nonstream_rounds(
             );
             return Ok((decoded, endpoint, current_round_output_tokens));
         }
-        decoded.validate_tool_inputs().map_err(|message| {
-            ExecuteError::Upstream(KiroError {
-                status: None,
-                endpoint: endpoint.clone(),
-                message,
-            })
-        })?;
-        fill_missing_usage(state, &mut decoded, &payload).await;
         let uses = decoded
             .tools
             .values()
@@ -1794,10 +2026,13 @@ async fn nonstream_claude(
     model_mapping_rule: Option<String>,
     attempts: Vec<UpstreamAttemptLog>,
     _input_tokens: u64,
+    compact: bool,
     estimated_credits: f64,
     started: Instant,
     prompt_cache: Option<PromptCacheProfile>,
     compaction_summary: Option<String>,
+    tool_search: Option<ClaudeToolSearchCatalog>,
+    web_tool_names: std::collections::HashMap<String, String>,
 ) -> Result<Response, ApiError> {
     let (mut decoded, endpoint, current_round_output_tokens) = collect_nonstream_rounds(
         &state,
@@ -1807,10 +2042,12 @@ async fn nonstream_claude(
         estimated_credits,
         upstream,
         payload,
+        compact,
+        tool_search.as_ref(),
     )
     .await
     .map_err(|error| upstream_error(error, ErrorFormat::Claude))?;
-    decoded.restore_tool_names(&claude_web_tool_names(&request));
+    decoded.restore_tool_names(&web_tool_names);
     let current_round_output_tokens = if current_round_output_tokens == 0 {
         decoded.usage.output_tokens
     } else {
@@ -1907,6 +2144,8 @@ async fn nonstream_openai(
         estimated_credits,
         upstream,
         payload,
+        false,
+        None,
     )
     .await
     .map_err(|error| upstream_error(error, ErrorFormat::OpenAi))?;
@@ -2470,6 +2709,80 @@ fn enforce_context(
     } else {
         Ok(())
     }
+}
+
+fn serialized_payload_bytes(
+    payload: &kproxy_translate::KiroPayload,
+    format: ErrorFormat,
+) -> Result<usize, ApiError> {
+    serde_json::to_vec(payload)
+        .map(|payload| payload.len())
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to serialize upstream request: {error}"),
+                format,
+            )
+        })
+}
+
+fn loaded_tool_count(payload: &kproxy_translate::KiroPayload) -> usize {
+    payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .user_input_message_context
+        .as_ref()
+        .map_or(0, |context| context.tools.len())
+}
+
+fn enforce_payload_budget(
+    state: &Arc<AppState>,
+    tool_tokens: u64,
+    payload_bytes: usize,
+    loaded_tools: usize,
+    tool_search_enabled: bool,
+    format: ErrorFormat,
+) -> Result<(), ApiError> {
+    let context = &state.config.current().context;
+    if loaded_tools > kproxy_translate::validate::MAX_TOOLS {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "too many loaded tools: {loaded_tools} > {}; defer more tools or reduce Tool Search references",
+                kproxy_translate::validate::MAX_TOOLS
+            ),
+            format,
+        ));
+    }
+    if tool_tokens > u64::from(context.max_tool_input_tokens) {
+        let guidance = if tool_search_enabled {
+            "reduce always-loaded tools or their schemas"
+        } else if format == ErrorFormat::Claude {
+            "enable Anthropic Tool Search (for Claude Code, set ENABLE_TOOL_SEARCH=true) or disable unused MCP servers"
+        } else {
+            "reduce the number or size of loaded tool schemas"
+        };
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "loaded tool definitions are too large: {tool_tokens} estimated tokens > {}; {guidance}",
+                context.max_tool_input_tokens
+            ),
+            format,
+        ));
+    }
+    if payload_bytes > context.max_upstream_payload_bytes {
+        return Err(ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "translated upstream payload is too large: {payload_bytes} bytes > {}; reduce the conversation or loaded tool schemas",
+                context.max_upstream_payload_bytes
+            ),
+            format,
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn check_context_limit(

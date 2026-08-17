@@ -4,12 +4,15 @@ use base64::Engine as _;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::{ClaudeRequest, OpenAiRequest};
+use crate::{is_tool_search_type, ClaudeRequest, OpenAiRequest};
 
 pub const MAX_SCHEMA_DEPTH: usize = 64;
 pub const MAX_SCHEMA_NODES: usize = 50_000;
 pub const MAX_TOOL_DOC_CHARS: usize = 512_000;
 pub const MAX_TOOLS: usize = 256;
+pub const MAX_DEFERRED_TOOLS: usize = 10_000;
+pub const MAX_LOADED_TOOL_BYTES: usize = 4 * 1024 * 1024;
+pub const MAX_DEFERRED_TOOL_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_TOOL_NAME_CHARS: usize = 1_024;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -22,6 +25,12 @@ pub enum ValidationError {
     InvalidMaxTokens,
     #[error("too many tools: maximum is {MAX_TOOLS}")]
     TooManyTools,
+    #[error("too many deferred tools: maximum is {MAX_DEFERRED_TOOLS}")]
+    TooManyDeferredTools,
+    #[error("loaded tool definitions exceed the {MAX_LOADED_TOOL_BYTES} byte limit; enable Anthropic Tool Search and defer MCP tools")]
+    LoadedToolDefinitionsTooLarge,
+    #[error("deferred tool catalog exceeds the {MAX_DEFERRED_TOOL_BYTES} byte limit")]
+    DeferredToolDefinitionsTooLarge,
     #[error("tool name exceeds {MAX_TOOL_NAME_CHARS} characters")]
     ToolNameTooLong,
     #[error("tool documentation exceeds {MAX_TOOL_DOC_CHARS} characters")]
@@ -52,12 +61,43 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
             format!("messages.{index}.content"),
         )?;
     }
-    if request.tools.len() > MAX_TOOLS {
+    let deferred_count = request
+        .tools
+        .iter()
+        .filter(|tool| tool.defer_loading)
+        .count();
+    let loaded_count = request.tools.len().saturating_sub(deferred_count);
+    if loaded_count > MAX_TOOLS {
         return Err(ValidationError::TooManyTools);
+    }
+    if deferred_count > MAX_DEFERRED_TOOLS {
+        return Err(ValidationError::TooManyDeferredTools);
+    }
+    let (loaded_bytes, deferred_bytes) =
+        request
+            .tools
+            .iter()
+            .fold((0usize, 0usize), |(loaded, deferred), tool| {
+                let bytes = serde_json::to_vec(tool).map_or(usize::MAX, |value| value.len());
+                if tool.defer_loading {
+                    (loaded, deferred.saturating_add(bytes))
+                } else {
+                    (loaded.saturating_add(bytes), deferred)
+                }
+            });
+    if loaded_bytes > MAX_LOADED_TOOL_BYTES {
+        return Err(ValidationError::LoadedToolDefinitionsTooLarge);
+    }
+    if deferred_bytes > MAX_DEFERRED_TOOL_BYTES {
+        return Err(ValidationError::DeferredToolDefinitionsTooLarge);
+    }
+    if deferred_count > 0 && loaded_count == 0 {
+        return invalid("tools", "at least one tool must have defer_loading=false");
     }
     let docs = request
         .tools
         .iter()
+        .filter(|tool| !tool.defer_loading)
         .map(|tool| {
             tool.description.chars().count()
                 + tool
@@ -77,7 +117,8 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
         let kind = tool.r#type.as_deref();
         let web_tool = kind
             .is_some_and(|kind| kind.starts_with("web_search") || kind.starts_with("web_fetch"));
-        if kind.is_some_and(|kind| kind != "custom") && !web_tool {
+        let search_tool = kind.is_some_and(is_tool_search_type);
+        if kind.is_some_and(|kind| kind != "custom") && !web_tool && !search_tool {
             return invalid(
                 format!("tools.{index}.type"),
                 format!(
@@ -86,7 +127,7 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
                 ),
             );
         }
-        if !web_tool {
+        if !web_tool && !search_tool {
             validate_tool(&tool.name, &tool.input_schema).map_err(|error| {
                 ValidationError::InvalidField {
                     field: format!("tools.{index}.input_schema"),
@@ -98,6 +139,18 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
             return invalid(
                 format!("tools.{index}.strict"),
                 "strict tool schemas are not supported by the Kiro upstream",
+            );
+        }
+        if tool.defer_loading && tool.cache_control.is_some() {
+            return invalid(
+                format!("tools.{index}.cache_control"),
+                "deferred tools cannot define cache_control",
+            );
+        }
+        if search_tool && tool.defer_loading {
+            return invalid(
+                format!("tools.{index}.defer_loading"),
+                "the Tool Search tool must be loaded immediately",
             );
         }
         if tool
@@ -285,6 +338,51 @@ fn validate_claude_block(
                 return invalid(format!("{field}.input"), "expected an object");
             }
         }
+        "server_tool_use" if !tool_result_content => {
+            if role != "assistant" {
+                return invalid(
+                    format!("{field}.type"),
+                    "server_tool_use blocks require an assistant role",
+                );
+            }
+            for name in ["id", "name"] {
+                if block
+                    .get(name)
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    return invalid(format!("{field}.{name}"), "is required");
+                }
+            }
+            if !block.get("input").is_some_and(Value::is_object) {
+                return invalid(format!("{field}.input"), "expected an object");
+            }
+        }
+        "tool_search_tool_result" if !tool_result_content => {
+            if role != "assistant" {
+                return invalid(
+                    format!("{field}.type"),
+                    "tool_search_tool_result blocks require an assistant role",
+                );
+            }
+            if block
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return invalid(format!("{field}.tool_use_id"), "is required");
+            }
+            validate_tool_search_result(block.get("content"), &format!("{field}.content"))?;
+        }
+        "tool_reference" if tool_result_content => {
+            if block
+                .get("tool_name")
+                .and_then(Value::as_str)
+                .is_none_or(str::is_empty)
+            {
+                return invalid(format!("{field}.tool_name"), "is required");
+            }
+        }
         "thinking" if !tool_result_content => {
             if role != "assistant" || !block.get("thinking").is_some_and(Value::is_string) {
                 return invalid(
@@ -315,6 +413,45 @@ fn validate_claude_block(
         }
     }
     Ok(())
+}
+
+fn validate_tool_search_result(value: Option<&Value>, field: &str) -> Result<(), ValidationError> {
+    let Some(value) = value else {
+        return invalid(field, "is required");
+    };
+    match value.get("type").and_then(Value::as_str) {
+        Some("tool_search_tool_search_result") => {
+            let Some(references) = value.get("tool_references").and_then(Value::as_array) else {
+                return invalid(format!("{field}.tool_references"), "expected an array");
+            };
+            for (index, reference) in references.iter().enumerate() {
+                if reference.get("type").and_then(Value::as_str) != Some("tool_reference")
+                    || reference
+                        .get("tool_name")
+                        .and_then(Value::as_str)
+                        .is_none_or(str::is_empty)
+                {
+                    return invalid(
+                        format!("{field}.tool_references.{index}"),
+                        "expected a tool_reference with tool_name",
+                    );
+                }
+            }
+            Ok(())
+        }
+        Some("tool_search_tool_result_error") => {
+            if !value.get("error_code").is_some_and(Value::is_string)
+                || !value.get("error_message").is_some_and(Value::is_string)
+            {
+                return invalid(
+                    field,
+                    "tool search errors require error_code and error_message",
+                );
+            }
+            Ok(())
+        }
+        _ => invalid(field, "expected a Tool Search result or error"),
+    }
 }
 
 fn validate_claude_image(block: &Value, field: &str) -> Result<(), ValidationError> {
@@ -948,6 +1085,7 @@ mod tests {
             cache_control: None,
             strict: None,
             input_examples: None,
+            defer_loading: false,
         }
     }
 
@@ -976,6 +1114,7 @@ mod tests {
             cache_control: None,
             strict: None,
             input_examples: None,
+            defer_loading: false,
         });
         assert_eq!(
             validate_claude(&input),
@@ -997,6 +1136,7 @@ mod tests {
             cache_control: None,
             strict: Some(true),
             input_examples: Some(vec![Value::String("not an object".into())]),
+            defer_loading: false,
         });
         assert!(validate_claude(&input)
             .expect_err("strict")
@@ -1048,6 +1188,50 @@ mod tests {
             .expect_err("unknown block")
             .to_string()
             .contains("unsupported Claude content block"));
+    }
+
+    #[test]
+    fn validates_anthropic_tool_search_contract() {
+        let mut input = request();
+        input.tools = vec![
+            ClaudeTool {
+                r#type: Some("tool_search_tool_regex_20251119".into()),
+                name: "tool_search_tool_regex".into(),
+                description: String::new(),
+                input_schema: serde_json::json!({}),
+                cache_control: None,
+                strict: None,
+                input_examples: None,
+                defer_loading: false,
+            },
+            ClaudeTool {
+                defer_loading: true,
+                ..tool(1)
+            },
+        ];
+        input.messages = vec![
+            ClaudeMessage {
+                role: "assistant".into(),
+                content: serde_json::json!([
+                    {"type":"server_tool_use","id":"srvtoolu_1","name":"tool_search_tool_regex","input":{"pattern":"issue"}},
+                    {"type":"tool_search_tool_result","tool_use_id":"srvtoolu_1","content":{
+                        "type":"tool_search_tool_search_result",
+                        "tool_references":[{"type":"tool_reference","tool_name":"tool_1"}]
+                    }}
+                ]),
+            },
+            ClaudeMessage {
+                role: "user".into(),
+                content: Value::String("continue".into()),
+            },
+        ];
+        validate_claude(&input).expect("official Tool Search request");
+
+        input.tools.remove(0);
+        assert!(validate_claude(&input)
+            .expect_err("missing search tool")
+            .to_string()
+            .contains("defer_loading=false"));
     }
 
     #[test]

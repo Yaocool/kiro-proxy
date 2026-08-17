@@ -41,7 +41,7 @@ impl PromptCacheTracker {
     ) -> Option<PromptCacheProfile> {
         let mut blocks = Vec::new();
         append_value(&mut blocks, request.system.as_ref());
-        for tool in &request.tools {
+        for tool in request.tools.iter().filter(|tool| !tool.defer_loading) {
             append_owned(&mut blocks, serde_json::to_value(tool).ok());
         }
         for message in &request.messages {
@@ -262,5 +262,34 @@ mod tests {
         let mut other = UsageInfo::default();
         tracker.apply("two", Some(&profile), &mut other);
         assert_eq!(other.cache_write_tokens, first.cache_write_tokens);
+    }
+
+    #[test]
+    fn deferred_tools_do_not_change_prompt_cache_prefix() {
+        let tracker = PromptCacheTracker::default();
+        let base = json!({
+            "model":"claude-sonnet-4-5","max_tokens":128,
+            "tools":[{
+                "name":"Read","description":"cacheable tool ".repeat(1000),
+                "input_schema":{"type":"object"},
+                "cache_control":{"type":"ephemeral"}
+            }],
+            "messages":[{"role":"user","content":"summarize"}]
+        });
+        let first: ClaudeRequest = serde_json::from_value(base.clone()).expect("request");
+        let mut second: ClaudeRequest = serde_json::from_value(base).expect("request");
+        second.tools.push(
+            serde_json::from_value(json!({
+                "name":"mcp__large__schema",
+                "description":"different deferred catalog",
+                "input_schema":{"type":"object"},
+                "defer_loading":true
+            }))
+            .expect("tool"),
+        );
+        let first = tracker.claude_profile(&first, 8_000).expect("profile");
+        let second = tracker.claude_profile(&second, 8_000).expect("profile");
+        assert_eq!(first.fingerprint, second.fingerprint);
+        assert_eq!(first.tokens, second.tokens);
     }
 }

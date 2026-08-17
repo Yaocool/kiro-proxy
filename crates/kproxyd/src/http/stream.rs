@@ -11,7 +11,10 @@ use futures::StreamExt;
 use kproxy_core::config::ThinkingOutputFormat;
 use kproxy_kiro::{EventStreamDecoder, KiroEvent, KiroResponse};
 use kproxy_pool::AccountLease;
-use kproxy_translate::{auto_continue_payload, KiroPayload, KiroToolUse};
+use kproxy_translate::{
+    auto_continue_payload, tool_search_continue_payload, ClaudeToolSearchCatalog,
+    ClaudeToolSearchTrace, KiroPayload, KiroToolUse,
+};
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
 use tokio_util::codec::Decoder;
@@ -94,6 +97,8 @@ pub struct StreamContext {
     pub include_usage_chunk: bool,
     /// Kiro canonical web tool name -> original Claude server tool type.
     pub web_tool_names: std::collections::HashMap<String, String>,
+    /// Deferred Claude tools retained outside the Kiro payload.
+    pub tool_search: Option<ClaudeToolSearchCatalog>,
     /// Kiro-normalized tool name -> original OpenAI tool type and name.
     pub openai_tools: std::collections::HashMap<String, OpenAiToolIdentity>,
     pub _connection_guard: crate::state::AdmissionGuard,
@@ -142,10 +147,12 @@ pub fn response(
         let mut fallback_model = None::<String>;
         let mut accumulated_text = String::new();
         let mut accumulated_reasoning = String::new();
+        let mut accumulated_searches = Vec::new();
         let mut payload = context.payload.clone();
         let client_has_tools = payload.conversation_state.current_message.user_input_message
             .user_input_message_context.as_ref().is_some_and(|context| !context.tools.is_empty());
         let mut auto_round = 0;
+        let mut search_round = 0u32;
         'rounds: loop {
             let mut leak_filter = ToolLeakFilter::new(context.enable_tool_leak_filter);
             loop {
@@ -168,7 +175,11 @@ pub fn response(
                                         }
                                         for mut event in leak_filter.push(event) {
                                             restore_web_tool_name(&mut event, &context.web_tool_names);
-                                            if !should_buffer_tool_event(
+                                            let internal_search = event_is_tool_search(
+                                                &event,
+                                                context.tool_search.as_ref(),
+                                            );
+                                            if !internal_search && !should_buffer_tool_event(
                                                 &event,
                                                 context.buffer_tool_calls,
                                                 &context.openai_tools,
@@ -231,7 +242,11 @@ pub fn response(
             }
             for mut event in leak_filter.finish() {
                 restore_web_tool_name(&mut event, &context.web_tool_names);
-                if !should_buffer_tool_event(
+                let internal_search = event_is_tool_search(
+                    &event,
+                    context.tool_search.as_ref(),
+                );
+                if !internal_search && !should_buffer_tool_event(
                     &event,
                     context.buffer_tool_calls,
                     &context.openai_tools,
@@ -562,14 +577,169 @@ pub fn response(
             }
             pre_data_retries = 0;
             fill_missing_usage(&context.state, &mut decoded, &payload).await;
-            let should_continue = !client_has_tools
-                && !decoded.tools.is_empty()
-                && auto_round < context.auto_continue_rounds;
             if let Err(error) = decoded.validate_tool_inputs() {
                 failed = Some(error.clone());
                 yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
                 break 'rounds;
             }
+            let search_key = context.tool_search.as_ref().and_then(|catalog| {
+                decoded.tools.iter().find(|(_, tool)| catalog.is_search_tool(&tool.name))
+                    .map(|(id, _)| id.clone())
+            });
+            if let (Some(catalog), Some(search_key)) =
+                (context.tool_search.as_ref(), search_key)
+            {
+                const MAX_TOOL_SEARCH_ROUNDS: u32 = 8;
+                if search_round >= MAX_TOOL_SEARCH_ROUNDS {
+                    let error = format!(
+                        "Tool Search exceeded the {MAX_TOOL_SEARCH_ROUNDS}-round proxy limit"
+                    );
+                    failed = Some(error.clone());
+                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
+                    break 'rounds;
+                }
+                let search = decoded.tools.remove(&search_key).expect("Tool Search buffer exists");
+                let search_use = KiroToolUse {
+                    tool_use_id: search.id,
+                    name: search.name,
+                    input: repair_json(&search.input),
+                };
+                let outcome = catalog.search(&search_use);
+                let documentation_tokens = match context
+                    .state
+                    .tokenizer
+                    .count(outcome.documentation.join("\n\n"))
+                    .await
+                {
+                    Ok(tokens) => tokens as u64,
+                    Err(error) => {
+                        failed = Some(error.clone());
+                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
+                        break 'rounds;
+                    }
+                };
+                tracing::info!(
+                    trace_id = %context.trace_id,
+                    request_id = %context.request_id,
+                    account_id = %context.lease.account_id(),
+                    endpoint,
+                    search_tool = %outcome.trace.name,
+                    search_round = search_round + 1,
+                    matched_tools = outcome.trace.references.len(),
+                    search_error = outcome.trace.error.is_some(),
+                    "proxy Tool Search executed"
+                );
+                if matches!(protocol, StreamProtocol::Claude) {
+                    for data in claude.tool_search(&outcome.trace) {
+                        data_started = true;
+                        yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                    }
+                }
+                accumulated_searches.push(outcome.trace.clone());
+                if !decoded.tools.is_empty() {
+                    break 'rounds;
+                }
+                let round_text = std::mem::take(&mut decoded.text);
+                accumulated_text.push_str(&round_text);
+                accumulated_reasoning.push_str(&std::mem::take(&mut decoded.reasoning));
+                payload = tool_search_continue_payload(&payload, &round_text, search_use, &outcome);
+                accumulate_usage(&mut accumulated_usage, &decoded.usage);
+                decoded = DecodedResponse::default();
+
+                let next_input_tokens = match context.state.tokenizer.estimate_kiro_payload(&payload).await {
+                    Ok(tokens) => tokens as u64,
+                    Err(error) => {
+                        failed = Some(error.clone());
+                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
+                        break 'rounds;
+                    }
+                };
+                let next_tool_tokens = match context.state.tokenizer.estimate_kiro_tools(&payload).await {
+                    Ok(tokens) => (tokens as u64).saturating_add(documentation_tokens),
+                    Err(error) => {
+                        failed = Some(error.clone());
+                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
+                        break 'rounds;
+                    }
+                };
+                let next_payload_bytes = match serde_json::to_vec(&payload) {
+                    Ok(payload) => payload.len(),
+                    Err(error) => {
+                        failed = Some(error.to_string());
+                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error.to_string())));
+                        break 'rounds;
+                    }
+                };
+                let config = context.state.config.current();
+                let next_loaded_tools = payload.conversation_state.current_message
+                    .user_input_message.user_input_message_context.as_ref()
+                    .map_or(0, |context| context.tools.len());
+                let budget_error = if next_loaded_tools > kproxy_translate::validate::MAX_TOOLS {
+                    Some(format!(
+                        "too many loaded tools after Tool Search: {next_loaded_tools} > {}",
+                        kproxy_translate::validate::MAX_TOOLS
+                    ))
+                } else if next_tool_tokens > u64::from(config.context.max_tool_input_tokens) {
+                    Some(format!(
+                        "loaded tool definitions are too large after Tool Search: {next_tool_tokens} estimated tokens > {}",
+                        config.context.max_tool_input_tokens
+                    ))
+                } else if next_payload_bytes > config.context.max_upstream_payload_bytes {
+                    Some(format!(
+                        "translated upstream payload is too large after Tool Search: {next_payload_bytes} bytes > {}",
+                        config.context.max_upstream_payload_bytes
+                    ))
+                } else {
+                    None
+                };
+                if let Some(error) = budget_error {
+                    failed = Some(error.clone());
+                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
+                    break 'rounds;
+                }
+                let model = payload.conversation_state.current_message.user_input_message.model_id.clone();
+                if let Err(limit) = super::handlers::check_context_limit(
+                    &context.state,
+                    next_input_tokens,
+                    context.compact,
+                    &model,
+                ) {
+                    let error = format!(
+                        "prompt is too long after Tool Search: {} tokens > {}",
+                        limit.input_tokens, limit.maximum
+                    );
+                    failed = Some(error.clone());
+                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
+                    break 'rounds;
+                }
+                context.input_tokens = next_input_tokens;
+                if let Err(error) = context.reservation.extend(context.estimated_credits) {
+                    failed = Some(error.to_string());
+                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error.to_string())));
+                    break 'rounds;
+                }
+                let account = context.lease.account().await;
+                match context.state.kiro().generate(&account, &payload, None).await {
+                    Ok(next) => {
+                        let (next_endpoint, next_response, next_permit) = next.into_parts();
+                        endpoint = next_endpoint.name.to_string();
+                        source = next_response.bytes_stream();
+                        upstream_permit = next_permit;
+                        buffer.clear();
+                        decoder = EventStreamDecoder;
+                        search_round += 1;
+                        continue 'rounds;
+                    }
+                    Err(error) => {
+                        failed = Some(error.to_string());
+                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error.to_string())));
+                        break 'rounds;
+                    }
+                }
+            }
+            let should_continue = !client_has_tools
+                && !decoded.tools.is_empty()
+                && auto_round < context.auto_continue_rounds;
             if !should_continue {
                 break 'rounds;
             }
@@ -626,6 +796,7 @@ pub fn response(
         accumulated_reasoning.push_str(&decoded.reasoning);
         decoded.text = accumulated_text;
         decoded.reasoning = accumulated_reasoning;
+        decoded.tool_searches = accumulated_searches;
         let current_round_output_tokens = decoded.usage.output_tokens;
         accumulate_usage(&mut decoded.usage, &accumulated_usage);
         if failed.is_none() {
@@ -758,6 +929,13 @@ fn event_kind(event: &KiroEvent) -> &'static str {
         KiroEvent::Error { .. } => "error",
         KiroEvent::Other { .. } => "other",
     }
+}
+
+fn event_is_tool_search(event: &KiroEvent, catalog: Option<&ClaudeToolSearchCatalog>) -> bool {
+    let (Some(catalog), KiroEvent::ToolUse { name, .. }) = (catalog, event) else {
+        return false;
+    };
+    catalog.is_search_tool(name)
 }
 
 fn restore_web_tool_name(event: &mut KiroEvent, names: &std::collections::HashMap<String, String>) {
@@ -993,6 +1171,54 @@ impl ClaudeState {
             "type":"content_block_delta","index":index,
             "delta":{"type":"compaction_delta","content":content}
         })));
+        output.push(sse(&json!({"type":"content_block_stop","index":index})));
+        self.block = None;
+        output
+    }
+
+    fn tool_search(&mut self, search: &ClaudeToolSearchTrace) -> Vec<String> {
+        let mut output = Vec::new();
+        let index = self.switch_block(
+            &mut output,
+            "server_tool_use",
+            json!({
+                "type":"server_tool_use",
+                "id":search.id,
+                "name":search.name,
+                "input":{}
+            }),
+        );
+        output.push(sse(&json!({
+            "type":"content_block_delta",
+            "index":index,
+            "delta":{"type":"input_json_delta","partial_json":search.input.to_string()}
+        })));
+        output.push(sse(&json!({"type":"content_block_stop","index":index})));
+        self.block = None;
+
+        let result = if let Some(error) = &search.error {
+            json!({
+                "type":"tool_search_tool_result_error",
+                "error_code":error.code,
+                "error_message":error.message
+            })
+        } else {
+            json!({
+                "type":"tool_search_tool_search_result",
+                "tool_references":search.references.iter().map(|name| json!({
+                    "type":"tool_reference","tool_name":name
+                })).collect::<Vec<_>>()
+            })
+        };
+        let index = self.switch_block(
+            &mut output,
+            "tool_search_tool_result",
+            json!({
+                "type":"tool_search_tool_result",
+                "tool_use_id":search.id,
+                "content":result
+            }),
+        );
         output.push(sse(&json!({"type":"content_block_stop","index":index})));
         self.block = None;
         output
@@ -1296,6 +1522,24 @@ mod tests {
             joined.find("compaction_delta").expect("compaction")
                 < joined.find("text_delta").expect("text")
         );
+    }
+
+    #[test]
+    fn tool_search_stream_uses_server_blocks_and_references() {
+        let mut state = ClaudeState::new("msg_test".into(), "model".into(), 10);
+        let output = state.tool_search(&ClaudeToolSearchTrace {
+            id: "srvtoolu_1".into(),
+            name: "tool_search_tool_regex".into(),
+            input: json!({"pattern":"github"}),
+            references: vec!["mcp__github__list_issues".into()],
+            error: None,
+        });
+        let joined = output.join("");
+        assert_eq!(joined.matches("event: message_start").count(), 1);
+        assert!(joined.contains("server_tool_use"));
+        assert!(joined.contains("tool_search_tool_result"));
+        assert!(joined.contains("tool_reference"));
+        assert!(joined.contains("mcp__github__list_issues"));
     }
 
     #[test]
