@@ -646,4 +646,35 @@ mod tests {
             Some("claude-opus-4.6")
         );
     }
+
+    #[test]
+    fn low_credit_mapping_is_active_all_day_until_credit_recovers() {
+        let rule = ModelMappingRule {
+            name: "low-credit-fallback".into(),
+            enabled: true,
+            kind: "replace".into(),
+            source_models: vec!["claude-opus-*".into()],
+            target_models: vec!["claude-sonnet-4.6".into()],
+            priority: 1,
+            weights: None,
+            max_remaining_credit_percent: Some(10.0),
+            api_key_ids: None,
+            // No schedule is the documented all-day default.
+            schedule: None,
+        };
+
+        let low = map_model(
+            "claude-opus-4.6",
+            std::slice::from_ref(&rule),
+            None,
+            Some(9.9),
+            "",
+        );
+        assert_eq!(low.mapped, "claude-sonnet-4.6");
+        assert_eq!(low.rule.as_deref(), Some("low-credit-fallback"));
+
+        let recovered = map_model("claude-opus-4.6", &[rule], None, Some(10.0), "");
+        assert_eq!(recovered.mapped, "claude-opus-4.6");
+        assert!(recovered.rule.is_none());
+    }
 }

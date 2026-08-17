@@ -5,7 +5,7 @@ mod commands;
 mod output;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use kproxy_ipc::protocol::{
     method, ConfigPathResult, ConfigReloadResult, ConfigShowResult, StatusResult,
 };
@@ -82,19 +82,26 @@ enum Command {
         command: Option<TaskCommand>,
     },
     /// 显示代理统计。
-    #[command(after_help = "示例：\n  kproxy stats --since 1h\n  kproxy stats --by model --recent 20")]
+    #[command(
+        after_help = "示例：\n  kproxy stats --since 1h\n  kproxy stats --detail --by model --recent 20"
+    )]
     Stats {
+        /// 显示分组和最近请求明细。
         #[arg(long)]
+        detail: bool,
+        #[arg(long, requires = "detail")]
         recent: Option<usize>,
         /// 时间窗口，例如 30m、1h、7d。
         #[arg(long)]
         since: Option<String>,
         /// 分组维度：model/account/apikey/endpoint。
-        #[arg(long)]
+        #[arg(long, requires = "detail")]
         by: Option<String>,
     },
     /// 显示最近请求日志。
-    #[command(after_help = "示例：\n  kproxy logs --tail 100\n  kproxy logs --follow --level error")]
+    #[command(
+        after_help = "示例：\n  kproxy logs --tail 100\n  kproxy logs --follow --level error"
+    )]
     Logs {
         #[arg(long, default_value_t = 50)]
         tail: usize,
@@ -124,9 +131,9 @@ enum Command {
     /// 模型映射规则。
     #[command(name = "model-map", subcommand)]
     ModelMap(ModelMapCommand),
-    /// 查看主题帮助：balance/model-map/sso/config/apikey。
-    #[command(after_help = "示例：\n  kproxy help balance\n  kproxy help apikey")]
-    Help { topic: String },
+    /// 查看主题帮助。不指定主题时列出全部主题。
+    #[command(after_help = "示例：\n  kproxy help\n  kproxy help stats\n  kproxy help model-map")]
+    Help { topic: Option<String> },
 }
 
 #[derive(Debug, Subcommand)]
@@ -134,18 +141,83 @@ enum ModelMapCommand {
     /// 列出全部映射规则。
     #[command(after_help = "示例：\n  kproxy model-map list\n  kproxy --json model-map list")]
     List,
+    /// 添加模型映射规则。
+    #[command(
+        after_help = "示例：\n  kproxy model-map add --name low-credit --source 'claude-opus-*' --target claude-sonnet-4 --below-credits-percent 10"
+    )]
+    Add {
+        #[arg(long)]
+        name: String,
+        #[arg(long, default_value = "replace")]
+        kind: String,
+        #[arg(long = "source", value_delimiter = ',', required = true)]
+        source_models: Vec<String>,
+        #[arg(long = "target", value_delimiter = ',', required = true)]
+        target_models: Vec<String>,
+        #[arg(long, default_value_t = 0)]
+        priority: i32,
+        #[arg(long = "weight", value_delimiter = ',')]
+        weights: Vec<u32>,
+        /// 账号剩余 credits 百分比低于此值时生效。
+        #[arg(long)]
+        below_credits_percent: Option<f64>,
+        #[arg(long = "api-key", value_delimiter = ',')]
+        api_key_ids: Vec<String>,
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// 编辑模型映射规则。
+    Edit {
+        /// 当前规则名。
+        name: String,
+        #[arg(long)]
+        rename: Option<String>,
+        #[arg(long)]
+        kind: Option<String>,
+        #[arg(long = "source", value_delimiter = ',')]
+        source_models: Vec<String>,
+        #[arg(long = "target", value_delimiter = ',')]
+        target_models: Vec<String>,
+        #[arg(long)]
+        priority: Option<i32>,
+        #[arg(long = "weight", value_delimiter = ',')]
+        weights: Vec<u32>,
+        #[arg(long)]
+        clear_weights: bool,
+        #[arg(long)]
+        below_credits_percent: Option<f64>,
+        #[arg(long)]
+        clear_credits_threshold: bool,
+        #[arg(long = "api-key", value_delimiter = ',')]
+        api_key_ids: Vec<String>,
+        #[arg(long)]
+        clear_api_keys: bool,
+        #[arg(long, conflicts_with = "disable")]
+        enable: bool,
+        #[arg(long, conflicts_with = "enable")]
+        disable: bool,
+    },
+    /// 删除模型映射规则，执行前需输入 y 或 yes 确认。
+    #[command(name = "delete", visible_alias = "rm")]
+    Delete { name: String },
     /// 测试客户端模型名会命中的规则。
     #[command(
-        after_help = "示例：\n  kproxy model-map test claude-sonnet-4\n  kproxy model-map test gpt-5"
+        after_help = "示例：\n  kproxy model-map test claude-sonnet-4\n  kproxy model-map test claude-opus-4 --remaining-credits-percent 8"
     )]
-    Test { model: String },
+    Test {
+        model: String,
+        #[arg(long)]
+        remaining_credits_percent: Option<f64>,
+        #[arg(long)]
+        api_key: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
 enum TaskCommand {
     /// 立即运行一个任务。
     #[command(
-        after_help = "示例：\n  kproxy tasks run status_check\n  kproxy tasks run model_cache_refresh"
+        after_help = "示例：\n  kproxy tasks run status_check\n  kproxy tasks run model_cache_refresh\n  kproxy tasks run proxy_service_reconcile"
     )]
     Run { name: String },
 }
@@ -196,7 +268,9 @@ enum ConfigCommand {
     #[command(after_help = "示例：\n  kproxy config edit\n  EDITOR=vim kproxy config edit")]
     Edit,
     /// 只校验配置，不应用。
-    #[command(after_help = "示例：\n  kproxy config validate\n  kproxy config validate ./config.toml")]
+    #[command(
+        after_help = "示例：\n  kproxy config validate\n  kproxy config validate ./config.toml"
+    )]
     Validate { file: Option<String> },
 }
 
@@ -204,10 +278,19 @@ enum ConfigCommand {
 async fn main() -> Result<()> {
     kproxy_store::environment::load_dotenv()?;
     let cli = Cli::parse();
+    let Some(command) = cli.command else {
+        Cli::command().print_help()?;
+        println!();
+        return Ok(());
+    };
+    if let Command::Help { topic } = &command {
+        crate::commands::runtime::print_topic(topic.as_deref())?;
+        return Ok(());
+    }
     let socket = resolve_socket(cli.socket.clone()).await;
     let mut client = AdminClient::connect(socket);
 
-    match cli.command.unwrap_or(Command::Status { watch: false }) {
+    match command {
         Command::Status { watch } => loop {
             let status: StatusResult = client.call(method::STATUS, serde_json::json!({})).await?;
             if cli.json {
@@ -395,15 +478,22 @@ async fn main() -> Result<()> {
             crate::commands::runtime::simple_rpc(&mut client, method_name, params, cli.json)
                 .await?;
         }
-        Command::Stats { recent, since, by } => {
+        Command::Stats {
+            detail,
+            recent,
+            since,
+            by,
+        } => {
             let since_secs = since
                 .as_deref()
                 .map(crate::commands::runtime::parse_duration)
                 .transpose()?;
-            crate::commands::runtime::simple_rpc(
+            crate::commands::runtime::show_stats(
                 &mut client,
-                method::STATS,
-                serde_json::json!({"recent":recent,"since_secs":since_secs,"by":by}),
+                detail,
+                recent,
+                since_secs,
+                by.as_deref(),
                 cli.json,
             )
             .await?;
@@ -439,7 +529,7 @@ async fn main() -> Result<()> {
         Command::ModelMap(command) => {
             crate::commands::runtime::run_model_map(&mut client, command, cli.json).await?;
         }
-        Command::Help { topic } => crate::commands::runtime::print_topic(&topic)?,
+        Command::Help { .. } => unreachable!("help exits before connecting to kproxyd"),
     }
     Ok(())
 }

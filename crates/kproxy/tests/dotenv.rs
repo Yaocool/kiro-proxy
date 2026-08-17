@@ -12,7 +12,7 @@ fn dotenv_socket_is_loaded_before_cli_argument_parsing() {
     )
     .expect("write .env");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_kam"))
+    let output = Command::new(env!("CARGO_BIN_EXE_kproxy"))
         .current_dir(workspace.path())
         .env_remove("KPROXY_ADMIN_SOCKET")
         .arg("status")
