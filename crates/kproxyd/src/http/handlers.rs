@@ -13,9 +13,7 @@ use futures::StreamExt;
 use kproxy_kiro::{KiroError, KiroResponse};
 use kproxy_notify::{WebhookEvent, WebhookEventKind};
 use kproxy_pool::{AccountLease, PoolError};
-use kproxy_translate::model::{
-    apply_adaptive_thinking, map_model, resolve_dynamic_model, thinking_enabled_for_model,
-};
+use kproxy_translate::model::{apply_adaptive_thinking, map_model, thinking_enabled_for_model};
 use kproxy_translate::{
     apply_compaction_boundary, claude_to_kiro, compact_trigger_tokens, error_envelope,
     openai_to_kiro, sanitize_error_message, validate_claude, validate_openai, ClaudeRequest,
@@ -2545,24 +2543,9 @@ fn append_current_request_to_compaction(mut summary: String, request: &ClaudeReq
     summary
 }
 
-pub(super) fn resolved_model_info(
-    state: &Arc<AppState>,
-    model: &str,
-) -> Option<kproxy_kiro::ModelInfo> {
-    let config = state.config.current();
-    let (models, _) = state.models.get(config.models.cache_ttl_ms);
-    let available = models
-        .iter()
-        .map(|candidate| candidate.model_id.clone())
-        .collect::<Vec<_>>();
-    let resolved = resolve_dynamic_model(model, &available)?;
-    models
-        .into_iter()
-        .find(|candidate| candidate.model_id.eq_ignore_ascii_case(&resolved))
-}
-
 fn model_token_limit(state: &Arc<AppState>, model: &str, input: bool) -> Option<u32> {
-    resolved_model_info(state, model)
+    state
+        .resolved_model_info(model)
         .and_then(|model| model.token_limits)
         .and_then(|limits| {
             if input {

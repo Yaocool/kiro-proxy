@@ -8,12 +8,12 @@ use std::time::Instant;
 use kproxy_core::config::Config;
 use kproxy_core::paths::Paths;
 use kproxy_kiro::endpoint::EndpointOverrides;
-use kproxy_kiro::KiroClient;
+use kproxy_kiro::{KiroClient, ModelInfo};
 use kproxy_notify::Notifier;
 use kproxy_pool::{AccountPool, RefreshError, TokenRefresher};
 use kproxy_store::accounts::AccountStore;
 use kproxy_store::config_loader::ConfigHandle;
-use kproxy_translate::TokenCountCache;
+use kproxy_translate::{model::resolve_dynamic_model, TokenCountCache};
 use tokio_util::sync::CancellationToken;
 
 use crate::http::prompt_cache::PromptCacheTracker;
@@ -238,6 +238,23 @@ impl AppState {
     /// 等待账号或运维操作触发一次模型目录刷新。
     pub async fn wait_for_model_refresh(&self) {
         self.model_refresh.notified().await;
+    }
+
+    /// Resolve a client/model alias against the current discovered Kiro catalog.
+    ///
+    /// Model metadata is shared runtime state, so callers outside the HTTP
+    /// handler module must not depend on a private handler helper to read it.
+    pub fn resolved_model_info(&self, model: &str) -> Option<ModelInfo> {
+        let config = self.config.current();
+        let (models, _) = self.models.get(config.models.cache_ttl_ms);
+        let available = models
+            .iter()
+            .map(|candidate| candidate.model_id.clone())
+            .collect::<Vec<_>>();
+        let resolved = resolve_dynamic_model(model, &available)?;
+        models
+            .into_iter()
+            .find(|candidate| candidate.model_id.eq_ignore_ascii_case(&resolved))
     }
 
     /// 串行化账号的「复制、修改、落盘、提交」事务。

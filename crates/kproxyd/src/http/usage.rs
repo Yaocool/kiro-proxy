@@ -78,7 +78,8 @@ pub fn produced_output(decoded: &DecodedResponse) -> bool {
 /// actual output tokens.
 pub fn fallback_credits(state: &Arc<AppState>, model: &str, input: u64, output: u64) -> f64 {
     let config = state.config.current();
-    let multiplier = super::handlers::resolved_model_info(state, model)
+    let multiplier = state
+        .resolved_model_info(model)
         .and_then(|model| model.rate_multiplier)
         .filter(|value| value.is_finite() && *value > 0.0)
         .unwrap_or(1.0);
