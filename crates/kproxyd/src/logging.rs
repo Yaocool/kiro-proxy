@@ -538,9 +538,10 @@ mod tests {
             assert!(dated_path(&base, &date_string(day), "info", 0).exists());
         }
         assert!(directory.path().join("unrelated.log").exists());
-        let similar = directory
-            .path()
-            .join(format!("kproxyd-{}-info-manual.log", date_string(current - 3)));
+        let similar = directory.path().join(format!(
+            "kproxyd-{}-info-manual.log",
+            date_string(current - 3)
+        ));
         std::fs::write(&similar, b"keep").expect("similar unrelated log");
         files.cleanup(current).expect("second cleanup");
         assert!(similar.exists());
