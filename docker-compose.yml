@@ -1,5 +1,5 @@
 services:
-  kamd:
+  kproxyd:
     build:
       context: .
       target: runtime-slim # 支持 runtime-slim 和 runtime-full，runtime-full 支持启用 SSO 浏览器自动登录
@@ -12,9 +12,9 @@ services:
     labels:
       io.kiro-proxy.role: daemon
     volumes:
-      - kam-data:/var/lib/kam
+      - kproxy-data:/var/lib/kproxy
     environment:
       RUST_LOG: info
 
 volumes:
-  kam-data:
+  kproxy-data:
