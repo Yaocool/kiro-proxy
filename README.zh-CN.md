@@ -47,29 +47,40 @@ CLI 源码位于 [`crates/kproxy`](crates/kproxy)，daemon 源码位于
 
 最简生产部署只需要 Docker Engine 和 Compose v2 插件。Compose 默认构建启用全部 feature
 且包含 Chromium 的 full 镜像，使用 host network 启动 `kproxyd`，并将全部状态保存在
-`kproxy-data` named volume 中。以下命令均在
-仓库根目录执行：
+`kproxy-data` named volume 中。在仓库根目录执行一键脚本，它会校验环境、构建镜像、启动
+服务、等待健康，并在宿主机安装 `kproxy` 命令：
 
 ```bash
-docker compose up -d --build
-docker compose ps
-docker compose logs -f kproxyd
+./deploy/docker-setup.sh
+kproxy health
+kproxy status
 ```
+
+默认安装到 `/usr/local/bin/kproxy`，需要时脚本会调用 `sudo`。没有 sudo 权限时可安装到
+用户目录：
+
+```bash
+./deploy/docker-setup.sh --target "$HOME/.local/bin/kproxy"
+```
+
+宿主机上的 `kproxy` 是轻量包装器：它把命令转发给容器内同版本 CLI，避免 Linux 容器二进制
+与 macOS 等宿主机不兼容，也无需暴露管理 Unix socket。源码升级后重新运行同一脚本即可；
+如只需启动已有镜像，可增加 `--no-build`。
 
 全新 daemon 只开放 Unix 管理 socket，不会自动创建业务代理。显式创建首个 service，并
 立即保存命令输出的 API Key：
 
 ```bash
-docker compose exec kproxyd kproxy status
-docker compose exec kproxyd kproxy service create --name main
-docker compose exec kproxyd kproxy service list
+kproxy status
+kproxy service create --name main
+kproxy service list
 ```
 
 发送生成请求前，至少导入一个受支持的 Kiro 企业 SSO 账号：
 
 ```bash
-docker compose exec -T kproxyd kproxy account import --stdin < accounts.json
-docker compose exec kproxyd kproxy account probe --all
+kproxy account import --stdin < accounts.json
+kproxy account probe --all
 ```
 
 默认监听 `0.0.0.0:5580`，应使用宿主机防火墙或云安全组限制该端口；只允许 Docker 宿主机
@@ -353,17 +364,18 @@ docker compose exec kproxyd kproxy config show --effective
 `server.host = "127.0.0.1"`；如果需要采用新的 `0.0.0.0` 默认值，请使用
 `kproxy config edit` 修改。
 
-在宿主机安装一次 Docker 包装器后，可直接使用 `kproxy`，无需再输入 `docker compose exec`：
+一键构建、启动并安装 Docker 包装器：
 
 ```bash
-sudo ./deploy/install-kproxy-wrapper.sh
+./deploy/docker-setup.sh
 kproxy health
 kproxy service list
 ```
 
 包装器通过 Compose 标签自动发现运行中的 daemon，并始终使用容器内与 `kproxyd` 同版本的
 CLI。当前用户必须有 Docker 权限；同时运行多个 kiro-proxy Compose 项目时，设置
-`KPROXY_COMPOSE_PROJECT` 选择目标项目。
+`KPROXY_COMPOSE_PROJECT` 选择目标项目。仅需单独重装包装器时，仍可执行
+`sudo ./deploy/install-kproxy-wrapper.sh`。
 
 加固后的服务模板位于 [`deploy/kproxyd.service`](deploy/kproxyd.service)。将 `kproxyd` 和
 `kproxy` 安装到 `/usr/local/bin`，创建 `kproxy` 系统用户与用户组，安装 unit 后即可启用服务。

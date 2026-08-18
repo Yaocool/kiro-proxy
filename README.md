@@ -56,29 +56,43 @@ is located in [`crates/kproxyd`](crates/kproxyd).
 Docker Engine with the Compose v2 plugin is the shortest production setup. The
 Compose stack builds the full image with all features and Chromium enabled by
 default, runs `kproxyd` with host networking, and keeps all state in the `kproxy-data`
-named volume. Run these commands from the repository root:
+named volume. Run the one-step setup from the repository root. It validates the
+environment, builds and starts the stack, waits for health, and installs the
+`kproxy` command on the host:
 
 ```bash
-docker compose up -d --build
-docker compose ps
-docker compose logs -f kproxyd
+./deploy/docker-setup.sh
+kproxy health
+kproxy status
 ```
+
+The default target is `/usr/local/bin/kproxy`; the script invokes `sudo` when
+needed. Without sudo access, install it in a user-owned directory:
+
+```bash
+./deploy/docker-setup.sh --target "$HOME/.local/bin/kproxy"
+```
+
+The host command is a small wrapper that runs the matching CLI inside the
+container. This avoids Linux-container binary incompatibility on hosts such as
+macOS and keeps the administration Unix socket private. Rerun the same script
+after a source update, or pass `--no-build` to start an existing image.
 
 A fresh daemon exposes only its Unix administration socket. Create the first
 business proxy explicitly and save the API key printed by the command:
 
 ```bash
-docker compose exec kproxyd kproxy status
-docker compose exec kproxyd kproxy service create --name main
-docker compose exec kproxyd kproxy service list
+kproxy status
+kproxy service create --name main
+kproxy service list
 ```
 
 Import at least one supported Kiro enterprise SSO account before sending
 generation requests:
 
 ```bash
-docker compose exec -T kproxyd kproxy account import --stdin < accounts.json
-docker compose exec kproxyd kproxy account probe --all
+kproxy account import --stdin < accounts.json
+kproxy account probe --all
 ```
 
 The default listener is `0.0.0.0:5580`. Restrict that port with the host
@@ -409,11 +423,10 @@ Existing `config.toml` files are never overwritten. A volume created by an
 older version may still contain `server.host = "127.0.0.1"`; change it with
 `kproxy config edit` if the new `0.0.0.0` default is desired.
 
-Install the Docker-backed host wrapper once to use `kproxy` directly without
-typing `docker compose exec`:
+Build, start, and install the Docker-backed wrapper in one step:
 
 ```bash
-sudo ./deploy/install-kproxy-wrapper.sh
+./deploy/docker-setup.sh
 kproxy health
 kproxy service list
 ```
@@ -421,7 +434,8 @@ kproxy service list
 The wrapper discovers the running daemon through its Compose label and always
 uses the CLI version bundled with that container. It requires permission to use
 Docker. Set `KPROXY_COMPOSE_PROJECT` when multiple kiro-proxy Compose projects are
-running.
+running. To reinstall only the wrapper, run
+`sudo ./deploy/install-kproxy-wrapper.sh`.
 
 A hardened service template is available at
 [`deploy/kproxyd.service`](deploy/kproxyd.service). Install `kproxyd` and `kproxy` under

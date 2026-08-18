@@ -306,6 +306,15 @@ cargo run -p kproxy -- stats --detail --since 1h --by endpoint
 构建并启动默认 full 镜像（启用全部 feature 并包含 Chromium SSO）：
 
 ```bash
+./deploy/docker-setup.sh
+kproxy health
+```
+
+该脚本会完成 Compose 配置校验、镜像构建、服务启动、健康等待和宿主机 `kproxy` 命令安装。
+默认目标是 `/usr/local/bin/kproxy`；无 sudo 权限时可使用
+`--target "$HOME/.local/bin/kproxy"`。以下是对应的手工命令，适合调试：
+
+```bash
 docker compose config --quiet
 docker compose up -d --build
 docker compose ps
@@ -339,11 +348,11 @@ docker compose exec kproxyd kproxy config show --effective
 
 ### 在 Docker 宿主机直接使用 `kproxy`
 
-Dockerfile 或 Compose 服务无法安全地直接向宿主机 `/usr/local/bin` 安装文件。在宿主机
-执行一次项目提供的安装脚本即可：
+Dockerfile 或 Compose 服务无法安全地直接向宿主机 `/usr/local/bin` 安装文件。一键脚本会在
+宿主机安装项目提供的包装器，并将 Compose 服务拉起至健康状态：
 
 ```bash
-sudo ./deploy/install-kproxy-wrapper.sh
+./deploy/docker-setup.sh
 kproxy health
 kproxy status
 kproxy service list
@@ -353,11 +362,14 @@ kproxy service list
 透传 stdin，并且只在交互场景分配 TTY。这样既不需要暴露管理 Unix socket，也不存在
 宿主机与容器二进制兼容问题。
 
-安装器默认拒绝覆盖已有命令：
+需要只安装包装器时可直接运行底层安装器。它会自动更新由本项目管理的包装器，并默认拒绝
+覆盖其他已有命令：
 
 ```bash
-sudo ./deploy/install-kproxy-wrapper.sh --force
+sudo ./deploy/install-kproxy-wrapper.sh
 ./deploy/install-kproxy-wrapper.sh --target "$HOME/.local/bin/kproxy"
+# 只有明确要替换其他同名命令时才使用：
+sudo ./deploy/install-kproxy-wrapper.sh --force
 ```
 
 当前宿主机用户必须具备 Docker 权限。同时运行多个 kiro-proxy 项目时，可以按 Compose

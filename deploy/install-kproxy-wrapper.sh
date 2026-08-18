@@ -47,10 +47,28 @@ source_file="$script_dir/kproxy-docker"
   exit 1
 }
 
-if [ -e "$target" ] && [ "$force" -ne 1 ]; then
-  echo "install-kproxy-wrapper.sh: target already exists: $target" >&2
-  echo "rerun with --force to replace it, or use --target for another path" >&2
-  exit 1
+if [ -e "$target" ]; then
+  if cmp -s "$source_file" "$target"; then
+    echo "Docker-backed kproxy wrapper is already installed at $target"
+    exit 0
+  fi
+
+  managed=0
+  if grep -qF "Managed by kiro-proxy's install-kproxy-wrapper.sh." "$target"; then
+    managed=1
+  else
+    # Recognize the exact wrapper shipped before the managed marker was added.
+    legacy_checksum="$(cksum "$target" 2>/dev/null || true)"
+    case "$legacy_checksum" in
+      "3654078470 1244 "*) managed=1 ;;
+    esac
+  fi
+
+  if [ "$force" -ne 1 ] && [ "$managed" -ne 1 ]; then
+    echo "install-kproxy-wrapper.sh: target already exists and is not managed by this project: $target" >&2
+    echo "rerun with --force to replace it, or use --target for another path" >&2
+    exit 1
+  fi
 fi
 
 install -m 0755 "$source_file" "$target"

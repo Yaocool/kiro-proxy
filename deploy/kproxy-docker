@@ -1,4 +1,5 @@
 #!/bin/sh
+# Managed by kiro-proxy's install-kproxy-wrapper.sh.
 set -eu
 
 fail() {

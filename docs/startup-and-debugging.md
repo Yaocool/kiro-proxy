@@ -340,6 +340,17 @@ record prompts, generated response bodies, or API-key values.
 Build and start the default full image with all features and Chromium SSO:
 
 ```bash
+./deploy/docker-setup.sh
+kproxy health
+```
+
+This command validates Compose, builds the image, starts the service, waits for
+health, and installs the host `kproxy` command. It targets
+`/usr/local/bin/kproxy` by default; without sudo access, use
+`--target "$HOME/.local/bin/kproxy"`. The equivalent manual commands are useful
+for debugging:
+
+```bash
 docker compose config --quiet
 docker compose up -d --build
 docker compose ps
@@ -379,10 +390,11 @@ docker compose exec kproxyd kproxy config show --effective
 ### Use `kproxy` directly on the Docker host
 
 Docker cannot safely install files into the host's `/usr/local/bin` from a
-Dockerfile or Compose service. Install the provided wrapper once on the host:
+Dockerfile or Compose service. The one-step script installs the provided wrapper
+on the host and brings the Compose service to a healthy state:
 
 ```bash
-sudo ./deploy/install-kproxy-wrapper.sh
+./deploy/docker-setup.sh
 kproxy health
 kproxy status
 kproxy service list
@@ -393,11 +405,15 @@ container label, preserves command exit codes, forwards stdin, and allocates a
 TTY only for interactive use. This keeps the admin Unix socket private and
 avoids host/container binary compatibility problems.
 
-The installer refuses to overwrite an existing command by default:
+To install only the wrapper, invoke the low-level installer directly. It updates
+a wrapper managed by this project but refuses to overwrite other commands by
+default:
 
 ```bash
-sudo ./deploy/install-kproxy-wrapper.sh --force
+sudo ./deploy/install-kproxy-wrapper.sh
 ./deploy/install-kproxy-wrapper.sh --target "$HOME/.local/bin/kproxy"
+# Use this only when intentionally replacing another command with the same name:
+sudo ./deploy/install-kproxy-wrapper.sh --force
 ```
 
 The current host user must be allowed to access Docker. When more than one
