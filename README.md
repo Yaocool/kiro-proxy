@@ -142,20 +142,70 @@ a third-party proxy unless Tool Search is explicitly enabled. For large MCP
 catalogs, start Claude Code with:
 
 ```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:5580 ENABLE_TOOL_SEARCH=true claude
+ANTHROPIC_BASE_URL=http://127.0.0.1:5580 ENABLE_TOOL_SEARCH=auto claude
 ```
 
 `kiro-proxy` accepts Anthropic `defer_loading`, regex/BM25 Tool Search, and
 `tool_reference` history blocks. Because Kiro has no native Tool Search server
-tool, the proxy executes the search locally, exposes at most five matching
-definitions by default (or the requested `limit`, from 1 to 10,000) to Kiro,
-and continues the same response. Deferred definitions remain outside the Kiro
-context and payload until discovered.
+tool, the proxy executes the search locally and continues the same response.
+The official Tool Search input contains `pattern` or `query` plus an optional
+`limit` from 1 to 10,000 (default 5). `kiro-proxy` honors that requested limit
+and then packs results against the remaining tool-count, tool-token, context,
+and payload-byte budgets; there is no fixed five-tool working set. Deferred
+definitions remain outside the Kiro context and payload until discovered. The
+catalog index and searches run on blocking workers rather than HTTP runtime
+threads.
 
-The generated `[context]` configuration also bounds loaded tool definitions
-with `max_tool_input_tokens` and the serialized Kiro request with
+The generated `[context]` configuration also bounds the loaded working set with
+`max_loaded_tools` (default and upstream protocol ceiling 128), loaded tool
+definitions with `max_tool_input_tokens`, and the serialized Kiro request with
 `max_upstream_payload_bytes`. Oversized requests fail locally with an explicit
 413 instead of an opaque upstream error.
+
+`features.tool_search_max_rounds` defaults to 4 and is hard-clamped to 8. If
+that per-request server loop is exhausted, the response uses Claude's
+`pause_turn` continuation state instead of converting a valid server call into
+an HTTP 5xx. `features.tool_search_max_operations` defaults to 32 (valid range
+1–256) and bounds aggregate searches across resumed calls and all internal
+rounds; excess calls receive an in-band `unavailable` Tool Search result.
+`features.enable_tool_search=false` is a rollback switch: native Tool Search
+requests are then rejected explicitly instead of expanding deferred tools into
+the upstream payload. Request logs retain catalog/working-set sizes, search
+limits and truncation, client/upstream status, and a stable error code. Error
+responses keep the normal Claude/OpenAI body and expose diagnostics through
+`request-id`, `x-kproxy-error-code`, `x-kproxy-error-stage`,
+`x-kproxy-upstream-status`, and `x-kproxy-account-error` headers.
+
+### Web Search
+
+For Claude's native `web_search` server tool, Kiro first decides whether to
+search and chooses the query. The proxy then calls Kiro's `/mcp` JSON-RPC
+`web_search`, returns the real result as a tool result to the same model turn,
+and lets Kiro synthesize the final answer. It does not search the first user
+message eagerly or present a raw search summary as model output. Streaming and
+non-streaming Claude responses use `server_tool_use` and
+`web_search_tool_result`; search failures are in-band tool errors and do not
+cool down or ban the account. Parallel searches are preserved. In mixed
+server/client-tool turns the server call remains pending until the client tool
+results are returned, matching Anthropic's continuation protocol. Results carry
+proxy-owned AES-256-GCM replay content so later turns can restore snippets;
+modified records are rejected before entering model context. Anthropic-owned
+opaque values remain accepted but are not decrypted locally. Final text carries
+a structured `web_search_result_location` citation only when it actually
+includes the exact result URL. The proxy
+safety limit defaults to 20 searches; an explicit `max_uses` above that
+configured limit is rejected instead of being silently clamped. Claude Web
+Fetch is rejected explicitly until a compatible server-side executor is
+implemented.
+
+The default MCP URL is `https://runtime.{region}.kiro.dev/mcp`. Override it with
+`upstream.web_search_endpoint` (the `{region}` placeholder is supported) or the
+temporary `KPROXY_MCP_URL` environment variable. The default
+`upstream.web_search_timeout_ms` is 60,000. Domain/location filters,
+code-execution callers, strict schemas, and eager streaming are rejected when
+Kiro cannot provide equivalent semantics. The proxy-generated encrypted fields
+are explicitly proxy-owned and are not claimed to be interoperable with
+Anthropic's hosted-search ciphertext.
 
 ## Configuration and files
 
@@ -173,6 +223,7 @@ under one directory. Without `KPROXY_HOME`, XDG locations are used:
 | `accounts.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | Contains credentials; created with mode `0600`. |
 | `daily.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | Daily credit accounting, reset on UTC boundaries. |
 | `stats.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | Persisted aggregate request statistics. |
+| `web-search-replay.key` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | AES-256-GCM replay key; created with mode `0600` and never overwritten. |
 | `admin.sock` | `${XDG_RUNTIME_DIR}/kproxy/` or `/run/kproxy/` | Local administration plane. |
 | Logs | `${XDG_DATA_HOME:-~/.local/share}/kproxy/logs/` | Split by UTC date and severity. |
 
