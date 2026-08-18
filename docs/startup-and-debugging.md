@@ -358,6 +358,21 @@ docker compose exec kproxyd kproxy health
 docker compose logs -f kproxyd
 ```
 
+On Linux Docker Engine, `failed to populate volume` together with a missing
+`.../volumes/kiro-proxy_kproxy-data/_data` path means Docker retained the named
+volume metadata while its data directory disappeared. The setup script checks
+for this before building. It asks before repairing in an interactive terminal;
+CI and other non-interactive environments can opt in explicitly:
+
+```bash
+./deploy/docker-setup.sh --no-build --repair-volume
+```
+
+Repair applies only to a volume labeled for the current Compose project whose
+data path is already missing. If Docker's volume root, disk mount, or a symlink
+is unsafe, the script stops and requires storage recovery instead of deleting
+anything.
+
 Compose uses `network_mode: host`. A proxy listener created inside the container
 therefore binds directly in the Docker host's network namespace. Arbitrary
 service ports become available immediately without editing Compose or recreating

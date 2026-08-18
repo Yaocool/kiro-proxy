@@ -67,6 +67,11 @@ kproxy status
 与 macOS 等宿主机不兼容，也无需暴露管理 Unix socket。源码升级后重新运行同一脚本即可；
 如只需启动已有镜像，可增加 `--no-build`。
 
+脚本还会在 Linux 上预检 named volume。如果 Docker 中保留了 volume 元数据、但宿主机上的
+实际数据目录已经丢失，交互运行时会询问是否重建；自动化环境可显式使用
+`--repair-volume`。仅当 volume 确认属于当前 Compose 项目、Docker volume 根目录正常且数据
+路径确实不存在时才允许重建；数据盘或软链接异常会直接停止，避免覆盖可能恢复的数据。
+
 全新 daemon 只开放 Unix 管理 socket，不会自动创建业务代理。显式创建首个 service，并
 立即保存命令输出的 API Key：
 

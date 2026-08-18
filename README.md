@@ -78,6 +78,14 @@ container. This avoids Linux-container binary incompatibility on hosts such as
 macOS and keeps the administration Unix socket private. Rerun the same script
 after a source update, or pass `--no-build` to start an existing image.
 
+On Linux, the script also checks the named volume before the long image build.
+If Docker retains the volume metadata but its host data directory is gone, an
+interactive run offers to recreate it; automation can opt in with
+`--repair-volume`. Repair is allowed only when the volume belongs to this
+Compose project, Docker's volume root is available, and the data path is truly
+missing. A missing disk mount or unsafe symlink stops the setup instead of
+hiding potentially recoverable data.
+
 A fresh daemon exposes only its Unix administration socket. Create the first
 business proxy explicitly and save the API key printed by the command:
 
