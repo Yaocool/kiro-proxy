@@ -24,6 +24,11 @@ use crate::endpoint::{
 };
 use crate::event_stream::{EventStreamDecoder, KiroEvent};
 
+const KIRO_BUILDER_ID_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+const KIRO_SOCIAL_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+
 #[derive(Debug, Clone, Error)]
 #[error("Kiro {endpoint} returned {status:?}: {message}")]
 pub struct KiroError {
@@ -373,6 +378,7 @@ pub struct KiroClient {
     short_slots: Arc<tokio::sync::Semaphore>,
     stream_slots: Arc<tokio::sync::Semaphore>,
     model_fetches: Arc<DashMap<(String, String), InFlightModelFetch>>,
+    profile_fetches: Arc<DashMap<(String, String), InFlightProfileFetch>>,
 }
 
 type SharedModelFetch = Shared<BoxFuture<'static, Result<Vec<ModelInfo>, KiroError>>>;
@@ -380,6 +386,13 @@ type SharedModelFetch = Shared<BoxFuture<'static, Result<Vec<ModelInfo>, KiroErr
 struct InFlightModelFetch {
     id: Uuid,
     future: SharedModelFetch,
+}
+
+type SharedProfileFetch = Shared<BoxFuture<'static, Result<String, KiroError>>>;
+
+struct InFlightProfileFetch {
+    id: Uuid,
+    future: SharedProfileFetch,
 }
 
 impl KiroClient {
@@ -437,6 +450,7 @@ impl KiroClient {
                     .max(1),
             )),
             model_fetches: Arc::new(DashMap::new()),
+            profile_fetches: Arc::new(DashMap::new()),
             upstream,
         })
     }
@@ -517,6 +531,186 @@ impl KiroClient {
             endpoint: "none".into(),
             message: "no usable upstream endpoint".into(),
         })
+    }
+
+    /// Resolves the profile ARN required by Kiro MCP requests. Existing ARN
+    /// values and the fixed Social profile do not require a network request;
+    /// missing IdC values are discovered once per access token.
+    pub async fn resolve_profile_arn(&self, account: &Account) -> Result<String, KiroError> {
+        if let Some(profile_arn) = account
+            .profile_arn
+            .as_deref()
+            .map(str::trim)
+            .filter(|profile_arn| !profile_arn.is_empty())
+        {
+            return Ok(profile_arn.to_owned());
+        }
+        if account.credentials.auth_method == kproxy_core::account::AuthMethod::Social {
+            return Ok(KIRO_SOCIAL_PROFILE_ARN.into());
+        }
+
+        let fetch_key = (account.id.clone(), account.credentials.access_token.clone());
+        let fetch_id = Uuid::new_v4();
+        let fetch = match self.profile_fetches.entry(fetch_key.clone()) {
+            Entry::Occupied(entry) => entry.get().future.clone(),
+            Entry::Vacant(entry) => {
+                let (result_sender, result_receiver) = tokio::sync::oneshot::channel();
+                let future = async move {
+                    result_receiver.await.unwrap_or_else(|_| {
+                        Err(KiroError {
+                            status: None,
+                            endpoint: "ListAvailableProfiles".into(),
+                            message: "profile ARN discovery task stopped unexpectedly".into(),
+                        })
+                    })
+                }
+                .boxed()
+                .shared();
+                entry.insert(InFlightProfileFetch {
+                    id: fetch_id,
+                    future: future.clone(),
+                });
+
+                let client = self.clone();
+                let account = account.clone();
+                let fetches = Arc::clone(&self.profile_fetches);
+                tokio::spawn(async move {
+                    let result = client.fetch_profile_arn_once(&account).await;
+                    let _sent = result_sender.send(result);
+                    fetches.remove_if(&fetch_key, |_, entry| entry.id == fetch_id);
+                });
+                future
+            }
+        };
+        fetch.await
+    }
+
+    async fn fetch_profile_arn_once(&self, account: &Account) -> Result<String, KiroError> {
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Profiles {
+            #[serde(default)]
+            profiles: Vec<Profile>,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Profile {
+            #[serde(default)]
+            arn: Option<String>,
+        }
+
+        let _permit = Arc::clone(&self.short_slots)
+            .acquire_owned()
+            .await
+            .map_err(build_error)?;
+        let urls = self.profile_discovery_urls(account)?;
+        let mut fallback_allowed = false;
+        let mut last_error = None;
+        for url in urls {
+            let response = self
+                .short
+                .post(url.clone())
+                .headers(profile_headers(account)?)
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .map_err(|error| KiroError {
+                    status: None,
+                    endpoint: "ListAvailableProfiles".into(),
+                    message: error.to_string(),
+                })?;
+            let status = response.status();
+            let body =
+                bounded_response_text(response, 1024 * 1024, "ListAvailableProfiles").await?;
+            if status.is_success() {
+                let profiles =
+                    serde_json::from_str::<Profiles>(&body).map_err(|error| KiroError {
+                        status: Some(502),
+                        endpoint: "ListAvailableProfiles".into(),
+                        message: format!("invalid profile discovery response: {error}"),
+                    })?;
+                if let Some(profile_arn) = profiles
+                    .profiles
+                    .into_iter()
+                    .filter_map(|profile| profile.arn)
+                    .map(|profile_arn| profile_arn.trim().to_owned())
+                    .find(|profile_arn| {
+                        profile_arn.starts_with("arn:") && profile_arn.len() <= 2_048
+                    })
+                {
+                    debug!(
+                        account = %account.id,
+                        endpoint = %url,
+                        "Kiro profile ARN discovered"
+                    );
+                    return Ok(profile_arn);
+                }
+                fallback_allowed = true;
+                continue;
+            }
+
+            let error = KiroError {
+                status: Some(status.as_u16()),
+                endpoint: "ListAvailableProfiles".into(),
+                message: nonempty_error_body(status.as_u16(), &body),
+            };
+            if status.as_u16() == 403 && !text_is_auth_error(&error.message) {
+                // Builder ID accounts cannot list Enterprise profiles. Kiro's
+                // own clients use the fixed Builder ID profile in this case.
+                fallback_allowed = true;
+                last_error = Some(error);
+                continue;
+            }
+            return Err(error);
+        }
+
+        if fallback_allowed {
+            debug!(account = %account.id, "using Kiro Builder ID profile ARN");
+            return Ok(KIRO_BUILDER_ID_PROFILE_ARN.into());
+        }
+        Err(last_error.unwrap_or_else(|| KiroError {
+            status: Some(502),
+            endpoint: "ListAvailableProfiles".into(),
+            message: "profile discovery returned no usable profile ARN".into(),
+        }))
+    }
+
+    fn profile_discovery_urls(&self, account: &Account) -> Result<Vec<url::Url>, KiroError> {
+        if let Some(endpoint) = self.overrides.codewhisperer_url.as_deref() {
+            let mut url = url::Url::parse(endpoint).map_err(build_error)?;
+            url.set_path("/ListAvailableProfiles");
+            url.set_query(None);
+            url.set_fragment(None);
+            return Ok(vec![url]);
+        }
+
+        let region = account.credentials.region.trim();
+        if region.is_empty()
+            || !region
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        {
+            return Err(KiroError {
+                status: None,
+                endpoint: "ListAvailableProfiles".into(),
+                message: "account has an invalid API region".into(),
+            });
+        }
+        let regions = if region.starts_with("eu-") {
+            ["eu-central-1", "us-east-1"]
+        } else {
+            ["us-east-1", "eu-central-1"]
+        };
+        regions
+            .into_iter()
+            .map(|region| {
+                url::Url::parse(&format!(
+                    "https://codewhisperer.{region}.amazonaws.com/ListAvailableProfiles"
+                ))
+                .map_err(build_error)
+            })
+            .collect()
     }
 
     /// Executes Kiro's JSON-RPC MCP web search. The nested MCP text block is
@@ -1084,6 +1278,69 @@ fn mcp_headers(account: &Account) -> Result<reqwest::header::HeaderMap, KiroErro
         reqwest::header::HeaderName::from_static("x-amzn-codewhisperer-optout"),
         HeaderValue::from_static("false"),
     );
+    let profile_arn = account
+        .profile_arn
+        .as_deref()
+        .map(str::trim)
+        .filter(|profile_arn| !profile_arn.is_empty())
+        .ok_or_else(|| KiroError {
+            status: None,
+            endpoint: "MCP web_search".into(),
+            message: "account profile ARN was not resolved before web search".into(),
+        })?;
+    headers.insert(
+        reqwest::header::HeaderName::from_static("x-amzn-kiro-profile-arn"),
+        HeaderValue::from_str(profile_arn).map_err(build_error)?,
+    );
+    headers.insert(
+        reqwest::header::HeaderName::from_static("x-amz-user-agent"),
+        HeaderValue::from_str(&format!(
+            "aws-sdk-js/1.0.18 KiroIDE 0.6.18 {}",
+            account.machine_id
+        ))
+        .map_err(build_error)?,
+    );
+    headers.insert(
+        reqwest::header::HeaderName::from_static("amz-sdk-invocation-id"),
+        HeaderValue::from_str(&Uuid::new_v4().to_string()).map_err(build_error)?,
+    );
+    headers.insert(
+        reqwest::header::HeaderName::from_static("amz-sdk-request"),
+        HeaderValue::from_static("attempt=1; max=3"),
+    );
+    Ok(headers)
+}
+
+fn profile_headers(account: &Account) -> Result<reqwest::header::HeaderMap, KiroError> {
+    use reqwest::header::{
+        HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
+    };
+
+    let mut headers = HeaderMap::new();
+    let authorization = format!("Bearer {}", account.credentials.access_token);
+    let user_agent = format!(
+        "aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-0.6.18-{}",
+        account.machine_id
+    );
+    let amz_user_agent = format!("aws-sdk-js/1.0.18 KiroIDE 0.6.18 {}", account.machine_id);
+    for (name, value) in [
+        (CONTENT_TYPE, "application/json"),
+        (ACCEPT, "application/json"),
+        (USER_AGENT, user_agent.as_str()),
+        (AUTHORIZATION, authorization.as_str()),
+    ] {
+        headers.insert(name, HeaderValue::from_str(value).map_err(build_error)?);
+    }
+    for (name, value) in [
+        ("x-amz-user-agent", amz_user_agent),
+        ("amz-sdk-invocation-id", Uuid::new_v4().to_string()),
+        ("amz-sdk-request", "attempt=1; max=1".into()),
+    ] {
+        headers.insert(
+            reqwest::header::HeaderName::from_static(name),
+            HeaderValue::from_str(&value).map_err(build_error)?,
+        );
+    }
     Ok(headers)
 }
 
@@ -1506,8 +1763,11 @@ mod tests {
             .mount(&server)
             .await;
         let client = test_client(&server);
+        let mut account = account(AuthMethod::Idc);
+        account.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/test-profile".into());
         let results = client
-            .web_search(&account(AuthMethod::Idc), "rust async")
+            .web_search(&account, "rust async")
             .await
             .expect("search");
 
@@ -1524,6 +1784,13 @@ mod tests {
                 .get("x-amzn-codewhisperer-optout")
                 .and_then(|value| value.to_str().ok()),
             Some("false")
+        );
+        assert_eq!(
+            request
+                .headers
+                .get("x-amzn-kiro-profile-arn")
+                .and_then(|value| value.to_str().ok()),
+            account.profile_arn.as_deref()
         );
         let body: serde_json::Value = serde_json::from_slice(&request.body).expect("JSON body");
         assert_eq!(body["method"], "tools/call");
@@ -1544,8 +1811,11 @@ mod tests {
             .mount(&server)
             .await;
         let client = test_client(&server);
+        let mut account = account(AuthMethod::Idc);
+        account.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/test-profile".into());
         let error = client
-            .web_search(&account(AuthMethod::Idc), "news")
+            .web_search(&account, "news")
             .await
             .expect_err("JSON-RPC error");
 
@@ -1554,6 +1824,105 @@ mod tests {
         let requests = server.received_requests().await.expect("requests");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].url.path(), "/mcp");
+    }
+
+    #[tokio::test]
+    async fn missing_idc_profile_is_discovered_once_per_access_token() {
+        let server = MockServer::start().await;
+        let discovered = "arn:aws:codewhisperer:us-east-1:123456789012:profile/discovered-profile";
+        Mock::given(method("POST"))
+            .and(path("/ListAvailableProfiles"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(50))
+                    .set_body_json(serde_json::json!({
+                        "profiles":[{"arn":discovered}]
+                    })),
+            )
+            .mount(&server)
+            .await;
+        let client = test_client(&server);
+        let account = account(AuthMethod::Idc);
+
+        let (left, right) = tokio::join!(
+            client.resolve_profile_arn(&account),
+            client.resolve_profile_arn(&account)
+        );
+
+        assert_eq!(left.expect("left profile"), discovered);
+        assert_eq!(right.expect("right profile"), discovered);
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/ListAvailableProfiles");
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("authorization")
+                .and_then(|value| value.to_str().ok()),
+            Some("Bearer access-token")
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&requests[0].body).expect("JSON body"),
+            serde_json::json!({})
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_id_profile_is_used_when_profile_listing_is_forbidden() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/ListAvailableProfiles"))
+            .respond_with(
+                ResponseTemplate::new(403)
+                    .set_body_string("User is not authorized to make this call"),
+            )
+            .mount(&server)
+            .await;
+        let client = test_client(&server);
+
+        let profile = client
+            .resolve_profile_arn(&account(AuthMethod::Idc))
+            .await
+            .expect("Builder ID fallback");
+
+        assert_eq!(profile, KIRO_BUILDER_ID_PROFILE_ARN);
+        assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn social_profile_does_not_require_discovery() {
+        let server = MockServer::start().await;
+        let client = test_client(&server);
+
+        let profile = client
+            .resolve_profile_arn(&account(AuthMethod::Social))
+            .await
+            .expect("Social profile");
+
+        assert_eq!(profile, KIRO_SOCIAL_PROFILE_ARN);
+        assert!(server
+            .received_requests()
+            .await
+            .expect("requests")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn web_search_rejects_an_unresolved_profile_before_network_io() {
+        let server = MockServer::start().await;
+        let client = test_client(&server);
+
+        let error = client
+            .web_search(&account(AuthMethod::Idc), "news")
+            .await
+            .expect_err("unresolved profile");
+
+        assert!(error.message.contains("profile ARN was not resolved"));
+        assert!(server
+            .received_requests()
+            .await
+            .expect("requests")
+            .is_empty());
     }
 
     #[test]

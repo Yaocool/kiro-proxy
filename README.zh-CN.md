@@ -187,8 +187,11 @@ server call 会保持 pending，等客户端回传 client tool 结果后再按�
 
 默认 MCP 地址是 `https://runtime.{region}.kiro.dev/mcp`。可通过
 `upstream.web_search_endpoint`（支持 `{region}`）或临时环境变量 `KPROXY_MCP_URL` 覆盖；
-`upstream.web_search_timeout_ms` 默认为 60000。Kiro MCP 不具备等价语义的 domain/location
-过滤、code-execution caller、strict 或 eager streaming 会被明确拒绝，不会静默降级。代理生成
+`upstream.web_search_timeout_ms` 默认为 60000。每个 MCP 请求都会携带 Kiro 必需的
+`x-amzn-kiro-profile-arn` 请求头。导入账号缺少 profile ARN 时，代理会通过
+`ListAvailableProfiles` 自动发现，并发请求会按同一 token 合并，发现结果会写回账号文件；
+Builder ID 和 Social 账号使用 Kiro 兼容的固定 profile 回退。Kiro MCP 不具备等价语义的
+domain/location 过滤、code-execution caller、strict 或 eager streaming 会被明确拒绝，不会静默降级。代理生成
 的加密字段明确属于 kproxy 自有格式，不宣称与 Anthropic 托管搜索的 ciphertext 互通。
 
 ## 配置与文件

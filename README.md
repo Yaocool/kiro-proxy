@@ -229,9 +229,14 @@ implemented.
 The default MCP URL is `https://runtime.{region}.kiro.dev/mcp`. Override it with
 `upstream.web_search_endpoint` (the `{region}` placeholder is supported) or the
 temporary `KPROXY_MCP_URL` environment variable. The default
-`upstream.web_search_timeout_ms` is 60,000. Domain/location filters,
-code-execution callers, strict schemas, and eager streaming are rejected when
-Kiro cannot provide equivalent semantics. The proxy-generated encrypted fields
+`upstream.web_search_timeout_ms` is 60,000. Every MCP request carries Kiro's
+required `x-amzn-kiro-profile-arn` header. When an imported account has no
+profile ARN, the proxy discovers it through `ListAvailableProfiles`, collapses
+concurrent discovery for the same token, and persists the result. Builder ID
+and Social accounts use Kiro's compatible fixed-profile fallback.
+Domain/location filters, code-execution callers, strict schemas, and eager
+streaming are rejected when Kiro cannot provide equivalent semantics. The
+proxy-generated encrypted fields
 are explicitly proxy-owned and are not claimed to be interoperable with
 Anthropic's hosted-search ciphertext.
 
