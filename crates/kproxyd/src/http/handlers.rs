@@ -15,10 +15,13 @@ use kproxy_notify::{WebhookEvent, WebhookEventKind};
 use kproxy_pool::{AccountLease, PoolError};
 use kproxy_translate::model::{apply_adaptive_thinking, map_model, thinking_enabled_for_model};
 use kproxy_translate::{
-    apply_compaction_boundary, claude_loaded_tools, claude_to_kiro, compact_trigger_tokens,
-    error_envelope, openai_to_kiro, sanitize_error_message, tool_search_continue_payload,
-    validate_claude, validate_openai, ClaudeRequest, ClaudeToolSearchCatalog, ErrorFormat,
-    KiroToolUse, OpenAiRequest, TranslationOptions,
+    apply_compaction_boundary, claude_loaded_tools, claude_pending_server_tool_uses,
+    claude_to_kiro, compact_trigger_tokens, error_envelope, openai_to_kiro,
+    resume_tool_search_payload, resume_web_search_payload, sanitize_error_message,
+    tool_search_continue_payload_batch, validate_claude, validate_openai,
+    web_search_continue_payload_batch, ClaudeRequest, ClaudeToolSearchBudget,
+    ClaudeToolSearchCatalog, ClaudeWebSearchTrace, ErrorFormat, KiroToolUse, OpenAiRequest,
+    TranslationOptions, ValidationError,
 };
 use rand::Rng;
 use serde_json::{json, Value};
@@ -27,11 +30,11 @@ use uuid::Uuid;
 
 use crate::meter::{now_secs, CreditReservation, MeterError, UsageRecord};
 use crate::state::AppState;
-use crate::stats::{RequestLog, UpstreamAttemptLog};
+use crate::stats::{RequestDiagnostics, RequestLog, UpstreamAttemptLog};
 
 use super::prompt_cache::PromptCacheProfile;
 use super::request_trace_id;
-use super::response::{DecodedResponse, OpenAiToolIdentity, ToolLeakFilter};
+use super::response::{ClaudeServerEvent, DecodedResponse, OpenAiToolIdentity, ToolLeakFilter};
 use super::stream::{self, StreamContext, StreamProtocol};
 use super::usage::{fallback_credits, fill_missing_usage};
 use super::ServiceHttpState;
@@ -304,6 +307,21 @@ fn record_failed_request(
         output_tokens: 0,
         credits: 0.0,
         error: Some(safe_error),
+        diagnostics: RequestDiagnostics {
+            client_status: error.status.as_u16(),
+            upstream_status: error.upstream_status.or_else(|| {
+                error
+                    .log_context
+                    .attempts
+                    .iter()
+                    .rev()
+                    .find_map(|attempt| attempt.status)
+            }),
+            error_code: error.error_code.to_owned(),
+            error_stage: error.error_stage.to_owned(),
+            account_error: error.account_error,
+            ..RequestDiagnostics::default()
+        },
     });
 }
 
@@ -338,13 +356,14 @@ async fn handle_claude(
             ErrorFormat::Claude,
         )
     })?;
-    validate_claude(&request).map_err(|error| {
-        ApiError::new(
-            StatusCode::BAD_REQUEST,
-            error.to_string(),
-            ErrorFormat::Claude,
-        )
-    })?;
+    let compact_trigger = compact_trigger_tokens(request.context_management.as_ref());
+    // Claude discards everything before the latest compaction block. Apply
+    // that semantic boundary before validating references or authenticated
+    // replay records so ignored history cannot reject the effective request.
+    let compact_boundary_applied = apply_compaction_boundary(&mut request);
+    validate_claude(&request).map_err(claude_validation_error)?;
+    kproxy_translate::validate_web_search_replay_content(&request, &state.web_search_replay)
+        .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error, ErrorFormat::Claude))?;
     tracing::info!(
         trace_id = %trace_id,
         protocol = "claude",
@@ -367,8 +386,46 @@ async fn handle_claude(
                 .is_some_and(|kind| kind.starts_with("web_search") || kind.starts_with("web_fetch"))
         });
     }
-    let compact_trigger = compact_trigger_tokens(request.context_management.as_ref());
-    let compact_boundary_applied = apply_compaction_boundary(&mut request);
+    if !config.features.enable_tool_search
+        && request.tools.iter().any(|tool| {
+            tool.defer_loading
+                || tool
+                    .r#type
+                    .as_deref()
+                    .is_some_and(kproxy_translate::is_tool_search_type)
+        })
+    {
+        return Err(ApiError::new(
+            StatusCode::BAD_REQUEST,
+            "Anthropic Tool Search is disabled by proxy configuration; remove defer_loading/Tool Search or enable features.enable_tool_search",
+            ErrorFormat::Claude,
+        ));
+    }
+    // Discover pending calls only from the already validated effective
+    // history, so discarded calls cannot be executed again.
+    let pending_server_tools = claude_pending_server_tool_uses(&request);
+    let web_search_tool = request.tools.iter().find(|tool| {
+        tool.r#type
+            .as_deref()
+            .is_some_and(|kind| kind.starts_with("web_search"))
+    });
+    let web_search_client_limit = web_search_tool.is_some_and(|tool| tool.max_uses.is_some());
+    let web_search_proxy_limit = config.features.web_search_max_rounds.max(1);
+    if let Some(requested) = web_search_tool.and_then(|tool| tool.max_uses) {
+        if requested > web_search_proxy_limit {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "web_search max_uses={requested} exceeds this proxy's configured execution limit of {web_search_proxy_limit}"
+                ),
+                ErrorFormat::Claude,
+            ));
+        }
+    }
+    let web_search_max_rounds = web_search_tool
+        .map(|tool| tool.max_uses.unwrap_or(web_search_proxy_limit))
+        .unwrap_or(0);
+    let max_tool_search_operations = config.features.tool_search_max_operations.clamp(1, 256);
     let web_tool_names = claude_web_tool_names(&request);
     let route = map_model(
         &request.model,
@@ -380,7 +437,218 @@ async fn handle_claude(
     let mut options = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
     options.enhance_system_prompt = config.features.enhance_system_prompt;
     options.compact_mode = compact_trigger.is_some();
+    options.web_search_replay = Some(state.web_search_replay.clone());
     let mut payload = claude_to_kiro(&request, &options);
+    let original_tool_count = request.tools.len();
+    let catalog_bytes = request
+        .tools
+        .iter()
+        .filter(|tool| tool.defer_loading)
+        .filter_map(|tool| serde_json::to_vec(tool).ok())
+        .fold(2usize, |total, tool| {
+            total.saturating_add(tool.len()).saturating_add(1)
+        });
+    // Keep the deferred catalog proxy-side and resolve server calls that were
+    // intentionally left pending by a prior mixed client/server turn.
+    let (next_request, tool_search) = tokio::task::spawn_blocking(move || {
+        let mut request = request;
+        let catalog = ClaudeToolSearchCatalog::take_from_request(&mut request).map(Arc::new);
+        (request, catalog)
+    })
+    .await
+    .map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Tool Search catalog worker failed: {error}"),
+            ErrorFormat::Claude,
+        )
+    })?;
+    request = next_request;
+    // Pending server calls may execute an external Web Search before the
+    // first Kiro generation. Reject an oversized initial working set before
+    // acquiring a search account or making that external request. The same
+    // budgets are checked again after pending results and internal searches
+    // have changed the payload.
+    let initial_tool_tokens = (state
+        .tokenizer
+        .estimate_kiro_tools(&payload)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error,
+                ErrorFormat::Claude,
+            )
+        })? as u64)
+        .max(
+            state
+                .tokenizer
+                .estimate_claude_tools(&claude_loaded_tools(&request))
+                .await
+                .map_err(|error| {
+                    ApiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        error,
+                        ErrorFormat::Claude,
+                    )
+                })? as u64,
+        );
+    enforce_payload_budget(
+        &state,
+        initial_tool_tokens,
+        serialized_payload_bytes(&payload, ErrorFormat::Claude)?,
+        loaded_tool_count(&payload),
+        tool_search.is_some(),
+        ErrorFormat::Claude,
+    )?;
+    let mut resumed_tool_searches = Vec::new();
+    let mut resumed_web_searches = Vec::new();
+    let mut resumed_server_events = Vec::new();
+    let mut pending_web_searches = Vec::new();
+    let mut loaded_names = loaded_tool_names(&payload);
+    let mut tool_search_operations = 0u32;
+    for tool_use in pending_server_tools {
+        if tool_use.name == "web_search" {
+            if web_search_max_rounds == 0 {
+                return Err(ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    "pending web_search call has no matching web_search tool definition",
+                    ErrorFormat::Claude,
+                ));
+            }
+            pending_web_searches.push(tool_use);
+            continue;
+        }
+        let Some(catalog) = tool_search
+            .as_ref()
+            .filter(|catalog| catalog.is_search_tool(&tool_use.name))
+        else {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "pending server tool '{}' has no matching supported tool definition",
+                    tool_use.name
+                ),
+                ErrorFormat::Claude,
+            ));
+        };
+        let mut outcome = if tool_search_operations >= max_tool_search_operations {
+            catalog.unavailable_outcome(
+                &tool_use,
+                format!("Tool Search operation limit of {max_tool_search_operations} was reached"),
+            )
+        } else {
+            let budget = remaining_tool_search_budget(&state, &payload, false)
+                .await
+                .map_err(|message| {
+                    ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, message, ErrorFormat::Claude)
+                })?;
+            tool_search_operations += 1;
+            match catalog
+                .search_with_budget_excluding_async(tool_use.clone(), budget, loaded_names.clone())
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => catalog.unavailable_outcome(&tool_use, error),
+            }
+        };
+        outcome.trace.id = tool_use.tool_use_id.clone();
+        outcome.trace = outcome.trace.result_only();
+        loaded_names.extend(
+            outcome
+                .tools
+                .iter()
+                .map(|tool| tool.tool_specification.name.clone()),
+        );
+        resume_tool_search_payload(&mut payload, &tool_use, &outcome);
+        resumed_server_events.push(ClaudeServerEvent::ToolSearch {
+            index: resumed_tool_searches.len(),
+            preceding_text: String::new(),
+        });
+        resumed_tool_searches.push(outcome.trace);
+    }
+    if !pending_web_searches.is_empty() {
+        let needs_search_account = pending_web_searches
+            .iter()
+            .filter(|tool_use| {
+                tool_use
+                    .input
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .is_some_and(|query| !query.trim().is_empty())
+            })
+            .take(web_search_max_rounds as usize)
+            .next()
+            .is_some();
+        let search_lease =
+            if needs_search_account {
+                Some(state.pool().acquire("", 0.0, &[]).await.map_err(|error| {
+                    upstream_error(ExecuteError::Pool(error), ErrorFormat::Claude)
+                })?)
+            } else {
+                None
+            };
+        let mut resumed_web_search_uses = 0u32;
+        for tool_use in pending_web_searches {
+            let query = tool_use
+                .input
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let trace = if resumed_web_search_uses >= web_search_max_rounds {
+                ClaudeWebSearchTrace::error(
+                    tool_use.tool_use_id.clone(),
+                    &query,
+                    if web_search_client_limit {
+                        "max_uses_exceeded"
+                    } else {
+                        "unavailable"
+                    },
+                    format!("web search is limited to {web_search_max_rounds} uses"),
+                )
+            } else if query.is_empty() {
+                ClaudeWebSearchTrace::error(
+                    tool_use.tool_use_id.clone(),
+                    &query,
+                    "invalid_tool_input",
+                    "web search query must not be empty".into(),
+                )
+            } else {
+                resumed_web_search_uses += 1;
+                match search_lease.as_ref() {
+                    Some(lease) => match execute_kiro_web_search(&state, lease, &query).await {
+                        Ok(results) => ClaudeWebSearchTrace::success(
+                            tool_use.tool_use_id.clone(),
+                            &query,
+                            results,
+                        ),
+                        Err(error) => ClaudeWebSearchTrace::error(
+                            tool_use.tool_use_id.clone(),
+                            &query,
+                            web_search_error_code(&error),
+                            sanitize_error_message(&error.to_string()),
+                        )
+                        .executed(),
+                    },
+                    None => ClaudeWebSearchTrace::error(
+                        tool_use.tool_use_id.clone(),
+                        &query,
+                        "unavailable",
+                        "web search account is unavailable".into(),
+                    ),
+                }
+            }
+            .result_only();
+            resume_web_search_payload(&mut payload, &tool_use, &trace);
+            resumed_server_events.push(ClaudeServerEvent::WebSearch {
+                index: resumed_web_searches.len(),
+                preceding_text: String::new(),
+            });
+            resumed_web_searches.push(trace);
+        }
+    }
     let thinking_limit = model_token_limit(&state, &route.mapped, false)
         .unwrap_or(config.features.max_thinking_budget_tokens)
         .min(config.features.max_thinking_budget_tokens);
@@ -456,9 +724,6 @@ async fn handle_claude(
                 ErrorFormat::Claude,
             )
         })? as u64;
-    // Move the deferred catalog out of the public request after translation so
-    // a large MCP catalog has only one in-memory owner during upstream work.
-    let tool_search = ClaudeToolSearchCatalog::take_from_request(&mut request);
     let tool_tokens = (state
         .tokenizer
         .estimate_kiro_tools(&payload)
@@ -472,6 +737,18 @@ async fn handle_claude(
         })? as u64)
         .max(full_tool_tokens);
     let payload_bytes = serialized_payload_bytes(&payload, ErrorFormat::Claude)?;
+    let diagnostics = RequestDiagnostics {
+        original_tool_count,
+        loaded_tool_count: loaded_tool_count(&payload),
+        deferred_tool_count: tool_search
+            .as_ref()
+            .map_or(0, |catalog| catalog.deferred_len()),
+        loaded_tool_bytes: loaded_tool_bytes(&payload),
+        catalog_bytes,
+        tool_tokens,
+        payload_bytes,
+        ..RequestDiagnostics::default()
+    };
     enforce_payload_budget(
         &state,
         tool_tokens,
@@ -495,10 +772,13 @@ async fn handle_claude(
         requested_model = %request.model,
         mapped_model = %route.mapped,
         input_tokens,
+        original_tool_count = diagnostics.original_tool_count,
         tool_tokens,
         payload_bytes,
         loaded_tool_count = loaded_tool_count(&payload),
-        deferred_tool_count = tool_search.as_ref().map_or(0, ClaudeToolSearchCatalog::deferred_len),
+        loaded_tool_bytes = diagnostics.loaded_tool_bytes,
+        deferred_tool_count = tool_search.as_ref().map_or(0, |catalog| catalog.deferred_len()),
+        catalog_bytes = diagnostics.catalog_bytes,
         estimated_credits = estimate,
         "upstream request prepared"
     );
@@ -562,6 +842,14 @@ async fn handle_claude(
                 include_usage_chunk: false,
                 web_tool_names,
                 tool_search,
+                max_tool_search_operations,
+                tool_search_operations,
+                web_search_max_rounds,
+                web_search_client_limit,
+                resumed_tool_searches,
+                resumed_web_searches,
+                resumed_server_events,
+                diagnostics,
                 openai_tools: std::collections::HashMap::new(),
                 _connection_guard: connection_guard,
                 _admission_guard: admission_guard,
@@ -590,6 +878,14 @@ async fn handle_claude(
         prompt_cache,
         compaction_summary,
         tool_search,
+        max_tool_search_operations,
+        tool_search_operations,
+        web_search_max_rounds,
+        web_search_client_limit,
+        resumed_tool_searches,
+        resumed_web_searches,
+        resumed_server_events,
+        diagnostics,
         web_tool_names,
     )
     .await
@@ -709,6 +1005,16 @@ async fn handle_openai(
             )
         })? as u64;
     let payload_bytes = serialized_payload_bytes(&payload, ErrorFormat::OpenAi)?;
+    let diagnostics = RequestDiagnostics {
+        original_tool_count: request.tools.len(),
+        loaded_tool_count: loaded_tool_count(&payload),
+        deferred_tool_count: 0,
+        loaded_tool_bytes: loaded_tool_bytes(&payload),
+        catalog_bytes: 0,
+        tool_tokens,
+        payload_bytes,
+        ..RequestDiagnostics::default()
+    };
     enforce_payload_budget(
         &state,
         tool_tokens,
@@ -732,9 +1038,11 @@ async fn handle_openai(
         requested_model = %request.model,
         mapped_model = %route.mapped,
         input_tokens,
+        original_tool_count = diagnostics.original_tool_count,
         tool_tokens,
         payload_bytes,
         loaded_tool_count = loaded_tool_count(&payload),
+        loaded_tool_bytes = diagnostics.loaded_tool_bytes,
         max_tokens,
         estimated_credits = estimate,
         "upstream request prepared"
@@ -806,6 +1114,14 @@ async fn handle_openai(
                 include_usage_chunk,
                 web_tool_names: std::collections::HashMap::new(),
                 tool_search: None,
+                max_tool_search_operations: 0,
+                tool_search_operations: 0,
+                web_search_max_rounds: 0,
+                web_search_client_limit: false,
+                resumed_tool_searches: Vec::new(),
+                resumed_web_searches: Vec::new(),
+                resumed_server_events: Vec::new(),
+                diagnostics,
                 openai_tools,
                 _connection_guard: connection_guard,
                 _admission_guard: admission_guard,
@@ -832,6 +1148,7 @@ async fn handle_openai(
         estimate,
         started,
         prompt_cache,
+        diagnostics,
         openai_tools,
     )
     .await
@@ -1426,6 +1743,32 @@ async fn execute_upstream(
                     }
                 }
             }
+            Err(error) if error.is_request_rejection() => {
+                attempt_logs.push(upstream_attempt_log(
+                    attempt + 1,
+                    &account,
+                    &actual_model,
+                    &error,
+                ));
+                tracing::warn!(
+                    trace_id,
+                    attempt = attempt + 1,
+                    account_id = %account.id,
+                    account_name,
+                    endpoint = %error.endpoint,
+                    upstream_status = error.status.unwrap_or_default(),
+                    error = %sanitize_error_message(&error.message),
+                    "upstream rejected request payload; account health unchanged"
+                );
+                return Err(dispatch_error(
+                    error,
+                    &mapped_model,
+                    &actual_model,
+                    &model_path,
+                    model_mapping_rule,
+                    attempt_logs,
+                ));
+            }
             Err(error) if error.is_retriable() => {
                 attempt_logs.push(upstream_attempt_log(
                     attempt + 1,
@@ -1705,10 +2048,18 @@ async fn collect_nonstream_rounds(
     mut upstream: KiroResponse,
     mut payload: kproxy_translate::KiroPayload,
     compact: bool,
-    tool_search: Option<&ClaudeToolSearchCatalog>,
+    max_output_tokens: u32,
+    tool_search: Option<&Arc<ClaudeToolSearchCatalog>>,
+    max_tool_search_operations: u32,
+    mut tool_search_operations: u32,
+    web_search_max_rounds: u32,
+    web_search_client_limit: bool,
+    resumed_tool_searches: Vec<kproxy_translate::ClaudeToolSearchTrace>,
+    resumed_web_searches: Vec<ClaudeWebSearchTrace>,
+    resumed_server_events: Vec<ClaudeServerEvent>,
 ) -> Result<(DecodedResponse, String, u64), ExecuteError> {
-    const MAX_TOOL_SEARCH_ROUNDS: u32 = 8;
     let config = state.config.current();
+    let max_tool_search_rounds = config.features.tool_search_max_rounds.clamp(1, 8);
     let client_has_tools = payload
         .conversation_state
         .current_message
@@ -1720,9 +2071,15 @@ async fn collect_nonstream_rounds(
     let mut accumulated_usage = kproxy_kiro::UsageInfo::default();
     let mut accumulated_text = String::new();
     let mut accumulated_reasoning = String::new();
-    let mut accumulated_searches = Vec::new();
+    let mut accumulated_searches = resumed_tool_searches;
+    let mut accumulated_web_searches = resumed_web_searches;
+    let mut accumulated_server_events = resumed_server_events;
     let mut round = 0;
     let mut search_round = 0;
+    let mut web_search_round = accumulated_web_searches
+        .iter()
+        .filter(|search| search.executed)
+        .count() as u32;
     loop {
         let (endpoint_definition, response, _upstream_permit) = upstream.into_parts();
         let endpoint = endpoint_definition.name.to_string();
@@ -1761,37 +2118,255 @@ async fn collect_nonstream_rounds(
             })
         })?;
         fill_missing_usage(state, &mut decoded, &payload).await;
+        let output_exhausted = accumulated_usage
+            .output_tokens
+            .saturating_add(decoded.usage.output_tokens)
+            >= u64::from(max_output_tokens);
 
-        let search_key = tool_search.and_then(|catalog| {
-            decoded
-                .tools
-                .iter()
-                .find(|(_, tool)| catalog.is_search_tool(&tool.name))
-                .map(|(id, _)| id.clone())
-        });
-        if let (Some(catalog), Some(search_key)) = (tool_search, search_key) {
-            if search_round >= MAX_TOOL_SEARCH_ROUNDS {
-                return Err(ExecuteError::Upstream(KiroError {
-                    status: None,
-                    endpoint,
-                    message: format!(
-                        "Tool Search exceeded the {MAX_TOOL_SEARCH_ROUNDS}-round proxy limit"
-                    ),
-                }));
-            }
-            let search = decoded
-                .tools
-                .remove(&search_key)
-                .expect("Tool Search buffer exists");
-            let search_use = KiroToolUse {
-                tool_use_id: search.id,
-                name: search.name,
-                input: super::response::repair_json(&search.input),
+        let search_keys = tool_search
+            .map(|catalog| {
+                decoded
+                    .tools
+                    .iter()
+                    .filter(|(_, tool)| catalog.is_search_tool(&tool.name))
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if let Some(catalog) = tool_search.filter(|_| !search_keys.is_empty()) {
+            let search_uses = search_keys
+                .into_iter()
+                .map(|key| {
+                    let search = decoded
+                        .tools
+                        .remove(&key)
+                        .expect("Tool Search buffer exists");
+                    KiroToolUse {
+                        tool_use_id: search.id,
+                        name: search.name,
+                        input: super::response::repair_json(&search.input),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let parallel_web_uses = if web_search_max_rounds > 0 {
+                let keys = decoded
+                    .tools
+                    .iter()
+                    .filter(|(_, tool)| tool.name == "web_search")
+                    .map(|(id, _)| id.clone())
+                    .collect::<Vec<_>>();
+                keys.into_iter()
+                    .map(|key| {
+                        let search = decoded
+                            .tools
+                            .remove(&key)
+                            .expect("web search buffer exists");
+                        KiroToolUse {
+                            tool_use_id: search.id,
+                            name: search.name,
+                            input: super::response::repair_json(&search.input),
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            } else {
+                Vec::new()
             };
-            let outcome = catalog.search(&search_use);
+            let round_text = std::mem::take(&mut decoded.text);
+            let mut preceding_text = std::mem::take(&mut accumulated_text);
+            preceding_text.push_str(&round_text);
+
+            if search_round >= max_tool_search_rounds {
+                for search_use in &search_uses {
+                    let mut trace = catalog.pending_trace(search_use);
+                    trace.id = format!("srvtoolu_{}", Uuid::new_v4().simple());
+                    accumulated_server_events.push(ClaudeServerEvent::ToolSearch {
+                        index: accumulated_searches.len(),
+                        preceding_text: std::mem::take(&mut preceding_text),
+                    });
+                    accumulated_searches.push(trace);
+                }
+                for search_use in &parallel_web_uses {
+                    accumulated_server_events.push(ClaudeServerEvent::WebSearch {
+                        index: accumulated_web_searches.len(),
+                        preceding_text: std::mem::take(&mut preceding_text),
+                    });
+                    accumulated_web_searches.push(ClaudeWebSearchTrace::pending(
+                        format!("srvtoolu_{}", Uuid::new_v4().simple()),
+                        search_use.input.clone(),
+                    ));
+                }
+                accumulated_reasoning.push_str(&decoded.reasoning);
+                decoded.reasoning = accumulated_reasoning;
+                decoded.tool_searches = accumulated_searches;
+                decoded.web_searches = accumulated_web_searches;
+                decoded.claude_server_events = accumulated_server_events;
+                if decoded.tools.is_empty() {
+                    decoded.stop_reason = Some(
+                        if output_exhausted {
+                            "max_tokens"
+                        } else {
+                            "pause_turn"
+                        }
+                        .into(),
+                    );
+                }
+                merge_round_usage(&mut decoded.usage, &accumulated_usage);
+                let total_output_tokens = decoded.usage.output_tokens;
+                return Ok((decoded, endpoint, total_output_tokens));
+            }
+
+            // Anthropic leaves server calls pending when the same assistant
+            // turn also contains client tool calls. The client returns those
+            // results and replays these server_tool_use blocks next turn.
+            if !decoded.tools.is_empty() || output_exhausted {
+                for search_use in &search_uses {
+                    let mut trace = catalog.pending_trace(search_use);
+                    trace.id = format!("srvtoolu_{}", Uuid::new_v4().simple());
+                    accumulated_server_events.push(ClaudeServerEvent::ToolSearch {
+                        index: accumulated_searches.len(),
+                        preceding_text: std::mem::take(&mut preceding_text),
+                    });
+                    accumulated_searches.push(trace);
+                }
+                for search_use in &parallel_web_uses {
+                    accumulated_server_events.push(ClaudeServerEvent::WebSearch {
+                        index: accumulated_web_searches.len(),
+                        preceding_text: std::mem::take(&mut preceding_text),
+                    });
+                    accumulated_web_searches.push(ClaudeWebSearchTrace::pending(
+                        format!("srvtoolu_{}", Uuid::new_v4().simple()),
+                        search_use.input.clone(),
+                    ));
+                }
+                accumulated_reasoning.push_str(&decoded.reasoning);
+                decoded.reasoning = accumulated_reasoning;
+                decoded.tool_searches = accumulated_searches;
+                decoded.web_searches = accumulated_web_searches;
+                decoded.claude_server_events = accumulated_server_events;
+                if output_exhausted && decoded.tools.is_empty() {
+                    decoded.stop_reason = Some("max_tokens".into());
+                }
+                merge_round_usage(&mut decoded.usage, &accumulated_usage);
+                let total_output_tokens = decoded.usage.output_tokens;
+                return Ok((decoded, endpoint, total_output_tokens));
+            }
+
+            let mut budget = remaining_tool_search_budget(state, &payload, compact)
+                .await
+                .map_err(|message| {
+                    ExecuteError::Upstream(KiroError {
+                        status: None,
+                        endpoint: endpoint.clone(),
+                        message,
+                    })
+                })?;
+            let mut loaded_names = loaded_tool_names(&payload);
+            let mut searches = Vec::with_capacity(search_uses.len());
+            for search_use in search_uses {
+                let mut outcome = if tool_search_operations >= max_tool_search_operations {
+                    catalog.unavailable_outcome(
+                        &search_use,
+                        format!(
+                            "Tool Search operation limit of {max_tool_search_operations} was reached"
+                        ),
+                    )
+                } else {
+                    tool_search_operations += 1;
+                    match catalog
+                        .search_with_budget_excluding_async(
+                            search_use.clone(),
+                            budget,
+                            loaded_names.clone(),
+                        )
+                        .await
+                    {
+                        Ok(outcome) => outcome,
+                        Err(error) => catalog.unavailable_outcome(&search_use, error),
+                    }
+                };
+                outcome.trace.id = format!("srvtoolu_{}", Uuid::new_v4().simple());
+                let consumed_bytes = outcome
+                    .tools
+                    .iter()
+                    .filter_map(|tool| serde_json::to_vec(tool).ok())
+                    .map(|tool| tool.len())
+                    .sum::<usize>()
+                    .saturating_add(outcome.documentation.iter().map(String::len).sum());
+                budget = ClaudeToolSearchBudget {
+                    max_tools: budget.max_tools.saturating_sub(outcome.tools.len()),
+                    max_bytes: budget.max_bytes.saturating_sub(consumed_bytes),
+                };
+                loaded_names.extend(
+                    outcome
+                        .tools
+                        .iter()
+                        .map(|tool| tool.tool_specification.name.clone()),
+                );
+                accumulated_server_events.push(ClaudeServerEvent::ToolSearch {
+                    index: accumulated_searches.len(),
+                    preceding_text: std::mem::take(&mut preceding_text),
+                });
+                accumulated_searches.push(outcome.trace.clone());
+                searches.push((search_use, outcome));
+            }
+            let mut parallel_web_searches = Vec::with_capacity(parallel_web_uses.len());
+            for search_use in parallel_web_uses {
+                let query = search_use
+                    .input
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                let server_id = format!("srvtoolu_{}", Uuid::new_v4().simple());
+                let trace = if web_search_round >= web_search_max_rounds {
+                    ClaudeWebSearchTrace::error(
+                        server_id,
+                        &query,
+                        if web_search_client_limit {
+                            "max_uses_exceeded"
+                        } else {
+                            "unavailable"
+                        },
+                        format!("web search is limited to {web_search_max_rounds} uses"),
+                    )
+                } else if query.is_empty() {
+                    ClaudeWebSearchTrace::error(
+                        server_id,
+                        &query,
+                        "invalid_tool_input",
+                        "web search query must not be empty".into(),
+                    )
+                } else {
+                    web_search_round += 1;
+                    match execute_kiro_web_search(state, lease, &query).await {
+                        Ok(results) => ClaudeWebSearchTrace::success(server_id, &query, results),
+                        Err(error) => ClaudeWebSearchTrace::error(
+                            server_id,
+                            &query,
+                            web_search_error_code(&error),
+                            sanitize_error_message(&error.to_string()),
+                        )
+                        .executed(),
+                    }
+                };
+                accumulated_server_events.push(ClaudeServerEvent::WebSearch {
+                    index: accumulated_web_searches.len(),
+                    preceding_text: std::mem::take(&mut preceding_text),
+                });
+                accumulated_web_searches.push(trace.clone());
+                parallel_web_searches.push((search_use, trace));
+            }
             let documentation_tokens = state
                 .tokenizer
-                .count(outcome.documentation.join("\n\n"))
+                .count(
+                    searches
+                        .iter()
+                        .flat_map(|(_, outcome)| outcome.documentation.iter())
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("\n\n"),
+                )
                 .await
                 .map_err(|message| {
                     ExecuteError::Upstream(KiroError {
@@ -1804,30 +2379,40 @@ async fn collect_nonstream_rounds(
                 trace_id,
                 account_id = %lease.account_id(),
                 endpoint,
-                search_tool = %outcome.trace.name,
                 search_round = search_round + 1,
-                matched_tools = outcome.trace.references.len(),
-                search_error = outcome.trace.error.is_some(),
-                "proxy Tool Search executed"
+                search_count = searches.len(),
+                matched_tools = searches.iter().map(|(_, outcome)| outcome.trace.references.len()).sum::<usize>(),
+                result_truncated = searches.iter().any(|(_, outcome)| outcome.trace.budget_truncated),
+                search_error = searches.iter().any(|(_, outcome)| outcome.trace.error.is_some()),
+                "proxy Tool Search batch executed"
             );
-            accumulated_searches.push(outcome.trace.clone());
-            if !decoded.tools.is_empty() {
-                accumulated_text.push_str(&decoded.text);
-                accumulated_reasoning.push_str(&decoded.reasoning);
-                decoded.text = accumulated_text;
-                decoded.reasoning = accumulated_reasoning;
-                decoded.tool_searches = accumulated_searches;
-                let current_round_output_tokens = decoded.usage.output_tokens;
-                merge_round_usage(&mut decoded.usage, &accumulated_usage);
-                return Ok((decoded, endpoint, current_round_output_tokens));
-            }
-
-            let round_text = std::mem::take(&mut decoded.text);
-            accumulated_text.push_str(&round_text);
             accumulated_reasoning.push_str(&std::mem::take(&mut decoded.reasoning));
-            payload = tool_search_continue_payload(&payload, &round_text, search_use, &outcome);
+            payload = tool_search_continue_payload_batch(&payload, &round_text, &searches);
+            if !parallel_web_searches.is_empty() {
+                if let Some(assistant) = payload
+                    .conversation_state
+                    .history
+                    .last_mut()
+                    .and_then(|message| message.assistant_response_message.as_mut())
+                {
+                    assistant.tool_uses.extend(
+                        parallel_web_searches
+                            .iter()
+                            .map(|(tool_use, _)| tool_use.clone()),
+                    );
+                }
+                for (tool_use, trace) in &parallel_web_searches {
+                    resume_web_search_payload(&mut payload, tool_use, trace);
+                }
+            }
             merge_round_usage(&mut accumulated_usage, &decoded.usage);
             decoded = DecodedResponse::default();
+            let budget_available = apply_remaining_output_budget(
+                &mut payload,
+                max_output_tokens,
+                accumulated_usage.output_tokens,
+            );
+            debug_assert!(budget_available);
             let next_input_tokens = state
                 .tokenizer
                 .estimate_kiro_payload(&payload)
@@ -1861,13 +2446,16 @@ async fn collect_nonstream_rounds(
                 })?
                 .len();
             let next_loaded_tools = loaded_tool_count(&payload);
-            if next_loaded_tools > kproxy_translate::validate::MAX_TOOLS {
+            let max_loaded_tools = config
+                .context
+                .max_loaded_tools
+                .min(kproxy_translate::validate::MAX_TOOLS);
+            if next_loaded_tools > max_loaded_tools {
                 return Err(ExecuteError::Upstream(KiroError {
                     status: Some(413),
                     endpoint,
                     message: format!(
-                        "too many loaded tools after Tool Search: {next_loaded_tools} > {}",
-                        kproxy_translate::validate::MAX_TOOLS
+                        "too many loaded tools after Tool Search: {next_loaded_tools} > {max_loaded_tools}"
                     ),
                 }));
             }
@@ -1926,8 +2514,159 @@ async fn collect_nonstream_rounds(
             continue;
         }
 
+        let web_search_keys = if web_search_max_rounds > 0 {
+            decoded
+                .tools
+                .iter()
+                .filter(|(_, tool)| tool.name == "web_search")
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        if !web_search_keys.is_empty() {
+            let search_uses = web_search_keys
+                .into_iter()
+                .map(|key| {
+                    let search = decoded
+                        .tools
+                        .remove(&key)
+                        .expect("web search buffer exists");
+                    KiroToolUse {
+                        tool_use_id: search.id,
+                        name: search.name,
+                        input: super::response::repair_json(&search.input),
+                    }
+                })
+                .collect::<Vec<_>>();
+            let round_text = std::mem::take(&mut decoded.text);
+            let mut preceding_text = std::mem::take(&mut accumulated_text);
+            preceding_text.push_str(&round_text);
+
+            // Preserve every server call, but leave it unresolved until the
+            // client tool results from this mixed turn are returned.
+            if !decoded.tools.is_empty() || output_exhausted {
+                for search_use in &search_uses {
+                    accumulated_server_events.push(ClaudeServerEvent::WebSearch {
+                        index: accumulated_web_searches.len(),
+                        preceding_text: std::mem::take(&mut preceding_text),
+                    });
+                    accumulated_web_searches.push(ClaudeWebSearchTrace::pending(
+                        format!("srvtoolu_{}", Uuid::new_v4().simple()),
+                        search_use.input.clone(),
+                    ));
+                }
+                accumulated_reasoning.push_str(&decoded.reasoning);
+                decoded.reasoning = accumulated_reasoning;
+                decoded.tool_searches = accumulated_searches;
+                decoded.web_searches = accumulated_web_searches;
+                decoded.claude_server_events = accumulated_server_events;
+                if output_exhausted && decoded.tools.is_empty() {
+                    decoded.stop_reason = Some("max_tokens".into());
+                }
+                merge_round_usage(&mut decoded.usage, &accumulated_usage);
+                let total_output_tokens = decoded.usage.output_tokens;
+                return Ok((decoded, endpoint, total_output_tokens));
+            }
+
+            let mut searches = Vec::with_capacity(search_uses.len());
+            for search_use in search_uses {
+                let query = search_use
+                    .input
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .trim()
+                    .to_owned();
+                let server_id = format!("srvtoolu_{}", Uuid::new_v4().simple());
+                let trace = if web_search_round >= web_search_max_rounds {
+                    ClaudeWebSearchTrace::error(
+                        server_id,
+                        &query,
+                        if web_search_client_limit {
+                            "max_uses_exceeded"
+                        } else {
+                            "unavailable"
+                        },
+                        if web_search_client_limit {
+                            format!("web search is limited to max_uses={web_search_max_rounds}")
+                        } else {
+                            format!(
+                                "web search reached the proxy safety limit of {web_search_max_rounds} uses"
+                            )
+                        },
+                    )
+                } else if query.is_empty() {
+                    ClaudeWebSearchTrace::error(
+                        server_id,
+                        &query,
+                        "invalid_tool_input",
+                        "web search query must not be empty".into(),
+                    )
+                } else {
+                    web_search_round += 1;
+                    match execute_kiro_web_search(state, lease, &query).await {
+                        Ok(results) => ClaudeWebSearchTrace::success(server_id, &query, results),
+                        Err(error) => ClaudeWebSearchTrace::error(
+                            server_id,
+                            &query,
+                            web_search_error_code(&error),
+                            sanitize_error_message(&error.to_string()),
+                        )
+                        .executed(),
+                    }
+                };
+                accumulated_server_events.push(ClaudeServerEvent::WebSearch {
+                    index: accumulated_web_searches.len(),
+                    preceding_text: std::mem::take(&mut preceding_text),
+                });
+                accumulated_web_searches.push(trace.clone());
+                searches.push((search_use, trace));
+            }
+            tracing::info!(
+                trace_id,
+                account_id = %lease.account_id(),
+                endpoint,
+                web_search_round,
+                search_count = searches.len(),
+                result_count = searches.iter().map(|(_, trace)| trace.results.len()).sum::<usize>(),
+                search_error = searches.iter().any(|(_, trace)| trace.error.is_some()),
+                "proxy Kiro MCP web search batch executed"
+            );
+            accumulated_reasoning.push_str(&std::mem::take(&mut decoded.reasoning));
+            payload = web_search_continue_payload_batch(&payload, &round_text, &searches);
+            merge_round_usage(&mut accumulated_usage, &decoded.usage);
+            decoded = DecodedResponse::default();
+            let budget_available = apply_remaining_output_budget(
+                &mut payload,
+                max_output_tokens,
+                accumulated_usage.output_tokens,
+            );
+            debug_assert!(budget_available);
+            validate_internal_continuation(state, &payload, compact, &endpoint, "Web Search")
+                .await
+                .map_err(ExecuteError::Upstream)?;
+            if let Err(error) = reservation.extend(estimated_credits) {
+                if matches!(error, MeterError::DailyLimitExceeded) {
+                    trigger_quota_shutdown(
+                        state,
+                        "The service daily credit limit was reached during Web Search",
+                    );
+                }
+                return Err(ExecuteError::Meter(error));
+            }
+            let account = lease.account().await;
+            upstream = state
+                .kiro()
+                .generate(&account, &payload, None)
+                .await
+                .map_err(ExecuteError::Upstream)?;
+            continue;
+        }
+
         if client_has_tools
             || decoded.tools.is_empty()
+            || output_exhausted
             || round >= config.features.auto_continue_rounds.min(30)
         {
             accumulated_text.push_str(&decoded.text);
@@ -1935,8 +2674,13 @@ async fn collect_nonstream_rounds(
             decoded.text = accumulated_text;
             decoded.reasoning = accumulated_reasoning;
             decoded.tool_searches = accumulated_searches;
-            let current_round_output_tokens = decoded.usage.output_tokens;
+            decoded.web_searches = accumulated_web_searches;
+            decoded.claude_server_events = accumulated_server_events;
+            if output_exhausted && decoded.tools.is_empty() {
+                decoded.stop_reason = Some("max_tokens".into());
+            }
             merge_round_usage(&mut decoded.usage, &accumulated_usage);
+            let total_output_tokens = decoded.usage.output_tokens;
             tracing::debug!(
                 trace_id,
                 account_id = %lease.account_id(),
@@ -1948,7 +2692,7 @@ async fn collect_nonstream_rounds(
                 tool_count = decoded.tools.len(),
                 "upstream non-stream round decoded"
             );
-            return Ok((decoded, endpoint, current_round_output_tokens));
+            return Ok((decoded, endpoint, total_output_tokens));
         }
         let uses = decoded
             .tools
@@ -1975,6 +2719,12 @@ async fn collect_nonstream_rounds(
         decoded.tools.clear();
         merge_round_usage(&mut accumulated_usage, &decoded.usage);
         decoded.usage = kproxy_kiro::UsageInfo::default();
+        let budget_available = apply_remaining_output_budget(
+            &mut payload,
+            max_output_tokens,
+            accumulated_usage.output_tokens,
+        );
+        debug_assert!(budget_available);
         if let Err(error) = reservation.extend(estimated_credits) {
             if matches!(error, MeterError::DailyLimitExceeded) {
                 trigger_quota_shutdown(
@@ -1992,6 +2742,141 @@ async fn collect_nonstream_rounds(
             .map_err(ExecuteError::Upstream)?;
         round += 1;
     }
+}
+
+pub(super) fn web_search_error_code(error: &KiroError) -> &'static str {
+    match error.status {
+        Some(429) => "too_many_requests",
+        Some(413) => "request_too_large",
+        Some(400) if error.message.to_ascii_lowercase().contains("too long") => "query_too_long",
+        Some(400) => "invalid_tool_input",
+        _ => "unavailable",
+    }
+}
+
+/// Applies the remaining client output budget to the next internal Kiro
+/// continuation. Returns false when no model output may be generated.
+pub(super) fn apply_remaining_output_budget(
+    payload: &mut kproxy_translate::KiroPayload,
+    maximum: u32,
+    used: u64,
+) -> bool {
+    let remaining = u64::from(maximum).saturating_sub(used);
+    if remaining == 0 {
+        return false;
+    }
+    if let Some(inference) = payload.inference_config.as_mut() {
+        inference.max_tokens = remaining.min(u64::from(u32::MAX)) as u32;
+    }
+    true
+}
+
+pub(super) async fn execute_kiro_web_search(
+    state: &Arc<AppState>,
+    lease: &AccountLease,
+    query: &str,
+) -> Result<kproxy_translate::WebSearchResults, KiroError> {
+    let account = lease.account().await;
+    match state.kiro().web_search(&account, query).await {
+        Err(error) if error.is_auth() => {
+            state
+                .refresh_account_token(&state.pool(), &account.id, true)
+                .await
+                .map_err(|refresh| KiroError {
+                    status: error.status,
+                    endpoint: "MCP web_search".into(),
+                    message: format!("web search authentication refresh failed: {refresh}"),
+                })?;
+            persist_refreshed_accounts(state)
+                .await
+                .map_err(|_| KiroError {
+                    status: None,
+                    endpoint: "MCP web_search".into(),
+                    message: "failed to persist refreshed web search token".into(),
+                })?;
+            let refreshed = lease.account().await;
+            state.kiro().web_search(&refreshed, query).await
+        }
+        result => result,
+    }
+}
+
+pub(super) async fn validate_internal_continuation(
+    state: &Arc<AppState>,
+    payload: &kproxy_translate::KiroPayload,
+    compact: bool,
+    endpoint: &str,
+    stage: &str,
+) -> Result<u64, KiroError> {
+    let config = state.config.current();
+    let input_tokens = state
+        .tokenizer
+        .estimate_kiro_payload(payload)
+        .await
+        .map_err(|message| KiroError {
+            status: None,
+            endpoint: endpoint.into(),
+            message,
+        })? as u64;
+    let tool_tokens = state
+        .tokenizer
+        .estimate_kiro_tools(payload)
+        .await
+        .map_err(|message| KiroError {
+            status: None,
+            endpoint: endpoint.into(),
+            message,
+        })? as u64;
+    let payload_bytes = serde_json::to_vec(payload)
+        .map_err(|error| KiroError {
+            status: None,
+            endpoint: endpoint.into(),
+            message: error.to_string(),
+        })?
+        .len();
+    let loaded_tools = loaded_tool_count(payload);
+    let max_loaded_tools = config
+        .context
+        .max_loaded_tools
+        .min(kproxy_translate::validate::MAX_TOOLS);
+    let budget_message = if loaded_tools > max_loaded_tools {
+        Some(format!(
+            "too many loaded tools after {stage}: {loaded_tools} > {max_loaded_tools}"
+        ))
+    } else if tool_tokens > u64::from(config.context.max_tool_input_tokens) {
+        Some(format!(
+            "loaded tools are too large after {stage}: {tool_tokens} tokens > {}",
+            config.context.max_tool_input_tokens
+        ))
+    } else if payload_bytes > config.context.max_upstream_payload_bytes {
+        Some(format!(
+            "translated payload is too large after {stage}: {payload_bytes} bytes > {}",
+            config.context.max_upstream_payload_bytes
+        ))
+    } else {
+        None
+    };
+    if let Some(message) = budget_message {
+        return Err(KiroError {
+            status: Some(413),
+            endpoint: endpoint.into(),
+            message,
+        });
+    }
+    let model = &payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .model_id;
+    check_context_limit(state, input_tokens, compact, model).map_err(|limit| KiroError {
+        status: Some(413),
+        endpoint: endpoint.into(),
+        message: format!(
+            "prompt is too long after {stage}: {} tokens > {}",
+            limit.input_tokens, limit.maximum
+        ),
+    })?;
+    Ok(input_tokens)
 }
 
 fn merge_round_usage(total: &mut kproxy_kiro::UsageInfo, addition: &kproxy_kiro::UsageInfo) {
@@ -2031,7 +2916,15 @@ async fn nonstream_claude(
     started: Instant,
     prompt_cache: Option<PromptCacheProfile>,
     compaction_summary: Option<String>,
-    tool_search: Option<ClaudeToolSearchCatalog>,
+    tool_search: Option<Arc<ClaudeToolSearchCatalog>>,
+    max_tool_search_operations: u32,
+    tool_search_operations: u32,
+    web_search_max_rounds: u32,
+    web_search_client_limit: bool,
+    resumed_tool_searches: Vec<kproxy_translate::ClaudeToolSearchTrace>,
+    resumed_web_searches: Vec<ClaudeWebSearchTrace>,
+    resumed_server_events: Vec<ClaudeServerEvent>,
+    diagnostics: RequestDiagnostics,
     web_tool_names: std::collections::HashMap<String, String>,
 ) -> Result<Response, ApiError> {
     let (mut decoded, endpoint, current_round_output_tokens) = collect_nonstream_rounds(
@@ -2043,7 +2936,15 @@ async fn nonstream_claude(
         upstream,
         payload,
         compact,
+        request.max_tokens,
         tool_search.as_ref(),
+        max_tool_search_operations,
+        tool_search_operations,
+        web_search_max_rounds,
+        web_search_client_limit,
+        resumed_tool_searches,
+        resumed_web_searches,
+        resumed_server_events,
     )
     .await
     .map_err(|error| upstream_error(error, ErrorFormat::Claude))?;
@@ -2085,6 +2986,7 @@ async fn nonstream_claude(
         model_mapping_rule.as_deref(),
         attempts,
         started,
+        diagnostics,
         &decoded,
         credits,
     ));
@@ -2109,6 +3011,7 @@ async fn nonstream_claude(
         request.max_tokens,
         current_round_output_tokens,
         compaction_summary.as_deref(),
+        &state.web_search_replay,
     ))
     .into_response())
 }
@@ -2134,6 +3037,7 @@ async fn nonstream_openai(
     estimated_credits: f64,
     started: Instant,
     prompt_cache: Option<PromptCacheProfile>,
+    diagnostics: RequestDiagnostics,
     openai_tools: std::collections::HashMap<String, OpenAiToolIdentity>,
 ) -> Result<Response, ApiError> {
     let (mut decoded, endpoint, current_round_output_tokens) = collect_nonstream_rounds(
@@ -2145,7 +3049,15 @@ async fn nonstream_openai(
         upstream,
         payload,
         false,
+        max_tokens,
         None,
+        0,
+        0,
+        0,
+        false,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
     )
     .await
     .map_err(|error| upstream_error(error, ErrorFormat::OpenAi))?;
@@ -2186,6 +3098,7 @@ async fn nonstream_openai(
         model_mapping_rule.as_deref(),
         attempts,
         started,
+        diagnostics,
         &decoded,
         credits,
     ));
@@ -2294,9 +3207,39 @@ fn request_log(
     model_mapping_rule: Option<&str>,
     attempts: Vec<UpstreamAttemptLog>,
     started: Instant,
+    mut diagnostics: RequestDiagnostics,
     decoded: &DecodedResponse,
     credits: f64,
 ) -> RequestLog {
+    diagnostics.tool_search_rounds = decoded.tool_searches.len();
+    diagnostics.tool_search_matches = decoded
+        .tool_searches
+        .iter()
+        .map(|search| search.matched_count)
+        .sum();
+    diagnostics.search_requested_limit = decoded
+        .tool_searches
+        .iter()
+        .map(|search| search.requested_limit)
+        .max()
+        .unwrap_or_default();
+    diagnostics.search_returned_count = decoded
+        .tool_searches
+        .iter()
+        .map(|search| search.references.len())
+        .sum();
+    diagnostics.search_budget_truncated = decoded
+        .tool_searches
+        .iter()
+        .any(|search| search.budget_truncated);
+    diagnostics.web_search_rounds = decoded.web_searches.len();
+    diagnostics.web_search_results = decoded
+        .web_searches
+        .iter()
+        .map(|search| search.results.len())
+        .sum();
+    diagnostics.client_status = 200;
+    diagnostics.upstream_status = Some(200);
     RequestLog {
         timestamp: now_secs(),
         trace_id: trace_id.into(),
@@ -2317,6 +3260,7 @@ fn request_log(
         output_tokens: decoded.usage.output_tokens,
         credits,
         error: None,
+        diagnostics,
     }
 }
 
@@ -2380,13 +3324,9 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
                 ErrorFormat::Claude,
             )
         })?;
-        validate_claude(&request).map_err(|error| {
-            ApiError::new(
-                StatusCode::BAD_REQUEST,
-                error.to_string(),
-                ErrorFormat::Claude,
-            )
-        })?;
+        let mut original_request = request.clone();
+        let boundary_applied = apply_compaction_boundary(&mut request);
+        validate_claude(&request).map_err(claude_validation_error)?;
         tracing::info!(
             trace_id = %trace_id,
             protocol = "claude_count_tokens",
@@ -2399,12 +3339,34 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         if config.features.disable_tools {
             request.tools.clear();
             request.tool_choice = None;
+            original_request.tools.clear();
+            original_request.tool_choice = None;
         } else if !config.features.enable_web_tools {
             request.tools.retain(|tool| {
                 !tool.r#type.as_deref().is_some_and(|kind| {
                     kind.starts_with("web_search") || kind.starts_with("web_fetch")
                 })
             });
+            original_request.tools.retain(|tool| {
+                !tool.r#type.as_deref().is_some_and(|kind| {
+                    kind.starts_with("web_search") || kind.starts_with("web_fetch")
+                })
+            });
+        }
+        if !config.features.enable_tool_search
+            && request.tools.iter().any(|tool| {
+                tool.defer_loading
+                    || tool
+                        .r#type
+                        .as_deref()
+                        .is_some_and(kproxy_translate::is_tool_search_type)
+            })
+        {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Anthropic Tool Search is disabled by proxy configuration",
+                ErrorFormat::Claude,
+            ));
         }
         let compact_trigger = compact_trigger_tokens(request.context_management.as_ref());
         let route = map_model(
@@ -2417,7 +3379,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         let mut normal = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
         normal.enhance_system_prompt = config.features.enhance_system_prompt;
         normal.compact_mode = compact_trigger.is_some();
-        let mut original_payload = claude_to_kiro(&request, &normal);
+        let mut original_payload = claude_to_kiro(&original_request, &normal);
         let thinking_limit = model_token_limit(&state, &route.mapped, false)
             .unwrap_or(config.features.max_thinking_budget_tokens)
             .min(config.features.max_thinking_budget_tokens);
@@ -2439,7 +3401,6 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
                     ErrorFormat::Claude,
                 )
             })?;
-        let boundary_applied = apply_compaction_boundary(&mut request);
         let input_tokens = if boundary_applied {
             let mut effective_payload = claude_to_kiro(&request, &normal);
             apply_adaptive_thinking(
@@ -2612,20 +3573,18 @@ fn configured_model_info(model_id: String) -> kproxy_kiro::ModelInfo {
 }
 
 fn claude_web_tool_names(request: &ClaudeRequest) -> std::collections::HashMap<String, String> {
-    request
-        .tools
-        .iter()
-        .filter_map(|tool| {
-            let kind = tool.r#type.as_deref()?;
-            if kind.starts_with("web_search") {
-                Some(("web_search".into(), kind.into()))
-            } else if kind.starts_with("web_fetch") {
-                Some(("web_fetch".into(), kind.into()))
-            } else {
-                None
-            }
-        })
-        .collect()
+    let mut names = kproxy_translate::claude_tool_name_map(request);
+    names.extend(request.tools.iter().filter_map(|tool| {
+        let kind = tool.r#type.as_deref()?;
+        if kind.starts_with("web_search") {
+            Some(("web_search".into(), kind.into()))
+        } else if kind.starts_with("web_fetch") {
+            Some(("web_fetch".into(), kind.into()))
+        } else {
+            None
+        }
+    }));
+    names
 }
 
 fn authenticate(
@@ -2726,6 +3685,19 @@ fn serialized_payload_bytes(
         })
 }
 
+fn claude_validation_error(error: ValidationError) -> ApiError {
+    let status = match &error {
+        ValidationError::TooManyTools
+        | ValidationError::TooManyDeferredTools
+        | ValidationError::LoadedToolDefinitionsTooLarge
+        | ValidationError::DeferredToolDefinitionsTooLarge
+        | ValidationError::ToolDefinitionTooLarge
+        | ValidationError::ToolDocumentationTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
+        _ => StatusCode::BAD_REQUEST,
+    };
+    ApiError::new(status, error.to_string(), ErrorFormat::Claude)
+}
+
 fn loaded_tool_count(payload: &kproxy_translate::KiroPayload) -> usize {
     payload
         .conversation_state
@@ -2734,6 +3706,72 @@ fn loaded_tool_count(payload: &kproxy_translate::KiroPayload) -> usize {
         .user_input_message_context
         .as_ref()
         .map_or(0, |context| context.tools.len())
+}
+
+fn loaded_tool_bytes(payload: &kproxy_translate::KiroPayload) -> usize {
+    payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .user_input_message_context
+        .as_ref()
+        .and_then(|context| serde_json::to_vec(&context.tools).ok())
+        .map_or(0, |tools| tools.len())
+}
+
+pub(super) fn loaded_tool_names(payload: &kproxy_translate::KiroPayload) -> HashSet<String> {
+    payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .user_input_message_context
+        .as_ref()
+        .into_iter()
+        .flat_map(|context| context.tools.iter())
+        .map(|tool| tool.tool_specification.name.clone())
+        .collect()
+}
+
+pub(super) async fn remaining_tool_search_budget(
+    state: &Arc<AppState>,
+    payload: &kproxy_translate::KiroPayload,
+    compact: bool,
+) -> Result<kproxy_translate::ClaudeToolSearchBudget, String> {
+    let config = state.config.current();
+    let current_tools = loaded_tool_count(payload);
+    let current_tool_tokens = state.tokenizer.estimate_kiro_tools(payload).await? as u64;
+    let current_input_tokens = state.tokenizer.estimate_kiro_payload(payload).await? as u64;
+    let current_payload_bytes = serde_json::to_vec(payload)
+        .map_err(|error| format!("failed to serialize Tool Search payload: {error}"))?
+        .len();
+    let model = &payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .model_id;
+
+    // JSON/schema-heavy text generally tokenizes below three bytes per token.
+    // Using three here is deliberately conservative; the exact translated
+    // request is checked again before dispatch.
+    let token_bytes = u64::from(config.context.max_tool_input_tokens)
+        .saturating_sub(current_tool_tokens)
+        .saturating_mul(3);
+    let context_bytes = context_maximum(state, compact, model)
+        .saturating_sub(current_input_tokens)
+        .saturating_mul(3);
+    let payload_bytes = config
+        .context
+        .max_upstream_payload_bytes
+        .saturating_sub(current_payload_bytes) as u64;
+    Ok(kproxy_translate::ClaudeToolSearchBudget {
+        max_tools: config
+            .context
+            .max_loaded_tools
+            .min(kproxy_translate::validate::MAX_TOOLS)
+            .saturating_sub(current_tools),
+        max_bytes: usize::try_from(token_bytes.min(context_bytes).min(payload_bytes))
+            .unwrap_or(usize::MAX),
+    })
 }
 
 fn enforce_payload_budget(
@@ -2745,12 +3783,14 @@ fn enforce_payload_budget(
     format: ErrorFormat,
 ) -> Result<(), ApiError> {
     let context = &state.config.current().context;
-    if loaded_tools > kproxy_translate::validate::MAX_TOOLS {
+    let max_loaded_tools = context
+        .max_loaded_tools
+        .min(kproxy_translate::validate::MAX_TOOLS);
+    if loaded_tools > max_loaded_tools {
         return Err(ApiError::new(
-            StatusCode::BAD_REQUEST,
+            StatusCode::PAYLOAD_TOO_LARGE,
             format!(
-                "too many loaded tools: {loaded_tools} > {}; defer more tools or reduce Tool Search references",
-                kproxy_translate::validate::MAX_TOOLS
+                "too many loaded tools: {loaded_tools} > {max_loaded_tools}; defer more tools or reduce Tool Search references"
             ),
             format,
         ));
@@ -2983,6 +4023,14 @@ fn upstream_api_error(
     context: RequestLogContext,
     format: ErrorFormat,
 ) -> ApiError {
+    let upstream_status = error.status;
+    let upstream_throttle = error.is_throttle();
+    let request_rejection = error.is_request_rejection();
+    let account_error = !request_rejection
+        && (error.is_auth()
+            || error.is_quota()
+            || error.is_throttle()
+            || matches!(error.status, Some(500..=599)));
     let status = match error.status {
         Some(413) => StatusCode::PAYLOAD_TOO_LARGE,
         Some(400) if upstream_bad_request_is_actionable(&error.message) => StatusCode::BAD_REQUEST,
@@ -3006,6 +4054,20 @@ fn upstream_api_error(
         StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS
     );
     output.log_context = Box::new(context);
+    output.upstream_status = upstream_status;
+    output.error_stage = "upstream_dispatch";
+    output.account_error = account_error;
+    output.error_code = if upstream_status == Some(429) || upstream_throttle {
+        "upstream_rate_limited"
+    } else if request_rejection {
+        if status == StatusCode::PAYLOAD_TOO_LARGE {
+            "tool_budget_exceeded"
+        } else {
+            "invalid_tool_protocol"
+        }
+    } else {
+        "upstream_unavailable"
+    };
     output
 }
 
@@ -3036,13 +4098,19 @@ struct ApiError {
     suppress_model_stats: bool,
     request_id: Option<String>,
     log_context: Box<RequestLogContext>,
+    error_code: &'static str,
+    error_stage: &'static str,
+    upstream_status: Option<u16>,
+    account_error: bool,
 }
 
 impl ApiError {
     fn new(status: StatusCode, message: impl Into<String>, format: ErrorFormat) -> Self {
+        let message = message.into();
+        let (error_code, error_stage) = classify_api_error(status, &message);
         Self {
             status,
-            message: message.into(),
+            message,
             format,
             allow: None,
             authenticate: false,
@@ -3050,6 +4118,10 @@ impl ApiError {
             suppress_model_stats: false,
             request_id: None,
             log_context: Box::default(),
+            error_code,
+            error_stage,
+            upstream_status: None,
+            account_error: false,
         }
     }
 
@@ -3116,8 +4188,65 @@ impl IntoResponse for ApiError {
                 .headers_mut()
                 .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
         }
+        for (name, value) in [
+            ("x-kproxy-error-code", self.error_code),
+            ("x-kproxy-error-stage", self.error_stage),
+            (
+                "x-kproxy-account-error",
+                if self.account_error { "true" } else { "false" },
+            ),
+        ] {
+            if let (Ok(name), Ok(value)) = (
+                header::HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) {
+                response.headers_mut().insert(name, value);
+            }
+        }
+        if let Some(status) = self.upstream_status {
+            if let Ok(value) = HeaderValue::from_str(&status.to_string()) {
+                response.headers_mut().insert(
+                    header::HeaderName::from_static("x-kproxy-upstream-status"),
+                    value,
+                );
+            }
+        }
         response
     }
+}
+
+fn classify_api_error(status: StatusCode, message: &str) -> (&'static str, &'static str) {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("prompt is too long") || lower.contains("context length") {
+        return ("context_length_exceeded", "context_validation");
+    }
+    if (lower.contains("not supported") || lower.contains("unsupported"))
+        && (lower.contains("tool")
+            || lower.contains("strict")
+            || lower.contains("allowed_callers")
+            || lower.contains("eager"))
+    {
+        return ("unsupported_tool_protocol", "request_validation");
+    }
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        if lower.contains("catalog") || lower.contains("deferred") {
+            return ("tool_catalog_too_large", "request_budget");
+        }
+        return ("tool_budget_exceeded", "request_budget");
+    }
+    if status == StatusCode::BAD_REQUEST && lower.contains("tool") {
+        return ("invalid_tool_protocol", "request_validation");
+    }
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        return ("upstream_rate_limited", "upstream_dispatch");
+    }
+    if matches!(
+        status,
+        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE
+    ) {
+        return ("upstream_unavailable", "upstream_dispatch");
+    }
+    ("invalid_request", "request_validation")
 }
 
 #[cfg(test)]
@@ -3233,6 +4362,50 @@ mod model_tests {
     }
 
     #[test]
+    fn upstream_request_rejections_never_poison_an_account() {
+        let error = upstream_api_error(
+            KiroError {
+                status: Some(503),
+                endpoint: "test".into(),
+                message: "tool schema payload too large".into(),
+            },
+            RequestLogContext::default(),
+            ErrorFormat::Claude,
+        );
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error.error_code, "invalid_tool_protocol");
+        assert!(!error.account_error);
+    }
+
+    #[test]
+    fn stable_error_diagnostics_use_headers_without_changing_protocol_body() {
+        let response = ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "loaded tool definitions are too large",
+            ErrorFormat::Claude,
+        )
+        .with_request_id("trace_test")
+        .into_response();
+        assert_eq!(
+            response.headers()["x-kproxy-error-code"],
+            "tool_budget_exceeded"
+        );
+        assert_eq!(response.headers()["x-kproxy-error-stage"], "request_budget");
+        assert_eq!(response.headers()["request-id"], "trace_test");
+    }
+
+    #[test]
+    fn catalog_capacity_errors_are_413_with_stable_codes() {
+        let deferred = claude_validation_error(ValidationError::TooManyDeferredTools);
+        assert_eq!(deferred.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(deferred.error_code, "tool_catalog_too_large");
+
+        let loaded = claude_validation_error(ValidationError::TooManyTools);
+        assert_eq!(loaded.status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(loaded.error_code, "tool_budget_exceeded");
+    }
+
+    #[test]
     fn model_path_omits_empty_and_duplicate_hops() {
         assert_eq!(
             build_model_path("client", "mapped", "kiro"),
@@ -3249,6 +4422,37 @@ mod model_tests {
             ..kproxy_core::config::PoolConfig::default()
         };
         assert_eq!(estimated_credits(900, 500, &config), 2.0);
+    }
+
+    #[test]
+    fn internal_rounds_receive_only_the_remaining_output_budget() {
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4",
+            "max_tokens":100,
+            "messages":[{"role":"user","content":"use a tool"}],
+            "tools":[{"name":"lookup","input_schema":{"type":"object"}}]
+        }))
+        .expect("request");
+        let mut payload = claude_to_kiro(
+            &request,
+            &TranslationOptions::new("dynamic-sonnet", "AI_EDITOR"),
+        );
+        assert_eq!(
+            payload
+                .inference_config
+                .as_ref()
+                .map(|value| value.max_tokens),
+            Some(100)
+        );
+        assert!(apply_remaining_output_budget(&mut payload, 100, 35));
+        assert_eq!(
+            payload
+                .inference_config
+                .as_ref()
+                .map(|value| value.max_tokens),
+            Some(65)
+        );
+        assert!(!apply_remaining_output_budget(&mut payload, 100, 100));
     }
 
     #[test]

@@ -13,7 +13,7 @@ use kproxy_notify::Notifier;
 use kproxy_pool::{AccountPool, RefreshError, TokenRefresher};
 use kproxy_store::accounts::AccountStore;
 use kproxy_store::config_loader::ConfigHandle;
-use kproxy_translate::{model::resolve_dynamic_model, TokenCountCache};
+use kproxy_translate::{model::resolve_dynamic_model, TokenCountCache, WebSearchReplayCodec};
 use tokio_util::sync::CancellationToken;
 
 use crate::http::prompt_cache::PromptCacheTracker;
@@ -54,6 +54,7 @@ pub struct AppState {
     pub meter: Arc<Meter>,
     notifier: RwLock<Notifier>,
     pub tokenizer: TokenCountCache,
+    pub web_search_replay: WebSearchReplayCodec,
     pub stats: Arc<StatsStore>,
     pub models: Arc<ModelCache>,
     model_refresh: tokio::sync::Notify,
@@ -86,8 +87,15 @@ impl AppState {
         let current = config.current();
         let meter = Meter::empty(&paths.daily_file, &current.api_key);
         let stats = Arc::new(StatsStore::empty(&paths.stats_file));
-        Self::build(paths, config, accounts, meter, stats)
-            .expect("default runtime components must initialize")
+        Self::build(
+            paths,
+            config,
+            accounts,
+            meter,
+            stats,
+            WebSearchReplayCodec::from_key([0xA5; 32]),
+        )
+        .expect("default runtime components must initialize")
     }
 
     pub async fn load(
@@ -100,7 +108,17 @@ impl AppState {
         accounts.set_incremental_write(current.storage.incremental_write);
         let meter = Meter::load(&paths.daily_file, &current.api_key).await?;
         let stats = Arc::new(StatsStore::load(&paths.stats_file).await?);
-        Self::build(paths, config, accounts, meter, stats)
+        let replay_key = tokio::fs::read_to_string(&paths.web_search_replay_key_file)
+            .await
+            .map_err(|error| {
+                anyhow::anyhow!(
+                    "read web-search replay key {}: {error}",
+                    paths.web_search_replay_key_file.display()
+                )
+            })?;
+        let web_search_replay = WebSearchReplayCodec::from_base64(&replay_key)
+            .map_err(|error| anyhow::anyhow!(error))?;
+        Self::build(paths, config, accounts, meter, stats, web_search_replay)
     }
 
     fn build(
@@ -109,6 +127,7 @@ impl AppState {
         mut accounts: AccountStore,
         meter: Arc<Meter>,
         stats: Arc<StatsStore>,
+        web_search_replay: WebSearchReplayCodec,
     ) -> anyhow::Result<Self> {
         let current = config.current();
         meter.set_daily_limit(current.pool.daily_credit_limit);
@@ -117,6 +136,7 @@ impl AppState {
         let overrides = EndpointOverrides {
             codewhisperer_url: std::env::var("KPROXY_CODEWHISPERER_URL").ok(),
             amazonq_url: std::env::var("KPROXY_AMAZONQ_URL").ok(),
+            mcp_url: std::env::var("KPROXY_MCP_URL").ok(),
         };
         let kiro = KiroClient::new(current.upstream.clone(), overrides)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -135,6 +155,7 @@ impl AppState {
             meter,
             notifier: RwLock::new(notifier),
             tokenizer: TokenCountCache::new(512).map_err(anyhow::Error::msg)?,
+            web_search_replay,
             stats,
             models: Arc::new(ModelCache::default()),
             model_refresh: tokio::sync::Notify::new(),
@@ -415,6 +436,7 @@ impl AppState {
             let overrides = EndpointOverrides {
                 codewhisperer_url: std::env::var("KPROXY_CODEWHISPERER_URL").ok(),
                 amazonq_url: std::env::var("KPROXY_AMAZONQ_URL").ok(),
+                mcp_url: std::env::var("KPROXY_MCP_URL").ok(),
             };
             if let Ok(client) = KiroClient::new(next.upstream.clone(), overrides) {
                 *write_lock(&self.kiro) = client;
