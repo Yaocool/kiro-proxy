@@ -1,7 +1,7 @@
 //! Wire models. Optional and unknown fields intentionally remain forward compatible.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Anthropic Messages request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +37,7 @@ pub struct ClaudeMessage {
 pub struct ClaudeTool {
     #[serde(default)]
     pub r#type: Option<String>,
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub description: String,
@@ -52,6 +53,31 @@ pub struct ClaudeTool {
     /// catalog but are not loaded into the model context until discovered.
     #[serde(default)]
     pub defer_loading: bool,
+    /// Anthropic programmatic-tool-calling policy. Only direct calls can be
+    /// represented by the Kiro upstream today; validation rejects the other
+    /// values instead of silently weakening the contract.
+    #[serde(default)]
+    pub allowed_callers: Option<Vec<String>>,
+    /// Fine-grained tool-input streaming is an execution guarantee, not a
+    /// schema hint, so it must be validated explicitly.
+    #[serde(default)]
+    pub eager_input_streaming: Option<bool>,
+    /// Server-side web search controls.
+    #[serde(default)]
+    pub max_uses: Option<u32>,
+    #[serde(default)]
+    pub allowed_domains: Option<Vec<String>>,
+    #[serde(default)]
+    pub blocked_domains: Option<Vec<String>>,
+    #[serde(default)]
+    pub user_location: Option<Value>,
+    #[serde(default)]
+    pub response_inclusion: Option<String>,
+    /// Keep unknown tool-level fields visible to validation. Silently dropping
+    /// a future caller, execution, or safety control could weaken the contract
+    /// the client asked Anthropic to enforce.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -188,6 +214,32 @@ pub struct KiroToolResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KiroText {
     pub text: String,
+}
+
+/// Normalized Kiro MCP web search payload (the JSON string nested inside the
+/// MCP `result.content[].text` block).
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WebSearchResults {
+    #[serde(default)]
+    pub query: String,
+    #[serde(default)]
+    pub total_results: u64,
+    #[serde(default)]
+    pub results: Vec<WebSearchResult>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct WebSearchResult {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub url: String,
+    #[serde(default)]
+    pub snippet: String,
+    #[serde(default)]
+    pub published_date: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

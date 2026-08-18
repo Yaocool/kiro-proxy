@@ -3,6 +3,8 @@ use crate::{
     KiroPayload, KiroText, KiroToolResult, KiroToolUse,
 };
 
+use super::common::history_user_without_tools;
+
 /// Completes an internal Tool Search call, loads only the matching definitions,
 /// and asks Kiro to continue the same assistant turn.
 pub fn tool_search_continue_payload(
@@ -11,6 +13,16 @@ pub fn tool_search_continue_payload(
     tool_use: KiroToolUse,
     outcome: &ClaudeToolSearchOutcome,
 ) -> KiroPayload {
+    tool_search_continue_payload_batch(payload, assistant_content, &[(tool_use, outcome.clone())])
+}
+
+/// Completes multiple Tool Search calls from one assistant turn without
+/// dropping parallel server-tool uses.
+pub fn tool_search_continue_payload_batch(
+    payload: &KiroPayload,
+    assistant_content: &str,
+    searches: &[(KiroToolUse, ClaudeToolSearchOutcome)],
+) -> KiroPayload {
     let mut next = payload.clone();
     let previous_user = next
         .conversation_state
@@ -18,7 +30,7 @@ pub fn tool_search_continue_payload(
         .user_input_message
         .clone();
     next.conversation_state.history.push(KiroHistoryMessage {
-        user_input_message: Some(previous_user.clone()),
+        user_input_message: Some(history_user_without_tools(previous_user.clone())),
         assistant_response_message: None,
     });
     next.conversation_state.history.push(KiroHistoryMessage {
@@ -29,7 +41,10 @@ pub fn tool_search_continue_payload(
             } else {
                 tail_chars(assistant_content, 48_000)
             },
-            tool_uses: vec![tool_use.clone()],
+            tool_uses: searches
+                .iter()
+                .map(|(tool_use, _)| tool_use.clone())
+                .collect(),
         }),
     });
 
@@ -37,15 +52,84 @@ pub fn tool_search_continue_payload(
         .user_input_message_context
         .map(|context| context.tools)
         .unwrap_or_default();
-    for found in &outcome.tools {
-        let name = &found.tool_specification.name;
-        if !tools
-            .iter()
-            .any(|existing| existing.tool_specification.name == *name)
-        {
-            tools.push(found.clone());
+    for (_, outcome) in searches {
+        for found in &outcome.tools {
+            let name = &found.tool_specification.name;
+            if !tools
+                .iter()
+                .any(|existing| existing.tool_specification.name == *name)
+            {
+                tools.push(found.clone());
+            }
         }
     }
+    let tool_results = searches
+        .iter()
+        .map(|(tool_use, outcome)| tool_search_kiro_result(tool_use, outcome))
+        .collect();
+    let documentation = searches
+        .iter()
+        .flat_map(|(_, outcome)| outcome.documentation.iter().cloned())
+        .collect::<Vec<_>>();
+    let current = &mut next.conversation_state.current_message.user_input_message;
+    current.content = if documentation.is_empty() {
+        "Continue using the Tool Search result.".into()
+    } else {
+        format!(
+            "Continue using the Tool Search result.\n\n{}",
+            documentation.join("\n\n")
+        )
+    };
+    current.images.clear();
+    current.user_input_message_context = Some(KiroMessageContext {
+        tool_results,
+        tools,
+    });
+    if next.conversation_state.history.len() > 30 {
+        let remove = next.conversation_state.history.len() - 30;
+        next.conversation_state.history.drain(..remove);
+    }
+    next
+}
+
+/// Adds the result for a previously emitted pending Tool Search call to the
+/// current Kiro user turn.
+pub fn resume_tool_search_payload(
+    payload: &mut KiroPayload,
+    tool_use: &KiroToolUse,
+    outcome: &ClaudeToolSearchOutcome,
+) {
+    let current = &mut payload
+        .conversation_state
+        .current_message
+        .user_input_message;
+    let context = current
+        .user_input_message_context
+        .get_or_insert_with(KiroMessageContext::default);
+    for found in &outcome.tools {
+        if !context
+            .tools
+            .iter()
+            .any(|existing| existing.tool_specification.name == found.tool_specification.name)
+        {
+            context.tools.push(found.clone());
+        }
+    }
+    context
+        .tool_results
+        .push(tool_search_kiro_result(tool_use, outcome));
+    if !outcome.documentation.is_empty() {
+        current.content.push_str("\n\n");
+        current
+            .content
+            .push_str(&outcome.documentation.join("\n\n"));
+    }
+}
+
+fn tool_search_kiro_result(
+    tool_use: &KiroToolUse,
+    outcome: &ClaudeToolSearchOutcome,
+) -> KiroToolResult {
     let (status, result) = if let Some(error) = &outcome.trace.error {
         (
             "error",
@@ -62,29 +146,11 @@ pub fn tool_search_continue_payload(
             ),
         )
     };
-    let current = &mut next.conversation_state.current_message.user_input_message;
-    current.content = if outcome.documentation.is_empty() {
-        "Continue using the Tool Search result.".into()
-    } else {
-        format!(
-            "Continue using the Tool Search result.\n\n{}",
-            outcome.documentation.join("\n\n")
-        )
-    };
-    current.images.clear();
-    current.user_input_message_context = Some(KiroMessageContext {
-        tool_results: vec![KiroToolResult {
-            content: vec![KiroText { text: result }],
-            status: status.into(),
-            tool_use_id: tool_use.tool_use_id,
-        }],
-        tools,
-    });
-    if next.conversation_state.history.len() > 30 {
-        let remove = next.conversation_state.history.len() - 30;
-        next.conversation_state.history.drain(..remove);
+    KiroToolResult {
+        content: vec![KiroText { text: result }],
+        status: status.into(),
+        tool_use_id: tool_use.tool_use_id.clone(),
     }
-    next
 }
 
 /// Appends a completed assistant tool round and asks Kiro to continue.
@@ -100,7 +166,7 @@ pub fn auto_continue_payload(
         .user_input_message
         .clone();
     next.conversation_state.history.push(KiroHistoryMessage {
-        user_input_message: Some(previous_user.clone()),
+        user_input_message: Some(history_user_without_tools(previous_user.clone())),
         assistant_response_message: None,
     });
     next.conversation_state.history.push(KiroHistoryMessage {
@@ -247,6 +313,10 @@ mod tests {
                 input: search_use.input.clone(),
                 references: vec!["mcp__github__list_issues".into()],
                 error: None,
+                requested_limit: 5,
+                matched_count: 1,
+                budget_truncated: false,
+                emission: crate::ClaudeServerToolEmission::Complete,
             },
             tools: vec![KiroTool {
                 tool_specification: KiroToolSpecification {
@@ -258,8 +328,15 @@ mod tests {
                 },
             }],
             documentation: vec![],
+            truncated: false,
         };
         let next = tool_search_continue_payload(&payload, "searching", search_use, &outcome);
+        assert!(next.conversation_state.history[0]
+            .user_input_message
+            .as_ref()
+            .expect("history user")
+            .user_input_message_context
+            .is_none());
         let context = next
             .conversation_state
             .current_message
@@ -271,5 +348,37 @@ mod tests {
         assert!(context.tool_results[0].content[0]
             .text
             .contains("mcp__github__list_issues"));
+
+        let second_use = KiroToolUse {
+            tool_use_id: "srvtoolu_2".into(),
+            name: "tool_search_tool_regex".into(),
+            input: serde_json::json!({"pattern":"pull request"}),
+        };
+        let mut second_outcome = outcome.clone();
+        second_outcome.trace.id = second_use.tool_use_id.clone();
+        second_outcome.trace.references = Vec::new();
+        second_outcome.tools = Vec::new();
+        let batch = tool_search_continue_payload_batch(
+            &payload,
+            "searching",
+            &[
+                (
+                    KiroToolUse {
+                        tool_use_id: "srvtoolu_1".into(),
+                        name: "tool_search_tool_regex".into(),
+                        input: serde_json::json!({"pattern":"issue"}),
+                    },
+                    outcome,
+                ),
+                (second_use, second_outcome),
+            ],
+        );
+        let batch_context = batch
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .expect("batch context");
+        assert_eq!(batch_context.tool_results.len(), 2);
     }
 }

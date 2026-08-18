@@ -92,4 +92,53 @@ mod tests {
         assert_eq!(request.messages.len(), 2);
         assert_eq!(request.messages[0].content[0]["type"], "compaction");
     }
+
+    #[test]
+    fn compaction_discards_stale_pending_server_calls() {
+        let mut request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4.6",
+            "max_tokens":1024,
+            "messages":[
+                {"role":"assistant","content":[{
+                    "type":"server_tool_use",
+                    "id":"srvtoolu_stale",
+                    "name":"web_search",
+                    "input":{"query":"stale"}
+                }]},
+                {"role":"assistant","content":[{
+                    "type":"compaction",
+                    "content":"The stale search is no longer part of active context."
+                }]},
+                {"role":"user","content":"continue"}
+            ]
+        }))
+        .expect("request");
+
+        assert!(apply_compaction_boundary(&mut request));
+        assert!(crate::claude_pending_server_tool_uses(&request).is_empty());
+    }
+
+    #[test]
+    fn compaction_boundary_removes_stale_invalid_server_history_before_validation() {
+        let mut request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4.6",
+            "max_tokens":1024,
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"web_search_tool_result","tool_use_id":"orphan","content":[{
+                        "type":"web_search_result","url":"https://example.com","title":"stale"
+                    }]}
+                ]},
+                {"role":"assistant","content":[{
+                    "type":"compaction","content":"The stale result is outside active context."
+                }]},
+                {"role":"user","content":"continue"}
+            ]
+        }))
+        .expect("request");
+
+        assert!(crate::validate_claude(&request).is_err());
+        assert!(apply_compaction_boundary(&mut request));
+        crate::validate_claude(&request).expect("effective compacted history is valid");
+    }
 }
