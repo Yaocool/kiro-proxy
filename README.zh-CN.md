@@ -128,17 +128,49 @@ GET  /health
 一次性加载全部 MCP schema。MCP 工具较多时，应显式启用：
 
 ```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:5580 ENABLE_TOOL_SEARCH=true claude
+ANTHROPIC_BASE_URL=http://127.0.0.1:5580 ENABLE_TOOL_SEARCH=auto claude
 ```
 
 `kiro-proxy` 现已兼容 Anthropic 的 `defer_loading`、regex/BM25 Tool Search 和
 `tool_reference` 历史块。由于 Kiro 没有原生 Tool Search server tool，代理会在本地执行搜索，
-默认向 Kiro 暴露最多 5 个匹配定义，也支持搜索请求通过 `limit` 指定 1–10000 个结果，并在
-同一个响应中继续生成；未命中的 deferred schema 不会进入 Kiro 上下文或上游 payload。
+并在同一个响应中继续生成。官方 Tool Search 输入包含 `pattern` 或 `query`，并支持可选
+`limit`（1–10000，默认 5）。代理会先遵守请求的 limit，再按剩余工具数、tool token、上下文和
+payload 字节预算动态装载，因此不存在固定 5 个的工作集上限；未命中的 deferred schema 不会进入
+Kiro 上下文或上游 payload。Catalog 构建和搜索运行在 blocking worker，不会阻塞 HTTP runtime。
 
-自动生成的 `[context]` 配置还通过 `max_tool_input_tokens` 限制已加载工具的估算 token，
-并通过 `max_upstream_payload_bytes` 限制序列化后的 Kiro 请求大小。超限请求会在本地返回明确的
-413，而不是留给上游返回不透明错误。
+自动生成的 `[context]` 配置还通过 `max_loaded_tools` 限制已加载工作集（默认值及上游协议
+硬上限均为 128）、通过 `max_tool_input_tokens` 限制已加载工具的估算 token，并通过
+`max_upstream_payload_bytes` 限制序列化后的 Kiro 请求大小。超限请求会在本地返回明确的 413，
+而不是留给上游返回不透明错误。
+
+`features.tool_search_max_rounds` 默认 4、硬上限 8；单次请求达到内部轮次上限时返回 Claude
+`pause_turn` 续轮状态，不再把合法的 server call 转换成 HTTP 5xx。
+`features.tool_search_max_operations` 默认 32（有效范围 1–256），统一限制历史待续调用及所有内部
+轮次的搜索操作总数；超出的调用会收到响应内 `unavailable` Tool Search 结果。将
+`features.enable_tool_search=false` 作为回滚开关时，代理会明确拒绝原生 Tool Search 请求，
+不会把 deferred 工具重新全量塞给上游。持久化请求日志会保存 Catalog/Working Set 大小、搜索
+limit 与预算截断、Client/Upstream Status 和稳定错误码。错误响应保持原有 Claude/OpenAI body，
+并通过 `request-id`、`x-kproxy-error-code`、`x-kproxy-error-stage`、
+`x-kproxy-upstream-status`、`x-kproxy-account-error` 响应头提供诊断信息。
+
+### Web Search
+
+Claude 原生 `web_search` server tool 会先交给 Kiro 模型决定是否搜索及搜索词，再由代理调用
+Kiro 的 `/mcp` JSON-RPC `web_search`，把真实结果作为工具结果续回同一模型轮次。代理不会把
+首条用户消息直接当查询，也不会把原始搜索摘要伪装成模型最终回答。流式和非流式 Claude 响应
+均使用 `server_tool_use` / `web_search_tool_result`；搜索错误作为 200 响应内的工具错误返回，
+不会冷却或封禁账号。并行搜索不会被丢弃；当同一轮同时包含 server tool 和 client tool 时，
+server call 会保持 pending，等客户端回传 client tool 结果后再按官方续轮协议补结果。搜索结果
+携带代理自有的 AES-256-GCM opaque 内容，后续轮次可恢复 snippet，任何篡改都会在进入模型上下文
+前被拒绝；Anthropic 自有 opaque 值仍可带回，但代理不会尝试解密。只有最终文本确实包含结果的
+完整 URL 时才会输出结构化 `web_search_result_location` citation。代理安全上限默认 20 次；显式 `max_uses` 超过配置值时会
+明确拒绝，不再静默截断。Claude Web Fetch 在兼容的服务端执行器完成前会被明确拒绝。
+
+默认 MCP 地址是 `https://runtime.{region}.kiro.dev/mcp`。可通过
+`upstream.web_search_endpoint`（支持 `{region}`）或临时环境变量 `KPROXY_MCP_URL` 覆盖；
+`upstream.web_search_timeout_ms` 默认为 60000。Kiro MCP 不具备等价语义的 domain/location
+过滤、code-execution caller、strict 或 eager streaming 会被明确拒绝，不会静默降级。代理生成
+的加密字段明确属于 kproxy 自有格式，不宣称与 Anthropic 托管搜索的 ciphertext 互通。
 
 ## 配置与文件
 
@@ -155,6 +187,7 @@ XDG 目录：
 | `accounts.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | 包含凭证，创建权限为 `0600`。 |
 | `daily.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | 按 UTC 日期重置的每日额度记录。 |
 | `stats.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | 持久化请求聚合统计。 |
+| `web-search-replay.key` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | AES-256-GCM 回放密钥，以 `0600` 创建且永不覆盖。 |
 | `admin.sock` | `${XDG_RUNTIME_DIR}/kproxy/` 或 `/run/kproxy/` | 本地管理面。 |
 | 日志 | `${XDG_DATA_HOME:-~/.local/share}/kproxy/logs/` | 按 UTC 日期和级别拆分。 |
 
