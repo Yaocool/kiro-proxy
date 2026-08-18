@@ -3,10 +3,12 @@
 use std::path::Path;
 
 use anyhow::{anyhow, Context, Result};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use kproxy_core::config::{Config, DEFAULT_CONFIG_TOML};
 use kproxy_core::paths::Paths;
+use rand::RngCore;
 
-use crate::atomic::write_bytes_atomically;
+use crate::atomic::write_bytes_if_absent_atomically;
 
 /// 首次运行创建了哪些文件。
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -19,12 +21,18 @@ pub struct BootstrapReport {
     pub created_daily: bool,
     /// 是否创建了统计文件。
     pub created_stats: bool,
+    /// 是否创建了 Web Search 回放加密密钥。
+    pub created_web_search_replay_key: bool,
 }
 
 impl BootstrapReport {
     /// 是否创建了任何文件。
     pub fn created_anything(&self) -> bool {
-        self.created_config || self.created_accounts || self.created_daily || self.created_stats
+        self.created_config
+            || self.created_accounts
+            || self.created_daily
+            || self.created_stats
+            || self.created_web_search_replay_key
     }
 }
 
@@ -46,6 +54,10 @@ pub async fn ensure_layout(paths: &Paths) -> Result<BootstrapReport> {
         &format!("socket = \"{socket}\""),
     );
 
+    let mut replay_key = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut replay_key);
+    let replay_key = format!("{}\n", URL_SAFE_NO_PAD.encode(replay_key));
+
     Ok(BootstrapReport {
         created_config: create_if_absent(
             &paths.config_file,
@@ -56,15 +68,17 @@ pub async fn ensure_layout(paths: &Paths) -> Result<BootstrapReport> {
         created_accounts: create_if_absent(&paths.accounts_file, b"[]\n", Some(0o600)).await?,
         created_daily: create_if_absent(&paths.daily_file, b"{}\n", Some(0o600)).await?,
         created_stats: create_if_absent(&paths.stats_file, b"{}\n", Some(0o600)).await?,
+        created_web_search_replay_key: write_bytes_if_absent_atomically(
+            &paths.web_search_replay_key_file,
+            replay_key.as_bytes(),
+            Some(0o600),
+        )
+        .await?,
     })
 }
 
 async fn create_if_absent(path: &Path, contents: &[u8], mode: Option<u32>) -> Result<bool> {
-    if tokio::fs::try_exists(path).await.unwrap_or(false) {
-        return Ok(false);
-    }
-    write_bytes_atomically(path, contents, mode).await?;
-    Ok(true)
+    write_bytes_if_absent_atomically(path, contents, mode).await
 }
 
 #[cfg(unix)]
@@ -129,6 +143,7 @@ mod tests {
         assert!(report.created_accounts);
         assert!(report.created_daily);
         assert!(report.created_stats);
+        assert!(report.created_web_search_replay_key);
         let config: Config = toml::from_str(
             &tokio::fs::read_to_string(&paths.config_file)
                 .await
@@ -147,6 +162,16 @@ mod tests {
                 .await
                 .expect("read edit"),
             "[server]\nport = 6000\n"
+        );
+        let replay_key = tokio::fs::read_to_string(&paths.web_search_replay_key_file)
+            .await
+            .expect("read replay key");
+        assert_eq!(
+            URL_SAFE_NO_PAD
+                .decode(replay_key.trim())
+                .expect("decode replay key")
+                .len(),
+            32
         );
     }
 
@@ -173,6 +198,14 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&paths.accounts_file)
                 .expect("accounts metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(&paths.web_search_replay_key_file)
+                .expect("replay key metadata")
                 .permissions()
                 .mode()
                 & 0o777,
