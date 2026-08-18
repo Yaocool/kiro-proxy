@@ -2795,11 +2795,11 @@ pub(super) async fn execute_kiro_web_search(
     lease: &AccountLease,
     query: &str,
 ) -> Result<kproxy_translate::WebSearchResults, KiroError> {
-    let account = lease.account().await;
-    match state.kiro().web_search(&account, query).await {
+    let account_id = lease.account().await.id;
+    match execute_kiro_web_search_once(state, lease, query).await {
         Err(error) if error.is_auth() => {
             state
-                .refresh_account_token(&state.pool(), &account.id, true)
+                .refresh_account_token(&state.pool(), &account_id, true)
                 .await
                 .map_err(|refresh| KiroError {
                     status: error.status,
@@ -2813,11 +2813,72 @@ pub(super) async fn execute_kiro_web_search(
                     endpoint: "MCP web_search".into(),
                     message: "failed to persist refreshed web search token".into(),
                 })?;
-            let refreshed = lease.account().await;
-            state.kiro().web_search(&refreshed, query).await
+            execute_kiro_web_search_once(state, lease, query).await
         }
         result => result,
     }
+}
+
+async fn execute_kiro_web_search_once(
+    state: &Arc<AppState>,
+    lease: &AccountLease,
+    query: &str,
+) -> Result<kproxy_translate::WebSearchResults, KiroError> {
+    let account = ensure_web_search_profile_arn(state, lease).await?;
+    state.kiro().web_search(&account, query).await
+}
+
+async fn ensure_web_search_profile_arn(
+    state: &Arc<AppState>,
+    lease: &AccountLease,
+) -> Result<kproxy_core::account::Account, KiroError> {
+    for _attempt in 0..2 {
+        let account = lease.account().await;
+        if account
+            .profile_arn
+            .as_deref()
+            .is_some_and(|profile_arn| !profile_arn.trim().is_empty())
+        {
+            return Ok(account);
+        }
+
+        let profile_arn = state.kiro().resolve_profile_arn(&account).await?;
+        let pool = state.pool();
+        let account_state = pool.get(&account.id).await.ok_or_else(|| KiroError {
+            status: None,
+            endpoint: "MCP web_search".into(),
+            message: "web search account disappeared during profile discovery".into(),
+        })?;
+        let mut current = account_state.account.write().await;
+        if current
+            .profile_arn
+            .as_deref()
+            .is_some_and(|existing| !existing.trim().is_empty())
+        {
+            return Ok(current.clone());
+        }
+        if current.credentials.access_token != account.credentials.access_token {
+            continue;
+        }
+        current.profile_arn = Some(profile_arn);
+        let resolved = current.clone();
+        drop(current);
+
+        crate::tasks::persist_pool_accounts(state)
+            .await
+            .map_err(|error| KiroError {
+                status: None,
+                endpoint: "credential-store".into(),
+                message: format!("resolved profile ARN could not be persisted: {error}"),
+            })?;
+        return Ok(resolved);
+    }
+
+    Err(KiroError {
+        status: None,
+        endpoint: "MCP web_search".into(),
+        message: "account credentials changed repeatedly during profile discovery".into(),
+    })
 }
 
 pub(super) async fn validate_internal_continuation(
@@ -4380,6 +4441,77 @@ mod model_tests {
         );
         assert!(check_context_limit(&state, 900_000, false, "claude-4.6-sonnet").is_ok());
         assert!(check_context_limit(&state, 960_000, false, "claude-4.6-sonnet").is_err());
+    }
+
+    #[tokio::test]
+    async fn resolved_web_search_profile_is_saved_to_the_account_store() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = kproxy_core::paths::Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        let accounts_file = paths.accounts_file.clone();
+        let mut accounts = kproxy_store::accounts::AccountStore::load(&accounts_file)
+            .await
+            .expect("accounts");
+        accounts
+            .insert(kproxy_core::account::Account {
+                id: "acc_profile".into(),
+                email: "profile@example.com".into(),
+                label: None,
+                enabled: true,
+                machine_id: "a".repeat(64),
+                profile_arn: None,
+                credentials: kproxy_core::account::Credentials {
+                    access_token: "access-token".into(),
+                    refresh_token: None,
+                    client_id: None,
+                    client_secret: None,
+                    region: "us-east-1".into(),
+                    expires_at: i64::MAX,
+                    auth_method: kproxy_core::account::AuthMethod::Social,
+                },
+                usage: None,
+                subscription: None,
+                tags: Vec::new(),
+                created_at: 0,
+                credit_exhausted: false,
+            })
+            .expect("insert account");
+        accounts.save().await.expect("save account");
+        let state = Arc::new(AppState::new(
+            paths,
+            kproxy_store::config_loader::ConfigHandle::new(kproxy_core::config::Config::default()),
+            accounts,
+        ));
+        let lease = state
+            .pool()
+            .acquire("", 0.0, &[])
+            .await
+            .expect("account lease");
+
+        let resolved = ensure_web_search_profile_arn(&state, &lease)
+            .await
+            .expect("resolved account");
+
+        const SOCIAL_PROFILE_ARN: &str =
+            "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+        assert_eq!(resolved.profile_arn.as_deref(), Some(SOCIAL_PROFILE_ARN));
+        drop(lease);
+        let persisted = kproxy_store::accounts::AccountStore::load(&accounts_file)
+            .await
+            .expect("persisted accounts");
+        assert_eq!(
+            persisted
+                .find("acc_profile")
+                .and_then(|account| account.profile_arn.as_deref()),
+            Some(SOCIAL_PROFILE_ARN)
+        );
     }
 
     #[test]
