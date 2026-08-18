@@ -2,8 +2,8 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    ClaudeRequest, KiroAssistantMessage, KiroConversationState, KiroCurrentMessage,
-    KiroHistoryMessage, KiroPayload, KiroToolUse, KiroUserInputMessage,
+    matches_type_family, ClaudeRequest, KiroAssistantMessage, KiroConversationState,
+    KiroCurrentMessage, KiroHistoryMessage, KiroPayload, KiroToolUse, KiroUserInputMessage,
 };
 
 use super::common::{
@@ -22,7 +22,7 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
         .iter()
         .map(|tool| {
                 let (name, description, schema) = match tool.r#type.as_deref() {
-                    Some(kind) if kind.starts_with("web_search") => (
+                    Some(kind) if matches_type_family(kind, "web_search") => (
                         "web_search",
                         "Search the web for real-time information. Returns relevant search results with titles, URLs, and snippets.".to_string(),
                         serde_json::json!({
@@ -31,7 +31,7 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
                             "required":["query"]
                         }),
                     ),
-                    Some(kind) if kind.starts_with("web_fetch") => (
+                    Some(kind) if matches_type_family(kind, "web_fetch") => (
                         "web_fetch",
                         "Fetch and read content from a specific URL. Returns the page content in readable text format.".to_string(),
                         serde_json::json!({
@@ -54,7 +54,8 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
                     ),
                 };
                 let (tool, docs) = if tool.r#type.as_deref().is_some_and(|kind| {
-                    kind.starts_with("web_search") || kind.starts_with("web_fetch")
+                    matches_type_family(kind, "web_search")
+                        || matches_type_family(kind, "web_fetch")
                 }) {
                     kiro_tool(name, &description, &schema)
                 } else {
@@ -430,9 +431,9 @@ pub fn claude_pending_server_tool_uses(request: &ClaudeRequest) -> Vec<KiroToolU
 }
 
 fn normalize_history_tool_name(name: &str) -> String {
-    if name.starts_with("web_search") {
+    if matches_type_family(name, "web_search") {
         "web_search".into()
-    } else if name.starts_with("web_fetch") {
+    } else if matches_type_family(name, "web_fetch") {
         "web_fetch".into()
     } else {
         tool_name(name)

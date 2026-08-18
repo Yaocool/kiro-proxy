@@ -16,7 +16,7 @@ use kproxy_pool::{AccountLease, PoolError};
 use kproxy_translate::model::{apply_adaptive_thinking, map_model, thinking_enabled_for_model};
 use kproxy_translate::{
     apply_compaction_boundary, claude_loaded_tools, claude_pending_server_tool_uses,
-    claude_to_kiro, compact_trigger_tokens, error_envelope, openai_to_kiro,
+    claude_to_kiro, compact_trigger_tokens, error_envelope, matches_type_family, openai_to_kiro,
     resume_tool_search_payload, resume_web_search_payload, sanitize_error_message,
     tool_search_continue_payload_batch, validate_claude, validate_openai,
     web_search_continue_payload_batch, ClaudeRequest, ClaudeToolSearchBudget,
@@ -380,10 +380,9 @@ async fn handle_claude(
         request.tool_choice = None;
     } else if !config.features.enable_web_tools {
         request.tools.retain(|tool| {
-            !tool
-                .r#type
-                .as_deref()
-                .is_some_and(|kind| kind.starts_with("web_search") || kind.starts_with("web_fetch"))
+            !tool.r#type.as_deref().is_some_and(|kind| {
+                matches_type_family(kind, "web_search") || matches_type_family(kind, "web_fetch")
+            })
         });
     }
     if !config.features.enable_tool_search
@@ -407,7 +406,7 @@ async fn handle_claude(
     let web_search_tool = request.tools.iter().find(|tool| {
         tool.r#type
             .as_deref()
-            .is_some_and(|kind| kind.starts_with("web_search"))
+            .is_some_and(|kind| matches_type_family(kind, "web_search"))
     });
     let web_search_client_limit = web_search_tool.is_some_and(|tool| tool.max_uses.is_some());
     let web_search_proxy_limit = config.features.web_search_max_rounds.max(1);
@@ -3344,12 +3343,14 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         } else if !config.features.enable_web_tools {
             request.tools.retain(|tool| {
                 !tool.r#type.as_deref().is_some_and(|kind| {
-                    kind.starts_with("web_search") || kind.starts_with("web_fetch")
+                    matches_type_family(kind, "web_search")
+                        || matches_type_family(kind, "web_fetch")
                 })
             });
             original_request.tools.retain(|tool| {
                 !tool.r#type.as_deref().is_some_and(|kind| {
-                    kind.starts_with("web_search") || kind.starts_with("web_fetch")
+                    matches_type_family(kind, "web_search")
+                        || matches_type_family(kind, "web_fetch")
                 })
             });
         }
@@ -3576,9 +3577,9 @@ fn claude_web_tool_names(request: &ClaudeRequest) -> std::collections::HashMap<S
     let mut names = kproxy_translate::claude_tool_name_map(request);
     names.extend(request.tools.iter().filter_map(|tool| {
         let kind = tool.r#type.as_deref()?;
-        if kind.starts_with("web_search") {
+        if matches_type_family(kind, "web_search") {
             Some(("web_search".into(), kind.into()))
-        } else if kind.starts_with("web_fetch") {
+        } else if matches_type_family(kind, "web_fetch") {
             Some(("web_fetch".into(), kind.into()))
         } else {
             None
