@@ -929,6 +929,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn count_tokens_accepts_claude_code_context_edits() {
+        let (_directory, state) = test_state(Config::default()).await;
+        let clear_thinking = serde_json::json!({
+            "model":"claude-opus-5",
+            "messages":[{"role":"user","content":"hello"}],
+            "context_management":{"edits":[{
+                "type":"clear_thinking_20251015",
+                "keep":"all"
+            }]}
+        });
+        let counted = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/v1/messages/count_tokens")
+                    .header(header::USER_AGENT, "claude-cli/2.1.220 (external, test)")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("anthropic-beta", "context-management-2025-06-27")
+                    .body(Body::from(clear_thinking.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("count");
+        assert_eq!(counted.status(), StatusCode::OK);
+        let counted = body_json(counted).await;
+        assert_eq!(
+            counted["context_management"]["original_input_tokens"],
+            counted["input_tokens"]
+        );
+
+        let clear_tools = serde_json::json!({
+            "model":"claude-opus-5",
+            "messages":[
+                {"role":"user","content":"read the file"},
+                {"role":"assistant","content":[{
+                    "type":"tool_use","id":"toolu_old","name":"Read",
+                    "input":{"path":"/tmp/large"}
+                }]},
+                {"role":"user","content":[{
+                    "type":"tool_result","tool_use_id":"toolu_old",
+                    "content":"old output ".repeat(10_000)
+                }]},
+                {"role":"user","content":"continue"}
+            ],
+            "context_management":{"edits":[{
+                "type":"clear_tool_uses_20250919",
+                "keep":{"type":"tool_uses","value":0},
+                "clear_tool_inputs":true
+            }]}
+        });
+        let counted = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/v1/messages/count_tokens")
+                    .header(header::USER_AGENT, "claude-cli/2.1.220 (external, test)")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("anthropic-beta", "context-management-2025-06-27")
+                    .body(Body::from(clear_tools.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("count");
+        assert_eq!(counted.status(), StatusCode::OK);
+        let counted = body_json(counted).await;
+        assert!(
+            counted["context_management"]["original_input_tokens"]
+                .as_u64()
+                .expect("original")
+                > counted["input_tokens"].as_u64().expect("effective")
+        );
+    }
+
+    #[tokio::test]
     async fn reconcile_restarts_a_finished_proxy_listener() {
         let (_directory, state) = test_state(Config::default()).await;
         let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port");

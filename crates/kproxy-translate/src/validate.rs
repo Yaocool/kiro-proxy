@@ -895,9 +895,6 @@ fn validate_context_management(value: Option<&Value>) -> Result<(), ValidationEr
     let Some(object) = value.as_object() else {
         return invalid("context_management", "expected an object");
     };
-    if object.keys().any(|key| key != "edits") {
-        return invalid("context_management", "only the edits field is supported");
-    }
     let Some(edits) = object.get("edits").and_then(Value::as_array) else {
         return invalid("context_management.edits", "expected an array");
     };
@@ -911,15 +908,26 @@ fn validate_context_management(value: Option<&Value>) -> Result<(), ValidationEr
                 "expected an object",
             );
         };
-        if !edit
-            .get("type")
-            .and_then(Value::as_str)
-            .is_some_and(crate::is_compact_edit_type)
-        {
+        let Some(edit_type) = edit.get("type").and_then(Value::as_str) else {
             return invalid(
                 format!("context_management.edits.{index}.type"),
-                "expected a compact_* type",
+                "expected a string",
             );
+        };
+        if edit_type.trim().is_empty() {
+            return invalid(
+                format!("context_management.edits.{index}.type"),
+                "must not be empty",
+            );
+        }
+        // Context editing is an extensible Anthropic protocol. Kiro-account-manager
+        // accepts unknown edit families and locally emulates only the strategies it
+        // understands. Do the same here so a Claude Code upgrade cannot make every
+        // request fail before routing. Compact edits retain strict validation because
+        // kproxy actively implements their trigger and response semantics; other
+        // families are handled by context normalization or remain safe no-ops.
+        if !crate::is_compact_edit_type(edit_type) {
+            continue;
         }
         if edit.keys().any(|key| {
             !matches!(
@@ -1608,15 +1616,24 @@ mod tests {
         input.context_management = Some(serde_json::json!({"edits":[{
             "type":"clear_tool_uses_20250919"
         }]}));
-        assert!(validate_claude(&input)
-            .expect_err("unsupported context edit")
-            .to_string()
-            .contains("compact_*"));
+        validate_claude(&input).expect("tool-result clearing edit");
+
+        input.context_management = Some(serde_json::json!({"edits":[{
+            "type":"clear_thinking_20251015",
+            "keep":"all"
+        }]}));
+        validate_claude(&input).expect("Claude Code clear-thinking edit");
 
         input.context_management = Some(serde_json::json!({"edits":[{
             "type":"compaction_latest"
         }]}));
-        assert!(validate_claude(&input).is_err());
+        validate_claude(&input).expect("future context edit family");
+
+        input.context_management = Some(serde_json::json!({"edits":[{}]}));
+        assert!(validate_claude(&input)
+            .expect_err("missing edit type")
+            .to_string()
+            .contains("expected a string"));
     }
 
     #[test]

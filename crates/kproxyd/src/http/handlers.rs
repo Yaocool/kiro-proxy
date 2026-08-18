@@ -15,13 +15,13 @@ use kproxy_notify::{WebhookEvent, WebhookEventKind};
 use kproxy_pool::{AccountLease, PoolError};
 use kproxy_translate::model::{apply_adaptive_thinking, map_model, thinking_enabled_for_model};
 use kproxy_translate::{
-    apply_compaction_boundary, claude_loaded_tools, claude_pending_server_tool_uses,
-    claude_to_kiro, compact_trigger_tokens, error_envelope, matches_type_family, openai_to_kiro,
-    resume_tool_search_payload, resume_web_search_payload, sanitize_error_message,
-    tool_search_continue_payload_batch, validate_claude, validate_openai,
-    web_search_continue_payload_batch, ClaudeRequest, ClaudeToolSearchBudget,
-    ClaudeToolSearchCatalog, ClaudeWebSearchTrace, ErrorFormat, KiroToolUse, OpenAiRequest,
-    TranslationOptions, ValidationError,
+    apply_compaction_boundary, apply_context_management_edits, claude_loaded_tools,
+    claude_pending_server_tool_uses, claude_to_kiro, compact_trigger_tokens, error_envelope,
+    has_context_management_edits, matches_type_family, openai_to_kiro, resume_tool_search_payload,
+    resume_web_search_payload, sanitize_error_message, tool_search_continue_payload_batch,
+    validate_claude, validate_openai, web_search_continue_payload_batch, ClaudeRequest,
+    ClaudeToolSearchBudget, ClaudeToolSearchCatalog, ClaudeWebSearchTrace, ErrorFormat,
+    KiroToolUse, OpenAiRequest, TranslationOptions, ValidationError,
 };
 use rand::Rng;
 use serde_json::{json, Value};
@@ -362,6 +362,15 @@ async fn handle_claude(
     // replay records so ignored history cannot reject the effective request.
     let compact_boundary_applied = apply_compaction_boundary(&mut request);
     validate_claude(&request).map_err(claude_validation_error)?;
+    let context_edit_stats = apply_context_management_edits(&mut request);
+    if context_edit_stats.changed() {
+        tracing::info!(
+            trace_id = %trace_id,
+            cleared_tool_results = context_edit_stats.cleared_tool_results,
+            cleared_tool_inputs = context_edit_stats.cleared_tool_inputs,
+            "Claude context edits applied locally"
+        );
+    }
     kproxy_translate::validate_web_search_replay_content(&request, &state.web_search_replay)
         .map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error, ErrorFormat::Claude))?;
     tracing::info!(
@@ -3324,8 +3333,10 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             )
         })?;
         let mut original_request = request.clone();
+        let has_context_edits = has_context_management_edits(request.context_management.as_ref());
         let boundary_applied = apply_compaction_boundary(&mut request);
         validate_claude(&request).map_err(claude_validation_error)?;
+        let context_edit_stats = apply_context_management_edits(&mut request);
         tracing::info!(
             trace_id = %trace_id,
             protocol = "claude_count_tokens",
@@ -3402,7 +3413,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
                     ErrorFormat::Claude,
                 )
             })?;
-        let input_tokens = if boundary_applied {
+        let input_tokens = if boundary_applied || context_edit_stats.changed() {
             let mut effective_payload = claude_to_kiro(&request, &normal);
             apply_adaptive_thinking(
                 &mut effective_payload,
@@ -3426,7 +3437,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             original_input_tokens
         };
         let mut response = json!({"input_tokens":input_tokens});
-        if compact_trigger.is_some() {
+        if has_context_edits {
             response["context_management"] = json!({
                 "original_input_tokens":original_input_tokens
             });
@@ -3438,6 +3449,8 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             input_tokens,
             original_input_tokens,
             compaction_boundary_applied = boundary_applied,
+            cleared_tool_results = context_edit_stats.cleared_tool_results,
+            cleared_tool_inputs = context_edit_stats.cleared_tool_inputs,
             duration_ms = started.elapsed().as_millis() as u64,
             "client token-count response completed"
         );
