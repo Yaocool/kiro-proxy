@@ -17,6 +17,8 @@ pub struct Paths {
     pub daily_file: PathBuf,
     /// 累计统计文件。
     pub stats_file: PathBuf,
+    /// Web Search opaque replay records的本地加密密钥。
+    pub web_search_replay_key_file: PathBuf,
 }
 
 impl Paths {
@@ -72,6 +74,7 @@ impl Paths {
             accounts_file: data_dir.join("accounts.json"),
             daily_file: data_dir.join("daily.json"),
             stats_file: data_dir.join("stats.json"),
+            web_search_replay_key_file: data_dir.join("web-search-replay.key"),
             config_dir,
             data_dir,
         }
@@ -110,6 +113,10 @@ mod tests {
         assert_eq!(paths.data_dir, PathBuf::from("/x/data/kproxy"));
         assert_eq!(paths.daily_file, PathBuf::from("/x/data/kproxy/daily.json"));
         assert_eq!(paths.stats_file, PathBuf::from("/x/data/kproxy/stats.json"));
+        assert_eq!(
+            paths.web_search_replay_key_file,
+            PathBuf::from("/x/data/kproxy/web-search-replay.key")
+        );
     }
 
     #[test]

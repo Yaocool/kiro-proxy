@@ -87,6 +87,53 @@ pub async fn write_bytes_atomically(path: &Path, bytes: &[u8], mode: Option<u32>
     }
 }
 
+/// Atomically install a complete file only when the destination does not
+/// already exist. The temporary file is fully written and fsynced before an
+/// atomic hard-link publishes it, so concurrent processes cannot overwrite a
+/// secret and a crash cannot leave a partially written destination.
+pub async fn write_bytes_if_absent_atomically(
+    path: &Path,
+    bytes: &[u8],
+    mode: Option<u32>,
+) -> Result<bool> {
+    let path_lock = lock_for(path);
+    let _held = path_lock.lock().await;
+
+    if tokio::fs::try_exists(path).await.unwrap_or(false) {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("create parent dir for {}", path.display()))?;
+        }
+    }
+
+    let temporary = temp_path_for(path);
+    if let Err(error) = write_temp_file(&temporary, bytes, mode).await {
+        let _cleanup = tokio::fs::remove_file(&temporary).await;
+        return Err(error);
+    }
+    let published = match tokio::fs::hard_link(&temporary, path).await {
+        Ok(()) => true,
+        Err(error) if error.kind() == ErrorKind::AlreadyExists => false,
+        Err(error) => {
+            let _cleanup = tokio::fs::remove_file(&temporary).await;
+            return Err(
+                anyhow::Error::new(error).context(format!("publish new file {}", path.display()))
+            );
+        }
+    };
+    tokio::fs::remove_file(&temporary)
+        .await
+        .with_context(|| format!("remove temp file {}", temporary.display()))?;
+    if published {
+        sync_parent_directory(path).await?;
+    }
+    Ok(published)
+}
+
 fn temp_path_for(path: &Path) -> PathBuf {
     let name = path
         .file_name()
@@ -195,6 +242,31 @@ mod tests {
             .await
             .expect("second write");
         assert_eq!(read_to_string_with_retry(&path).await.expect("read"), "bb");
+        let entries = std::fs::read_dir(directory.path())
+            .expect("read dir")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("entries");
+        assert_eq!(entries.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn atomic_create_if_absent_publishes_complete_content_without_overwrite() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("secret.key");
+        assert!(
+            write_bytes_if_absent_atomically(&path, b"first-complete-secret", Some(0o600))
+                .await
+                .expect("first publish")
+        );
+        assert!(
+            !write_bytes_if_absent_atomically(&path, b"replacement", Some(0o600))
+                .await
+                .expect("second publish")
+        );
+        assert_eq!(
+            tokio::fs::read(&path).await.expect("read secret"),
+            b"first-complete-secret"
+        );
         let entries = std::fs::read_dir(directory.path())
             .expect("read dir")
             .collect::<Result<Vec<_>, _>>()
