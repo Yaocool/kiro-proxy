@@ -439,7 +439,7 @@ pub struct ContextConfig {
     pub safe_input_ratio: f64,
     /// compact 请求安全比例。
     pub compact_safe_input_ratio: f64,
-    /// 单次 Kiro 请求中工具定义允许占用的最大估算 token。
+    /// deferred Tool Search 工作集中工具定义允许占用的最大估算 token。
     pub max_tool_input_tokens: u32,
     /// 单次 Kiro 请求中允许发送的已加载工具数量。
     pub max_loaded_tools: usize,

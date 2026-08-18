@@ -621,6 +621,88 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ordinary_claude_tools_are_not_rejected_by_the_tool_search_budget() {
+        let mut config = Config::default();
+        config.context.max_tool_input_tokens = 1;
+        let (_directory, state) = test_state(config).await;
+        let response = router(state)
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::USER_AGENT, "claude-cli/2.1.220 (external, test)")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "claude-opus-5",
+                            "max_tokens": 1,
+                            "messages": [{"role": "user", "content": "Who are you?"}],
+                            "tools": [{
+                                "name": "lookup",
+                                "description": "Look up a value in the local workspace",
+                                "input_schema": {
+                                    "type": "object",
+                                    "properties": {"query": {"type": "string"}},
+                                    "required": ["query"]
+                                }
+                            }]
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        // No test account is configured, so reaching the pool proves the
+        // ordinary tool request passed local payload admission. Before the
+        // fix this returned 413 from max_tool_input_tokens.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn claude_tool_capacity_errors_do_not_masquerade_as_32mb_body_errors() {
+        let (_directory, state) = test_state(Config::default()).await;
+        let tools = (0..=kproxy_translate::validate::MAX_TOOLS)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("tool_{index}"),
+                    "description": "small test tool",
+                    "input_schema": {"type": "object"}
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = router(state)
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::USER_AGENT, "claude-cli/2.1.220 (external, test)")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "claude-opus-5",
+                            "max_tokens": 1,
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "tools": tools
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers()["x-kproxy-error-code"],
+            "tool_budget_exceeded"
+        );
+        let body = body_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("too many tools"));
+    }
+
+    #[tokio::test]
     async fn aliases_methods_and_model_timestamps_match_protocol_contract() {
         let (_directory, state) = test_state(Config::default()).await;
         for path in ["/v1/models", "/models"] {

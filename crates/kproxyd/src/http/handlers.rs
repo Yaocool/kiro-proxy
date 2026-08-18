@@ -549,7 +549,11 @@ async fn handle_claude(
             let budget = remaining_tool_search_budget(&state, &payload, false)
                 .await
                 .map_err(|message| {
-                    ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, message, ErrorFormat::Claude)
+                    ApiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        message,
+                        ErrorFormat::Claude,
+                    )
                 })?;
             tool_search_operations += 1;
             match catalog
@@ -2460,7 +2464,7 @@ async fn collect_nonstream_rounds(
                 .min(kproxy_translate::validate::MAX_TOOLS);
             if next_loaded_tools > max_loaded_tools {
                 return Err(ExecuteError::Upstream(KiroError {
-                    status: Some(413),
+                    status: Some(400),
                     endpoint,
                     message: format!(
                         "too many loaded tools after Tool Search: {next_loaded_tools} > {max_loaded_tools}"
@@ -2469,7 +2473,7 @@ async fn collect_nonstream_rounds(
             }
             if next_tool_tokens > u64::from(config.context.max_tool_input_tokens) {
                 return Err(ExecuteError::Upstream(KiroError {
-                    status: Some(413),
+                    status: Some(400),
                     endpoint,
                     message: format!(
                         "loaded tool definitions are too large after Tool Search: {next_tool_tokens} estimated tokens > {}",
@@ -2479,7 +2483,7 @@ async fn collect_nonstream_rounds(
             }
             if next_payload_bytes > config.context.max_upstream_payload_bytes {
                 return Err(ExecuteError::Upstream(KiroError {
-                    status: Some(413),
+                    status: Some(400),
                     endpoint,
                     message: format!(
                         "translated upstream payload is too large after Tool Search: {next_payload_bytes} bytes > {}",
@@ -2651,9 +2655,16 @@ async fn collect_nonstream_rounds(
                 accumulated_usage.output_tokens,
             );
             debug_assert!(budget_available);
-            validate_internal_continuation(state, &payload, compact, &endpoint, "Web Search")
-                .await
-                .map_err(ExecuteError::Upstream)?;
+            validate_internal_continuation(
+                state,
+                &payload,
+                compact,
+                &endpoint,
+                "Web Search",
+                tool_search.is_some(),
+            )
+            .await
+            .map_err(ExecuteError::Upstream)?;
             if let Err(error) = reservation.extend(estimated_credits) {
                 if matches!(error, MeterError::DailyLimitExceeded) {
                     trigger_quota_shutdown(
@@ -2815,6 +2826,7 @@ pub(super) async fn validate_internal_continuation(
     compact: bool,
     endpoint: &str,
     stage: &str,
+    enforce_tool_search_budget: bool,
 ) -> Result<u64, KiroError> {
     let config = state.config.current();
     let input_tokens = state
@@ -2851,9 +2863,11 @@ pub(super) async fn validate_internal_continuation(
         Some(format!(
             "too many loaded tools after {stage}: {loaded_tools} > {max_loaded_tools}"
         ))
-    } else if tool_tokens > u64::from(config.context.max_tool_input_tokens) {
+    } else if enforce_tool_search_budget
+        && tool_tokens > u64::from(config.context.max_tool_input_tokens)
+    {
         Some(format!(
-            "loaded tools are too large after {stage}: {tool_tokens} tokens > {}",
+            "loaded Tool Search working set is too large after {stage}: {tool_tokens} tokens > {}",
             config.context.max_tool_input_tokens
         ))
     } else if payload_bytes > config.context.max_upstream_payload_bytes {
@@ -2866,7 +2880,7 @@ pub(super) async fn validate_internal_continuation(
     };
     if let Some(message) = budget_message {
         return Err(KiroError {
-            status: Some(413),
+            status: Some(400),
             endpoint: endpoint.into(),
             message,
         });
@@ -2877,7 +2891,7 @@ pub(super) async fn validate_internal_continuation(
         .user_input_message
         .model_id;
     check_context_limit(state, input_tokens, compact, model).map_err(|limit| KiroError {
-        status: Some(413),
+        status: Some(400),
         endpoint: endpoint.into(),
         message: format!(
             "prompt is too long after {stage}: {} tokens > {}",
@@ -3700,16 +3714,16 @@ fn serialized_payload_bytes(
 }
 
 fn claude_validation_error(error: ValidationError) -> ApiError {
-    let status = match &error {
-        ValidationError::TooManyTools
-        | ValidationError::TooManyDeferredTools
-        | ValidationError::LoadedToolDefinitionsTooLarge
-        | ValidationError::DeferredToolDefinitionsTooLarge
-        | ValidationError::ToolDefinitionTooLarge
-        | ValidationError::ToolDocumentationTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
-        _ => StatusCode::BAD_REQUEST,
-    };
-    ApiError::new(status, error.to_string(), ErrorFormat::Claude)
+    // Claude Code reserves HTTP 413/request_too_large for its 32 MiB request
+    // body limit and replaces the server message with a generic attachment
+    // warning. Tool counts, schemas, and proxy working-set budgets are
+    // semantic request validation errors, so keep their actionable messages
+    // visible with HTTP 400.
+    ApiError::new(
+        StatusCode::BAD_REQUEST,
+        error.to_string(),
+        ErrorFormat::Claude,
+    )
 }
 
 fn loaded_tool_count(payload: &kproxy_translate::KiroPayload) -> usize {
@@ -3793,34 +3807,54 @@ fn enforce_payload_budget(
     tool_tokens: u64,
     payload_bytes: usize,
     loaded_tools: usize,
-    tool_search_enabled: bool,
+    enforce_tool_search_budget: bool,
     format: ErrorFormat,
 ) -> Result<(), ApiError> {
     let context = &state.config.current().context;
+    enforce_payload_budget_limits(
+        context,
+        tool_tokens,
+        payload_bytes,
+        loaded_tools,
+        enforce_tool_search_budget,
+        format,
+    )
+}
+
+fn enforce_payload_budget_limits(
+    context: &kproxy_core::config::ContextConfig,
+    tool_tokens: u64,
+    payload_bytes: usize,
+    loaded_tools: usize,
+    enforce_tool_search_budget: bool,
+    format: ErrorFormat,
+) -> Result<(), ApiError> {
+    let budget_status = if format == ErrorFormat::Claude {
+        StatusCode::BAD_REQUEST
+    } else {
+        StatusCode::PAYLOAD_TOO_LARGE
+    };
     let max_loaded_tools = context
         .max_loaded_tools
         .min(kproxy_translate::validate::MAX_TOOLS);
     if loaded_tools > max_loaded_tools {
         return Err(ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
+            budget_status,
             format!(
                 "too many loaded tools: {loaded_tools} > {max_loaded_tools}; defer more tools or reduce Tool Search references"
             ),
             format,
         ));
     }
-    if tool_tokens > u64::from(context.max_tool_input_tokens) {
-        let guidance = if tool_search_enabled {
-            "reduce always-loaded tools or their schemas"
-        } else if format == ErrorFormat::Claude {
-            "enable Anthropic Tool Search (for Claude Code, set ENABLE_TOOL_SEARCH=true) or disable unused MCP servers"
-        } else {
-            "reduce the number or size of loaded tool schemas"
-        };
+    // `max_tool_input_tokens` is a working-set guard for deferred Tool Search.
+    // Applying it to an ordinary request creates a second, much smaller
+    // context limit even though these tool definitions are already included
+    // in `estimate_kiro_payload` and checked against the model input window.
+    if enforce_tool_search_budget && tool_tokens > u64::from(context.max_tool_input_tokens) {
         return Err(ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
+            budget_status,
             format!(
-                "loaded tool definitions are too large: {tool_tokens} estimated tokens > {}; {guidance}",
+                "loaded Tool Search working set is too large: {tool_tokens} estimated tokens > {}; reduce always-loaded tools or their schemas",
                 context.max_tool_input_tokens
             ),
             format,
@@ -3828,7 +3862,7 @@ fn enforce_payload_budget(
     }
     if payload_bytes > context.max_upstream_payload_bytes {
         return Err(ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
+            budget_status,
             format!(
                 "translated upstream payload is too large: {payload_bytes} bytes > {}; reduce the conversation or loaded tool schemas",
                 context.max_upstream_payload_bytes
@@ -4046,6 +4080,10 @@ fn upstream_api_error(
             || error.is_throttle()
             || matches!(error.status, Some(500..=599)));
     let status = match error.status {
+        // An upstream 413 describes Kiro's translated payload, not necessarily
+        // a Claude request body over 32 MiB. Preserve the upstream status in
+        // diagnostics, but use 400 so Claude Code displays the real message.
+        Some(413) if format == ErrorFormat::Claude => StatusCode::BAD_REQUEST,
         Some(413) => StatusCode::PAYLOAD_TOO_LARGE,
         Some(400) if upstream_bad_request_is_actionable(&error.message) => StatusCode::BAD_REQUEST,
         // kproxy already validates the public request and enforces its context
@@ -4071,17 +4109,13 @@ fn upstream_api_error(
     output.upstream_status = upstream_status;
     output.error_stage = "upstream_dispatch";
     output.account_error = account_error;
-    output.error_code = if upstream_status == Some(429) || upstream_throttle {
-        "upstream_rate_limited"
-    } else if request_rejection {
-        if status == StatusCode::PAYLOAD_TOO_LARGE {
-            "tool_budget_exceeded"
-        } else {
-            "invalid_tool_protocol"
-        }
-    } else {
-        "upstream_unavailable"
-    };
+    if upstream_status == Some(429) || upstream_throttle {
+        output.error_code = "upstream_rate_limited";
+    } else if upstream_status == Some(413) {
+        output.error_code = "request_payload_exceeded";
+    } else if !request_rejection {
+        output.error_code = "upstream_unavailable";
+    }
     output
 }
 
@@ -4097,6 +4131,16 @@ fn upstream_bad_request_is_actionable(message: &str) -> bool {
         "validation error",
         "malformed request",
         "unsupported model",
+        "too many tools",
+        "too many loaded tools",
+        "tool definitions",
+        "tool schema",
+        "tool search working set",
+        "loaded tools are too large",
+        "payload too large",
+        "payload is too large",
+        "request too large",
+        "request entity too large",
     ]
     .iter()
     .any(|marker| lower.contains(marker))
@@ -4242,11 +4286,22 @@ fn classify_api_error(status: StatusCode, message: &str) -> (&'static str, &'sta
     {
         return ("unsupported_tool_protocol", "request_validation");
     }
-    if status == StatusCode::PAYLOAD_TOO_LARGE {
-        if lower.contains("catalog") || lower.contains("deferred") {
-            return ("tool_catalog_too_large", "request_budget");
-        }
+    if status == StatusCode::PAYLOAD_TOO_LARGE && lower.contains("request body") {
+        return ("request_body_too_large", "request_body");
+    }
+    let capacity_error =
+        lower.contains("too many") || lower.contains("too large") || lower.contains("exceed");
+    if capacity_error && (lower.contains("catalog") || lower.contains("deferred tool")) {
+        return ("tool_catalog_too_large", "request_budget");
+    }
+    if is_tool_budget_error(&lower) {
         return ("tool_budget_exceeded", "request_budget");
+    }
+    if is_payload_budget_error(&lower) {
+        return ("request_payload_exceeded", "request_budget");
+    }
+    if status == StatusCode::PAYLOAD_TOO_LARGE {
+        return ("request_payload_exceeded", "request_budget");
     }
     if status == StatusCode::BAD_REQUEST && lower.contains("tool") {
         return ("invalid_tool_protocol", "request_validation");
@@ -4261,6 +4316,25 @@ fn classify_api_error(status: StatusCode, message: &str) -> (&'static str, &'sta
         return ("upstream_unavailable", "upstream_dispatch");
     }
     ("invalid_request", "request_validation")
+}
+
+fn is_tool_budget_error(lower: &str) -> bool {
+    lower.contains("too many tools")
+        || lower.contains("too many loaded tools")
+        || lower.contains("tool definitions are too large")
+        || lower.contains("tool definitions exceed")
+        || lower.contains("tool definition exceeds")
+        || lower.contains("tool documentation exceeds")
+        || lower.contains("tool search working set is too large")
+        || lower.contains("loaded tools are too large")
+        || lower.contains("tool schema payload too large")
+}
+
+fn is_payload_budget_error(lower: &str) -> bool {
+    lower.contains("payload too large")
+        || lower.contains("payload is too large")
+        || lower.contains("request too large")
+        || lower.contains("request entity too large")
 }
 
 #[cfg(test)]
@@ -4295,16 +4369,17 @@ mod model_tests {
             description: String::new(),
             rate_multiplier: None,
             token_limits: Some(kproxy_kiro::client::TokenLimits {
-                max_input_tokens: Some(100_000),
+                max_input_tokens: Some(1_000_000),
                 max_output_tokens: Some(16_384),
             }),
         }]);
 
         assert_eq!(
             model_token_limit(&state, "claude-4.6-sonnet", true),
-            Some(100_000)
+            Some(1_000_000)
         );
-        assert!(check_context_limit(&state, 96_000, false, "claude-4.6-sonnet").is_err());
+        assert!(check_context_limit(&state, 900_000, false, "claude-4.6-sonnet").is_ok());
+        assert!(check_context_limit(&state, 960_000, false, "claude-4.6-sonnet").is_err());
     }
 
     #[test]
@@ -4387,19 +4462,26 @@ mod model_tests {
             ErrorFormat::Claude,
         );
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
-        assert_eq!(error.error_code, "invalid_tool_protocol");
+        assert_eq!(error.error_code, "tool_budget_exceeded");
         assert!(!error.account_error);
     }
 
     #[test]
-    fn stable_error_diagnostics_use_headers_without_changing_protocol_body() {
-        let response = ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
+    fn proxy_budget_errors_remain_visible_to_claude_code() {
+        let error = ApiError::new(
+            StatusCode::BAD_REQUEST,
             "loaded tool definitions are too large",
             ErrorFormat::Claude,
-        )
-        .with_request_id("trace_test")
-        .into_response();
+        );
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        let envelope = error_envelope(
+            ErrorFormat::Claude,
+            error.status.as_u16(),
+            &error.message,
+            None,
+        );
+        assert_eq!(envelope["error"]["type"], "invalid_request_error");
+        let response = error.with_request_id("trace_test").into_response();
         assert_eq!(
             response.headers()["x-kproxy-error-code"],
             "tool_budget_exceeded"
@@ -4409,14 +4491,87 @@ mod model_tests {
     }
 
     #[test]
-    fn catalog_capacity_errors_are_413_with_stable_codes() {
-        let deferred = claude_validation_error(ValidationError::TooManyDeferredTools);
-        assert_eq!(deferred.status, StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(deferred.error_code, "tool_catalog_too_large");
+    fn only_real_inbound_body_limits_use_request_too_large() {
+        let error = ApiError::new(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "request body exceeds the 50 MiB limit",
+            ErrorFormat::Claude,
+        );
+        assert_eq!(error.error_code, "request_body_too_large");
+        let envelope = error_envelope(
+            ErrorFormat::Claude,
+            error.status.as_u16(),
+            &error.message,
+            None,
+        );
+        assert_eq!(envelope["error"]["type"], "request_too_large");
+    }
 
-        let loaded = claude_validation_error(ValidationError::TooManyTools);
-        assert_eq!(loaded.status, StatusCode::PAYLOAD_TOO_LARGE);
-        assert_eq!(loaded.error_code, "tool_budget_exceeded");
+    #[test]
+    fn upstream_413_preserves_diagnostics_without_triggering_claude_32mb_ui() {
+        let error = upstream_api_error(
+            KiroError {
+                status: Some(413),
+                endpoint: "test".into(),
+                message: "translated upstream payload is too large".into(),
+            },
+            RequestLogContext::default(),
+            ErrorFormat::Claude,
+        );
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.upstream_status, Some(413));
+        assert_eq!(error.error_code, "request_payload_exceeded");
+    }
+
+    #[test]
+    fn ordinary_tools_use_the_model_context_instead_of_the_tool_search_budget() {
+        let context = kproxy_core::config::Config::default().context;
+        let tool_tokens = 37_239;
+
+        assert!(enforce_payload_budget_limits(
+            &context,
+            tool_tokens,
+            512 * 1024,
+            64,
+            false,
+            ErrorFormat::Claude,
+        )
+        .is_ok());
+
+        let error = enforce_payload_budget_limits(
+            &context,
+            tool_tokens,
+            512 * 1024,
+            64,
+            true,
+            ErrorFormat::Claude,
+        )
+        .expect_err("deferred Tool Search working sets must retain their own budget");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("Tool Search working set"));
+    }
+
+    #[test]
+    fn catalog_capacity_errors_are_invalid_requests_with_stable_codes() {
+        for error in [
+            ValidationError::TooManyDeferredTools,
+            ValidationError::DeferredToolDefinitionsTooLarge,
+        ] {
+            let error = claude_validation_error(error);
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            assert_eq!(error.error_code, "tool_catalog_too_large");
+        }
+
+        for error in [
+            ValidationError::TooManyTools,
+            ValidationError::LoadedToolDefinitionsTooLarge,
+            ValidationError::ToolDefinitionTooLarge,
+            ValidationError::ToolDocumentationTooLarge,
+        ] {
+            let error = claude_validation_error(error);
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            assert_eq!(error.error_code, "tool_budget_exceeded");
+        }
     }
 
     #[test]

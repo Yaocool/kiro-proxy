@@ -155,9 +155,12 @@ payload 字节预算动态装载，因此不存在固定 5 个的工作集上限
 Kiro 上下文或上游 payload。Catalog 构建和搜索运行在 blocking worker，不会阻塞 HTTP runtime。
 
 自动生成的 `[context]` 配置还通过 `max_loaded_tools` 限制已加载工作集（默认值及上游协议
-硬上限均为 128）、通过 `max_tool_input_tokens` 限制已加载工具的估算 token，并通过
-`max_upstream_payload_bytes` 限制序列化后的 Kiro 请求大小。超限请求会在本地返回明确的 413，
-而不是留给上游返回不透明错误。
+硬上限均为 128）、通过 `max_tool_input_tokens` 限制 deferred Tool Search 工作集的估算 token，
+并通过 `max_upstream_payload_bytes` 限制序列化后的 Kiro 请求大小。未启用 Tool Search 的普通请求
+不会再被这个 32k 工作集预算误拦截，其工具定义仍会计入模型总输入 token，并接受上下文窗口、
+工具数量及 payload 字节限制。真实超限请求会在本地拒绝，而不是留给上游返回不透明错误。
+`413/request_too_large` 仅用于真实入站请求体超过 50 MiB；工具、上下文及转换后 payload 的
+语义预算错误使用 400，以免 Claude Code 将其误显示成 32MB 附件错误。
 
 `features.tool_search_max_rounds` 默认 4、硬上限 8；单次请求达到内部轮次上限时返回 Claude
 `pause_turn` 续轮状态，不再把合法的 server call 转换成 HTTP 5xx。
