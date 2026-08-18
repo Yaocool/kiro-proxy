@@ -29,6 +29,48 @@ pub struct UpstreamAttemptLog {
     pub error: String,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RequestDiagnostics {
+    #[serde(default)]
+    pub original_tool_count: usize,
+    #[serde(default)]
+    pub loaded_tool_count: usize,
+    #[serde(default)]
+    pub deferred_tool_count: usize,
+    #[serde(default)]
+    pub loaded_tool_bytes: usize,
+    #[serde(default)]
+    pub catalog_bytes: usize,
+    #[serde(default)]
+    pub tool_tokens: u64,
+    #[serde(default)]
+    pub payload_bytes: usize,
+    #[serde(default)]
+    pub tool_search_rounds: usize,
+    #[serde(default)]
+    pub tool_search_matches: usize,
+    #[serde(default)]
+    pub search_requested_limit: usize,
+    #[serde(default)]
+    pub search_returned_count: usize,
+    #[serde(default)]
+    pub search_budget_truncated: bool,
+    #[serde(default)]
+    pub web_search_rounds: usize,
+    #[serde(default)]
+    pub web_search_results: usize,
+    #[serde(default)]
+    pub client_status: u16,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_status: Option<u16>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error_code: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error_stage: String,
+    #[serde(default)]
+    pub account_error: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestLog {
     pub timestamp: i64,
@@ -60,6 +102,8 @@ pub struct RequestLog {
     pub output_tokens: u64,
     pub credits: f64,
     pub error: Option<String>,
+    #[serde(default)]
+    pub diagnostics: RequestDiagnostics,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -451,6 +495,7 @@ mod tests {
             output_tokens: 1,
             credits: 0.1,
             error: (status >= 400).then(|| "failed".into()),
+            diagnostics: RequestDiagnostics::default(),
         }
     }
 
@@ -462,11 +507,13 @@ mod tests {
         object.remove("model_path");
         object.remove("model_mapping_rule");
         object.remove("attempts");
+        object.remove("diagnostics");
         let decoded: RequestLog = serde_json::from_value(value).expect("deserialize legacy log");
         assert!(decoded.account_name.is_empty());
         assert!(decoded.model_path.is_empty());
         assert!(decoded.model_mapping_rule.is_none());
         assert!(decoded.attempts.is_empty());
+        assert_eq!(decoded.diagnostics.loaded_tool_count, 0);
     }
 
     #[test]

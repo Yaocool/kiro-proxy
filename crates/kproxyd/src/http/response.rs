@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
 use kproxy_kiro::{KiroEvent, UsageInfo};
-use kproxy_translate::ClaudeToolSearchTrace;
+use kproxy_translate::{
+    ClaudeServerToolEmission, ClaudeToolSearchTrace, ClaudeWebSearchTrace, WebSearchReplayCodec,
+};
 use serde_json::{json, Value};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -16,7 +18,27 @@ pub struct DecodedResponse {
     pub reasoning: String,
     pub tools: BTreeMap<String, ToolBuffer>,
     pub tool_searches: Vec<ClaudeToolSearchTrace>,
+    pub web_searches: Vec<ClaudeWebSearchTrace>,
+    /// Non-streaming order for proxy-executed server tools. Text produced
+    /// before each server call must stay before that call; the final answer is
+    /// rendered after the complete timeline.
+    pub claude_server_events: Vec<ClaudeServerEvent>,
     pub usage: UsageInfo,
+    /// Explicit Claude stop reason for proxy-managed server loops (for example
+    /// `pause_turn`). When absent the ordinary tool/max/end inference applies.
+    pub stop_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaudeServerEvent {
+    ToolSearch {
+        index: usize,
+        preceding_text: String,
+    },
+    WebSearch {
+        index: usize,
+        preceding_text: String,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -364,6 +386,7 @@ impl DecodedResponse {
         max_tokens: u32,
         current_round_output_tokens: u64,
         compaction_summary: Option<&str>,
+        web_search_replay: &WebSearchReplayCodec,
     ) -> Value {
         let mut content = Vec::new();
         if let Some(summary) = compaction_summary {
@@ -376,35 +399,52 @@ impl DecodedResponse {
                 "signature":kproxy_translate::SIGNATURE_PLACEHOLDER
             }));
         }
-        if !self.text.is_empty() {
-            content.push(json!({"type":"text","text":self.text}));
+        if self.claude_server_events.is_empty() {
+            for search in &self.tool_searches {
+                append_tool_search_blocks(&mut content, search);
+            }
+            for search in &self.web_searches {
+                append_web_search_blocks(&mut content, search, web_search_replay);
+            }
+        } else {
+            for event in &self.claude_server_events {
+                match event {
+                    ClaudeServerEvent::ToolSearch {
+                        index,
+                        preceding_text,
+                    } => {
+                        if !preceding_text.is_empty() {
+                            content.push(json!({"type":"text","text":preceding_text}));
+                        }
+                        if let Some(search) = self.tool_searches.get(*index) {
+                            append_tool_search_blocks(&mut content, search);
+                        }
+                    }
+                    ClaudeServerEvent::WebSearch {
+                        index,
+                        preceding_text,
+                    } => {
+                        if !preceding_text.is_empty() {
+                            content.push(json!({"type":"text","text":preceding_text}));
+                        }
+                        if let Some(search) = self.web_searches.get(*index) {
+                            append_web_search_blocks(&mut content, search, web_search_replay);
+                        }
+                    }
+                }
+            }
         }
-        for search in &self.tool_searches {
-            content.push(json!({
-                "type":"server_tool_use",
-                "id":search.id,
-                "name":search.name,
-                "input":search.input
-            }));
-            let result = if let Some(error) = &search.error {
-                json!({
-                    "type":"tool_search_tool_result_error",
-                    "error_code":error.code,
-                    "error_message":error.message
-                })
+        let citations = web_search_citations(&self.web_searches, &self.text, web_search_replay);
+        if !self.text.is_empty() {
+            if citations.is_empty() {
+                content.push(json!({"type":"text","text":self.text}));
             } else {
-                json!({
-                    "type":"tool_search_tool_search_result",
-                    "tool_references":search.references.iter().map(|name| json!({
-                        "type":"tool_reference","tool_name":name
-                    })).collect::<Vec<_>>()
-                })
-            };
-            content.push(json!({
-                "type":"tool_search_tool_result",
-                "tool_use_id":search.id,
-                "content":result
-            }));
+                content.push(json!({
+                    "type":"text",
+                    "text":self.text,
+                    "citations":citations
+                }));
+            }
         }
         for tool in self.tools.values() {
             content.push(json!({
@@ -414,7 +454,9 @@ impl DecodedResponse {
                 "input":repair_json(&tool.input)
             }));
         }
-        let stop = if !self.tools.is_empty() {
+        let stop = if let Some(reason) = self.stop_reason.as_deref() {
+            reason
+        } else if !self.tools.is_empty() {
             "tool_use"
         } else if current_round_output_tokens >= u64::from(max_tokens) {
             "max_tokens"
@@ -426,7 +468,7 @@ impl DecodedResponse {
             .input_tokens
             .saturating_sub(self.usage.cache_read_tokens)
             .saturating_sub(self.usage.cache_write_tokens);
-        json!({
+        let mut response = json!({
             "id":id,"type":"message","role":"assistant","content":content,
             "model":model,"stop_reason":stop,"stop_sequence":Value::Null,
             "usage":{
@@ -435,7 +477,15 @@ impl DecodedResponse {
                 "cache_creation_input_tokens":self.usage.cache_write_tokens,
                 "cache_read_input_tokens":self.usage.cache_read_tokens
             }
-        })
+        });
+        if !self.web_searches.is_empty() {
+            response["usage"]["server_tool_use"] = json!({
+                "web_search_requests":self.web_searches.iter()
+                    .filter(|search| search.executed)
+                    .count()
+            });
+        }
+        response
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -510,6 +560,121 @@ impl DecodedResponse {
             }
         })
     }
+}
+
+fn append_tool_search_blocks(content: &mut Vec<Value>, search: &ClaudeToolSearchTrace) {
+    if search.emission != ClaudeServerToolEmission::ResultOnly {
+        content.push(json!({
+            "type":"server_tool_use",
+            "id":search.id,
+            "name":search.name,
+            "input":search.input
+        }));
+    }
+    if search.emission == ClaudeServerToolEmission::Pending {
+        return;
+    }
+    let result = if let Some(error) = &search.error {
+        json!({
+            "type":"tool_search_tool_result_error",
+            "error_code":error.code,
+            "error_message":error.message
+        })
+    } else {
+        json!({
+            "type":"tool_search_tool_search_result",
+            "tool_references":search.references.iter().map(|name| json!({
+                "type":"tool_reference","tool_name":name
+            })).collect::<Vec<_>>()
+        })
+    };
+    content.push(json!({
+        "type":"tool_search_tool_result",
+        "tool_use_id":search.id,
+        "content":result
+    }));
+}
+
+fn append_web_search_blocks(
+    content: &mut Vec<Value>,
+    search: &ClaudeWebSearchTrace,
+    web_search_replay: &WebSearchReplayCodec,
+) {
+    if search.emission != ClaudeServerToolEmission::ResultOnly {
+        content.push(json!({
+            "type":"server_tool_use",
+            "id":search.id,
+            "name":"web_search",
+            "input":search.input
+        }));
+    }
+    if search.emission == ClaudeServerToolEmission::Pending {
+        return;
+    }
+    let result = if let Some(error) = &search.error {
+        json!({
+            "type":"web_search_tool_result_error",
+            "error_code":error.code
+        })
+    } else {
+        Value::Array(
+            search
+                .results
+                .iter()
+                .map(|result| {
+                    json!({
+                        "type":"web_search_result",
+                        "url":result.url,
+                        "title":result.title,
+                        "page_age":Value::Null,
+                        "encrypted_content":web_search_replay.encrypt(result)
+                    })
+                })
+                .collect(),
+        )
+    };
+    content.push(json!({
+        "type":"web_search_tool_result",
+        "tool_use_id":search.id,
+        "caller":{"type":"direct"},
+        "content":result
+    }));
+}
+
+pub(crate) fn web_search_citations(
+    searches: &[ClaudeWebSearchTrace],
+    answer_text: &str,
+    web_search_replay: &WebSearchReplayCodec,
+) -> Vec<Value> {
+    const MAX_CITATIONS: usize = 20;
+
+    let mut seen = std::collections::HashSet::new();
+    searches
+        .iter()
+        .filter(|search| search.emission != ClaudeServerToolEmission::Pending)
+        .flat_map(|search| search.results.iter())
+        // Kiro does not return Anthropic's internal citation alignment. Only
+        // emit a structured citation when the answer explicitly includes the
+        // exact source URL requested by the continuation prompt. This avoids
+        // falsely attributing unused search results to the answer.
+        .filter(|result| answer_text.contains(&result.url))
+        .filter(|result| seen.insert(result.url.clone()))
+        .take(MAX_CITATIONS)
+        .map(|result| {
+            let cited_text = if result.snippet.trim().is_empty() {
+                result.title.chars().take(150).collect::<String>()
+            } else {
+                result.snippet.chars().take(150).collect::<String>()
+            };
+            json!({
+                "type":"web_search_result_location",
+                "url":result.url,
+                "title":result.title,
+                "encrypted_index":web_search_replay.encrypt(result),
+                "cited_text":cited_text
+            })
+        })
+        .collect()
 }
 
 fn merge_usage(output: &mut UsageInfo, value: &Value) {
@@ -723,6 +888,10 @@ fn sanitize_text(text: &str) -> String {
 mod tests {
     use super::*;
 
+    fn replay_codec() -> WebSearchReplayCodec {
+        WebSearchReplayCodec::from_key([0x5A; 32])
+    }
+
     #[test]
     fn recovers_split_function_calls_and_keeps_visible_text() {
         let mut filter = ToolLeakFilter::new(true);
@@ -786,8 +955,14 @@ mod tests {
             },
             ..DecodedResponse::default()
         };
-        let claude = decoded.claude_json("msg", "model", 50, 10, None);
+        let claude = decoded.claude_json("msg", "model", 50, 10, None, &replay_codec());
         assert_eq!(claude["stop_reason"], "end_turn");
+        let paused = DecodedResponse {
+            stop_reason: Some("pause_turn".into()),
+            ..DecodedResponse::default()
+        }
+        .claude_json("msg", "model", 50, 0, None, &replay_codec());
+        assert_eq!(paused["stop_reason"], "pause_turn");
         let tagged = decoded.openai_json(
             "chat",
             "model",
@@ -826,10 +1001,14 @@ mod tests {
                 input: json!({"pattern":"github"}),
                 references: vec!["mcp__github__list_issues".into()],
                 error: None,
+                requested_limit: 5,
+                matched_count: 1,
+                budget_truncated: false,
+                emission: ClaudeServerToolEmission::Complete,
             }],
             ..DecodedResponse::default()
         };
-        let response = decoded.claude_json("msg", "model", 100, 1, None);
+        let response = decoded.claude_json("msg", "model", 100, 1, None, &replay_codec());
         assert_eq!(response["content"][0]["type"], "server_tool_use");
         assert_eq!(response["content"][1]["type"], "tool_search_tool_result");
         assert_eq!(
@@ -837,6 +1016,159 @@ mod tests {
             "mcp__github__list_issues"
         );
         assert_eq!(response["stop_reason"], "end_turn");
+    }
+
+    #[test]
+    fn claude_response_uses_native_web_search_blocks_and_usage() {
+        let decoded = DecodedResponse {
+            text: "Tokio uses an async runtime: https://tokio.rs".into(),
+            web_searches: vec![kproxy_translate::ClaudeWebSearchTrace::success(
+                "srvtoolu_web".into(),
+                "rust async",
+                kproxy_translate::WebSearchResults {
+                    query: "rust async".into(),
+                    total_results: 1,
+                    results: vec![kproxy_translate::WebSearchResult {
+                        title: "Tokio".into(),
+                        url: "https://tokio.rs".into(),
+                        snippet: "runtime".into(),
+                        published_date: None,
+                    }],
+                },
+            )],
+            ..DecodedResponse::default()
+        };
+        let response = decoded.claude_json("msg", "model", 100, 1, None, &replay_codec());
+        assert_eq!(response["content"][0]["name"], "web_search");
+        assert_eq!(response["content"][1]["type"], "web_search_tool_result");
+        assert_eq!(
+            response["content"][1]["content"][0]["url"],
+            "https://tokio.rs"
+        );
+        assert_eq!(
+            response["usage"]["server_tool_use"]["web_search_requests"],
+            1
+        );
+        assert!(response["content"][1]["content"][0]["encrypted_content"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("kproxy.v2.")));
+        assert_eq!(
+            response["content"][2]["citations"][0]["url"],
+            "https://tokio.rs"
+        );
+    }
+
+    #[test]
+    fn web_search_does_not_cite_results_absent_from_the_answer() {
+        let decoded = DecodedResponse {
+            text: "The available results do not answer the question.".into(),
+            web_searches: vec![ClaudeWebSearchTrace::success(
+                "srvtoolu_web".into(),
+                "rust async",
+                kproxy_translate::WebSearchResults {
+                    query: "rust async".into(),
+                    total_results: 1,
+                    results: vec![kproxy_translate::WebSearchResult {
+                        title: "Tokio".into(),
+                        url: "https://tokio.rs".into(),
+                        snippet: "runtime".into(),
+                        published_date: None,
+                    }],
+                },
+            )],
+            ..DecodedResponse::default()
+        };
+        let response = decoded.claude_json("msg", "model", 100, 1, None, &replay_codec());
+        assert!(response["content"][2].get("citations").is_none());
+    }
+
+    #[test]
+    fn pending_and_resumed_server_tools_emit_only_the_protocol_phase_they_own() {
+        let pending = DecodedResponse {
+            web_searches: vec![ClaudeWebSearchTrace::pending(
+                "srvtoolu_pending".into(),
+                json!({"query":"rust"}),
+            )],
+            ..DecodedResponse::default()
+        }
+        .claude_json("msg", "model", 100, 1, None, &replay_codec());
+        assert_eq!(pending["content"].as_array().map(Vec::len), Some(1));
+        assert_eq!(pending["content"][0]["type"], "server_tool_use");
+        assert_eq!(
+            pending["usage"]["server_tool_use"]["web_search_requests"],
+            0
+        );
+
+        let resumed = DecodedResponse {
+            web_searches: vec![ClaudeWebSearchTrace::success(
+                "srvtoolu_pending".into(),
+                "rust",
+                kproxy_translate::WebSearchResults::default(),
+            )
+            .result_only()],
+            ..DecodedResponse::default()
+        }
+        .claude_json("msg", "model", 100, 1, None, &replay_codec());
+        assert_eq!(resumed["content"].as_array().map(Vec::len), Some(1));
+        assert_eq!(resumed["content"][0]["type"], "web_search_tool_result");
+        assert_eq!(
+            resumed["usage"]["server_tool_use"]["web_search_requests"],
+            1
+        );
+    }
+
+    #[test]
+    fn nonstream_server_tools_preserve_pre_call_and_final_text_order() {
+        let decoded = DecodedResponse {
+            text: "final answer".into(),
+            tool_searches: vec![ClaudeToolSearchTrace {
+                id: "srvtoolu_tool".into(),
+                name: "tool_search_tool_regex".into(),
+                input: json!({"pattern":"web"}),
+                references: vec!["web_search".into()],
+                error: None,
+                requested_limit: 5,
+                matched_count: 1,
+                budget_truncated: false,
+                emission: ClaudeServerToolEmission::Complete,
+            }],
+            web_searches: vec![ClaudeWebSearchTrace::success(
+                "srvtoolu_web".into(),
+                "news",
+                kproxy_translate::WebSearchResults::default(),
+            )],
+            claude_server_events: vec![
+                ClaudeServerEvent::ToolSearch {
+                    index: 0,
+                    preceding_text: "finding a tool".into(),
+                },
+                ClaudeServerEvent::WebSearch {
+                    index: 0,
+                    preceding_text: "searching the web".into(),
+                },
+            ],
+            ..DecodedResponse::default()
+        };
+
+        let response = decoded.claude_json("msg", "model", 100, 1, None, &replay_codec());
+        let types = response["content"]
+            .as_array()
+            .expect("content")
+            .iter()
+            .map(|block| block["type"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            types,
+            [
+                "text",
+                "server_tool_use",
+                "tool_search_tool_result",
+                "text",
+                "server_tool_use",
+                "web_search_tool_result",
+                "text"
+            ]
+        );
     }
 
     #[test]
@@ -858,7 +1190,7 @@ mod tests {
         assert_eq!(decoded.usage.cache_write_tokens, 5);
         assert_eq!(decoded.usage.output_tokens, 7);
         assert_eq!(decoded.usage.credits, 1.25);
-        let response = decoded.claude_json("msg", "model", 100, 7, None);
+        let response = decoded.claude_json("msg", "model", 100, 7, None, &replay_codec());
         assert_eq!(response["usage"]["input_tokens"], 10);
         assert_eq!(response["usage"]["cache_read_input_tokens"], 20);
         assert_eq!(response["usage"]["cache_creation_input_tokens"], 5);
@@ -879,7 +1211,7 @@ mod tests {
             .expect("usage");
 
         assert_eq!(decoded.usage.input_tokens, 100);
-        let response = decoded.claude_json("msg", "model", 100, 20, None);
+        let response = decoded.claude_json("msg", "model", 100, 20, None, &replay_codec());
         assert_eq!(response["usage"]["input_tokens"], 30);
         assert_eq!(response["usage"]["cache_read_input_tokens"], 60);
         assert_eq!(response["usage"]["cache_creation_input_tokens"], 10);
@@ -897,6 +1229,7 @@ mod tests {
             100,
             10,
             Some("compacted conversation summary"),
+            &replay_codec(),
         );
 
         assert_eq!(response["content"][0]["type"], "compaction");

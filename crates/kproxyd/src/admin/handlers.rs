@@ -1562,6 +1562,7 @@ mod tests {
             output_tokens: 30,
             credits: 0.5,
             error: None,
+            diagnostics: crate::stats::RequestDiagnostics::default(),
         });
 
         let compact = expect_ok(
