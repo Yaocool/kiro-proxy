@@ -553,7 +553,7 @@ fn build_catalog(
 
 fn translate_deferred_tool(tool: &ClaudeTool, kiro_name: &str) -> (KiroTool, Option<String>) {
     match tool.r#type.as_deref() {
-        Some(kind) if kind.starts_with("web_search") => kiro_tool(
+        Some(kind) if crate::matches_type_family(kind, "web_search") => kiro_tool(
             "web_search",
             "Search the web for real-time information. Returns relevant search results with titles, URLs, and snippets.",
             &serde_json::json!({
@@ -562,7 +562,7 @@ fn translate_deferred_tool(tool: &ClaudeTool, kiro_name: &str) -> (KiroTool, Opt
                 "required":["query"]
             }),
         ),
-        Some(kind) if kind.starts_with("web_fetch") => kiro_tool(
+        Some(kind) if crate::matches_type_family(kind, "web_fetch") => kiro_tool(
             "web_fetch",
             "Fetch and read content from a specific URL. Returns the page content in readable text format.",
             &serde_json::json!({
@@ -624,10 +624,13 @@ pub(crate) fn tool_search_kiro_tool_named(tool: &ClaudeTool, kiro_name: &str) ->
 }
 
 fn search_kind(kind: Option<&str>) -> Option<SearchKind> {
-    match kind? {
-        "tool_search_tool_regex" | "tool_search_tool_regex_20251119" => Some(SearchKind::Regex),
-        "tool_search_tool_bm25" | "tool_search_tool_bm25_20251119" => Some(SearchKind::Bm25),
-        _ => None,
+    let kind = kind?;
+    if crate::matches_type_family(kind, "tool_search_tool_regex") {
+        Some(SearchKind::Regex)
+    } else if crate::matches_type_family(kind, "tool_search_tool_bm25") {
+        Some(SearchKind::Bm25)
+    } else {
+        None
     }
 }
 
@@ -734,17 +737,33 @@ mod tests {
     use super::*;
 
     fn request(kind: &str) -> ClaudeRequest {
+        let name = match search_kind(Some(kind)).expect("search type") {
+            SearchKind::Regex => "tool_search_tool_regex",
+            SearchKind::Bm25 => "tool_search_tool_bm25",
+        };
         serde_json::from_value(serde_json::json!({
             "model":"claude-sonnet-4-5",
             "max_tokens":256,
             "messages":[{"role":"user","content":"find an issue"}],
             "tools":[
-                {"type":kind,"name":kind.trim_end_matches("_20251119")},
+                {"type":kind,"name":name},
                 {"name":"mcp__github__list_issues","description":"List GitHub issues by repository","input_schema":{"type":"object"},"defer_loading":true},
                 {"name":"mcp__slack__search","description":"Search Slack messages","input_schema":{"type":"object"},"defer_loading":true}
             ]
         }))
         .expect("request")
+    }
+
+    #[test]
+    fn accepts_opaque_tool_search_version_suffixes() {
+        assert!(is_tool_search_type("tool_search_tool_regex_next"));
+        assert!(is_tool_search_type("tool_search_tool_bm25_v2-preview"));
+        assert!(!is_tool_search_type("tool_search_tool_vector_next"));
+
+        ClaudeToolSearchCatalog::from_request(&request("tool_search_tool_regex_next"))
+            .expect("opaque regex version");
+        ClaudeToolSearchCatalog::from_request(&request("tool_search_tool_bm25_v2-preview"))
+            .expect("opaque BM25 version");
     }
 
     fn request_with_matching_tools(kind: &str, count: usize) -> ClaudeRequest {

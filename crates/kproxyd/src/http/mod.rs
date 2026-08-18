@@ -907,7 +907,7 @@ mod tests {
             "model":"model",
             "messages":[{"role":"user","content":old_context}],
             "context_management":{"edits":[{
-                "type":"compact_20260112",
+                "type":"compact_next",
                 "trigger":{"type":"input_tokens","value":50_000}
             }]}
         });

@@ -3,6 +3,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
+/// Matches an unversioned protocol type or any versioned/aliased member of
+/// that type family without assuming a date-shaped suffix.
+pub fn matches_type_family(kind: &str, base: &str) -> bool {
+    kind == base
+        || kind
+            .strip_prefix(base)
+            .is_some_and(|suffix| suffix.starts_with('_'))
+}
+
 /// Anthropic Messages request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeRequest {
@@ -302,4 +311,19 @@ fn object_schema() -> Value {
 
 fn default_parallel() -> bool {
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::matches_type_family;
+
+    #[test]
+    fn protocol_type_families_do_not_assume_a_version_format() {
+        assert!(matches_type_family("web_search", "web_search"));
+        assert!(matches_type_family("web_search_20260318", "web_search"));
+        assert!(matches_type_family("web_search_next", "web_search"));
+        assert!(matches_type_family("web_search_", "web_search"));
+        assert!(!matches_type_family("web_searcher", "web_search"));
+        assert!(!matches_type_family("other_web_search_next", "web_search"));
+    }
 }

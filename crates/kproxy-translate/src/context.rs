@@ -7,14 +7,26 @@ use crate::ClaudeRequest;
 pub const DEFAULT_COMPACT_TRIGGER_TOKENS: u64 = 150_000;
 pub const MIN_COMPACT_TRIGGER_TOKENS: u64 = 50_000;
 
+/// Returns whether an edit type belongs to Claude's compaction strategy family.
+///
+/// The suffix is intentionally opaque: clients may send date versions, aliases,
+/// or future version schemes while the locally emulated fields remain stable.
+pub fn is_compact_edit_type(edit_type: &str) -> bool {
+    edit_type.starts_with("compact_")
+}
+
 /// Returns the configured server-compaction trigger, if the request contains
-/// the supported `compact_20260112` edit.
+/// an edit in the `compact_*` type family.
 pub fn compact_trigger_tokens(context_management: Option<&Value>) -> Option<u64> {
     context_management?
         .get("edits")?
         .as_array()?
         .iter()
-        .find(|edit| edit.get("type").and_then(Value::as_str) == Some("compact_20260112"))
+        .find(|edit| {
+            edit.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(is_compact_edit_type)
+        })
         .map(|edit| {
             edit.pointer("/trigger/value")
                 .and_then(Value::as_u64)
@@ -65,6 +77,17 @@ mod tests {
     use serde_json::json;
 
     #[test]
+    fn recognizes_compaction_edit_types_without_parsing_the_suffix() {
+        assert!(is_compact_edit_type("compact_20260112"));
+        assert!(is_compact_edit_type("compact_next"));
+        assert!(is_compact_edit_type("compact_202601120"));
+        assert!(is_compact_edit_type("compact_"));
+        assert!(!is_compact_edit_type("compact"));
+        assert!(!is_compact_edit_type("compaction_next"));
+        assert!(!is_compact_edit_type("clear_tool_uses_20250919"));
+    }
+
+    #[test]
     fn reads_compact_trigger_and_applies_latest_boundary() {
         let mut request: ClaudeRequest = serde_json::from_value(json!({
             "model":"claude-sonnet-4.6",
@@ -91,6 +114,19 @@ mod tests {
         assert!(apply_compaction_boundary(&mut request));
         assert_eq!(request.messages.len(), 2);
         assert_eq!(request.messages[0].content[0]["type"], "compaction");
+    }
+
+    #[test]
+    fn reads_trigger_from_an_opaque_compaction_version() {
+        let context_management = json!({"edits":[{
+            "type":"compact_next",
+            "trigger":{"type":"input_tokens","value":80_000}
+        }]});
+
+        assert_eq!(
+            compact_trigger_tokens(Some(&context_management)),
+            Some(80_000)
+        );
     }
 
     #[test]

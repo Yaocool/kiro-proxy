@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 use thiserror::Error;
 
-use crate::{is_tool_search_type, ClaudeRequest, OpenAiRequest};
+use crate::{is_tool_search_type, matches_type_family, ClaudeRequest, OpenAiRequest};
 
 pub const MAX_SCHEMA_DEPTH: usize = 64;
 pub const MAX_SCHEMA_NODES: usize = 50_000;
@@ -123,7 +123,7 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
     let mut seen_tool_names = HashSet::new();
     for (index, tool) in request.tools.iter().enumerate() {
         let kind = tool.r#type.as_deref();
-        if kind.is_some_and(|kind| kind.starts_with("web_fetch")) {
+        if kind.is_some_and(|kind| matches_type_family(kind, "web_fetch")) {
             return invalid(
                 format!("tools.{index}.type"),
                 "Claude Web Fetch is not implemented by this proxy; rejecting it avoids exposing a client tool with incompatible server-tool semantics",
@@ -141,7 +141,7 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
         if !seen_tool_names.insert(tool.name.as_str()) {
             return invalid(format!("tools.{index}.name"), "tool names must be unique");
         }
-        let web_tool = kind.is_some_and(|kind| kind.starts_with("web_search"));
+        let web_tool = kind.is_some_and(|kind| matches_type_family(kind, "web_search"));
         let search_tool = kind.is_some_and(is_tool_search_type);
         if kind.is_some_and(|kind| kind.starts_with("tool_search_tool_")) && !search_tool {
             return invalid(
@@ -152,26 +152,7 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
                 ),
             );
         }
-        if kind.is_some_and(|kind| kind.starts_with("web_search"))
-            && !matches!(
-                kind,
-                Some(
-                    "web_search"
-                        | "web_search_20250305"
-                        | "web_search_20260209"
-                        | "web_search_20260318"
-                )
-            )
-        {
-            return invalid(
-                format!("tools.{index}.type"),
-                format!(
-                    "unsupported Claude web search version '{}'",
-                    kind.unwrap_or_default()
-                ),
-            );
-        }
-        if kind.is_some_and(|kind| kind.starts_with("web_search")) && tool.name != "web_search" {
+        if web_tool && tool.name != "web_search" {
             return invalid(
                 format!("tools.{index}.name"),
                 "web_search server tools must use name=\"web_search\"",
@@ -234,7 +215,8 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
             }
         }
         if kind.is_some_and(|kind| {
-            kind.starts_with("web_search_20260209") || kind.starts_with("web_search_20260318")
+            matches_type_family(kind, "web_search")
+                && !matches!(kind, "web_search" | "web_search_20250305")
         }) && tool.allowed_callers.is_none()
         {
             return invalid(
@@ -259,12 +241,6 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
                 return invalid(
                     format!("tools.{index}.user_location"),
                     "web search localization is not supported by the Kiro MCP search endpoint",
-                );
-            }
-            if tool.response_inclusion.is_some() && kind != Some("web_search_20260318") {
-                return invalid(
-                    format!("tools.{index}.response_inclusion"),
-                    "response_inclusion is only available on web_search_20260318",
                 );
             }
             if tool
@@ -346,12 +322,12 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
                         && tool
                             .r#type
                             .as_deref()
-                            .is_some_and(|kind| kind.starts_with("web_search")))
+                            .is_some_and(|kind| matches_type_family(kind, "web_search")))
                     || (name == "web_fetch"
                         && tool
                             .r#type
                             .as_deref()
-                            .is_some_and(|kind| kind.starts_with("web_fetch")))
+                            .is_some_and(|kind| matches_type_family(kind, "web_fetch")))
             });
             if !found {
                 return invalid("tool_choice.name", format!("tool '{name}' was not found"));
@@ -935,10 +911,14 @@ fn validate_context_management(value: Option<&Value>) -> Result<(), ValidationEr
                 "expected an object",
             );
         };
-        if edit.get("type").and_then(Value::as_str) != Some("compact_20260112") {
+        if !edit
+            .get("type")
+            .and_then(Value::as_str)
+            .is_some_and(crate::is_compact_edit_type)
+        {
             return invalid(
                 format!("context_management.edits.{index}.type"),
-                "only compact_20260112 is supported",
+                "expected a compact_* type",
             );
         }
         if edit.keys().any(|key| {
@@ -1620,12 +1600,23 @@ mod tests {
         validate_claude(&input).expect("supported compact configuration");
 
         input.context_management = Some(serde_json::json!({"edits":[{
+            "type":"compact_next",
+            "trigger":{"type":"input_tokens","value":80_000}
+        }]}));
+        validate_claude(&input).expect("opaque compact version");
+
+        input.context_management = Some(serde_json::json!({"edits":[{
             "type":"clear_tool_uses_20250919"
         }]}));
         assert!(validate_claude(&input)
             .expect_err("unsupported context edit")
             .to_string()
-            .contains("compact_20260112"));
+            .contains("compact_*"));
+
+        input.context_management = Some(serde_json::json!({"edits":[{
+            "type":"compaction_latest"
+        }]}));
+        assert!(validate_claude(&input).is_err());
     }
 
     #[test]
@@ -1741,6 +1732,9 @@ mod tests {
             .contains("allowed_callers"));
         input.tools[0].allowed_callers = Some(vec!["direct".into()]);
         validate_claude(&input).expect("explicit direct caller");
+        input.tools[0].r#type = Some("web_search_next".into());
+        input.tools[0].response_inclusion = Some("full".into());
+        validate_claude(&input).expect("opaque web search version");
         input.tools[0].allowed_domains = Some(vec!["example.com".into()]);
         assert!(validate_claude(&input)
             .expect_err("domain filter")
@@ -1764,15 +1758,25 @@ mod tests {
             "max_tokens":100,
             "messages":[{"role":"user","content":"find a tool"}],
             "tools":[{
-                "type":"tool_search_tool_regex_20990101",
+                "type":"tool_search_tool_regex_next",
                 "name":"tool_search_tool_regex"
             }]
         }))
         .expect("parse future search version");
+        validate_claude(&input).expect("opaque Tool Search version");
+
+        input.tools[0].r#type = Some("tool_search_tool_vector_next".into());
         assert!(validate_claude(&input)
-            .expect_err("unknown future search semantics")
+            .expect_err("unknown search algorithm")
             .to_string()
             .contains("unsupported Claude Tool Search version"));
+
+        input.tools[0].r#type = Some("web_searcher_next".into());
+        input.tools[0].name = "web_search".into();
+        assert!(validate_claude(&input)
+            .expect_err("similar-looking server tool")
+            .to_string()
+            .contains("unsupported Claude server tool"));
     }
 
     #[test]
