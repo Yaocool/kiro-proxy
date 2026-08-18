@@ -1103,6 +1103,7 @@ pub fn response(
                     context.compact,
                     &endpoint,
                     "Web Search",
+                    context.tool_search.is_some(),
                 )
                 .await
                 {

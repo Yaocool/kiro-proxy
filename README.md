@@ -179,10 +179,16 @@ catalog index and searches run on blocking workers rather than HTTP runtime
 threads.
 
 The generated `[context]` configuration also bounds the loaded working set with
-`max_loaded_tools` (default and upstream protocol ceiling 128), loaded tool
-definitions with `max_tool_input_tokens`, and the serialized Kiro request with
-`max_upstream_payload_bytes`. Oversized requests fail locally with an explicit
-413 instead of an opaque upstream error.
+`max_loaded_tools` (default and upstream protocol ceiling 128), deferred Tool
+Search working-set definitions with `max_tool_input_tokens`, and the serialized
+Kiro request with `max_upstream_payload_bytes`. Ordinary requests without Tool
+Search are not subject to that 32k working-set budget: their definitions remain
+part of the model's total input-token estimate and are still bounded by the
+context window, tool count, and payload size. Truly oversized requests fail
+locally instead of producing an opaque upstream error. HTTP
+`413/request_too_large` is reserved for an actual inbound body over 50 MiB;
+tool, context, and translated-payload budget errors use 400 so Claude Code does
+not misreport them as a 32 MB attachment failure.
 
 `features.tool_search_max_rounds` defaults to 4 and is hard-clamped to 8. If
 that per-request server loop is exhausted, the response uses Claude's
