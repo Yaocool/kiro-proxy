@@ -9,8 +9,10 @@ pub mod translate;
 pub mod validate;
 
 pub use context::{
-    apply_compaction_boundary, compact_trigger_tokens, is_compact_edit_type,
-    DEFAULT_COMPACT_TRIGGER_TOKENS, MIN_COMPACT_TRIGGER_TOKENS,
+    apply_compaction_boundary, apply_context_management_edits, compact_trigger_tokens,
+    has_context_management_edits, is_compact_edit_type, ClaudeContextEditStats,
+    CLEARED_TOOL_RESULT_TEXT, DEFAULT_COMPACT_TRIGGER_TOKENS, DEFAULT_TOOL_USES_TO_KEEP,
+    MIN_COMPACT_TRIGGER_TOKENS,
 };
 pub use error::{error_envelope, sanitize_error_message, ErrorFormat};
 pub use protocol::*;

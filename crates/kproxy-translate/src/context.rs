@@ -1,11 +1,27 @@
-//! Claude context-management parsing and compaction-boundary handling.
+//! Claude context-management parsing and local compatibility handling.
 
 use serde_json::Value;
+use std::collections::{HashMap, HashSet};
 
-use crate::ClaudeRequest;
+use crate::{matches_type_family, ClaudeRequest};
 
 pub const DEFAULT_COMPACT_TRIGGER_TOKENS: u64 = 150_000;
 pub const MIN_COMPACT_TRIGGER_TOKENS: u64 = 50_000;
+pub const DEFAULT_TOOL_USES_TO_KEEP: usize = 3;
+pub const CLEARED_TOOL_RESULT_TEXT: &str =
+    "[Older tool result omitted by Claude context management.]";
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClaudeContextEditStats {
+    pub cleared_tool_results: usize,
+    pub cleared_tool_inputs: usize,
+}
+
+impl ClaudeContextEditStats {
+    pub fn changed(&self) -> bool {
+        self.cleared_tool_results > 0 || self.cleared_tool_inputs > 0
+    }
+}
 
 /// Returns whether an edit type belongs to Claude's compaction strategy family.
 ///
@@ -32,6 +48,150 @@ pub fn compact_trigger_tokens(context_management: Option<&Value>) -> Option<u64>
                 .and_then(Value::as_u64)
                 .unwrap_or(DEFAULT_COMPACT_TRIGGER_TOKENS)
         })
+}
+
+/// Returns whether a request contains at least one context-management edit.
+///
+/// Token-count responses use this to preserve Anthropic's response envelope
+/// even when an edit is a safe local no-op (for example Claude Code's
+/// `clear_thinking_*` with `keep: "all"`).
+pub fn has_context_management_edits(context_management: Option<&Value>) -> bool {
+    context_management
+        .and_then(|value| value.get("edits"))
+        .and_then(Value::as_array)
+        .is_some_and(|edits| !edits.is_empty())
+}
+
+#[derive(Debug)]
+struct ClearToolUsesPlan {
+    keep: usize,
+    exclude_tools: HashSet<String>,
+    clear_tool_inputs: bool,
+}
+
+fn clear_tool_uses_plan(context_management: Option<&Value>) -> Option<ClearToolUsesPlan> {
+    let edit = context_management?
+        .get("edits")?
+        .as_array()?
+        .iter()
+        .find(|edit| {
+            edit.get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| matches_type_family(kind, "clear_tool_uses"))
+        })?;
+    let keep = if edit.pointer("/keep/type").and_then(Value::as_str) == Some("tool_uses") {
+        edit.pointer("/keep/value")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .unwrap_or(DEFAULT_TOOL_USES_TO_KEEP)
+    } else {
+        DEFAULT_TOOL_USES_TO_KEEP
+    };
+    let exclude_tools = edit
+        .get("exclude_tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_owned)
+        .collect();
+    Some(ClearToolUsesPlan {
+        keep,
+        exclude_tools,
+        clear_tool_inputs: edit
+            .get("clear_tool_inputs")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+    })
+}
+
+/// Applies context edits that can be represented safely before translating to
+/// Kiro. Unsupported and future edit families remain forward-compatible no-ops.
+/// In particular, Claude Code currently sends `clear_thinking_*` with
+/// `keep: "all"`; retaining those blocks already satisfies that contract.
+pub fn apply_context_management_edits(request: &mut ClaudeRequest) -> ClaudeContextEditStats {
+    let Some(plan) = clear_tool_uses_plan(request.context_management.as_ref()) else {
+        return ClaudeContextEditStats::default();
+    };
+
+    let tool_names = request
+        .messages
+        .iter()
+        .filter_map(|message| message.content.as_array())
+        .flatten()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_use"))
+        .filter_map(|block| {
+            Some((
+                block.get("id")?.as_str()?.to_owned(),
+                block.get("name")?.as_str()?.to_owned(),
+            ))
+        })
+        .collect::<HashMap<_, _>>();
+
+    let mut remaining_to_keep = plan.keep;
+    let mut cleared_ids = HashSet::new();
+    for message in request.messages.iter_mut().rev() {
+        let Some(blocks) = message.content.as_array_mut() else {
+            continue;
+        };
+        for block in blocks.iter_mut().rev() {
+            if block.get("type").and_then(Value::as_str) != Some("tool_result") {
+                continue;
+            }
+            let Some(tool_use_id) = block
+                .get("tool_use_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            if tool_names
+                .get(&tool_use_id)
+                .is_some_and(|name| plan.exclude_tools.contains(name))
+            {
+                continue;
+            }
+            if remaining_to_keep > 0 {
+                remaining_to_keep -= 1;
+                continue;
+            }
+            if let Some(object) = block.as_object_mut() {
+                object.insert(
+                    "content".into(),
+                    Value::String(CLEARED_TOOL_RESULT_TEXT.into()),
+                );
+                cleared_ids.insert(tool_use_id);
+            }
+        }
+    }
+
+    let mut cleared_tool_inputs = 0;
+    if plan.clear_tool_inputs && !cleared_ids.is_empty() {
+        for message in &mut request.messages {
+            let Some(blocks) = message.content.as_array_mut() else {
+                continue;
+            };
+            for block in blocks {
+                if block.get("type").and_then(Value::as_str) != Some("tool_use")
+                    || !block
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .is_some_and(|id| cleared_ids.contains(id))
+                {
+                    continue;
+                }
+                if let Some(object) = block.as_object_mut() {
+                    object.insert("input".into(), Value::Object(Default::default()));
+                    cleared_tool_inputs += 1;
+                }
+            }
+        }
+    }
+
+    ClaudeContextEditStats {
+        cleared_tool_results: cleared_ids.len(),
+        cleared_tool_inputs,
+    }
 }
 
 /// Claude ignores every content block before the most recent compaction block.
@@ -127,6 +287,77 @@ mod tests {
             compact_trigger_tokens(Some(&context_management)),
             Some(80_000)
         );
+    }
+
+    #[test]
+    fn accepts_clear_thinking_keep_all_as_a_noop() {
+        let mut request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-opus-5",
+            "max_tokens":1024,
+            "context_management":{"edits":[{
+                "type":"clear_thinking_20251015",
+                "keep":"all"
+            }]},
+            "messages":[{"role":"assistant","content":[{
+                "type":"thinking","thinking":"retain me"
+            }]}]
+        }))
+        .expect("request");
+
+        assert!(has_context_management_edits(
+            request.context_management.as_ref()
+        ));
+        assert_eq!(
+            apply_context_management_edits(&mut request),
+            ClaudeContextEditStats::default()
+        );
+        assert_eq!(request.messages[0].content[0]["thinking"], "retain me");
+    }
+
+    #[test]
+    fn clears_old_tool_results_and_inputs_but_honors_exclusions() {
+        let mut request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4.6",
+            "max_tokens":1024,
+            "context_management":{"edits":[{
+                "type":"clear_tool_uses_20250919",
+                "keep":{"type":"tool_uses","value":1},
+                "exclude_tools":["Preserve"],
+                "clear_tool_inputs":true
+            }]},
+            "messages":[
+                {"role":"assistant","content":[
+                    {"type":"tool_use","id":"old","name":"Read","input":{"path":"old"}},
+                    {"type":"tool_use","id":"excluded","name":"Preserve","input":{"key":"safe"}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"old","content":"old output"},
+                    {"type":"tool_result","tool_use_id":"excluded","content":"preserved output"}
+                ]},
+                {"role":"assistant","content":[
+                    {"type":"tool_use","id":"recent","name":"Read","input":{"path":"new"}}
+                ]},
+                {"role":"user","content":[
+                    {"type":"tool_result","tool_use_id":"recent","content":"recent output"}
+                ]}
+            ]
+        }))
+        .expect("request");
+
+        let stats = apply_context_management_edits(&mut request);
+
+        assert_eq!(stats.cleared_tool_results, 1);
+        assert_eq!(stats.cleared_tool_inputs, 1);
+        assert_eq!(request.messages[0].content[0]["input"], json!({}));
+        assert_eq!(
+            request.messages[1].content[0]["content"],
+            CLEARED_TOOL_RESULT_TEXT
+        );
+        assert_eq!(
+            request.messages[1].content[1]["content"],
+            "preserved output"
+        );
+        assert_eq!(request.messages[3].content[0]["content"], "recent output");
     }
 
     #[test]
