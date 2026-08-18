@@ -10,7 +10,7 @@ use futures::future::{BoxFuture, FutureExt, Shared};
 use futures::{Stream, StreamExt};
 use kproxy_core::account::{Account, Subscription, SubscriptionKind, Usage};
 use kproxy_core::config::{AgentMode, UpstreamConfig};
-use kproxy_translate::KiroPayload;
+use kproxy_translate::{KiroPayload, WebSearchResults};
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -47,6 +47,10 @@ impl KiroError {
 
     pub fn is_retriable(&self) -> bool {
         self.status.is_none() || self.is_throttle() || matches!(self.status, Some(500..=599))
+    }
+
+    pub fn is_request_rejection(&self) -> bool {
+        matches!(self.status, Some(400 | 413 | 422)) || text_is_request_rejection(&self.message)
     }
 }
 
@@ -92,6 +96,26 @@ pub fn text_is_throttle_error(message: &str) -> bool {
     .iter()
     .any(|marker| text.contains(marker))
         || contains_status(&text, 429)
+}
+
+pub fn text_is_request_rejection(message: &str) -> bool {
+    let text = message.to_ascii_lowercase();
+    [
+        "too many tools",
+        "tool definitions are too large",
+        "tool schema",
+        "payload too large",
+        "request too large",
+        "request entity too large",
+        "context length",
+        "prompt is too long",
+        "input is too long",
+        "validationexception",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+        || contains_status(&text, 413)
+        || contains_status(&text, 422)
 }
 
 fn contains_status(text: &str, status: u16) -> bool {
@@ -341,6 +365,7 @@ fn subscription_kind(raw: &str, title: &str) -> SubscriptionKind {
 #[derive(Clone)]
 pub struct KiroClient {
     short: Client,
+    mcp: Client,
     stream: Client,
     cache: Arc<EndpointCache>,
     overrides: EndpointOverrides,
@@ -374,6 +399,15 @@ impl KiroClient {
             .timeout(Duration::from_secs(30))
             .build()
             .map_err(build_error)?;
+        let mcp = Client::builder()
+            .pool_max_idle_per_host(upstream.pool.http_max_connections)
+            .pool_idle_timeout(idle)
+            .connect_timeout(Duration::from_secs(15))
+            .timeout(Duration::from_millis(
+                upstream.web_search_timeout_ms.clamp(1_000, 300_000),
+            ))
+            .build()
+            .map_err(build_error)?;
         // No total/read timeout for streams: legitimate thinking pauses may be long.
         // hyper does not pipeline HTTP/1.1 requests, avoiding long-stream HOL blocking.
         let stream = Client::builder()
@@ -384,6 +418,7 @@ impl KiroClient {
             .map_err(build_error)?;
         Ok(Self {
             short,
+            mcp,
             stream,
             cache: Arc::new(EndpointCache::default()),
             overrides,
@@ -482,6 +517,167 @@ impl KiroClient {
             endpoint: "none".into(),
             message: "no usable upstream endpoint".into(),
         })
+    }
+
+    /// Executes Kiro's JSON-RPC MCP web search. The nested MCP text block is
+    /// JSON itself, so both envelope layers are validated before results are
+    /// exposed to the response/continuation pipeline.
+    pub async fn web_search(
+        &self,
+        account: &Account,
+        query: &str,
+    ) -> Result<WebSearchResults, KiroError> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Err(KiroError {
+                status: Some(400),
+                endpoint: "MCP web_search".into(),
+                message: "web search query must not be empty".into(),
+            });
+        }
+        if query.chars().count() > 2_000 {
+            return Err(KiroError {
+                status: Some(400),
+                endpoint: "MCP web_search".into(),
+                message: "web search query exceeds 2000 characters".into(),
+            });
+        }
+        let _permit = Arc::clone(&self.short_slots)
+            .acquire_owned()
+            .await
+            .map_err(build_error)?;
+        let url = self.web_search_url(account)?;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let request = serde_json::json!({
+            "id":format!("web_search_tooluse_{}_{}", Uuid::new_v4().simple(), timestamp),
+            "jsonrpc":"2.0",
+            "method":"tools/call",
+            "params":{"name":"web_search","arguments":{"query":query}}
+        });
+        let response = self
+            .mcp
+            .post(url.clone())
+            .headers(mcp_headers(account)?)
+            .json(&request)
+            .send()
+            .await
+            .map_err(|error| KiroError {
+                status: None,
+                endpoint: "MCP web_search".into(),
+                message: error.to_string(),
+            })?;
+        let status = response.status();
+        let body = bounded_response_text(response, 8 * 1024 * 1024, "MCP web_search").await?;
+        if !status.is_success() {
+            return Err(KiroError {
+                status: Some(status.as_u16()),
+                endpoint: "MCP web_search".into(),
+                message: nonempty_error_body(status.as_u16(), &body),
+            });
+        }
+        let envelope: serde_json::Value =
+            serde_json::from_str(&body).map_err(|error| KiroError {
+                status: Some(502),
+                endpoint: "MCP web_search".into(),
+                message: format!("invalid JSON-RPC response: {error}"),
+            })?;
+        if let Some(error) = envelope.get("error").filter(|error| !error.is_null()) {
+            return Err(KiroError {
+                status: Some(502),
+                endpoint: "MCP web_search".into(),
+                message: format!(
+                    "JSON-RPC error: {}",
+                    truncate_chars(&error.to_string(), 1_000)
+                ),
+            });
+        }
+        if envelope
+            .pointer("/result/isError")
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            return Err(KiroError {
+                status: Some(502),
+                endpoint: "MCP web_search".into(),
+                message: "Kiro MCP web_search returned an error result".into(),
+            });
+        }
+        let content = envelope
+            .pointer("/result/content")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| KiroError {
+                status: Some(502),
+                endpoint: "MCP web_search".into(),
+                message: "MCP response is missing result.content".into(),
+            })?;
+        let mut parsed = None;
+        for block in content {
+            if block.get("type").and_then(serde_json::Value::as_str) != Some("text") {
+                continue;
+            }
+            let Some(text) = block.get("text").and_then(serde_json::Value::as_str) else {
+                continue;
+            };
+            if let Ok(results) = serde_json::from_str::<WebSearchResults>(text) {
+                parsed = Some(results);
+                break;
+            }
+        }
+        let mut results = parsed.ok_or_else(|| KiroError {
+            status: Some(502),
+            endpoint: "MCP web_search".into(),
+            message: "MCP response contains no valid web search JSON text block".into(),
+        })?;
+        if results.query.is_empty() {
+            results.query = query.to_owned();
+        }
+        sanitize_web_search_results(&mut results);
+        debug!(
+            account = %account.id,
+            endpoint = %url,
+            query_chars = query.chars().count(),
+            result_count = results.results.len(),
+            total_results = results.total_results,
+            "Kiro MCP web search completed"
+        );
+        Ok(results)
+    }
+
+    fn web_search_url(&self, account: &Account) -> Result<url::Url, KiroError> {
+        let region = account.credentials.region.trim();
+        if region.is_empty()
+            || !region
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '-')
+        {
+            return Err(KiroError {
+                status: None,
+                endpoint: "MCP web_search".into(),
+                message: "account has an invalid API region".into(),
+            });
+        }
+        let template = self
+            .overrides
+            .mcp_url
+            .as_deref()
+            .or(self.upstream.web_search_endpoint.as_deref())
+            .unwrap_or("https://runtime.{region}.kiro.dev/mcp");
+        let url = template.replace("{region}", region);
+        let parsed = url::Url::parse(&url).map_err(build_error)?;
+        if !matches!(parsed.scheme(), "http" | "https")
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err(KiroError {
+                status: None,
+                endpoint: "MCP web_search".into(),
+                message: "web search endpoint must be an HTTP(S) URL without credentials".into(),
+            });
+        }
+        Ok(parsed)
     }
 
     async fn send_generation(
@@ -869,6 +1065,28 @@ fn headers(
     Ok(headers)
 }
 
+fn mcp_headers(account: &Account) -> Result<reqwest::header::HeaderMap, KiroError> {
+    use reqwest::header::{
+        HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
+    };
+
+    let mut headers = HeaderMap::new();
+    let authorization = format!("Bearer {}", account.credentials.access_token);
+    for (name, value) in [
+        (CONTENT_TYPE, "application/json"),
+        (ACCEPT, "application/json"),
+        (USER_AGENT, "kproxy/0.0.2 KiroIDE/0.6.18"),
+        (AUTHORIZATION, authorization.as_str()),
+    ] {
+        headers.insert(name, HeaderValue::from_str(value).map_err(build_error)?);
+    }
+    headers.insert(
+        reqwest::header::HeaderName::from_static("x-amzn-codewhisperer-optout"),
+        HeaderValue::from_static("false"),
+    );
+    Ok(headers)
+}
+
 fn metadata_headers(
     account: &Account,
     endpoint: &EndpointDefinition,
@@ -901,6 +1119,79 @@ async fn response_error(response: Response, endpoint: &EndpointDefinition) -> Ki
         status: Some(status.as_u16()),
         endpoint: endpoint.name.into(),
         message: text.chars().take(2_000).collect(),
+    }
+}
+
+fn nonempty_error_body(status: u16, body: &str) -> String {
+    if body.trim().is_empty() {
+        format!("upstream returned HTTP {status} without an error message")
+    } else {
+        truncate_chars(body, 2_000)
+    }
+}
+
+fn truncate_chars(value: &str, maximum: usize) -> String {
+    value.chars().take(maximum).collect()
+}
+
+async fn bounded_response_text(
+    response: Response,
+    maximum: usize,
+    endpoint: &str,
+) -> Result<String, KiroError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > maximum as u64)
+    {
+        return Err(KiroError {
+            status: Some(502),
+            endpoint: endpoint.to_owned(),
+            message: format!("response exceeds the {maximum} byte safety limit"),
+        });
+    }
+    let mut source = response.bytes_stream();
+    let mut body = Vec::new();
+    while let Some(chunk) = source.next().await {
+        let chunk = chunk.map_err(|error| KiroError {
+            status: None,
+            endpoint: endpoint.to_owned(),
+            message: error.to_string(),
+        })?;
+        if body.len().saturating_add(chunk.len()) > maximum {
+            return Err(KiroError {
+                status: Some(502),
+                endpoint: endpoint.to_owned(),
+                message: format!("response exceeds the {maximum} byte safety limit"),
+            });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    String::from_utf8(body).map_err(|error| KiroError {
+        status: Some(502),
+        endpoint: endpoint.to_owned(),
+        message: format!("response is not valid UTF-8: {error}"),
+    })
+}
+
+fn sanitize_web_search_results(results: &mut WebSearchResults) {
+    const MAX_RESULTS: usize = 50;
+    results.query = truncate_chars(&results.query, 2_000);
+    results.results.retain(|result| {
+        result.url.chars().count() <= 8_192
+            && url::Url::parse(&result.url)
+                .ok()
+                .is_some_and(|url| matches!(url.scheme(), "http" | "https"))
+    });
+    results.results.truncate(MAX_RESULTS);
+    for result in &mut results.results {
+        if result.title.trim().is_empty() {
+            result.title = url::Url::parse(&result.url)
+                .ok()
+                .and_then(|url| url.host_str().map(str::to_owned))
+                .unwrap_or_else(|| result.url.clone());
+        }
+        result.title = truncate_chars(&result.title, 1_000);
+        result.snippet = truncate_chars(&result.snippet, 32_000);
     }
 }
 
@@ -976,6 +1267,7 @@ mod tests {
                     "{}/codewhisperer/generateAssistantResponse",
                     server.uri()
                 )),
+                mcp_url: Some(format!("{}/mcp", server.uri())),
             },
         )
         .expect("client")
@@ -1191,6 +1483,79 @@ mod tests {
         assert_eq!(requests[0].url.path(), "/amazon/listAvailableSubscriptions");
     }
 
+    #[tokio::test]
+    async fn web_search_calls_mcp_and_decodes_nested_json_text() {
+        let server = MockServer::start().await;
+        let nested = serde_json::json!({
+            "query":"rust async",
+            "totalResults":3,
+            "results":[
+                {"title":"Tokio","url":"https://tokio.rs/","snippet":"runtime","publishedDate":123},
+                {"title":"","url":"https://example.org/page","snippet":"title fallback"},
+                {"title":"unsafe","url":"javascript:alert(1)","snippet":"drop me"}
+            ]
+        })
+        .to_string();
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc":"2.0",
+                "id":"response",
+                "result":{"content":[{"type":"text","text":nested}],"isError":false}
+            })))
+            .mount(&server)
+            .await;
+        let client = test_client(&server);
+        let results = client
+            .web_search(&account(AuthMethod::Idc), "rust async")
+            .await
+            .expect("search");
+
+        assert_eq!(results.total_results, 3);
+        assert_eq!(results.results.len(), 2);
+        assert_eq!(results.results[0].title, "Tokio");
+        assert_eq!(results.results[1].title, "example.org");
+        let requests = server.received_requests().await.expect("requests");
+        let request = requests.last().expect("MCP request");
+        assert_eq!(request.url.path(), "/mcp");
+        assert_eq!(
+            request
+                .headers
+                .get("x-amzn-codewhisperer-optout")
+                .and_then(|value| value.to_str().ok()),
+            Some("false")
+        );
+        let body: serde_json::Value = serde_json::from_slice(&request.body).expect("JSON body");
+        assert_eq!(body["method"], "tools/call");
+        assert_eq!(body["params"]["name"], "web_search");
+        assert_eq!(body["params"]["arguments"]["query"], "rust async");
+    }
+
+    #[tokio::test]
+    async fn web_search_surfaces_json_rpc_errors_without_generation_fallback() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/mcp"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "jsonrpc":"2.0",
+                "id":"response",
+                "error":{"code":-32000,"message":"unavailable"}
+            })))
+            .mount(&server)
+            .await;
+        let client = test_client(&server);
+        let error = client
+            .web_search(&account(AuthMethod::Idc), "news")
+            .await
+            .expect_err("JSON-RPC error");
+
+        assert_eq!(error.status, Some(502));
+        assert!(error.message.contains("JSON-RPC error"));
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].url.path(), "/mcp");
+    }
+
     #[test]
     fn usage_limits_normalize_base_trial_bonus_and_subscription() {
         let limits: UsageLimits = serde_json::from_value(serde_json::json!({
@@ -1244,5 +1609,13 @@ mod tests {
             message: "credits exhausted".into(),
         };
         assert!(quota.is_quota());
+
+        let payload = KiroError {
+            status: Some(500),
+            endpoint: "AmazonQ".into(),
+            message: "ValidationException: tool schema request too large".into(),
+        };
+        assert!(payload.is_request_rejection());
+        assert!(payload.is_retriable());
     }
 }
