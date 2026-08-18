@@ -322,6 +322,18 @@ docker compose exec kproxyd kproxy health
 docker compose logs -f kproxyd
 ```
 
+Linux Docker Engine 上如果出现 `failed to populate volume`，且错误指出
+`.../volumes/kiro-proxy_kproxy-data/_data` 不存在，说明 Docker 保留了 named volume 元数据，
+但实际目录已经丢失。新版一键脚本会在构建前检测这一状态：交互终端会请求确认后重建，CI
+或其他非交互环境可运行：
+
+```bash
+./deploy/docker-setup.sh --no-build --repair-volume
+```
+
+修复只针对带有当前 Compose 项目标记且数据路径已经不存在的 volume。如果 Docker volume
+根目录、数据盘挂载或软链接本身异常，脚本会停止并要求先恢复 Docker 存储，不会自动删除。
+
 Compose 使用 `network_mode: host`，容器内创建的代理监听会直接进入 Docker 宿主机网络
 命名空间。因此任意服务端口创建后立即可用，不需要修改 Compose 或重建容器。Linux 上的
 Docker Engine 可直接使用；Docker Desktop 4.34 及以上版本需要先在 Settings > Resources
