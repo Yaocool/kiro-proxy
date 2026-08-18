@@ -41,7 +41,9 @@ chromiumoxide = { version = "=0.9.1", default-features = false }
 notify = "=6.1.1"
 notify-debouncer-full = "=0.3.2"
 rand = "=0.8.5"
+ring = "=0.17.14"
 regex = "=1.13.1"
+fancy-regex = "=0.12.0"
 uuid = { version = "=1.10.0", features = ["v4"] }
 tempfile = "=3.12.0"
 async-stream = "=0.3.5"

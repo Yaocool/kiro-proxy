@@ -1192,6 +1192,7 @@ dependencies = [
  "kproxy-core",
  "notify",
  "notify-debouncer-full",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "tempfile",
@@ -1206,12 +1207,14 @@ name = "kproxy-translate"
 version = "0.0.2"
 dependencies = [
  "base64 0.22.1",
+ "fancy-regex",
  "kproxy-core",
  "libc",
  "lru",
  "proptest",
  "rand 0.8.5",
  "regex",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
