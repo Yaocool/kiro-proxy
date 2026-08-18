@@ -73,6 +73,7 @@ impl EndpointDefinition {
 pub struct EndpointOverrides {
     pub codewhisperer_url: Option<String>,
     pub amazonq_url: Option<String>,
+    pub mcp_url: Option<String>,
 }
 
 type PurposeKey = (String, EndpointPurpose);

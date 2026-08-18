@@ -198,6 +198,11 @@ pub struct UpstreamConfig {
     pub token_refresh_before_expiry: i64,
     /// 双连接池参数。
     pub pool: UpstreamPoolConfig,
+    /// Kiro MCP Web Search 端点。支持 `{region}` 占位符；空值使用
+    /// `https://runtime.{region}.kiro.dev/mcp`。
+    pub web_search_endpoint: Option<String>,
+    /// MCP Web Search 请求超时。
+    pub web_search_timeout_ms: u64,
 }
 
 impl Default for UpstreamConfig {
@@ -208,6 +213,8 @@ impl Default for UpstreamConfig {
             max_retries: 3,
             token_refresh_before_expiry: 900,
             pool: UpstreamPoolConfig::default(),
+            web_search_endpoint: None,
+            web_search_timeout_ms: 60_000,
         }
     }
 }
@@ -323,6 +330,14 @@ impl Default for PoolConfig {
 pub struct FeaturesConfig {
     /// 工具调用后自动续轮次数。
     pub auto_continue_rounds: u32,
+    /// 代理内部 Tool Search 的最大续轮次数（硬上限 8）。
+    pub tool_search_max_rounds: u32,
+    /// 单个客户端请求内允许实际执行的 Tool Search 操作数。
+    pub tool_search_max_operations: u32,
+    /// 是否启用原生 Anthropic Tool Search 模拟。
+    pub enable_tool_search: bool,
+    /// 单个客户端请求内代理执行 MCP Web Search 的安全上限。
+    pub web_search_max_rounds: u32,
     /// 是否移除工具。
     pub disable_tools: bool,
     /// 429 时是否启用同族模型降级。
@@ -353,6 +368,10 @@ impl Default for FeaturesConfig {
     fn default() -> Self {
         Self {
             auto_continue_rounds: 0,
+            tool_search_max_rounds: 4,
+            tool_search_max_operations: 32,
+            enable_tool_search: true,
+            web_search_max_rounds: 20,
             disable_tools: false,
             enable_model_fallback: true,
             enable_prompt_cache: false,
@@ -422,6 +441,8 @@ pub struct ContextConfig {
     pub compact_safe_input_ratio: f64,
     /// 单次 Kiro 请求中工具定义允许占用的最大估算 token。
     pub max_tool_input_tokens: u32,
+    /// 单次 Kiro 请求中允许发送的已加载工具数量。
+    pub max_loaded_tools: usize,
     /// 单次序列化 Kiro 请求的最大字节数。
     pub max_upstream_payload_bytes: usize,
 }
@@ -433,6 +454,7 @@ impl Default for ContextConfig {
             safe_input_ratio: 0.95,
             compact_safe_input_ratio: 0.99,
             max_tool_input_tokens: 32_000,
+            max_loaded_tools: 128,
             max_upstream_payload_bytes: 8 * 1024 * 1024,
         }
     }
@@ -892,6 +914,18 @@ impl Config {
                 return invalid_config(field, "must be greater than zero");
             }
         }
+        if self.context.max_loaded_tools > 128 {
+            return invalid_config(
+                "context.max_loaded_tools",
+                "must not exceed the upstream protocol ceiling of 128",
+            );
+        }
+        if !(1..=256).contains(&self.features.tool_search_max_operations) {
+            return invalid_config(
+                "features.tool_search_max_operations",
+                "must be between 1 and 256",
+            );
+        }
         if self.upstream.pool.stream_pipelining != 1 {
             return invalid_config(
                 "upstream.pool.stream_pipelining",
@@ -941,6 +975,7 @@ impl Config {
                 "context.max_tool_input_tokens",
                 self.context.max_tool_input_tokens as usize,
             ),
+            ("context.max_loaded_tools", self.context.max_loaded_tools),
             (
                 "context.max_upstream_payload_bytes",
                 self.context.max_upstream_payload_bytes,
@@ -1232,6 +1267,8 @@ agent_mode = "vibe"
 max_retries = 3
 # 默认提前 15 分钟；运行时不低于扫描间隔的 2 倍和 10 分钟
 token_refresh_before_expiry = 900
+# web_search_endpoint = "https://runtime.{region}.kiro.dev/mcp"
+web_search_timeout_ms = 60000
 
 [upstream.pool]
 http_max_connections = 128
@@ -1269,6 +1306,10 @@ quota_error_threshold = 50
 
 [features]
 auto_continue_rounds = 0
+tool_search_max_rounds = 4
+tool_search_max_operations = 32
+enable_tool_search = true
+web_search_max_rounds = 20
 disable_tools = false
 enable_model_fallback = true
 enable_prompt_cache = false
@@ -1296,6 +1337,7 @@ max_input_tokens = 200000
 safe_input_ratio = 0.95
 compact_safe_input_ratio = 0.99
 max_tool_input_tokens = 32000
+max_loaded_tools = 128
 max_upstream_payload_bytes = 8388608
 
 [storage]
@@ -1403,17 +1445,24 @@ mod tests {
         assert_eq!(config.features.max_thinking_budget_tokens, 8192);
         assert!(config.features.enable_web_tools);
         assert!(config.features.enable_tool_leak_filter);
+        assert_eq!(config.features.tool_search_max_rounds, 4);
+        assert_eq!(config.features.tool_search_max_operations, 32);
+        assert!(config.features.enable_tool_search);
+        assert_eq!(config.features.web_search_max_rounds, 20);
 
         assert_eq!(config.upstream.pool.stream_pipelining, 1);
         assert_eq!(config.upstream.pool.http_pipelining, 5);
         assert_eq!(config.upstream.pool.stream_max_connections, 256);
         assert_eq!(config.upstream.pool.http_max_connections, 128);
         assert_eq!(config.upstream.token_refresh_before_expiry, 900);
+        assert_eq!(config.upstream.web_search_timeout_ms, 60_000);
+        assert!(config.upstream.web_search_endpoint.is_none());
         assert_eq!(config.effective_token_refresh_before_expiry(), 900);
         assert_eq!(config.context.max_input_tokens, 200_000);
         assert_eq!(config.context.safe_input_ratio, 0.95);
         assert_eq!(config.context.compact_safe_input_ratio, 0.99);
         assert_eq!(config.context.max_tool_input_tokens, 32_000);
+        assert_eq!(config.context.max_loaded_tools, 128);
         assert_eq!(config.context.max_upstream_payload_bytes, 8 * 1024 * 1024);
         assert_eq!(config.notify.low_credit_threshold_percent, 10.0);
         assert_eq!(config.notify.max_notifications, 5);
@@ -1452,6 +1501,36 @@ mod tests {
         let parsed: Config = toml::from_str("").expect("empty toml must parse");
         assert_eq!(parsed.server.port, 5580);
         assert_eq!(parsed.pool.max_concurrent_per_account, 50);
+    }
+
+    #[test]
+    fn loaded_tool_limit_cannot_exceed_the_upstream_protocol_ceiling() {
+        let mut config = Config::default();
+        config.context.max_loaded_tools = 129;
+        let error = config
+            .validate()
+            .expect_err("limits above the parser ceiling must be rejected");
+        assert!(
+            error.to_string().contains("context.max_loaded_tools"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn tool_search_operation_limit_is_positive_and_bounded() {
+        for value in [0, 257] {
+            let mut config = Config::default();
+            config.features.tool_search_max_operations = value;
+            let error = config
+                .validate()
+                .expect_err("unsafe Tool Search operation limit must be rejected");
+            assert!(
+                error
+                    .to_string()
+                    .contains("features.tool_search_max_operations"),
+                "{error}"
+            );
+        }
     }
 
     #[test]
