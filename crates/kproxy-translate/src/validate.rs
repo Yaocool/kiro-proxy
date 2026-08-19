@@ -10,7 +10,7 @@ use crate::{is_tool_search_type, matches_type_family, ClaudeRequest, OpenAiReque
 pub const MAX_SCHEMA_DEPTH: usize = 64;
 pub const MAX_SCHEMA_NODES: usize = 50_000;
 pub const MAX_TOOL_DOC_CHARS: usize = 512_000;
-pub const MAX_TOOLS: usize = 128;
+pub const MAX_TOOLS: usize = kproxy_core::config::MAX_LOADED_TOOLS;
 pub const MAX_DEFERRED_TOOLS: usize = 10_000;
 pub const MAX_LOADED_TOOL_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_DEFERRED_TOOL_BYTES: usize = 32 * 1024 * 1024;

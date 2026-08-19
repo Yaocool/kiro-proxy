@@ -154,8 +154,8 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:5580 ENABLE_TOOL_SEARCH=auto claude
 payload 字节预算动态装载，因此不存在固定 5 个的工作集上限；未命中的 deferred schema 不会进入
 Kiro 上下文或上游 payload。Catalog 构建和搜索运行在 blocking worker，不会阻塞 HTTP runtime。
 
-自动生成的 `[context]` 配置还通过 `max_loaded_tools` 限制已加载工作集（默认值及上游协议
-硬上限均为 128）、通过 `max_tool_input_tokens` 限制 deferred Tool Search 工作集的估算 token，
+自动生成的 `[context]` 配置还通过 `max_loaded_tools` 限制已加载工作集（默认值及代理上限
+均为 512）、通过 `max_tool_input_tokens` 限制 deferred Tool Search 工作集的估算 token，
 并通过 `max_upstream_payload_bytes` 限制序列化后的 Kiro 请求大小。未启用 Tool Search 的普通请求
 不会再被这个 32k 工作集预算误拦截，其工具定义仍会计入模型总输入 token，并接受上下文窗口、
 工具数量及 payload 字节限制。真实超限请求会在本地拒绝，而不是留给上游返回不透明错误。

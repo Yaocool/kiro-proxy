@@ -659,6 +659,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claude_accepts_more_than_the_legacy_128_tool_limit() {
+        let (_directory, state) = test_state(Config::default()).await;
+        let tools = (0..129)
+            .map(|index| {
+                serde_json::json!({
+                    "name": format!("tool_{index}"),
+                    "description": "small test tool",
+                    "input_schema": {"type": "object"}
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = router(state)
+            .oneshot(
+                Request::post("/v1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::USER_AGENT, "claude-cli/2.1.220 (external, test)")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model": "claude-opus-5",
+                            "max_tokens": 1,
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "tools": tools
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        // No test account is configured, so reaching the pool proves that
+        // the request passed the proxy's tool-count admission checks.
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn claude_tool_capacity_errors_do_not_masquerade_as_32mb_body_errors() {
         let (_directory, state) = test_state(Config::default()).await;
         let tools = (0..=kproxy_translate::validate::MAX_TOOLS)
