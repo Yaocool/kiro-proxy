@@ -5,6 +5,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+/// Maximum number of immediately loaded tools accepted by the proxy.
+pub const MAX_LOADED_TOOLS: usize = 512;
+
 /// 配置校验错误。
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -454,7 +457,7 @@ impl Default for ContextConfig {
             safe_input_ratio: 0.95,
             compact_safe_input_ratio: 0.99,
             max_tool_input_tokens: 32_000,
-            max_loaded_tools: 128,
+            max_loaded_tools: MAX_LOADED_TOOLS,
             max_upstream_payload_bytes: 8 * 1024 * 1024,
         }
     }
@@ -914,10 +917,10 @@ impl Config {
                 return invalid_config(field, "must be greater than zero");
             }
         }
-        if self.context.max_loaded_tools > 128 {
+        if self.context.max_loaded_tools > MAX_LOADED_TOOLS {
             return invalid_config(
                 "context.max_loaded_tools",
-                "must not exceed the upstream protocol ceiling of 128",
+                format!("must not exceed the proxy ceiling of {MAX_LOADED_TOOLS}"),
             );
         }
         if !(1..=256).contains(&self.features.tool_search_max_operations) {
@@ -1337,7 +1340,7 @@ max_input_tokens = 200000
 safe_input_ratio = 0.95
 compact_safe_input_ratio = 0.99
 max_tool_input_tokens = 32000
-max_loaded_tools = 128
+max_loaded_tools = 512
 max_upstream_payload_bytes = 8388608
 
 [storage]
@@ -1462,7 +1465,7 @@ mod tests {
         assert_eq!(config.context.safe_input_ratio, 0.95);
         assert_eq!(config.context.compact_safe_input_ratio, 0.99);
         assert_eq!(config.context.max_tool_input_tokens, 32_000);
-        assert_eq!(config.context.max_loaded_tools, 128);
+        assert_eq!(config.context.max_loaded_tools, MAX_LOADED_TOOLS);
         assert_eq!(config.context.max_upstream_payload_bytes, 8 * 1024 * 1024);
         assert_eq!(config.notify.low_credit_threshold_percent, 10.0);
         assert_eq!(config.notify.max_notifications, 5);
@@ -1504,12 +1507,12 @@ mod tests {
     }
 
     #[test]
-    fn loaded_tool_limit_cannot_exceed_the_upstream_protocol_ceiling() {
+    fn loaded_tool_limit_cannot_exceed_the_proxy_ceiling() {
         let mut config = Config::default();
-        config.context.max_loaded_tools = 129;
+        config.context.max_loaded_tools = MAX_LOADED_TOOLS + 1;
         let error = config
             .validate()
-            .expect_err("limits above the parser ceiling must be rejected");
+            .expect_err("limits above the proxy ceiling must be rejected");
         assert!(
             error.to_string().contains("context.max_loaded_tools"),
             "{error}"

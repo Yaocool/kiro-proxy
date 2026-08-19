@@ -179,7 +179,7 @@ catalog index and searches run on blocking workers rather than HTTP runtime
 threads.
 
 The generated `[context]` configuration also bounds the loaded working set with
-`max_loaded_tools` (default and upstream protocol ceiling 128), deferred Tool
+`max_loaded_tools` (default and proxy ceiling 512), deferred Tool
 Search working-set definitions with `max_tool_input_tokens`, and the serialized
 Kiro request with `max_upstream_payload_bytes`. Ordinary requests without Tool
 Search are not subject to that 32k working-set budget: their definitions remain
