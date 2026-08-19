@@ -11,6 +11,7 @@ use kproxy_ipc::protocol::{
 use rand::RngCore;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::path::{Path, PathBuf};
 
 use crate::client::AdminClient;
 use crate::output::{format_timestamp, print_json, render_table};
@@ -1462,19 +1463,18 @@ pub async fn edit_config(client: &mut AdminClient) -> Result<()> {
     let original = tokio::fs::read(&path)
         .await
         .with_context(|| format!("读取 {} 失败", path.display()))?;
-    let editor = std::env::var("VISUAL")
-        .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| "vi".into());
-    let mut parts = editor.split_whitespace();
-    let program = parts
-        .next()
-        .ok_or_else(|| anyhow!("$VISUAL/$EDITOR 不能为空"))?;
-    let status = tokio::process::Command::new(program)
-        .args(parts)
+    let editor = resolve_editor()?;
+    let status = tokio::process::Command::new(&editor.program)
+        .args(&editor.args)
         .arg(&path)
         .status()
         .await
-        .with_context(|| format!("启动编辑器 {program} 失败"))?;
+        .with_context(|| {
+            format!(
+                "启动编辑器 {} 失败；请确认命令已安装，或通过 $VISUAL/$EDITOR 指定编辑器",
+                editor.program.display()
+            )
+        })?;
     if !status.success() {
         return Err(anyhow!("编辑器退出状态为 {status}"));
     }
@@ -1500,6 +1500,71 @@ pub async fn edit_config(client: &mut AdminClient) -> Result<()> {
     }
     println!("配置已保存并重载");
     Ok(())
+}
+
+const DEFAULT_EDITORS: [&str; 3] = ["vi", "vim", "nano"];
+
+#[derive(Debug, PartialEq, Eq)]
+struct EditorCommand {
+    program: PathBuf,
+    args: Vec<String>,
+}
+
+fn resolve_editor() -> Result<EditorCommand> {
+    if let Some(configured) = ["VISUAL", "EDITOR"]
+        .iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .find(|value| !value.trim().is_empty())
+    {
+        return parse_editor(&configured);
+    }
+
+    let path = std::env::var_os("PATH");
+    let program = find_default_editor(path.as_deref()).ok_or_else(|| {
+        anyhow!(
+            "未找到可用编辑器（已尝试 {}）；请安装编辑器，或设置 $VISUAL/$EDITOR，例如 EDITOR=nano kproxy config edit",
+            DEFAULT_EDITORS.join("、")
+        )
+    })?;
+    Ok(EditorCommand {
+        program,
+        args: Vec::new(),
+    })
+}
+
+fn parse_editor(configured: &str) -> Result<EditorCommand> {
+    let mut parts = shlex::split(configured)
+        .ok_or_else(|| anyhow!("$VISUAL/$EDITOR 存在未闭合的引号"))?
+        .into_iter();
+    let program = parts
+        .next()
+        .ok_or_else(|| anyhow!("$VISUAL/$EDITOR 不能为空"))?;
+    Ok(EditorCommand {
+        program: PathBuf::from(program),
+        args: parts.collect(),
+    })
+}
+
+fn find_default_editor(path: Option<&std::ffi::OsStr>) -> Option<PathBuf> {
+    let path = path?;
+    DEFAULT_EDITORS.iter().find_map(|editor| {
+        std::env::split_paths(path)
+            .map(|directory| directory.join(editor))
+            .find(|candidate| is_executable(candidate))
+    })
+}
+
+#[cfg(unix)]
+fn is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    path.metadata()
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn is_executable(path: &Path) -> bool {
+    path.is_file()
 }
 
 pub async fn show_models(client: &mut AdminClient, mapped: bool, json: bool) -> Result<()> {
@@ -1833,6 +1898,36 @@ pub fn print_topic(topic: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_editor_preserves_quoted_arguments() {
+        assert_eq!(
+            parse_editor("code --wait --profile 'K Proxy'").expect("editor command"),
+            EditorCommand {
+                program: PathBuf::from("code"),
+                args: vec!["--wait".into(), "--profile".into(), "K Proxy".into()],
+            }
+        );
+        assert!(parse_editor("code '").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_editor_uses_first_executable_candidate_on_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let first = tempfile::tempdir().expect("first temp directory");
+        let second = tempfile::tempdir().expect("second temp directory");
+        let non_executable_vi = first.path().join("vi");
+        std::fs::write(&non_executable_vi, "").expect("non-executable vi");
+        let vim = second.path().join("vim");
+        std::fs::write(&vim, "").expect("vim");
+        std::fs::set_permissions(&vim, std::fs::Permissions::from_mode(0o755))
+            .expect("executable permissions");
+        let path = std::env::join_paths([first.path(), second.path()]).expect("PATH");
+
+        assert_eq!(find_default_editor(Some(path.as_os_str())), Some(vim));
+    }
 
     #[test]
     fn log_account_prefers_name_and_keeps_id_for_diagnostics() {

@@ -25,7 +25,7 @@ RUN --mount=type=cache,id=kproxy-cargo-registry,target=/usr/local/cargo/registry
 FROM debian:bookworm-slim AS runtime-base
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-        ca-certificates socat tini \
+        ca-certificates socat tini vim-tiny \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 10001 kproxy \
     && useradd --system --uid 10001 --gid kproxy --home /var/lib/kproxy kproxy \
