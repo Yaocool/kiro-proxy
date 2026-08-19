@@ -364,9 +364,11 @@ kproxy model-map test claude-opus-4
 
 kproxy apikey list
 kproxy apikey list --detail
-kproxy webhook add --name alerts --kind dingtalk --url https://example/hook --event token-expired
-kproxy webhook edit alerts --event token-expired --event quota-exhausted
-kproxy webhook delete alerts
+kproxy alert events
+kproxy alert config --low-credit-threshold-percent 10 --max-notifications 5 --suppress-window 30m
+kproxy alert add --name alerts --kind dingtalk --url https://example/hook --event token-expired,quota-exhausted
+kproxy alert edit alerts --event token-expired --event quota-exhausted
+kproxy alert delete alerts
 kproxy stats --since 1h
 kproxy stats --detail --since 1h --by endpoint
 kproxy logs -f --level warn

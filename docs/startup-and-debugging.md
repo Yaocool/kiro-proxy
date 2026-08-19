@@ -263,14 +263,16 @@ are reconciled at runtime. The following changes require a daemon restart:
 Log filters, formatting, output paths, pool behavior, model rules, notification
 settings, and TLS certificate contents can otherwise be updated at runtime.
 
-Webhooks and model mappings can be created, edited, and deleted directly from
-the CLI. Each command validates the result, writes it atomically, and hot
-reloads the daemon:
+The alert policy, notification targets, and model mappings can be managed
+directly from the CLI. Each command validates the result, writes it atomically,
+and hot reloads the daemon:
 
 ```bash
-kproxy webhook add --name alerts --kind dingtalk --url https://example/hook --event token-expired
-kproxy webhook edit alerts --event token-expired --event quota-exhausted
-kproxy webhook delete alerts
+kproxy alert events
+kproxy alert config --low-credit-threshold-percent 10 --max-notifications 5 --suppress-window 30m
+kproxy alert add --name alerts --kind dingtalk --url https://example/hook --event token-expired,quota-exhausted
+kproxy alert edit alerts --event token-expired --event quota-exhausted
+kproxy alert delete alerts
 
 kproxy model-map add --name low-credit --source 'claude-opus-*' \
   --target claude-sonnet-4.6 --below-credits-percent 10
@@ -278,6 +280,11 @@ kproxy model-map edit low-credit --below-credits-percent 15
 kproxy model-map test claude-opus-4.6 --remaining-credits-percent 8
 kproxy model-map delete low-credit
 ```
+
+`kproxy alert events` explains when each event is emitted. Alert targets can
+subscribe to multiple events by repeating `--event` or by passing a
+comma-separated list; `alert edit --event ...` replaces the target's complete
+subscription list.
 
 A mapping with `--below-credits-percent` is evaluated against each selected
 account's remaining credits. With no schedule it is active all day: it matches

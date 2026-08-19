@@ -1,7 +1,7 @@
-//! Pool, diagnostics, statistics, API-key and webhook commands.
+//! Pool, diagnostics, statistics, API-key and alert commands.
 
 use anyhow::{anyhow, Context, Result};
-use clap::Subcommand;
+use clap::{Subcommand, ValueEnum};
 use kproxy_core::paths::Paths;
 use kproxy_ipc::protocol::method;
 use kproxy_ipc::protocol::{
@@ -119,13 +119,58 @@ pub enum ApiKeyCommand {
     ResetUsage { id: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum AlertEvent {
+    /// 账号剩余额度首次跌破配置的递进告警档位。
+    LowCredit,
+    /// 认证错误后的 Token 刷新失败，账号被封禁。
+    AccountBanned,
+    /// 后台任务刷新即将过期的 Token 失败。
+    TokenExpired,
+    /// 账号或代理服务的可用额度耗尽。
+    QuotaExhausted,
+    /// 额度耗尽触发代理停止流程。
+    ServiceDegraded,
+}
+
+impl AlertEvent {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::LowCredit => "low-credit",
+            Self::AccountBanned => "account-banned",
+            Self::TokenExpired => "token-expired",
+            Self::QuotaExhausted => "quota-exhausted",
+            Self::ServiceDegraded => "service-degraded",
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
-pub enum WebhookCommand {
-    #[command(after_help = "示例：\n  kproxy webhook list\n  kproxy --json webhook list")]
-    List,
-    /// 添加 Webhook。
+pub enum AlertCommand {
+    /// 查看或修改告警策略。
     #[command(
-        after_help = "示例：\n  kproxy webhook add --name alerts --kind dingtalk --url https://example/hook --event token-expired --event quota-exhausted"
+        after_help = "示例：\n  kproxy alert config\n  kproxy alert config --low-credit-threshold-percent 15 --max-notifications 3 --suppress-window 20m"
+    )]
+    Config {
+        /// 低额度告警的起始百分比，0 表示关闭低额度告警。
+        #[arg(long, value_name = "PERCENT")]
+        low_credit_threshold_percent: Option<f64>,
+        /// 低额度递进告警的最大档位数，0 表示关闭低额度告警。
+        #[arg(long, value_name = "COUNT")]
+        max_notifications: Option<u32>,
+        /// 非额度事件的重复告警抑制窗口，例如 30s、20m、1h。
+        #[arg(long, value_name = "DURATION")]
+        suppress_window: Option<String>,
+    },
+    /// 列出可订阅事件及其触发条件。
+    #[command(after_help = "示例：\n  kproxy alert events\n  kproxy --json alert events")]
+    Events,
+    #[command(after_help = "示例：\n  kproxy alert list\n  kproxy --json alert list")]
+    List,
+    /// 添加告警目标。
+    #[command(
+        after_help = "先用 `kproxy alert events` 查看事件说明。\n多选可重复传入 --event，也可使用逗号分隔。\n\n示例：\n  kproxy alert add --name alerts --kind dingtalk --url https://example/hook --event token-expired --event quota-exhausted\n  kproxy alert add --name alerts --kind feishu --url https://example/hook --event low-credit,account-banned"
     )]
     Add {
         #[arg(long)]
@@ -134,8 +179,13 @@ pub enum WebhookCommand {
         kind: String,
         #[arg(long)]
         url: String,
-        #[arg(long = "event", value_delimiter = ',', required = true)]
-        events: Vec<String>,
+        #[arg(
+            long = "event",
+            value_delimiter = ',',
+            required = true,
+            value_name = "EVENT"
+        )]
+        events: Vec<AlertEvent>,
         #[arg(long)]
         disabled: bool,
         #[arg(long)]
@@ -145,9 +195,9 @@ pub enum WebhookCommand {
         #[arg(long)]
         custom_template: Option<String>,
     },
-    /// 编辑 Webhook。
+    /// 编辑告警目标。
     #[command(
-        after_help = "示例：\n  kproxy webhook edit alerts --url https://example/new-hook\n  kproxy webhook edit alerts --event token-expired --event service-degraded"
+        after_help = "先用 `kproxy alert events` 查看事件说明。\n多选可重复传入 --event，也可使用逗号分隔；新的事件列表会整体替换原订阅。\n\n示例：\n  kproxy alert edit alerts --url https://example/new-hook\n  kproxy alert edit alerts --event token-expired --event service-degraded\n  kproxy alert edit alerts --event low-credit,quota-exhausted"
     )]
     Edit {
         /// 当前名称。
@@ -158,8 +208,13 @@ pub enum WebhookCommand {
         kind: Option<String>,
         #[arg(long)]
         url: Option<String>,
-        #[arg(long = "event", value_delimiter = ',', conflicts_with = "clear_events")]
-        events: Vec<String>,
+        #[arg(
+            long = "event",
+            value_delimiter = ',',
+            conflicts_with = "clear_events",
+            value_name = "EVENT"
+        )]
+        events: Vec<AlertEvent>,
         #[arg(long)]
         clear_events: bool,
         #[arg(long, conflicts_with = "disable")]
@@ -179,16 +234,16 @@ pub enum WebhookCommand {
         #[arg(long)]
         clear_custom_template: bool,
     },
-    /// 删除 Webhook，执行前需输入 y 或 yes 确认。
+    /// 删除告警目标，执行前需输入 y 或 yes 确认。
     #[command(name = "delete", visible_alias = "rm")]
     Delete { name: String },
-    #[command(after_help = "示例：\n  kproxy webhook test alerts\n  kproxy webhook test --all")]
+    #[command(after_help = "示例：\n  kproxy alert test alerts\n  kproxy alert test --all")]
     Test {
         name: Option<String>,
         #[arg(long, conflicts_with = "name")]
         all: bool,
     },
-    #[command(after_help = "示例：\n  kproxy webhook logs\n  kproxy webhook logs --tail 200")]
+    #[command(after_help = "示例：\n  kproxy alert logs\n  kproxy alert logs --tail 200")]
     Logs {
         #[arg(long, default_value_t = 50)]
         tail: usize,
@@ -672,16 +727,56 @@ fn log_model_route(request: &serde_json::Value) -> LogModelRoute<'_> {
     }
 }
 
-pub async fn run_webhook(
-    client: &mut AdminClient,
-    command: WebhookCommand,
-    json: bool,
-) -> Result<()> {
+pub async fn run_alert(client: &mut AdminClient, command: AlertCommand, json: bool) -> Result<()> {
     match command {
-        WebhookCommand::List => {
+        AlertCommand::Config {
+            low_credit_threshold_percent,
+            max_notifications,
+            suppress_window,
+        } => {
+            let suppress_window_ms = suppress_window
+                .as_deref()
+                .map(parse_duration)
+                .transpose()?
+                .map(|seconds| {
+                    seconds
+                        .checked_mul(1_000)
+                        .ok_or_else(|| anyhow!("告警抑制窗口过大"))
+                })
+                .transpose()?;
+            if low_credit_threshold_percent.is_some()
+                || max_notifications.is_some()
+                || suppress_window_ms.is_some()
+            {
+                mutate_config_table(client, "notify", |table| {
+                    if let Some(value) = low_credit_threshold_percent {
+                        table.insert(
+                            "low_credit_threshold_percent".into(),
+                            toml::Value::Float(value),
+                        );
+                    }
+                    if let Some(value) = max_notifications {
+                        table.insert(
+                            "max_notifications".into(),
+                            toml::Value::Integer(i64::from(value)),
+                        );
+                    }
+                    if let Some(value) = suppress_window_ms {
+                        let value = i64::try_from(value)
+                            .map_err(|_| anyhow!("告警抑制窗口超过 TOML 整数范围"))?;
+                        table.insert("suppress_window_ms".into(), toml::Value::Integer(value));
+                    }
+                    Ok(())
+                })
+                .await?;
+            }
+            show_alert_config(client, json).await
+        }
+        AlertCommand::Events => show_alert_events(json),
+        AlertCommand::List => {
             simple_rpc(client, method::WEBHOOK_LIST, serde_json::json!({}), json).await
         }
-        WebhookCommand::Add {
+        AlertCommand::Add {
             name,
             kind,
             url,
@@ -693,14 +788,14 @@ pub async fn run_webhook(
         } => {
             mutate_config_array(client, "webhook", |array| {
                 if array.iter().any(|value| named_value_matches(value, &name)) {
-                    return Err(anyhow!("Webhook already exists: {name}"));
+                    return Err(anyhow!("告警目标已存在: {name}"));
                 }
                 let mut table = toml::map::Map::new();
                 table.insert("name".into(), toml::Value::String(name.clone()));
                 table.insert("kind".into(), toml::Value::String(kind.clone()));
                 table.insert("url".into(), toml::Value::String(url.clone()));
                 table.insert("enabled".into(), toml::Value::Boolean(!disabled));
-                table.insert("events".into(), string_array_value(&events));
+                table.insert("events".into(), alert_event_array_value(&events));
                 insert_optional_string(&mut table, "dingtalk_sign", dingtalk_sign.as_deref());
                 insert_optional_string(&mut table, "telegram_chat_id", telegram_chat_id.as_deref());
                 insert_optional_string(&mut table, "custom_template", custom_template.as_deref());
@@ -708,10 +803,10 @@ pub async fn run_webhook(
                 Ok(())
             })
             .await?;
-            println!("已添加 Webhook {name}");
+            println!("已添加告警目标 {name}");
             Ok(())
         }
-        WebhookCommand::Edit {
+        AlertCommand::Edit {
             name,
             rename,
             kind,
@@ -728,7 +823,7 @@ pub async fn run_webhook(
             clear_custom_template,
         } => {
             mutate_config_array(client, "webhook", |array| {
-                let table = find_named_table_mut(array, &name, "Webhook")?;
+                let table = find_named_table_mut(array, &name, "告警目标")?;
                 replace_optional_string(table, "name", rename.as_deref());
                 replace_optional_string(table, "kind", kind.as_deref());
                 replace_optional_string(table, "url", url.as_deref());
@@ -753,7 +848,7 @@ pub async fn run_webhook(
                 if clear_events {
                     table.insert("events".into(), toml::Value::Array(Vec::new()));
                 } else if !events.is_empty() {
-                    table.insert("events".into(), string_array_value(&events));
+                    table.insert("events".into(), alert_event_array_value(&events));
                 }
                 if enable || disable {
                     table.insert("enabled".into(), toml::Value::Boolean(enable));
@@ -761,24 +856,24 @@ pub async fn run_webhook(
                 Ok(())
             })
             .await?;
-            println!("已更新 Webhook {name}");
+            println!("已更新告警目标 {name}");
             Ok(())
         }
-        WebhookCommand::Delete { name } => {
-            if !crate::commands::confirm(&format!("确认删除 Webhook {name}？")).await? {
+        AlertCommand::Delete { name } => {
+            if !crate::commands::confirm(&format!("确认删除告警目标 {name}？")).await? {
                 println!("已取消");
                 return Ok(());
             }
             mutate_config_array(client, "webhook", |array| {
-                remove_named_value(array, &name, "Webhook")
+                remove_named_value(array, &name, "告警目标")
             })
             .await?;
-            println!("已删除 Webhook {name}");
+            println!("已删除告警目标 {name}");
             Ok(())
         }
-        WebhookCommand::Test { name, all } => {
+        AlertCommand::Test { name, all } => {
             if name.is_none() && !all {
-                return Err(anyhow!("需指定 webhook 名称或 --all"));
+                return Err(anyhow!("需指定告警目标名称或 --all"));
             }
             simple_rpc(
                 client,
@@ -788,7 +883,7 @@ pub async fn run_webhook(
             )
             .await
         }
-        WebhookCommand::Logs { tail } => {
+        AlertCommand::Logs { tail } => {
             simple_rpc(
                 client,
                 method::WEBHOOK_LOGS,
@@ -798,6 +893,71 @@ pub async fn run_webhook(
             .await
         }
     }
+}
+
+#[derive(serde::Serialize)]
+struct AlertEventInfo {
+    event: &'static str,
+    condition: &'static str,
+}
+
+fn alert_event_catalog() -> [AlertEventInfo; 5] {
+    [
+        AlertEventInfo {
+            event: AlertEvent::LowCredit.as_str(),
+            condition: "定时额度检查发现启用账号的剩余额度首次跌破 [notify] 配置的某个递进档位。",
+        },
+        AlertEventInfo {
+            event: AlertEvent::AccountBanned.as_str(),
+            condition: "生成请求发生认证错误，强制刷新 Token 失败，或刷新后重试仍为认证错误，账号被封禁。",
+        },
+        AlertEventInfo {
+            event: AlertEvent::TokenExpired.as_str(),
+            condition: "后台 Token 扫描发现账号进入提前刷新窗口，并且自动刷新失败；不要求 Token 已完全过期。",
+        },
+        AlertEventInfo {
+            event: AlertEvent::QuotaExhausted.as_str(),
+            condition: "账号连续额度错误达到阈值，或代理日额度达到上限，或全部兼容账号都被判定额度耗尽。",
+        },
+        AlertEventInfo {
+            event: AlertEvent::ServiceDegraded.as_str(),
+            condition: "额度耗尽触发代理停止流程时发送；普通上游 5xx、限流或手动重启不会触发。",
+        },
+    ]
+}
+
+pub fn show_alert_events(json: bool) -> Result<()> {
+    let events = alert_event_catalog();
+    if json {
+        return print_json(&events);
+    }
+    let rows = events
+        .iter()
+        .map(|event| vec![event.event.into(), event.condition.into()])
+        .collect::<Vec<_>>();
+    println!("{}", render_table(&["EVENT", "触发条件"], &rows));
+    println!("\n多选方式：重复使用 `--event`，或用逗号分隔多个事件。");
+    Ok(())
+}
+
+async fn show_alert_config(client: &mut AdminClient, json: bool) -> Result<()> {
+    let notify = effective_config(client).await?.notify;
+    if json {
+        return print_json(&notify);
+    }
+    let suppress_seconds = notify.suppress_window_ms / 1_000;
+    let suppress_seconds = i64::try_from(suppress_seconds).unwrap_or(i64::MAX);
+    println!(
+        "低额度起始阈值  {:.1}%",
+        notify.low_credit_threshold_percent
+    );
+    println!("递进告警档位    {}", notify.max_notifications);
+    println!(
+        "重复告警抑制    {}（{} ms）",
+        crate::output::format_relative(suppress_seconds),
+        notify.suppress_window_ms
+    );
+    Ok(())
 }
 
 pub async fn run_apikey(
@@ -1288,6 +1448,37 @@ async fn mutate_config_array(
     section: &str,
     mutate: impl FnOnce(&mut Vec<toml::Value>) -> Result<()>,
 ) -> Result<()> {
+    mutate_config(client, |table| {
+        let array = table
+            .entry(section)
+            .or_insert_with(|| toml::Value::Array(Vec::new()))
+            .as_array_mut()
+            .ok_or_else(|| anyhow!("{section} must be an array of tables"))?;
+        mutate(array)
+    })
+    .await
+}
+
+async fn mutate_config_table(
+    client: &mut AdminClient,
+    section: &str,
+    mutate: impl FnOnce(&mut toml::map::Map<String, toml::Value>) -> Result<()>,
+) -> Result<()> {
+    mutate_config(client, |table| {
+        let nested = table
+            .entry(section)
+            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+            .as_table_mut()
+            .ok_or_else(|| anyhow!("{section} must be a table"))?;
+        mutate(nested)
+    })
+    .await
+}
+
+async fn mutate_config(
+    client: &mut AdminClient,
+    mutate: impl FnOnce(&mut toml::map::Map<String, toml::Value>) -> Result<()>,
+) -> Result<()> {
     let paths: ConfigPathResult = client
         .call(method::CONFIG_PATH, serde_json::json!({}))
         .await?;
@@ -1299,12 +1490,7 @@ async fn mutate_config_array(
     let table = root
         .as_table_mut()
         .ok_or_else(|| anyhow!("config root must be a TOML table"))?;
-    let array = table
-        .entry(section)
-        .or_insert_with(|| toml::Value::Array(Vec::new()))
-        .as_array_mut()
-        .ok_or_else(|| anyhow!("{section} must be an array of tables"))?;
-    mutate(array)?;
+    mutate(table)?;
     let output = toml::to_string_pretty(&root).context("序列化配置失败")?;
     let config: kproxy_core::config::Config =
         toml::from_str(&output).context("修改后的配置无法解析")?;
@@ -1334,6 +1520,15 @@ async fn mutate_config_array(
 
 fn string_array_value(values: &[String]) -> toml::Value {
     toml::Value::Array(values.iter().cloned().map(toml::Value::String).collect())
+}
+
+fn alert_event_array_value(events: &[AlertEvent]) -> toml::Value {
+    toml::Value::Array(
+        events
+            .iter()
+            .map(|event| toml::Value::String(event.as_str().into()))
+            .collect(),
+    )
 }
 
 fn integer_array_value(values: &[u32]) -> toml::Value {
@@ -1812,7 +2007,7 @@ const HELP_TOPICS: &[&str] = &[
     "tasks",
     "stats",
     "logs",
-    "webhook",
+    "alert",
     "models",
     "model-map",
     "config",
@@ -1875,8 +2070,8 @@ pub fn print_topic(topic: Option<&str>) -> Result<()> {
         "logs" => {
             "`kproxy logs` 按请求显示 trace ID、账号名称、模型路由和上游尝试；支持 `--level`、`--account`、`--tail` 和 `-f/--follow`。"
         }
-        "webhook" => {
-            "`kproxy webhook add/edit/delete/list/test/logs` 管理告警目标。事件包括 low-credit、account-banned、token-expired、quota-exhausted、service-degraded。"
+        "alert" => {
+            "`kproxy alert events` 列出全部事件和触发条件；`kproxy alert config` 查看或修改低额度阈值、递进档位和重复告警抑制窗口；`kproxy alert add/edit/delete/list/test/logs` 管理钉钉、飞书等告警目标。`--event` 可重复传入或使用逗号分隔实现多选。"
         }
         "models" => {
             "`kproxy models` 显示账号自动探测到的 Kiro 模型；`--mapped` 同时显示显式映射结果。自动别名解析与强制 model-map 是两层机制。"
