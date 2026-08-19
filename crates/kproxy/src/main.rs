@@ -142,9 +142,9 @@ enum Command {
     /// API 代理服务管理。
     #[command(name = "service", subcommand)]
     Service(crate::commands::runtime::ServiceCommand),
-    /// Webhook 管理。
-    #[command(subcommand)]
-    Webhook(crate::commands::runtime::WebhookCommand),
+    /// 告警策略与通知目标管理。
+    #[command(name = "alert", subcommand)]
+    Alert(crate::commands::runtime::AlertCommand),
     /// 显示上游动态模型。
     #[command(after_help = "示例：\n  kproxy models\n  kproxy models --mapped")]
     Models {
@@ -309,6 +309,13 @@ async fn main() -> Result<()> {
     };
     if let Command::Help { topic } = &command {
         crate::commands::runtime::print_topic(topic.as_deref())?;
+        return Ok(());
+    }
+    if matches!(
+        &command,
+        Command::Alert(crate::commands::runtime::AlertCommand::Events)
+    ) {
+        crate::commands::runtime::show_alert_events(cli.json)?;
         return Ok(());
     }
     if matches!(
@@ -557,8 +564,8 @@ async fn main() -> Result<()> {
         Command::Service(command) => {
             crate::commands::runtime::run_service(&mut client, command, cli.json).await?;
         }
-        Command::Webhook(command) => {
-            crate::commands::runtime::run_webhook(&mut client, command, cli.json).await?;
+        Command::Alert(command) => {
+            crate::commands::runtime::run_alert(&mut client, command, cli.json).await?;
         }
         Command::Models { mapped } => {
             crate::commands::runtime::show_models(&mut client, mapped, cli.json).await?;
@@ -622,5 +629,71 @@ fn print_status(status: &StatusResult) {
     }
     if let Some(hint) = &status.hint {
         println!("提示    {hint}");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn alert_command_replaces_the_webhook_entrypoint() {
+        let cli = Cli::try_parse_from([
+            "kproxy",
+            "alert",
+            "config",
+            "--low-credit-threshold-percent",
+            "15",
+            "--max-notifications",
+            "3",
+            "--suppress-window",
+            "20m",
+        ])
+        .expect("alert command");
+        let Some(Command::Alert(crate::commands::runtime::AlertCommand::Config {
+            low_credit_threshold_percent,
+            max_notifications,
+            suppress_window,
+        })) = cli.command
+        else {
+            panic!("expected alert config command");
+        };
+        assert_eq!(low_credit_threshold_percent, Some(15.0));
+        assert_eq!(max_notifications, Some(3));
+        assert_eq!(suppress_window.as_deref(), Some("20m"));
+        assert!(Cli::try_parse_from(["kproxy", "webhook", "list"]).is_err());
+    }
+
+    #[test]
+    fn alert_events_accept_repeated_and_comma_separated_values() {
+        let cli = Cli::try_parse_from([
+            "kproxy",
+            "alert",
+            "add",
+            "--name",
+            "ops",
+            "--kind",
+            "dingtalk",
+            "--url",
+            "https://example.com/hook",
+            "--event",
+            "low-credit,account-banned",
+            "--event",
+            "quota-exhausted",
+        ])
+        .expect("multi-event alert target");
+        let Some(Command::Alert(crate::commands::runtime::AlertCommand::Add { events, .. })) =
+            cli.command
+        else {
+            panic!("expected alert add command");
+        };
+        assert_eq!(
+            events,
+            vec![
+                crate::commands::runtime::AlertEvent::LowCredit,
+                crate::commands::runtime::AlertEvent::AccountBanned,
+                crate::commands::runtime::AlertEvent::QuotaExhausted,
+            ]
+        );
     }
 }

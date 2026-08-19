@@ -239,12 +239,14 @@ cargo run -p kproxy -- config reload
 
 日志过滤、格式、输出路径、账号池行为、模型规则、通知配置和 TLS 证书内容可以在运行时更新。
 
-Webhook 和模型映射可直接通过 CLI 新增、编辑、删除，命令会校验配置、原子写入并热重载：
+告警策略、钉钉/飞书等通知目标和模型映射均可通过 CLI 管理，命令会校验配置、原子写入并热重载：
 
 ```bash
-kproxy webhook add --name alerts --kind dingtalk --url https://example/hook --event token-expired
-kproxy webhook edit alerts --event token-expired --event quota-exhausted
-kproxy webhook delete alerts
+kproxy alert events
+kproxy alert config --low-credit-threshold-percent 10 --max-notifications 5 --suppress-window 30m
+kproxy alert add --name alerts --kind dingtalk --url https://example/hook --event token-expired,quota-exhausted
+kproxy alert edit alerts --event token-expired --event quota-exhausted
+kproxy alert delete alerts
 
 kproxy model-map add --name low-credit --source 'claude-opus-*' \
   --target claude-sonnet-4.6 --below-credits-percent 10
@@ -252,6 +254,9 @@ kproxy model-map edit low-credit --below-credits-percent 15
 kproxy model-map test claude-opus-4.6 --remaining-credits-percent 8
 kproxy model-map delete low-credit
 ```
+
+`kproxy alert events` 会说明每个事件的实际触发条件。一个告警目标可重复传入 `--event`，
+也可使用逗号分隔订阅多个事件；`alert edit --event ...` 会整体替换该目标原有的事件列表。
 
 带 `--below-credits-percent` 的映射按每个选中账号的剩余 Credits 判断。未配置 schedule 时
 默认全天生效；剩余额度低于阈值时命中，次月额度恢复到阈值以上后自动停止命中。
