@@ -94,7 +94,7 @@ pub struct TlsConfig {
     pub key: Option<String>,
 }
 
-/// 基于延迟反馈的自适应并发。
+/// 基于代理内部排队与上游过载反馈的自适应并发。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct AdaptiveConfig {
@@ -102,19 +102,25 @@ pub struct AdaptiveConfig {
     pub enabled: bool,
     /// 检查间隔。
     pub check_interval_ms: u64,
-    /// P99 超过此值时降低并发。
+    /// 上游流式连接槽位等待 P99 超过此值时降低并发。
     pub p99_degrade_ms: u64,
-    /// P99 低于此值时恢复并发。
+    /// 上游流式连接槽位等待 P99 低于此值时恢复并发。
     pub p99_recover_ms: u64,
+    /// 每次决策所需的最少上游调用样本数。
+    pub minimum_samples: usize,
+    /// 上游 429/503 占比达到此值时降低并发。
+    pub overload_error_rate: f64,
 }
 
 impl Default for AdaptiveConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             check_interval_ms: 10_000,
             p99_degrade_ms: 200,
             p99_recover_ms: 100,
+            minimum_samples: 5,
+            overload_error_rate: 0.05,
         }
     }
 }
@@ -949,11 +955,21 @@ impl Config {
         }
         if self.server.adaptive.enabled
             && (self.server.adaptive.check_interval_ms == 0
-                || self.server.adaptive.p99_degrade_ms == 0)
+                || self.server.adaptive.p99_degrade_ms == 0
+                || self.server.adaptive.minimum_samples == 0
+                || self.server.adaptive.minimum_samples > 10_000)
         {
             return invalid_config(
                 "server.adaptive",
-                "enabled adaptive admission requires positive interval and degrade threshold",
+                "enabled adaptive admission requires a positive interval and degrade threshold, with sample count in 1..=10000",
+            );
+        }
+        if !self.server.adaptive.overload_error_rate.is_finite()
+            || !(0.0..=1.0).contains(&self.server.adaptive.overload_error_rate)
+        {
+            return invalid_config(
+                "server.adaptive.overload_error_rate",
+                "must be a finite number between 0 and 1",
             );
         }
         if self.upstream.token_refresh_before_expiry < 0 {
@@ -1259,10 +1275,12 @@ enabled = false
 # key_path = "/etc/kproxy/privkey.pem"
 
 [server.adaptive]
-enabled = true
+enabled = false
 check_interval_ms = 10000
-p99_degrade_ms = 200
+p99_degrade_ms = 200              # 上游流式连接槽位等待 P99
 p99_recover_ms = 100
+minimum_samples = 5               # 低流量时跨检查周期累计
+overload_error_rate = 0.05         # 上游 429/503 比例
 
 [upstream]
 # preferred_endpoint = "amazonq"
@@ -1417,6 +1435,9 @@ mod tests {
         assert!(config.server.enforce_user_agent_check);
         assert_eq!(config.server.max_concurrent_requests, 500);
         assert!(!config.server.tls.enabled);
+        assert!(!config.server.adaptive.enabled);
+        assert_eq!(config.server.adaptive.minimum_samples, 5);
+        assert_eq!(config.server.adaptive.overload_error_rate, 0.05);
 
         assert_eq!(config.pool.max_concurrent_per_account, 50);
         assert_eq!(config.pool.max_queue_size, 10);
@@ -1680,6 +1701,27 @@ schedule = { start = "09:00", end = "18:00", days = ["mon", "tue"] }
         let mut config = Config::default();
         config.context.safe_input_ratio = 1.5;
         assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.server.adaptive.overload_error_rate = f64::NAN;
+        assert!(config.validate().is_err());
+
+        let mut config = Config::default();
+        config.server.adaptive.overload_error_rate = 1.1;
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn adaptive_feedback_sample_count_is_positive_and_bounded() {
+        for minimum_samples in [0, 10_001] {
+            let mut config = Config::default();
+            config.server.adaptive.enabled = true;
+            config.server.adaptive.minimum_samples = minimum_samples;
+            let error = config
+                .validate()
+                .expect_err("unsafe adaptive sample count must be rejected");
+            assert!(error.to_string().contains("server.adaptive"), "{error}");
+        }
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Upstream HTTP client with independent short-request and streaming pools.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use dashmap::mapref::entry::Entry;
@@ -133,9 +133,15 @@ pub struct KiroResponse {
     pub endpoint: EndpointDefinition,
     pub response: Response,
     permit: tokio::sync::OwnedSemaphorePermit,
+    stream_slot_wait_ms: u64,
 }
 
 impl KiroResponse {
+    /// Time spent waiting for an upstream streaming connection slot.
+    pub fn stream_slot_wait_ms(&self) -> u64 {
+        self.stream_slot_wait_ms
+    }
+
     pub fn into_parts(
         self,
     ) -> (
@@ -880,10 +886,12 @@ impl KiroClient {
         payload: &KiroPayload,
         endpoint: EndpointDefinition,
     ) -> Result<KiroResponse, KiroError> {
+        let slot_wait_started = Instant::now();
         let permit = Arc::clone(&self.stream_slots)
             .acquire_owned()
             .await
             .map_err(build_error)?;
+        let stream_slot_wait_ms = slot_wait_started.elapsed().as_millis() as u64;
         let mut payload = payload.clone();
         set_payload_origin(&mut payload, endpoint.origin);
         let response = self
@@ -903,6 +911,7 @@ impl KiroClient {
                 endpoint,
                 response,
                 permit,
+                stream_slot_wait_ms,
             });
         }
         Err(response_error(response, &endpoint).await)

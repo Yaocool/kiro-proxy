@@ -262,9 +262,27 @@ fn spawn_adaptive_admission(state: Arc<AppState>, shutdown: CancellationToken) {
             tokio::select! {
                 _ = shutdown.cancelled() => break,
                 _ = tokio::time::sleep(delay) => {
-                    let (_, _, p99) = state.stats.snapshot(None).percentiles();
-                    let limit = state.adjust_admission(p99).await;
-                    debug!(p99_ms = p99, admission_limit = limit, "adaptive admission check");
+                    let adaptive = state.config.current().server.adaptive.clone();
+                    let feedback = state
+                        .adaptive_feedback
+                        .take_if_ready(adaptive.minimum_samples);
+                    let queued_requests = state.pool().queued();
+                    let limit = state.adjust_admission(feedback, queued_requests).await;
+                    let feedback = feedback.unwrap_or_default();
+                    let overload_rate = if feedback.attempts == 0 {
+                        0.0
+                    } else {
+                        feedback.overloads as f64 / feedback.attempts as f64
+                    };
+                    debug!(
+                        p99_stream_slot_wait_ms = feedback.p99_stream_slot_wait_ms,
+                        adaptive_samples = feedback.attempts,
+                        upstream_overloads = feedback.overloads,
+                        overload_rate,
+                        queued_requests,
+                        admission_limit = limit,
+                        "adaptive admission check"
+                    );
                 }
             }
         }

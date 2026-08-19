@@ -336,6 +336,9 @@ pub fn response(
                 let is_throttle = kproxy_kiro::client::text_is_throttle_error(&failure_text);
                 let is_request_rejection =
                     kproxy_kiro::client::text_is_request_rejection(&failure_text);
+                if is_throttle {
+                    context.state.record_stream_overload();
+                }
                 tracing::warn!(
                     trace_id = %context.trace_id,
                     request_id = %context.request_id,
@@ -376,7 +379,7 @@ pub fn response(
                         } else {
                             let account = context.lease.account().await;
                             payload.profile_arn.clone_from(&account.profile_arn);
-                            match context.state.kiro().generate(&account, &payload, None).await {
+                            match context.state.generate(&account, &payload).await {
                                 Ok(retry) => {
                                     let (next_endpoint, next_response, next_permit) = retry.into_parts();
                                     endpoint = next_endpoint.name.to_string();
@@ -451,7 +454,7 @@ pub fn response(
                             context.kiro_model.clone_from(&fallback);
                             super::handlers::set_payload_model(&mut payload, &fallback);
                             let account = context.lease.account().await;
-                            match context.state.kiro().generate(&account, &payload, None).await {
+                            match context.state.generate(&account, &payload).await {
                                 Ok(retry) => {
                                     let (next_endpoint, next_response, next_permit) =
                                         retry.into_parts();
@@ -616,7 +619,7 @@ pub fn response(
                         200u64.saturating_mul(1u64 << exponent).min(5_000),
                     ))
                     .await;
-                    match context.state.kiro().generate(&account, &payload, None).await {
+                    match context.state.generate(&account, &payload).await {
                         Ok(retry) => {
                             let (next_endpoint, next_response, next_permit) = retry.into_parts();
                             endpoint = next_endpoint.name.to_string();
@@ -973,7 +976,7 @@ pub fn response(
                     break 'rounds;
                 }
                 let account = context.lease.account().await;
-                match context.state.kiro().generate(&account, &payload, None).await {
+                match context.state.generate(&account, &payload).await {
                     Ok(next) => {
                         let (next_endpoint, next_response, next_permit) = next.into_parts();
                         endpoint = next_endpoint.name.to_string();
@@ -1121,7 +1124,7 @@ pub fn response(
                     break 'rounds;
                 }
                 let account = context.lease.account().await;
-                match context.state.kiro().generate(&account, &payload, None).await {
+                match context.state.generate(&account, &payload).await {
                     Ok(next) => {
                         let (next_endpoint, next_response, next_permit) = next.into_parts();
                         endpoint = next_endpoint.name.to_string();
@@ -1186,7 +1189,7 @@ pub fn response(
                 break 'rounds;
             }
             let account = context.lease.account().await;
-            match context.state.kiro().generate(&account, &payload, None).await {
+            match context.state.generate(&account, &payload).await {
                 Ok(next) => {
                     let (next_endpoint, next_response, next_permit) = next.into_parts();
                     endpoint = next_endpoint.name.to_string();
