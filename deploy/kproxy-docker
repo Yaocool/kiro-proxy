@@ -7,27 +7,90 @@ fail() {
   exit 1
 }
 
+lifecycle_action=""
+uninstall_yes=0
+uninstall_backup_dir=""
+uninstall_retention="ask"
+case "${1:-}" in
+  restart|stop)
+    case "$#:${2:-}" in
+      2:-h|2:--help)
+        echo "Usage: kproxy $1"
+        exit 0
+        ;;
+    esac
+    [ "$#" -eq 1 ] || fail "usage: kproxy $1"
+    lifecycle_action="$1"
+    ;;
+  uninstall)
+    lifecycle_action="$1"
+    shift
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --yes|-y)
+          uninstall_yes=1
+          shift
+          ;;
+        --backup-dir)
+          [ "$#" -ge 2 ] || fail "--backup-dir requires a path"
+          [ -n "$2" ] || fail "--backup-dir cannot be empty"
+          uninstall_backup_dir="$2"
+          shift 2
+          ;;
+        --backup-dir=*)
+          uninstall_backup_dir="${1#*=}"
+          [ -n "$uninstall_backup_dir" ] || fail "--backup-dir cannot be empty"
+          shift
+          ;;
+        --keep-backup)
+          [ "$uninstall_retention" != "delete" ] || \
+            fail "--keep-backup conflicts with --delete-backup"
+          uninstall_retention="keep"
+          shift
+          ;;
+        --delete-backup)
+          [ "$uninstall_retention" != "keep" ] || \
+            fail "--delete-backup conflicts with --keep-backup"
+          uninstall_retention="delete"
+          shift
+          ;;
+        --help|-h)
+          echo 'Usage: kproxy uninstall [--yes] [--backup-dir PATH] [--keep-backup|--delete-backup]'
+          echo '删除 Docker 服务前必定备份数据；默认备份到 ~/.kproxy/backups，源码目录保留。'
+          exit 0
+          ;;
+        *) fail "unknown uninstall option: $1" ;;
+      esac
+    done
+    ;;
+esac
+
 command -v docker >/dev/null 2>&1 || fail "docker command not found"
 
 if [ -n "${KPROXY_DOCKER_CONTAINER:-}" ]; then
   container_id="$KPROXY_DOCKER_CONTAINER"
 else
+  include_stopped=""
+  if [ -n "$lifecycle_action" ]; then
+    include_stopped="--all"
+  fi
   if [ -n "${KPROXY_COMPOSE_PROJECT:-}" ]; then
-    containers="$(docker ps \
+    containers="$(docker ps $include_stopped \
       --filter 'label=io.kiro-proxy.role=daemon' \
       --filter "label=com.docker.compose.project=${KPROXY_COMPOSE_PROJECT}" \
-      --filter 'status=running' \
       --format '{{.ID}}')"
   else
-    containers="$(docker ps \
+    containers="$(docker ps $include_stopped \
       --filter 'label=io.kiro-proxy.role=daemon' \
-      --filter 'status=running' \
       --format '{{.ID}}')"
   fi
 
   container_count="$(printf '%s\n' "$containers" | awk 'NF { count++ } END { print count + 0 }')"
   case "$container_count" in
     0)
+      if [ -n "$lifecycle_action" ]; then
+        fail "no kiro-proxy daemon container found"
+      fi
       fail "no running kiro-proxy daemon container found"
       ;;
     1)
@@ -38,6 +101,217 @@ else
       ;;
   esac
 fi
+
+wait_until_healthy() {
+  attempt=0
+  while [ "$attempt" -lt 30 ]; do
+    state="$(docker inspect --format '{{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}' "$container_id" 2>/dev/null || true)"
+    case "$state" in
+      "running healthy"|running|"running ") return 0 ;;
+      "exited "*|"dead "*) return 1 ;;
+    esac
+    attempt=$((attempt + 1))
+    sleep 2
+  done
+  return 1
+}
+
+container_state() {
+  docker inspect --format '{{.State.Status}}' "$container_id"
+}
+
+create_data_backup() {
+  umask 077
+  mkdir -p "$backup_root" || return 1
+  backup_root="$(CDPATH= cd "$backup_root" 2>/dev/null && pwd -P)" || return 1
+  backup_name="kproxy-backup-${project}-$(date -u +%Y%m%dT%H%M%SZ)-$$"
+  backup_path="$backup_root/$backup_name"
+  backup_partial="${backup_path}.partial"
+  mkdir "$backup_partial" || return 1
+  docker cp "${container_id}:/var/lib/kproxy/." "$backup_partial" || return 1
+  [ -f "$backup_partial/config.toml" ] || return 1
+  {
+    printf 'project=%s\n' "$project"
+    printf 'container=%s\n' "$container_id"
+    printf 'volume=%s\n' "$data_volume"
+    printf 'image=%s\n' "$image_ref"
+    printf 'created_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  } > "$backup_partial/BACKUP_MANIFEST.txt" || return 1
+  mv "$backup_partial" "$backup_path" || return 1
+}
+
+remove_managed_wrapper() {
+  wrapper_path="$0"
+  case "$wrapper_path" in
+    /*) ;;
+    *) wrapper_path="$(command -v "$wrapper_path" 2>/dev/null || printf '%s' "$wrapper_path")" ;;
+  esac
+  case "$wrapper_path" in
+    */kproxy)
+      if grep -qF "Managed by kiro-proxy's install-kproxy-wrapper.sh." "$wrapper_path" 2>/dev/null; then
+        if rm -f "$wrapper_path"; then
+          echo "已删除宿主机命令 $wrapper_path"
+        else
+          echo "kproxy: 无法删除宿主机命令 ${wrapper_path}，请手工删除" >&2
+          return 1
+        fi
+      fi
+      ;;
+    *)
+      echo "宿主机 wrapper 未删除（当前入口不是名为 kproxy 的已安装文件）：$wrapper_path"
+      ;;
+  esac
+}
+
+case "$lifecycle_action" in
+  restart)
+    echo "正在重启 kiro-proxy 容器 $container_id ..."
+    if [ "$(container_state)" = "running" ]; then
+      docker restart --time 30 "$container_id" >/dev/null
+    else
+      docker start "$container_id" >/dev/null
+    fi
+    if wait_until_healthy; then
+      echo "kiro-proxy 已重启并通过健康检查"
+      exit 0
+    fi
+    docker logs --tail 50 "$container_id" >&2 || true
+    fail "容器重启后未在 60 秒内恢复健康"
+    ;;
+  stop)
+    if [ "$(container_state)" = "running" ]; then
+      docker stop --time 30 "$container_id" >/dev/null
+      echo 'kiro-proxy 已停止；可用 `kproxy restart` 重新启动'
+    else
+      echo 'kiro-proxy 已处于停止状态；可用 `kproxy restart` 重新启动'
+    fi
+    exit 0
+    ;;
+  uninstall)
+    project="$(docker inspect --format '{{ index .Config.Labels "com.docker.compose.project" }}' "$container_id")"
+    case "$project" in
+      ""|"<no value>") project="${KPROXY_COMPOSE_PROJECT:-kiro-proxy}" ;;
+    esac
+    data_volume="$(docker inspect --format '{{range .Mounts}}{{if and (eq .Type "volume") (eq .Destination "/var/lib/kproxy")}}{{.Name}}{{end}}{{end}}' "$container_id")"
+    image_ref="$(docker inspect --format '{{.Config.Image}}' "$container_id")"
+    backup_root="$uninstall_backup_dir"
+    if [ -z "$backup_root" ]; then
+      backup_root="${KPROXY_BACKUP_DIR:-}"
+    fi
+    if [ -z "$backup_root" ]; then
+      if [ -n "${HOME:-}" ]; then
+        backup_root="$HOME/.kproxy/backups"
+      else
+        backup_root="$(pwd)/kproxy-backups"
+      fi
+    fi
+    case "$backup_root" in
+      /*) ;;
+      *) backup_root="$(pwd)/$backup_root" ;;
+    esac
+
+    echo "即将完全卸载 kiro-proxy Compose 项目 ${project}："
+    echo "  容器：$container_id"
+    if [ -n "$data_volume" ]; then
+      echo "  数据卷：${data_volume}（配置、账号、统计和日志会永久删除）"
+    fi
+    if [ -n "$image_ref" ]; then
+      echo "  镜像：${image_ref}（未被其他容器使用时删除）"
+    fi
+    echo "  卸载前备份到宿主机目录：$backup_root"
+    echo "  宿主机 kproxy wrapper（源码目录保留）"
+
+    if [ "$uninstall_yes" -ne 1 ]; then
+      printf '请输入 Compose 项目名 %s 以确认：' "$project"
+      IFS= read -r confirmation || fail "无法读取确认输入"
+      if [ "$confirmation" != "$project" ]; then
+        echo "已取消卸载"
+        exit 0
+      fi
+    fi
+
+    if [ "$uninstall_retention" = "ask" ]; then
+      if [ "$uninstall_yes" -eq 1 ]; then
+        uninstall_retention="keep"
+      else
+        printf '卸载完成后是否保留备份？[Y/n] '
+        IFS= read -r keep_answer || fail "无法读取备份保留选择"
+        case "$keep_answer" in
+          n|N|no|NO|No) uninstall_retention="delete" ;;
+          *) uninstall_retention="keep" ;;
+        esac
+      fi
+    fi
+
+    was_running=0
+    if [ "$(container_state)" = "running" ]; then
+      was_running=1
+      docker stop --time 30 "$container_id" >/dev/null
+    fi
+
+    echo "正在备份 /var/lib/kproxy ..."
+    if ! create_data_backup; then
+      if [ "$was_running" -eq 1 ]; then
+        docker start "$container_id" >/dev/null || true
+        echo "原 kiro-proxy 容器已重新启动" >&2
+      fi
+      if [ -n "${backup_partial:-}" ]; then
+        case "$backup_partial" in
+          "$backup_root"/kproxy-backup-*.partial) rm -rf -- "$backup_partial" || true ;;
+        esac
+      fi
+      fail "备份失败，已中止卸载且未删除原数据；请检查备份目录 $backup_root"
+    fi
+    echo "数据备份已完成：$backup_path"
+
+    docker rm "$container_id" >/dev/null
+    cleanup_failed=0
+    if [ -n "$data_volume" ]; then
+      if docker volume rm "$data_volume" >/dev/null; then
+        echo "已删除数据卷 $data_volume"
+      else
+        echo "kproxy: 数据卷 ${data_volume} 仍被占用，未删除" >&2
+        cleanup_failed=1
+      fi
+    fi
+    if [ -n "$image_ref" ]; then
+      image_users="$(docker ps --all --quiet --filter "ancestor=$image_ref")"
+      if [ -n "$image_users" ]; then
+        echo "镜像 $image_ref 仍被其他容器使用，已保留"
+      elif docker image rm "$image_ref" >/dev/null; then
+        echo "已删除镜像 $image_ref"
+      else
+        echo "kproxy: 无法删除镜像 ${image_ref}，请检查 Docker 镜像引用" >&2
+        cleanup_failed=1
+      fi
+    fi
+    if [ "$cleanup_failed" -ne 0 ]; then
+      fail "服务容器已删除，但部分资源清理失败；备份 $backup_path 和宿主机 wrapper 已保留"
+    fi
+
+    backup_delete_failed=0
+    if [ "$uninstall_retention" = "delete" ]; then
+      case "$backup_path" in
+        "$backup_root"/kproxy-backup-*) ;;
+        *) fail "拒绝删除范围异常的备份路径：$backup_path" ;;
+      esac
+      if rm -rf -- "$backup_path"; then
+        echo "已按用户选择删除备份：$backup_path"
+      else
+        echo "kproxy: 无法删除备份 ${backup_path}，备份已保留" >&2
+        backup_delete_failed=1
+      fi
+    else
+      echo "备份已保留：$backup_path"
+    fi
+    remove_managed_wrapper || exit 1
+    if [ "$backup_delete_failed" -ne 0 ]; then
+      fail "kiro-proxy 已卸载，但备份删除失败"
+    fi
+    echo "kiro-proxy 已完全卸载"
+    exit 0
+    ;;
+esac
 
 if [ -t 0 ] && [ -t 1 ]; then
   exec docker exec -it "$container_id" /usr/local/bin/kproxy "$@"

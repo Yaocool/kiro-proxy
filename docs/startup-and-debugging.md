@@ -440,6 +440,24 @@ export KPROXY_COMPOSE_PROJECT=kiro-proxy
 kproxy status
 ```
 
+The host wrapper also manages the Docker service lifecycle directly:
+
+```bash
+kproxy restart
+kproxy stop
+kproxy uninstall
+kproxy uninstall --backup-dir /srv/kproxy-backups
+```
+
+`restart` waits for the container health check, and a stopped service remains
+available to `restart`. `uninstall` stops the daemon and backs up
+`/var/lib/kproxy` to the host before removing the container, persistent data
+volume, unshared image, and installed wrapper. The default backup root is
+`~/.kproxy/backups`; use `--backup-dir` or `KPROXY_BACKUP_DIR` to override it.
+A failed backup aborts the uninstall and restarts the original container.
+Interactive use asks whether to retain the backup; `--yes` keeps it unless
+`--delete-backup` is also explicit. The source checkout is always retained.
+
 On a fresh volume, explicitly create the proxy and save the API key printed by
 the command:
 

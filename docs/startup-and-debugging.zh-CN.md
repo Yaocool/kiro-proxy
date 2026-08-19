@@ -393,6 +393,21 @@ export KPROXY_COMPOSE_PROJECT=kiro-proxy
 kproxy status
 ```
 
+宿主机包装器还可直接管理 Docker 服务生命周期：
+
+```bash
+kproxy restart
+kproxy stop
+kproxy uninstall
+kproxy uninstall --backup-dir /srv/kproxy-backups
+```
+
+`restart` 会等待容器健康检查通过，`stop` 后仍可用 `restart` 启动。`uninstall`
+会先停服并把 `/var/lib/kproxy` 备份到宿主机，默认位置为 `~/.kproxy/backups`。备份失败
+时原数据不会删除，原容器会重新启动。交互执行会询问是否保留备份；`--yes` 默认保留，
+使用 `--delete-backup` 才会在成功卸载后删除。容器、数据卷、未共享镜像和已安装的
+包装器会被删除，源码目录始终保留。
+
 全新 volume 需要显式创建代理服务，并保存命令返回的 API Key：
 
 ```bash
