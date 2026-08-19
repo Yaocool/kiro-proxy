@@ -1,19 +1,23 @@
 //! 服务运行态共享句柄。
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+use kproxy_core::account::Account;
 use kproxy_core::config::Config;
 use kproxy_core::paths::Paths;
 use kproxy_kiro::endpoint::EndpointOverrides;
-use kproxy_kiro::{KiroClient, ModelInfo};
+use kproxy_kiro::{KiroClient, KiroError, KiroResponse, ModelInfo};
 use kproxy_notify::Notifier;
 use kproxy_pool::{AccountPool, RefreshError, TokenRefresher};
 use kproxy_store::accounts::AccountStore;
 use kproxy_store::config_loader::ConfigHandle;
-use kproxy_translate::{model::resolve_dynamic_model, TokenCountCache, WebSearchReplayCodec};
+use kproxy_translate::{
+    model::resolve_dynamic_model, KiroPayload, TokenCountCache, WebSearchReplayCodec,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::http::prompt_cache::PromptCacheTracker;
@@ -27,6 +31,69 @@ pub struct TokenRefreshReport {
     pub eligible: usize,
     pub refreshed: Vec<(String, String)>,
     pub failures: Vec<(String, String, RefreshError)>,
+}
+
+const MAX_ADAPTIVE_FEEDBACK_SAMPLES: usize = 10_000;
+
+#[derive(Debug, Clone, Copy, Default)]
+pub struct AdaptiveFeedbackSnapshot {
+    pub attempts: usize,
+    pub successful_samples: usize,
+    pub overloads: usize,
+    pub p99_stream_slot_wait_ms: u64,
+}
+
+#[derive(Default)]
+struct AdaptiveFeedbackWindow {
+    attempts: usize,
+    overloads: usize,
+    stream_slot_wait_ms: VecDeque<u64>,
+}
+
+#[derive(Default)]
+pub struct AdaptiveFeedback {
+    inner: Mutex<AdaptiveFeedbackWindow>,
+}
+
+impl AdaptiveFeedback {
+    fn clear(&self) {
+        *lock(&self.inner) = AdaptiveFeedbackWindow::default();
+    }
+
+    fn record_success(&self, stream_slot_wait_ms: u64) {
+        let mut window = lock(&self.inner);
+        window.attempts = window.attempts.saturating_add(1);
+        window.stream_slot_wait_ms.push_back(stream_slot_wait_ms);
+        while window.stream_slot_wait_ms.len() > MAX_ADAPTIVE_FEEDBACK_SAMPLES {
+            window.stream_slot_wait_ms.pop_front();
+        }
+    }
+
+    fn record_failure(&self, overloaded: bool) {
+        let mut window = lock(&self.inner);
+        window.attempts = window.attempts.saturating_add(1);
+        window.overloads = window.overloads.saturating_add(usize::from(overloaded));
+    }
+
+    pub fn take_if_ready(&self, minimum_samples: usize) -> Option<AdaptiveFeedbackSnapshot> {
+        let mut window = lock(&self.inner);
+        if window.attempts < minimum_samples.max(1) {
+            return None;
+        }
+        let window = std::mem::take(&mut *window);
+        let mut waits = window.stream_slot_wait_ms.into_iter().collect::<Vec<_>>();
+        waits.sort_unstable();
+        let p99_stream_slot_wait_ms = waits
+            .get(((waits.len().saturating_sub(1)) as f64 * 0.99).ceil() as usize)
+            .copied()
+            .unwrap_or_default();
+        Some(AdaptiveFeedbackSnapshot {
+            attempts: window.attempts,
+            successful_samples: waits.len(),
+            overloads: window.overloads,
+            p99_stream_slot_wait_ms,
+        })
+    }
 }
 
 impl TokenRefreshReport {
@@ -63,6 +130,7 @@ pub struct AppState {
     runtime_handle: Option<tokio::runtime::Handle>,
     runtime_config: RwLock<Config>,
     pub admission: Arc<AdmissionGate>,
+    pub adaptive_feedback: AdaptiveFeedback,
     pub connections: Arc<AdmissionGate>,
     pub body_budget: Arc<BodyBudget>,
     pub keepalive: KeepaliveHub,
@@ -164,6 +232,7 @@ impl AppState {
             runtime_handle: tokio::runtime::Handle::try_current().ok(),
             runtime_config: RwLock::new(current.as_ref().clone()),
             admission: Arc::new(AdmissionGate::new(admission_limit)),
+            adaptive_feedback: AdaptiveFeedback::default(),
             connections: Arc::new(AdmissionGate::new(connection_limit)),
             body_budget: Arc::new(BodyBudget::new(128 * 1024 * 1024)),
             keepalive: KeepaliveHub::new(),
@@ -343,6 +412,30 @@ impl AppState {
         read_lock(&self.kiro).clone()
     }
 
+    /// Dispatches one generation request and records only proxy-side queueing
+    /// and explicit upstream overload feedback for adaptive admission.
+    pub async fn generate(
+        &self,
+        account: &Account,
+        payload: &KiroPayload,
+    ) -> Result<KiroResponse, KiroError> {
+        let result = self.kiro().generate(account, payload, None).await;
+        match &result {
+            Ok(response) => self
+                .adaptive_feedback
+                .record_success(response.stream_slot_wait_ms()),
+            Err(error) => self
+                .adaptive_feedback
+                .record_failure(error.is_throttle() || matches!(error.status, Some(429 | 503))),
+        }
+        result
+    }
+
+    /// Records an overload delivered inside an already accepted event stream.
+    pub fn record_stream_overload(&self) {
+        self.adaptive_feedback.record_failure(true);
+    }
+
     pub fn notifier(&self) -> Notifier {
         read_lock(&self.notifier).clone()
     }
@@ -414,6 +507,7 @@ impl AppState {
         self.meter.set_daily_limit(next.pool.daily_credit_limit);
         self.admission
             .set_maximum(next.server.max_concurrent_requests.max(1));
+        self.adaptive_feedback.clear();
         self.connections
             .set_maximum(next.server.max_connections.max(1));
         match self.accounts.write() {
@@ -495,8 +589,13 @@ impl AppState {
         *write_lock(&self.runtime_config) = next.clone();
     }
 
-    /// 根据 P99 延迟收缩或恢复全局准入上限，返回新的有效上限。
-    pub async fn adjust_admission(&self, p99_ms: u64) -> usize {
+    /// Adjusts global admission from proxy-side queueing and explicit upstream
+    /// overloads. Model generation time is deliberately excluded.
+    pub async fn adjust_admission(
+        &self,
+        feedback: Option<AdaptiveFeedbackSnapshot>,
+        queued_requests: usize,
+    ) -> usize {
         let adaptive = self.config.current().server.adaptive.clone();
         let configured = self.config.current().server.max_concurrent_requests.max(1);
         if !adaptive.enabled {
@@ -504,11 +603,29 @@ impl AppState {
             return configured;
         }
         let current = self.admission.maximum();
-        let step = (configured / 10).max(1);
-        let next = if p99_ms > adaptive.p99_degrade_ms {
-            current.saturating_sub(step).max(1)
-        } else if p99_ms > 0 && p99_ms < adaptive.p99_recover_ms {
-            current.saturating_add(step).min(configured)
+        let decrease_step = (current / 10).max(1);
+        let increase_step = (configured / 100).max(1);
+        let feedback = feedback.unwrap_or_default();
+        let overload_rate = if feedback.attempts == 0 {
+            0.0
+        } else {
+            feedback.overloads as f64 / feedback.attempts as f64
+        };
+        let enough_latency_samples = feedback.successful_samples >= adaptive.minimum_samples.max(1);
+        let pressure = queued_requests > 0
+            || (feedback.overloads > 0
+                && feedback.attempts >= adaptive.minimum_samples.max(1)
+                && overload_rate >= adaptive.overload_error_rate)
+            || (enough_latency_samples
+                && feedback.p99_stream_slot_wait_ms > adaptive.p99_degrade_ms);
+        let healthy = queued_requests == 0
+            && feedback.overloads == 0
+            && enough_latency_samples
+            && feedback.p99_stream_slot_wait_ms < adaptive.p99_recover_ms;
+        let next = if pressure {
+            current.saturating_sub(decrease_step).max(1)
+        } else if healthy {
+            current.saturating_add(increase_step).min(configured)
         } else {
             current.min(configured)
         };
@@ -570,6 +687,12 @@ impl Drop for AdmissionGuard {
 
 fn read_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockReadGuard<'_, T> {
     lock.read().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
@@ -638,8 +761,8 @@ impl Drop for BodyGuard {
 }
 
 #[cfg(test)]
-mod token_refresh_report_tests {
-    use super::TokenRefreshReport;
+mod tests {
+    use super::*;
 
     #[test]
     fn summary_distinguishes_checks_from_actual_refreshes() {
@@ -653,5 +776,69 @@ mod token_refresh_report_tests {
             report.summary(),
             "ok: 3 checked, 1 eligible, 1 refreshed, 0 failures"
         );
+    }
+
+    #[test]
+    fn adaptive_feedback_uses_stream_slot_wait_and_overload_samples() {
+        let feedback = AdaptiveFeedback::default();
+        for wait_ms in [5, 10, 20, 50, 250] {
+            feedback.record_success(wait_ms);
+        }
+        feedback.record_failure(true);
+
+        let snapshot = feedback.take_if_ready(5).expect("feedback");
+        assert_eq!(snapshot.attempts, 6);
+        assert_eq!(snapshot.successful_samples, 5);
+        assert_eq!(snapshot.overloads, 1);
+        assert_eq!(snapshot.p99_stream_slot_wait_ms, 250);
+        assert!(feedback.take_if_ready(5).is_none());
+    }
+
+    #[tokio::test]
+    async fn adaptive_admission_ignores_generation_duration_and_tracks_pressure() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        let accounts = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("accounts");
+        let mut config = Config::default();
+        config.server.adaptive.enabled = true;
+        let state = AppState::new(paths, ConfigHandle::new(config), accounts);
+
+        state.admission.set_maximum(300);
+        let healthy = AdaptiveFeedbackSnapshot {
+            attempts: 5,
+            successful_samples: 5,
+            overloads: 0,
+            p99_stream_slot_wait_ms: 20,
+        };
+        assert_eq!(state.adjust_admission(Some(healthy), 0).await, 305);
+
+        let slot_pressure = AdaptiveFeedbackSnapshot {
+            p99_stream_slot_wait_ms: 250,
+            ..healthy
+        };
+        assert_eq!(state.adjust_admission(Some(slot_pressure), 0).await, 275);
+
+        let upstream_pressure = AdaptiveFeedbackSnapshot {
+            attempts: 5,
+            successful_samples: 4,
+            overloads: 1,
+            p99_stream_slot_wait_ms: 20,
+        };
+        assert_eq!(
+            state.adjust_admission(Some(upstream_pressure), 0).await,
+            248
+        );
+        assert_eq!(state.adjust_admission(None, 1).await, 224);
+        assert_eq!(state.adjust_admission(None, 0).await, 224);
     }
 }

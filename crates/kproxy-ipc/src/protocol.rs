@@ -265,7 +265,7 @@ pub struct StatusResult {
     /// 当前在途请求数。
     #[serde(default)]
     pub active_requests: usize,
-    /// 配置的全局并发上限。
+    /// 当前生效的全局并发上限（可能由自适应准入动态调整）。
     #[serde(default)]
     pub max_concurrent_requests: usize,
     /// 等待账号许可的请求数。

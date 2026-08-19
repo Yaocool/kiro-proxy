@@ -305,7 +305,7 @@ async fn handle_status(state: &Arc<AppState>) -> Handled {
         account_exhausted: health[2],
         account_banned: health[3],
         active_requests: pool.active().await,
-        max_concurrent_requests: config.server.max_concurrent_requests,
+        max_concurrent_requests: state.admission.maximum(),
         queued_requests: pool.queued(),
         request_count,
         success_rate,
@@ -1513,6 +1513,7 @@ mod tests {
             sample_account("acc_00000002", "b@example.com", false),
         ])
         .await;
+        state.admission.set_maximum(123);
         let status: StatusResult = serde_json::from_value(expect_ok(
             dispatch(
                 &state,
@@ -1526,6 +1527,7 @@ mod tests {
         assert_eq!(status.listen, "-");
         assert_eq!(status.proxy_service_total, 0);
         assert_eq!(status.proxy_service_running, 0);
+        assert_eq!(status.max_concurrent_requests, 123);
 
         let (_directory, empty) = state_with(vec![]).await;
         let empty_status: StatusResult = serde_json::from_value(expect_ok(

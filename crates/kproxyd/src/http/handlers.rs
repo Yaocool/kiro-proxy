@@ -1314,7 +1314,6 @@ async fn execute_upstream(
     let pool = state.pool();
     let account_count = pool.snapshot().await.len() as u32;
     let attempts = retry_attempt_count(config.upstream.max_retries, account_count);
-    let kiro = state.kiro();
     let mut last_error = None;
     let mut actual_model = model.to_string();
     let mut mapped_model = model.to_string();
@@ -1510,7 +1509,7 @@ async fn execute_upstream(
             persist_refreshed_accounts(state).await?;
         }
         let account = lease.account().await;
-        match kiro.generate(&account, &request_payload, None).await {
+        match state.generate(&account, &request_payload).await {
             Ok(response) => {
                 tracing::info!(
                     trace_id,
@@ -1564,7 +1563,7 @@ async fn execute_upstream(
                     request_payload
                         .profile_arn
                         .clone_from(&refreshed.profile_arn);
-                    match kiro.generate(&refreshed, &request_payload, None).await {
+                    match state.generate(&refreshed, &request_payload).await {
                         Ok(response) => {
                             let refreshed_name = refreshed.display_name().to_owned();
                             tracing::info!(
@@ -1717,7 +1716,7 @@ async fn execute_upstream(
                             push_model_path(&mut model_path, &mapped_model);
                             push_model_path(&mut model_path, &actual_model);
                             set_payload_model(&mut request_payload, &actual_model);
-                            match kiro.generate(&account, &request_payload, None).await {
+                            match state.generate(&account, &request_payload).await {
                                 Ok(response) => {
                                     tracing::info!(
                                         trace_id,
@@ -2518,8 +2517,7 @@ async fn collect_nonstream_rounds(
             }
             let account = lease.account().await;
             upstream = state
-                .kiro()
-                .generate(&account, &payload, None)
+                .generate(&account, &payload)
                 .await
                 .map_err(ExecuteError::Upstream)?;
             search_round += 1;
@@ -2676,8 +2674,7 @@ async fn collect_nonstream_rounds(
             }
             let account = lease.account().await;
             upstream = state
-                .kiro()
-                .generate(&account, &payload, None)
+                .generate(&account, &payload)
                 .await
                 .map_err(ExecuteError::Upstream)?;
             continue;
@@ -2755,8 +2752,7 @@ async fn collect_nonstream_rounds(
         }
         let account = lease.account().await;
         upstream = state
-            .kiro()
-            .generate(&account, &payload, None)
+            .generate(&account, &payload)
             .await
             .map_err(ExecuteError::Upstream)?;
         round += 1;
