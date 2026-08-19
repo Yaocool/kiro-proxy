@@ -67,6 +67,21 @@ kproxy status
 与 macOS 等宿主机不兼容，也无需暴露管理 Unix socket。源码升级后重新运行同一脚本即可；
 如只需启动已有镜像，可增加 `--no-build`。
 
+该 wrapper 同时提供宿主机服务生命周期管理：
+
+```bash
+kproxy restart     # 重启并等待健康检查通过
+kproxy stop        # 停止，之后仍可 restart
+kproxy uninstall   # 完全卸载
+kproxy uninstall --backup-dir /srv/kproxy-backups
+```
+
+`uninstall` 会先优雅停止 daemon，将 `/var/lib/kproxy` 完整备份到宿主机，并确认
+`config.toml` 存在后才删除容器、持久化数据卷、未共享镜像和 wrapper。备份失败
+会中止卸载并重新启动原容器。默认备份根目录为 `~/.kproxy/backups`，也可使用
+`--backup-dir` 或 `KPROXY_BACKUP_DIR` 指定。交互模式会询问是否保留备份；`--yes` 默认保留，
+只有显式传入 `--delete-backup` 才会在卸载成功后删除。源码目录始终保留。
+
 脚本还会在 Linux 上预检 named volume。如果 Docker 中保留了 volume 元数据、但宿主机上的
 实际数据目录已经丢失，交互运行时会询问是否重建；自动化环境可显式使用
 `--repair-volume`。仅当 volume 确认属于当前 Compose 项目、Docker volume 根目录正常且数据

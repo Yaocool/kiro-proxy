@@ -19,7 +19,7 @@ use crate::output::{format_relative, format_timestamp, print_json};
     version,
     disable_help_subcommand = true,
     about = "kiro-proxy 管理工具",
-    long_about = "查看服务状态、管理账号与配置。\n\n示例：\n  kproxy status\n  kproxy account list --tag prod\n  kproxy config show --effective"
+    long_about = "查看服务状态，管理服务生命周期、账号与配置。\n\n示例：\n  kproxy status\n  kproxy restart\n  kproxy account list --tag prod\n  kproxy config show --effective"
 )]
 struct Cli {
     /// 管理面 socket 路径，默认读取配置文件。
@@ -47,6 +47,30 @@ enum Command {
     /// 显示版本与默认上游端点。
     #[command(after_help = "示例：\n  kproxy version\n  kproxy --json version")]
     Version,
+    /// 重启 kproxyd（Docker 宿主机命令）。
+    #[command(after_help = "示例：\n  kproxy restart")]
+    Restart,
+    /// 停止 kproxyd（Docker 宿主机命令）。
+    #[command(after_help = "示例：\n  kproxy stop\n\n停止后可用 `kproxy restart` 重新启动。")]
+    Stop,
+    /// 完全卸载 Docker 服务、数据卷、专用镜像和宿主机 wrapper。
+    #[command(
+        after_help = "示例：\n  kproxy uninstall\n  kproxy uninstall --backup-dir /srv/backups\n  kproxy uninstall --yes --keep-backup\n  kproxy uninstall --yes --delete-backup\n\n卸载前必定先备份数据。默认备份目录为 ~/.kproxy/backups；会永久删除配置、账号、统计和日志，但不删除源码目录。"
+    )]
+    Uninstall {
+        /// 跳过交互确认，用于自动化。
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// 宿主机备份根目录；默认 ~/.kproxy/backups。
+        #[arg(long, value_name = "PATH", env = "KPROXY_BACKUP_DIR")]
+        backup_dir: Option<String>,
+        /// 卸载成功后保留备份。
+        #[arg(long, conflicts_with = "delete_backup")]
+        keep_backup: bool,
+        /// 卸载成功后删除备份。
+        #[arg(long, conflicts_with = "keep_backup")]
+        delete_backup: bool,
+    },
     /// 配置查看与重载。
     #[command(subcommand)]
     Config(ConfigCommand),
@@ -287,6 +311,16 @@ async fn main() -> Result<()> {
         crate::commands::runtime::print_topic(topic.as_deref())?;
         return Ok(());
     }
+    if matches!(
+        &command,
+        Command::Restart | Command::Stop | Command::Uninstall { .. }
+    ) {
+        anyhow::bail!(
+            "该命令需在 Docker 宿主机通过 kproxy wrapper 执行。\n\
+             请在仓库根目录运行 `./deploy/docker-setup.sh` 安装或更新 wrapper；\n\
+             原生 systemd 部署请使用 `sudo systemctl restart|stop kproxyd`。"
+        );
+    }
     let socket = resolve_socket(cli.socket.clone()).await;
     let mut client = AdminClient::connect(socket);
 
@@ -332,6 +366,9 @@ async fn main() -> Result<()> {
                 println!("CodeWhisperer {}", kproxy_kiro::endpoint::CODEWHISPERER_URL);
                 println!("AmazonQ        {}", kproxy_kiro::endpoint::AMAZONQ_URL);
             }
+        }
+        Command::Restart | Command::Stop | Command::Uninstall { .. } => {
+            unreachable!("host lifecycle commands returned before connecting to the daemon")
         }
         Command::Config(ConfigCommand::Show { effective }) => {
             let show: ConfigShowResult = client

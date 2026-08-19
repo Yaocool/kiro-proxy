@@ -78,6 +78,24 @@ container. This avoids Linux-container binary incompatibility on hosts such as
 macOS and keeps the administration Unix socket private. Rerun the same script
 after a source update, or pass `--no-build` to start an existing image.
 
+The wrapper also manages the Docker service lifecycle from the host:
+
+```bash
+kproxy restart     # Restart and wait until the health check passes
+kproxy stop        # Stop; restart remains available afterwards
+kproxy uninstall   # Completely uninstall the service
+kproxy uninstall --backup-dir /srv/kproxy-backups
+```
+
+`uninstall` first stops the daemon gracefully, copies all of `/var/lib/kproxy`
+to the host, and verifies that `config.toml` exists before removing the
+container, persistent data volume, unshared image, and installed wrapper. A
+backup failure aborts the uninstall and starts the original container again.
+The default backup root is `~/.kproxy/backups`; override it with `--backup-dir`
+or `KPROXY_BACKUP_DIR`. Interactive use asks whether to retain the backup.
+`--yes` retains it by default, and only an explicit `--delete-backup` removes it
+after a successful uninstall. The source checkout is always retained.
+
 On Linux, the script also checks the named volume before the long image build.
 If Docker retains the volume metadata but its host data directory is gone, an
 interactive run offers to recreate it; automation can opt in with
