@@ -460,6 +460,12 @@ pub struct ContextConfig {
     pub max_loaded_tools: usize,
     /// 单次序列化 Kiro 请求的最大字节数。
     pub max_upstream_payload_bytes: usize,
+    /// compact 摘要模型；留空时复用当轮映射后的模型。
+    pub compaction_summary_model: String,
+    /// compact 摘要普通 Kiro 请求的超时。
+    pub compaction_summary_timeout_ms: u64,
+    /// 当轮 compact 后额外保留的最近完整 user/assistant 轮数。
+    pub compaction_preserve_recent_turns: usize,
 }
 
 impl Default for ContextConfig {
@@ -471,6 +477,9 @@ impl Default for ContextConfig {
             max_tool_input_tokens: 32_000,
             max_loaded_tools: MAX_LOADED_TOOLS,
             max_upstream_payload_bytes: 8 * 1024 * 1024,
+            compaction_summary_model: String::new(),
+            compaction_summary_timeout_ms: 30_000,
+            compaction_preserve_recent_turns: 3,
         }
     }
 }
@@ -938,6 +947,12 @@ impl Config {
                 format!("must not exceed the proxy ceiling of {MAX_LOADED_TOOLS}"),
             );
         }
+        if self.context.compaction_preserve_recent_turns > 64 {
+            return invalid_config(
+                "context.compaction_preserve_recent_turns",
+                "must not exceed 64",
+            );
+        }
         if !(1..=256).contains(&self.features.tool_search_max_operations) {
             return invalid_config(
                 "features.tool_search_max_operations",
@@ -1020,6 +1035,12 @@ impl Config {
             if value == 0 {
                 return invalid_config(field, "must be greater than zero");
             }
+        }
+        if self.context.compaction_summary_timeout_ms == 0 {
+            return invalid_config(
+                "context.compaction_summary_timeout_ms",
+                "must be greater than zero",
+            );
         }
         if self.models.dynamic_discovery && self.models.cache_ttl_ms == 0 {
             return invalid_config("models.cache_ttl_ms", "must be greater than zero");
@@ -1382,6 +1403,9 @@ compact_safe_input_ratio = 0.99
 max_tool_input_tokens = 32000
 max_loaded_tools = 512
 max_upstream_payload_bytes = 8388608
+compaction_summary_model = ""
+compaction_summary_timeout_ms = 30000
+compaction_preserve_recent_turns = 3
 
 [storage]
 compression_threshold = 100
@@ -1513,6 +1537,9 @@ mod tests {
         assert_eq!(config.context.max_tool_input_tokens, 32_000);
         assert_eq!(config.context.max_loaded_tools, MAX_LOADED_TOOLS);
         assert_eq!(config.context.max_upstream_payload_bytes, 8 * 1024 * 1024);
+        assert!(config.context.compaction_summary_model.is_empty());
+        assert_eq!(config.context.compaction_summary_timeout_ms, 30_000);
+        assert_eq!(config.context.compaction_preserve_recent_turns, 3);
         assert_eq!(config.notify.low_credit_threshold_percent, 10.0);
         assert_eq!(config.notify.max_notifications, 5);
         assert_eq!(config.storage.compression_threshold, 100);
@@ -1581,6 +1608,33 @@ mod tests {
             .expect_err("limits above the proxy ceiling must be rejected");
         assert!(
             error.to_string().contains("context.max_loaded_tools"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn compaction_summary_limits_are_validated() {
+        let mut config = Config::default();
+        config.context.compaction_summary_timeout_ms = 0;
+        let error = config
+            .validate()
+            .expect_err("zero compaction summary timeout must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("context.compaction_summary_timeout_ms"),
+            "{error}"
+        );
+
+        let mut config = Config::default();
+        config.context.compaction_preserve_recent_turns = 65;
+        let error = config
+            .validate()
+            .expect_err("unbounded retained compact turns must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("context.compaction_preserve_recent_turns"),
             "{error}"
         );
     }

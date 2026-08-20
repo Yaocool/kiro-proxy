@@ -11,6 +11,8 @@ use tokio::process::{Child, Command};
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+static HTTP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 struct Daemon {
     child: Child,
     socket: PathBuf,
@@ -177,6 +179,47 @@ fn event_stream_frame(event_type: &str, payload: serde_json::Value) -> Vec<u8> {
     frame
 }
 
+fn generation_body(content: &str) -> Vec<u8> {
+    let mut body = event_stream_frame(
+        "assistantResponseEvent",
+        serde_json::json!({"content":content}),
+    );
+    body.extend(event_stream_frame(
+        "messageMetadataEvent",
+        serde_json::json!({
+            "messageMetadataEvent": {
+                "usage": {
+                    "inputTokens": 100,
+                    "outputTokens": 20,
+                    "creditsConsumed": 0.25
+                }
+            }
+        }),
+    ));
+    body
+}
+
+#[derive(Clone)]
+struct CompactionResponder;
+
+impl wiremock::Respond for CompactionResponder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let payload =
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap_or_default();
+        let current = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+            .as_str()
+            .unwrap_or_default();
+        let content = if current.contains("durable conversation checkpoint") {
+            "<summary>Task Overview: migrate compact to semantic Kiro summaries. Current State: implementation is active. Next Steps: verify the main response.</summary>"
+        } else {
+            "main request completed"
+        };
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "application/vnd.amazon.eventstream")
+            .set_body_bytes(generation_body(content))
+    }
+}
+
 #[tokio::test]
 async fn dotenv_is_loaded_before_daemon_startup_configuration() {
     let workspace = tempfile::tempdir().expect("tempdir");
@@ -213,6 +256,7 @@ async fn dotenv_is_loaded_before_daemon_startup_configuration() {
 
 #[tokio::test]
 async fn inbound_openai_request_runs_through_translation_pool_and_mock_upstream() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;
     let mut upstream_body = event_stream_frame(
         "assistantResponseEvent",
@@ -315,6 +359,124 @@ async fn inbound_openai_request_runs_through_translation_pool_and_mock_upstream(
                 .is_some_and(|content| content.ends_with("exercise every layer"))
         );
     }
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn claude_compaction_uses_a_separate_semantic_kiro_request() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(CompactionResponder)
+        .mount(&mock)
+        .await;
+
+    let port = unused_tcp_port();
+    let upstream_url = format!("{}/generateAssistantResponse", mock.uri());
+    let daemon = Daemon::start_http(port, &upstream_url).await;
+    assert_eq!(
+        expect_ok(
+            daemon
+                .call(
+                    "account.import",
+                    serde_json::json!({
+                        "accounts": [{
+                            "id": "acc_88888888",
+                            "email": "compact@example.com",
+                            "machine_id": "8".repeat(64),
+                            "credentials": {
+                                "access_token": "compact-token",
+                                "region": "us-east-1",
+                                "expires_at": 4_000_000_000i64,
+                                "auth_method": "idc"
+                            },
+                            "usage": {
+                                "current": 0.0,
+                                "limit": 100.0,
+                                "percent_used": 0.0,
+                                "updated_at": 1
+                            },
+                            "subscription": {"kind": "pro"},
+                            "created_at": 1
+                        }]
+                    }),
+                )
+                .await,
+        )["imported"],
+        1
+    );
+
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header(
+            "x-api-key",
+            daemon.api_key.as_deref().expect("service API key"),
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("user-agent", "claude-cli/2.1.0 (external, e2e)")
+        .json(&serde_json::json!({
+            "model":"minimax-m2.5",
+            "max_tokens":64,
+            "stream":false,
+            "context_management":{"edits":[{
+                "type":"compact_20260112",
+                "trigger":{"type":"input_tokens","value":50000}
+            }]},
+            "messages":[
+                {"role":"user","content":"old context ".repeat(35_000)},
+                {"role":"assistant","content":"an earlier conclusion"},
+                {"role":"user","content":"continue the implementation"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("call Claude compact path");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("Claude response JSON");
+    assert_eq!(body["content"][0]["type"], "compaction");
+    assert!(body["content"][0]["content"]
+        .as_str()
+        .is_some_and(|content| content.contains("migrate compact to semantic Kiro summaries")));
+    assert_eq!(body["content"][1]["text"], "main request completed");
+
+    let requests = mock.received_requests().await.expect("received requests");
+    let payloads = requests
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+        .filter(|payload| payload.get("conversationState").is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(payloads.len(), 2, "summary plus main Kiro generation");
+    let summary_request = payloads
+        .iter()
+        .find(|payload| {
+            payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("durable conversation checkpoint"))
+        })
+        .expect("semantic summary request");
+    assert!(
+        summary_request["conversationState"]["currentMessage"]["userInputMessage"]
+            .get("userInputMessageContext")
+            .is_none()
+    );
+    let main_request = payloads
+        .iter()
+        .find(|payload| {
+            payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+                .as_str()
+                .is_some_and(|content| {
+                    content.contains("continue the implementation")
+                        && !content.contains("durable conversation checkpoint")
+                })
+        })
+        .expect("main request");
+    assert!(
+        main_request["conversationState"]["history"][0]["userInputMessage"]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("System-generated conversation checkpoint"))
+    );
+
     daemon.stop().await;
 }
 
