@@ -454,6 +454,8 @@ pub struct ContextConfig {
     pub safe_input_ratio: f64,
     /// compact 请求安全比例。
     pub compact_safe_input_ratio: f64,
+    /// 映射后的 Claude 模型窗口不足时，在首次上游调用前自动 compact。
+    pub auto_compact_on_overflow: bool,
     /// deferred Tool Search 工作集中工具定义允许占用的最大估算 token。
     pub max_tool_input_tokens: u32,
     /// 单次 Kiro 请求中允许发送的已加载工具数量。
@@ -462,7 +464,7 @@ pub struct ContextConfig {
     pub max_upstream_payload_bytes: usize,
     /// compact 摘要模型；留空时复用当轮映射后的模型。
     pub compaction_summary_model: String,
-    /// compact 摘要普通 Kiro 请求的超时。
+    /// 主链路等待 compact 摘要的超时；后台结算另有固定有界宽限期。
     pub compaction_summary_timeout_ms: u64,
     /// 当轮 compact 后额外保留的最近完整 user/assistant 轮数。
     pub compaction_preserve_recent_turns: usize,
@@ -474,6 +476,7 @@ impl Default for ContextConfig {
             max_input_tokens: 200_000,
             safe_input_ratio: 0.95,
             compact_safe_input_ratio: 0.99,
+            auto_compact_on_overflow: false,
             max_tool_input_tokens: 32_000,
             max_loaded_tools: MAX_LOADED_TOOLS,
             max_upstream_payload_bytes: 8 * 1024 * 1024,
@@ -1400,6 +1403,7 @@ stats_persist_interval_ms = 60000
 max_input_tokens = 200000
 safe_input_ratio = 0.95
 compact_safe_input_ratio = 0.99
+auto_compact_on_overflow = false
 max_tool_input_tokens = 32000
 max_loaded_tools = 512
 max_upstream_payload_bytes = 8388608
@@ -1534,6 +1538,7 @@ mod tests {
         assert_eq!(config.context.max_input_tokens, 200_000);
         assert_eq!(config.context.safe_input_ratio, 0.95);
         assert_eq!(config.context.compact_safe_input_ratio, 0.99);
+        assert!(!config.context.auto_compact_on_overflow);
         assert_eq!(config.context.max_tool_input_tokens, 32_000);
         assert_eq!(config.context.max_loaded_tools, MAX_LOADED_TOOLS);
         assert_eq!(config.context.max_upstream_payload_bytes, 8 * 1024 * 1024);
