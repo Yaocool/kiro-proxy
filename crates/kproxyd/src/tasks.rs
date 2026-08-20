@@ -1,9 +1,12 @@
 //! Periodic refresh and persistence scheduler.
 
 use std::collections::BTreeMap;
+use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use futures::FutureExt;
 use kproxy_notify::{WebhookEvent, WebhookEventKind};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -44,18 +47,91 @@ impl TaskRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         serde_json::json!({
+            "account_file_watcher":{"interval_ms":1_000u64,"run":runs.get("account_file_watcher")},
             "token_refresh":{
                 "interval_ms":config.tasks.token_refresh_interval_ms,
                 "before_expiry_secs":config.effective_token_refresh_before_expiry(),
                 "run":runs.get("token_refresh")
             },
             "status_check":{"interval_ms":config.tasks.status_check_interval_ms,"run":runs.get("status_check")},
+            "adaptive_admission":{"interval_ms":config.server.adaptive.check_interval_ms,"run":runs.get("adaptive_admission")},
             "stats_persist":{"interval_ms":config.tasks.stats_persist_interval_ms,"run":runs.get("stats_persist")},
             "daily_reset":{"interval_ms":86_400_000u64,"run":runs.get("daily_reset")},
             "model_cache_refresh":{"interval_ms":config.models.cache_ttl_ms,"run":runs.get("model_cache_refresh")},
             "proxy_service_reconcile":{"interval_ms":PROXY_SERVICE_RECONCILE_INTERVAL.as_millis() as u64,"run":runs.get("proxy_service_reconcile")},
             "health_recheck":{"interval_ms":config.pool.cooldown.quota_reset_ms,"run":runs.get("health_recheck")}
         })
+    }
+
+    pub fn readiness_issues(&self, state: &AppState) -> Vec<String> {
+        let config = state.config.current();
+        let runs = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let intervals = [
+            ("account_file_watcher", 1_000u64),
+            (
+                "token_refresh",
+                config.tasks.token_refresh_interval_ms.max(1_000),
+            ),
+            (
+                "adaptive_admission",
+                config.server.adaptive.check_interval_ms.max(1_000),
+            ),
+            (
+                "model_cache_refresh",
+                config.models.cache_ttl_ms.max(60_000),
+            ),
+            (
+                "status_check",
+                config.tasks.status_check_interval_ms.max(10_000),
+            ),
+            (
+                "proxy_service_reconcile",
+                PROXY_SERVICE_RECONCILE_INTERVAL.as_millis() as u64,
+            ),
+            (
+                "health_recheck",
+                config.pool.cooldown.quota_reset_ms.max(10_000),
+            ),
+            (
+                "stats_persist",
+                config.tasks.stats_persist_interval_ms.max(1_000),
+            ),
+        ];
+        let now = crate::meter::now_secs();
+        let uptime_ms = state.uptime_secs().saturating_mul(1_000);
+        let mut issues = Vec::new();
+        for (name, interval_ms) in intervals {
+            let stale_after_ms = interval_ms.saturating_mul(3).max(60_000);
+            let Some(run) = runs.get(name) else {
+                if uptime_ms > stale_after_ms {
+                    issues.push(format!(
+                        "background task {name} has not reported a heartbeat"
+                    ));
+                }
+                continue;
+            };
+            if run
+                .last_result
+                .as_deref()
+                .is_some_and(|result| result.starts_with("supervisor failure:"))
+            {
+                issues.push(format!("background task {name} is restarting"));
+                continue;
+            }
+            let stale_after = i64::try_from(stale_after_ms / 1_000)
+                .unwrap_or(i64::MAX)
+                .max(60);
+            if run
+                .last_run_at
+                .is_some_and(|last_run| now.saturating_sub(last_run) > stale_after)
+            {
+                issues.push(format!("background task {name} heartbeat is stale"));
+            }
+        }
+        issues
     }
 }
 
@@ -72,40 +148,46 @@ pub fn spawn(state: Arc<AppState>, shutdown: CancellationToken) {
 }
 
 fn spawn_account_file_watcher(state: Arc<AppState>, shutdown: CancellationToken) {
-    tokio::spawn(async move {
-        let path = state.paths.accounts_file.clone();
-        let mut previous = account_storage_signature(&path).await;
-        let mut interval = tokio::time::interval(Duration::from_secs(1));
-        interval.tick().await;
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = interval.tick() => {
-                    let current = account_storage_signature(&path).await;
-                    if current == previous {
-                        continue;
-                    }
-                    previous = current;
-                    match kproxy_store::accounts::AccountStore::load(&path).await {
-                        Ok(next) => {
-                            let disk = serde_json::to_value(next.all()).ok();
-                            let memory = state.with_accounts(|accounts| {
-                                serde_json::to_value(accounts.all()).ok()
-                            });
-                            if disk != memory {
-                                let count = next.len();
-                                state.apply_account_file_reload(next).await;
-                                info!(count, path = %path.display(), "accounts file reloaded");
-                            }
+    spawn_supervised(
+        "account_file_watcher",
+        state,
+        shutdown,
+        |state, shutdown| async move {
+            let path = state.paths.accounts_file.clone();
+            let mut previous = account_storage_signature(&path).await;
+            let mut interval = tokio::time::interval(Duration::from_secs(1));
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = interval.tick() => {
+                        let current = account_storage_signature(&path).await;
+                        state.task_registry.record("account_file_watcher", "ok");
+                        if current == previous {
+                            continue;
                         }
-                        Err(error) => {
-                            warn!(%error, path = %path.display(), "accounts file reload failed; keeping current accounts");
+                        previous = current;
+                        match kproxy_store::accounts::AccountStore::load(&path).await {
+                            Ok(next) => {
+                                let disk = serde_json::to_value(next.all()).ok();
+                                let memory = state.with_accounts(|accounts| {
+                                    serde_json::to_value(accounts.all()).ok()
+                                });
+                                if disk != memory {
+                                    let count = next.len();
+                                    state.apply_account_file_reload(next).await;
+                                    info!(count, path = %path.display(), "accounts file reloaded");
+                                }
+                            }
+                            Err(error) => {
+                                warn!(%error, path = %path.display(), "accounts file reload failed; keeping current accounts");
+                            }
                         }
                     }
                 }
             }
-        }
-    });
+        },
+    );
 }
 
 async fn account_storage_signature(path: &std::path::Path) -> Vec<(String, Vec<u8>)> {
@@ -136,235 +218,328 @@ async fn account_storage_signature(path: &std::path::Path) -> Vec<(String, Vec<u
 }
 
 fn spawn_status_check(state: Arc<AppState>, shutdown: CancellationToken) {
-    tokio::spawn(async move {
-        loop {
-            let delay = Duration::from_millis(
-                state
-                    .config
-                    .current()
-                    .tasks
-                    .status_check_interval_ms
-                    .max(10_000),
-            );
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(delay) => {
-                    let result = status_check(&state).await;
-                    state.task_registry.record(
-                        "status_check",
-                        result.unwrap_or_else(|error| error.to_string()),
-                    );
+    spawn_supervised(
+        "status_check",
+        state,
+        shutdown,
+        |state, shutdown| async move {
+            loop {
+                let delay = Duration::from_millis(
+                    state
+                        .config
+                        .current()
+                        .tasks
+                        .status_check_interval_ms
+                        .max(10_000),
+                );
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(delay) => {
+                        let result = status_check(&state).await;
+                        state.task_registry.record(
+                            "status_check",
+                            result.unwrap_or_else(|error| error.to_string()),
+                        );
+                    }
                 }
             }
-        }
-    });
+        },
+    );
 }
 
 fn spawn_health_recheck(state: Arc<AppState>, shutdown: CancellationToken) {
-    tokio::spawn(async move {
-        loop {
-            let delay = Duration::from_millis(
-                state
-                    .config
-                    .current()
-                    .pool
-                    .cooldown
-                    .quota_reset_ms
-                    .max(10_000),
-            );
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(delay) => {
-                    let result = health_recheck(&state).await;
-                    state.task_registry.record(
-                        "health_recheck",
-                        result.unwrap_or_else(|error| error.to_string()),
-                    );
+    spawn_supervised(
+        "health_recheck",
+        state,
+        shutdown,
+        |state, shutdown| async move {
+            loop {
+                let delay = Duration::from_millis(
+                    state
+                        .config
+                        .current()
+                        .pool
+                        .cooldown
+                        .quota_reset_ms
+                        .max(10_000),
+                );
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(delay) => {
+                        let result = health_recheck(&state).await;
+                        state.task_registry.record(
+                            "health_recheck",
+                            result.unwrap_or_else(|error| error.to_string()),
+                        );
+                    }
                 }
             }
-        }
-    });
+        },
+    );
 }
 
 fn spawn_model_refresh(state: Arc<AppState>, shutdown: CancellationToken) {
-    tokio::spawn(async move {
-        loop {
-            let result = refresh_models(&state).await;
-            state.task_registry.record(
-                "model_cache_refresh",
-                result.unwrap_or_else(|error| error.to_string()),
-            );
-            let delay =
-                Duration::from_millis(state.config.current().models.cache_ttl_ms.max(60_000));
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(delay) => {}
-                _ = state.wait_for_model_refresh() => {}
+    spawn_supervised(
+        "model_cache_refresh",
+        state,
+        shutdown,
+        |state, shutdown| async move {
+            loop {
+                let result = refresh_models(&state).await;
+                state.task_registry.record(
+                    "model_cache_refresh",
+                    result.unwrap_or_else(|error| error.to_string()),
+                );
+                let delay =
+                    Duration::from_millis(state.config.current().models.cache_ttl_ms.max(60_000));
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(delay) => {}
+                    _ = state.wait_for_model_refresh() => {}
+                }
             }
-        }
-    });
+        },
+    );
 }
 
 fn spawn_proxy_service_reconcile(state: Arc<AppState>, shutdown: CancellationToken) {
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(PROXY_SERVICE_RECONCILE_INTERVAL) => {
-                    let _mutation = state.lock_config_mutation().await;
-                    let config = state.config.current();
-                    let failures = state.reconcile_proxy_services(&config).await;
-                    let result = if failures.is_empty() {
-                        "ok".to_string()
-                    } else {
-                        for (service_id, error) in &failures {
-                            warn!(%service_id, %error, "proxy service supervisor restart failed");
-                        }
-                        format!("{} restart failures", failures.len())
-                    };
-                    state.task_registry.record("proxy_service_reconcile", result);
+    spawn_supervised(
+        "proxy_service_reconcile",
+        state,
+        shutdown,
+        |state, shutdown| async move {
+            loop {
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(PROXY_SERVICE_RECONCILE_INTERVAL) => {
+                        let _mutation = state.lock_config_mutation().await;
+                        let config = state.config.current();
+                        let failures = state.reconcile_proxy_services(&config).await;
+                        let result = if failures.is_empty() {
+                            "ok".to_string()
+                        } else {
+                            for (service_id, error) in &failures {
+                                warn!(%service_id, %error, "proxy service supervisor restart failed");
+                            }
+                            format!("{} restart failures", failures.len())
+                        };
+                        state.task_registry.record("proxy_service_reconcile", result);
+                    }
                 }
             }
-        }
-    });
+        },
+    );
 }
 
 fn spawn_daily_reset(state: Arc<AppState>, shutdown: CancellationToken) {
-    tokio::spawn(async move {
-        loop {
-            let now = crate::meter::now_secs();
-            let wait = 86_400 - now.rem_euclid(86_400);
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_secs(wait as u64)) => {
-                    if let Err(error) = state.meter.reset_daily().await {
-                        warn!(%error, "failed to persist daily credit reset");
+    spawn_supervised(
+        "daily_reset",
+        state,
+        shutdown,
+        |state, shutdown| async move {
+            loop {
+                let now = crate::meter::now_secs();
+                let wait = 86_400 - now.rem_euclid(86_400);
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_secs(wait as u64)) => {
+                        let result = match state.meter.reset_daily().await {
+                            Ok(()) => "ok".to_string(),
+                            Err(error) => {
+                                warn!(%error, "failed to persist daily credit reset");
+                                error.to_string()
+                            }
+                        };
+                        state.task_registry.record("daily_reset", result);
                     }
-                    state.task_registry.record("daily_reset", "ok");
                 }
             }
-        }
-    });
+        },
+    );
 }
 
 fn spawn_adaptive_admission(state: Arc<AppState>, shutdown: CancellationToken) {
-    tokio::spawn(async move {
-        loop {
-            let delay = Duration::from_millis(
-                state
-                    .config
-                    .current()
-                    .server
-                    .adaptive
-                    .check_interval_ms
-                    .max(1_000),
-            );
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(delay) => {
-                    let adaptive = state.config.current().server.adaptive.clone();
-                    let feedback = state
-                        .adaptive_feedback
-                        .take_if_ready(adaptive.minimum_samples);
-                    let queued_requests = state.pool().queued();
-                    let limit = state.adjust_admission(feedback, queued_requests).await;
-                    let feedback = feedback.unwrap_or_default();
-                    let overload_rate = if feedback.attempts == 0 {
-                        0.0
-                    } else {
-                        feedback.overloads as f64 / feedback.attempts as f64
-                    };
-                    debug!(
-                        p99_stream_slot_wait_ms = feedback.p99_stream_slot_wait_ms,
-                        adaptive_samples = feedback.attempts,
-                        upstream_overloads = feedback.overloads,
-                        overload_rate,
-                        queued_requests,
-                        admission_limit = limit,
-                        "adaptive admission check"
-                    );
+    spawn_supervised(
+        "adaptive_admission",
+        state,
+        shutdown,
+        |state, shutdown| async move {
+            loop {
+                let delay = Duration::from_millis(
+                    state
+                        .config
+                        .current()
+                        .server
+                        .adaptive
+                        .check_interval_ms
+                        .max(1_000),
+                );
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(delay) => {
+                        let adaptive = state.config.current().server.adaptive.clone();
+                        let feedback = state
+                            .adaptive_feedback
+                            .take_if_ready(adaptive.minimum_samples);
+                        let queued_requests = state.pool().queued();
+                        let limit = state.adjust_admission(feedback, queued_requests).await;
+                        let feedback = feedback.unwrap_or_default();
+                        let overload_rate = if feedback.attempts == 0 {
+                            0.0
+                        } else {
+                            feedback.overloads as f64 / feedback.attempts as f64
+                        };
+                        debug!(
+                            p99_stream_slot_wait_ms = feedback.p99_stream_slot_wait_ms,
+                            adaptive_samples = feedback.attempts,
+                            upstream_overloads = feedback.overloads,
+                            overload_rate,
+                            queued_requests,
+                            admission_limit = limit,
+                            "adaptive admission check"
+                        );
+                        state.task_registry.record("adaptive_admission", "ok");
+                    }
                 }
             }
-        }
-    });
+        },
+    );
 }
 
 fn spawn_token_refresh(state: Arc<AppState>, shutdown: CancellationToken) {
-    tokio::spawn(async move {
-        loop {
-            let delay = Duration::from_millis(
-                state
-                    .config
-                    .current()
-                    .tasks
-                    .token_refresh_interval_ms
-                    .max(1_000),
-            );
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(delay) => {
-                    let pool = state.pool();
-                    let report = state.refresh_expiring_tokens(&pool).await;
-                    for (account_id, account_name) in &report.refreshed {
-                        info!(%account_id, %account_name, "background token refresh succeeded");
-                    }
-                    for (account_id, account_name, error) in &report.failures {
-                        warn!(%account_id, %account_name, %error, "background token refresh failed");
-                        let mut event = WebhookEvent::new(
-                            WebhookEventKind::TokenExpired,
-                            "Kiro token refresh failed",
-                            error.to_string(),
-                        );
-                        event.account_id = Some(account_id.clone());
-                        state.notifier().emit(event);
-                    }
-                    if !report.refreshed.is_empty() {
-                        if let Err(error) = persist_pool_accounts(&state).await {
-                            warn!(%error, "failed to persist refreshed credentials");
+    spawn_supervised(
+        "token_refresh",
+        state,
+        shutdown,
+        |state, shutdown| async move {
+            loop {
+                let delay = Duration::from_millis(
+                    state
+                        .config
+                        .current()
+                        .tasks
+                        .token_refresh_interval_ms
+                        .max(1_000),
+                );
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(delay) => {
+                        let pool = state.pool();
+                        let report = state.refresh_expiring_tokens(&pool).await;
+                        for (account_id, account_name) in &report.refreshed {
+                            info!(%account_id, %account_name, "background token refresh succeeded");
                         }
+                        for (account_id, account_name, error) in &report.failures {
+                            warn!(%account_id, %account_name, %error, "background token refresh failed");
+                            let mut event = WebhookEvent::new(
+                                WebhookEventKind::TokenExpired,
+                                "Kiro token refresh failed",
+                                error.to_string(),
+                            );
+                            event.account_id = Some(account_id.clone());
+                            state.notifier().emit(event);
+                        }
+                        if !report.refreshed.is_empty() {
+                            if let Err(error) = persist_pool_accounts(&state).await {
+                                warn!(%error, "failed to persist refreshed credentials");
+                            }
+                        }
+                        info!(
+                            checked = report.checked,
+                            eligible = report.eligible,
+                            refreshed = report.refreshed.len(),
+                            failures = report.failures.len(),
+                            "background token refresh check completed"
+                        );
+                        state.task_registry.record("token_refresh", report.summary());
                     }
-                    info!(
-                        checked = report.checked,
-                        eligible = report.eligible,
-                        refreshed = report.refreshed.len(),
-                        failures = report.failures.len(),
-                        "background token refresh check completed"
-                    );
-                    state.task_registry.record("token_refresh", report.summary());
                 }
             }
-        }
-    });
+        },
+    );
 }
 
 fn spawn_persistence(state: Arc<AppState>, shutdown: CancellationToken) {
-    tokio::spawn(async move {
-        loop {
-            let delay = Duration::from_millis(
-                state
-                    .config
-                    .current()
-                    .tasks
-                    .stats_persist_interval_ms
-                    .max(1_000),
-            );
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    persist_usage(&state).await;
-                    break;
+    spawn_supervised(
+        "stats_persist",
+        state,
+        shutdown,
+        |state, shutdown| async move {
+            loop {
+                let delay = Duration::from_millis(
+                    state
+                        .config
+                        .current()
+                        .tasks
+                        .stats_persist_interval_ms
+                        .max(1_000),
+                );
+                tokio::select! {
+                    _ = shutdown.cancelled() => {
+                        persist_usage(&state).await;
+                        break;
+                    }
+                    _ = tokio::time::sleep(delay) => persist_usage(&state).await,
                 }
-                _ = tokio::time::sleep(delay) => persist_usage(&state).await,
+            }
+        },
+    );
+}
+
+fn spawn_supervised<F, Fut>(
+    name: &'static str,
+    state: Arc<AppState>,
+    shutdown: CancellationToken,
+    task: F,
+) where
+    F: Fn(Arc<AppState>, CancellationToken) -> Fut + Send + Sync + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut restart_attempt = 0u32;
+        loop {
+            let outcome = AssertUnwindSafe(task(Arc::clone(&state), shutdown.clone()))
+                .catch_unwind()
+                .await;
+            if shutdown.is_cancelled() {
+                break;
+            }
+            restart_attempt = restart_attempt.saturating_add(1);
+            let reason = match outcome {
+                Ok(()) => "task exited unexpectedly".to_string(),
+                Err(payload) => format!("task panicked: {}", panic_message(payload)),
+            };
+            state.task_registry.record(
+                name,
+                format!("supervisor failure: {reason}; restart {restart_attempt}"),
+            );
+            warn!(task = name, %reason, restart_attempt, "background task will be restarted");
+            let backoff = Duration::from_secs(1u64 << restart_attempt.saturating_sub(1).min(6));
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(backoff) => {}
             }
         }
     });
 }
 
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|message| (*message).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic payload".to_string())
+}
+
 async fn persist_usage(state: &Arc<AppState>) {
+    let mut errors = Vec::new();
     if let Err(error) = state.meter.persist().await {
         warn!(%error, "failed to persist API key usage");
+        errors.push(error.to_string());
     }
     if let Err(error) = state.stats.persist().await {
         warn!(%error, "failed to persist proxy stats");
+        errors.push(error.to_string());
     }
     let (p50, p95, p99) = state.stats.snapshot(None).percentiles();
     debug!(
@@ -373,7 +548,14 @@ async fn persist_usage(state: &Arc<AppState>) {
         p99_ms = p99,
         "request latency percentiles"
     );
-    state.task_registry.record("stats_persist", "ok");
+    state.task_registry.record(
+        "stats_persist",
+        if errors.is_empty() {
+            "ok".to_string()
+        } else {
+            format!("failed: {}", errors.join("; "))
+        },
+    );
 }
 
 pub(crate) async fn refresh_models(state: &Arc<AppState>) -> anyhow::Result<String> {
@@ -593,4 +775,64 @@ pub(crate) async fn persist_pool_accounts(state: &Arc<AppState>) -> anyhow::Resu
     next.save().await?;
     state.replace_accounts(next);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use kproxy_core::config::Config;
+    use kproxy_core::paths::Paths;
+    use kproxy_store::accounts::AccountStore;
+    use kproxy_store::config_loader::ConfigHandle;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn supervisor_restarts_a_panicked_background_task() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        let accounts = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("accounts");
+        let state = Arc::new(AppState::new(
+            paths,
+            ConfigHandle::new(Config::default()),
+            accounts,
+        ));
+        let shutdown = CancellationToken::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let task_attempts = Arc::clone(&attempts);
+        spawn_supervised(
+            "panic_probe",
+            state,
+            shutdown.clone(),
+            move |_state, shutdown| {
+                let attempts = Arc::clone(&task_attempts);
+                async move {
+                    if attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                        panic!("injected task failure");
+                    }
+                    shutdown.cancelled().await;
+                }
+            },
+        );
+
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while attempts.load(Ordering::Acquire) < 2 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("task restarted");
+        shutdown.cancel();
+    }
 }

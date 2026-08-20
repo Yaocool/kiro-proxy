@@ -111,7 +111,9 @@ cargo build --release --locked
 socket 仍能接受连接，第二个 daemon 不会删除它。
 
 全新 daemon 默认不创建业务 API 代理服务。即使没有账号或代理服务，`kproxy health` 仍会
-成功，因为应用健康与账号、代理服务的可用性相互独立。需要业务 API 时显式创建：
+成功，因为应用健康与账号、代理服务的可用性相互独立。业务可用性监控请使用
+`kproxy ready`（或代理监听器的 `/ready`）：它会报告账号不可用、监听失败、计量恢复模式和
+后台任务心跳过期，但不会停止 daemon。需要业务 API 时显式创建：
 
 ```bash
 cargo run -p kproxy -- service create --name main

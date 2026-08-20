@@ -299,6 +299,12 @@ pub struct StatusResult {
     /// 面向用户的提示。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// 业务面是否具备接收请求的条件；不影响 daemon 存活状态。
+    #[serde(default)]
+    pub ready: bool,
+    /// readiness 降级原因。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub readiness_reasons: Vec<String>,
 }
 
 /// API 代理服务运行视图。
@@ -670,11 +676,22 @@ mod tests {
             config_path: "/tmp/config.toml".into(),
             config_reloaded_at: None,
             hint: Some("empty".into()),
+            ready: true,
+            readiness_reasons: Vec::new(),
         };
         let back: StatusResult =
             serde_json::from_str(&serde_json::to_string(&status).expect("serialize status"))
                 .expect("deserialize status");
         assert_eq!(back.pid, 42);
+        assert!(back.ready);
+
+        let legacy: StatusResult = serde_json::from_value(serde_json::json!({
+            "version":"0.0.1","pid":1,"uptime_secs":1,"listen":"-",
+            "admin_socket":"/tmp/admin.sock","account_total":0,"account_enabled":0,
+            "config_path":"/tmp/config.toml"
+        }))
+        .expect("legacy status");
+        assert!(!legacy.ready);
 
         let summary = AccountSummary {
             id: "acc_00000001".into(),

@@ -290,6 +290,23 @@ async fn handle_status(state: &Arc<AppState>) -> Handled {
     };
     let (daily_credit_day, daily_credit_used, daily_credit_reserved, daily_credit_limit) =
         state.meter.daily_snapshot();
+    let enabled_services = services.iter().filter(|service| service.enabled).count();
+    let mut readiness_reasons = state.task_registry.readiness_issues(state);
+    if enabled_services == 0 {
+        readiness_reasons.push("no enabled proxy service is configured".to_string());
+    } else if running_services.len() < enabled_services {
+        readiness_reasons.push(format!(
+            "only {} of {enabled_services} enabled proxy services are running",
+            running_services.len()
+        ));
+    }
+    if health[0] == 0 {
+        readiness_reasons.push("no account is currently available".to_string());
+    }
+    if let Some(error) = state.meter.recovery_error() {
+        readiness_reasons.push(format!("metering recovery required: {error}"));
+    }
+    let ready = readiness_reasons.is_empty();
     to_value(StatusResult {
         version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
@@ -318,6 +335,8 @@ async fn handle_status(state: &Arc<AppState>) -> Handled {
         config_path: state.paths.config_file.display().to_string(),
         config_reloaded_at: state.config_reloaded_at(),
         hint,
+        ready,
+        readiness_reasons,
     })
 }
 
@@ -1528,6 +1547,11 @@ mod tests {
         assert_eq!(status.proxy_service_total, 0);
         assert_eq!(status.proxy_service_running, 0);
         assert_eq!(status.max_concurrent_requests, 123);
+        assert!(!status.ready);
+        assert!(status
+            .readiness_reasons
+            .iter()
+            .any(|reason| reason.contains("proxy service")));
 
         let (_directory, empty) = state_with(vec![]).await;
         let empty_status: StatusResult = serde_json::from_value(expect_ok(
@@ -1539,6 +1563,7 @@ mod tests {
         ))
         .expect("empty status");
         assert!(empty_status.hint.is_some());
+        assert!(!empty_status.ready);
     }
 
     #[tokio::test]

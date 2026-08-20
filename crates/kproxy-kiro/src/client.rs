@@ -427,12 +427,14 @@ impl KiroClient {
             ))
             .build()
             .map_err(build_error)?;
-        // No total/read timeout for streams: legitimate thinking pauses may be long.
+        // There is deliberately no total timeout: legitimate generations may be long.
+        // A finite per-read timeout still prevents a silent peer from pinning a slot forever.
         // hyper does not pipeline HTTP/1.1 requests, avoiding long-stream HOL blocking.
         let stream = Client::builder()
             .pool_max_idle_per_host(upstream.pool.stream_max_connections)
             .pool_idle_timeout(idle)
             .connect_timeout(Duration::from_secs(15))
+            .read_timeout(Duration::from_millis(upstream.stream_read_timeout_ms))
             .build()
             .map_err(build_error)?;
         Ok(Self {
@@ -887,10 +889,20 @@ impl KiroClient {
         endpoint: EndpointDefinition,
     ) -> Result<KiroResponse, KiroError> {
         let slot_wait_started = Instant::now();
-        let permit = Arc::clone(&self.stream_slots)
-            .acquire_owned()
-            .await
-            .map_err(build_error)?;
+        let permit = tokio::time::timeout(
+            Duration::from_millis(self.upstream.stream_slot_wait_timeout_ms),
+            Arc::clone(&self.stream_slots).acquire_owned(),
+        )
+        .await
+        .map_err(|_| KiroError {
+            status: None,
+            endpoint: endpoint.name.into(),
+            message: format!(
+                "timed out after {} ms waiting for an upstream stream slot",
+                self.upstream.stream_slot_wait_timeout_ms
+            ),
+        })?
+        .map_err(build_error)?;
         let stream_slot_wait_ms = slot_wait_started.elapsed().as_millis() as u64;
         let mut payload = payload.clone();
         set_payload_origin(&mut payload, endpoint.origin);
@@ -1537,6 +1549,73 @@ mod tests {
             },
         )
         .expect("client")
+    }
+
+    fn generation_endpoint(server: &MockServer) -> EndpointDefinition {
+        EndpointDefinition {
+            key: EndpointKey::Amazonq,
+            url: format!("{}/amazon/generateAssistantResponse", server.uri()),
+            origin: "CLI",
+            amz_target: "AmazonQDeveloperStreamingService.SendMessage",
+            name: "AmazonQ",
+        }
+    }
+
+    #[tokio::test]
+    async fn generation_times_out_when_waiting_for_a_stream_slot() {
+        let server = MockServer::start().await;
+        let mut upstream = UpstreamConfig::default();
+        upstream.pool.stream_max_connections = 1;
+        upstream.stream_slot_wait_timeout_ms = 20;
+        let client = KiroClient::new(upstream, EndpointOverrides::default()).expect("client");
+        let _held = client.stream_slots.acquire().await.expect("held slot");
+
+        let error = match client
+            .send_generation(
+                &account(AuthMethod::Idc),
+                &payload(),
+                generation_endpoint(&server),
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("slot wait must time out"),
+        };
+
+        assert!(error
+            .message
+            .contains("waiting for an upstream stream slot"));
+    }
+
+    #[tokio::test]
+    async fn generation_times_out_when_upstream_sends_no_response() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/amazon/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(500)))
+            .mount(&server)
+            .await;
+        let upstream = UpstreamConfig {
+            stream_read_timeout_ms: 20,
+            ..UpstreamConfig::default()
+        };
+        let client = KiroClient::new(upstream, EndpointOverrides::default()).expect("client");
+
+        let started = Instant::now();
+        let error = match client
+            .send_generation(
+                &account(AuthMethod::Idc),
+                &payload(),
+                generation_endpoint(&server),
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("silent upstream must time out"),
+        };
+
+        assert!(error.status.is_none());
+        assert!(started.elapsed() < Duration::from_millis(300));
     }
 
     #[tokio::test]

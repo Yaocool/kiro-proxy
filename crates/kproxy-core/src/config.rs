@@ -212,6 +212,10 @@ pub struct UpstreamConfig {
     pub web_search_endpoint: Option<String>,
     /// MCP Web Search 请求超时。
     pub web_search_timeout_ms: u64,
+    /// 等待流式连接槽位的最长时间。
+    pub stream_slot_wait_timeout_ms: u64,
+    /// 流式上游连续无响应数据的最长时间；不是请求总时长。
+    pub stream_read_timeout_ms: u64,
 }
 
 impl Default for UpstreamConfig {
@@ -224,6 +228,8 @@ impl Default for UpstreamConfig {
             pool: UpstreamPoolConfig::default(),
             web_search_endpoint: None,
             web_search_timeout_ms: 60_000,
+            stream_slot_wait_timeout_ms: 30_000,
+            stream_read_timeout_ms: 600_000,
         }
     }
 }
@@ -524,6 +530,8 @@ pub struct LogConfig {
     pub max_file_size_mb: u64,
     /// 按 UTC 日期保留最近多少天的文件。
     pub retention_days: u64,
+    /// 每个日志级别每天最多保留多少个分片，达到上限后丢弃该级别文件日志。
+    pub max_files_per_day: u64,
 }
 
 impl Default for LogConfig {
@@ -534,6 +542,7 @@ impl Default for LogConfig {
             file_path: String::new(),
             max_file_size_mb: 100,
             retention_days: 3,
+            max_files_per_day: 3,
         }
     }
 }
@@ -947,6 +956,14 @@ impl Config {
                 "idle and maximum lifetime must be greater than zero",
             );
         }
+        if self.upstream.stream_slot_wait_timeout_ms == 0
+            || self.upstream.stream_read_timeout_ms == 0
+        {
+            return invalid_config(
+                "upstream.stream_timeout",
+                "slot wait and read timeout must be greater than zero",
+            );
+        }
         if self.server.adaptive.p99_recover_ms > self.server.adaptive.p99_degrade_ms {
             return invalid_config(
                 "server.adaptive.p99_recover_ms",
@@ -1033,10 +1050,13 @@ impl Config {
         {
             return invalid_config("sso.start_url", "must use https://");
         }
-        if self.log.max_file_size_mb == 0 || self.log.retention_days == 0 {
+        if self.log.max_file_size_mb == 0
+            || self.log.retention_days == 0
+            || self.log.max_files_per_day == 0
+        {
             return invalid_config(
                 "log",
-                "max_file_size_mb and retention_days must be positive",
+                "max_file_size_mb, retention_days, and max_files_per_day must be positive",
             );
         }
         let mut api_key_ids = BTreeSet::new();
@@ -1290,6 +1310,8 @@ max_retries = 3
 token_refresh_before_expiry = 900
 # web_search_endpoint = "https://runtime.{region}.kiro.dev/mcp"
 web_search_timeout_ms = 60000
+stream_slot_wait_timeout_ms = 30000    # 等待流式连接槽位的上限
+stream_read_timeout_ms = 600000        # 连续 10 分钟无上游数据则中止，不限制流总时长
 
 [upstream.pool]
 http_max_connections = 128
@@ -1376,6 +1398,7 @@ format = "json"
 file_path = ""
 max_file_size_mb = 100
 retention_days = 3
+max_files_per_day = 3               # 每个级别每天最多 3 个分片
 
 [admin]
 socket = "/run/kproxy/admin.sock"
@@ -1480,6 +1503,8 @@ mod tests {
         assert_eq!(config.upstream.pool.http_max_connections, 128);
         assert_eq!(config.upstream.token_refresh_before_expiry, 900);
         assert_eq!(config.upstream.web_search_timeout_ms, 60_000);
+        assert_eq!(config.upstream.stream_slot_wait_timeout_ms, 30_000);
+        assert_eq!(config.upstream.stream_read_timeout_ms, 600_000);
         assert!(config.upstream.web_search_endpoint.is_none());
         assert_eq!(config.effective_token_refresh_before_expiry(), 900);
         assert_eq!(config.context.max_input_tokens, 200_000);
@@ -1494,6 +1519,7 @@ mod tests {
         assert!(config.storage.incremental_write);
         assert_eq!(config.log.max_file_size_mb, 100);
         assert_eq!(config.log.retention_days, 3);
+        assert_eq!(config.log.max_files_per_day, 3);
         assert!(config.model_mapping.is_empty());
         assert!(config.sso.start_url.is_empty());
         assert!(config.webhook.is_empty());
@@ -1525,6 +1551,25 @@ mod tests {
         let parsed: Config = toml::from_str("").expect("empty toml must parse");
         assert_eq!(parsed.server.port, 5580);
         assert_eq!(parsed.pool.max_concurrent_per_account, 50);
+    }
+
+    #[test]
+    fn stream_and_log_resource_limits_must_be_positive() {
+        let mut config = Config::default();
+        config.upstream.stream_slot_wait_timeout_ms = 0;
+        assert!(config
+            .validate()
+            .expect_err("zero stream timeout")
+            .to_string()
+            .contains("upstream.stream_timeout"));
+
+        let mut config = Config::default();
+        config.log.max_files_per_day = 0;
+        assert!(config
+            .validate()
+            .expect_err("zero log file limit")
+            .to_string()
+            .contains("log"));
     }
 
     #[test]

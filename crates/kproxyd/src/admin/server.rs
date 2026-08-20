@@ -25,11 +25,13 @@ pub async fn serve(
     restrict_socket_permissions(&socket_path)?;
     info!(socket = %socket_path.display(), "admin plane listening");
 
+    let mut accept_backoff = std::time::Duration::from_millis(25);
     loop {
         tokio::select! {
             () = shutdown.cancelled() => break,
             accepted = listener.accept() => match accepted {
                 Ok((stream, _address)) => {
+                    accept_backoff = std::time::Duration::from_millis(25);
                     let connection_state = Arc::clone(&state);
                     tokio::spawn(async move {
                         if let Err(connection_error) = handle_connection(connection_state, stream).await {
@@ -37,7 +39,14 @@ pub async fn serve(
                         }
                     });
                 }
-                Err(accept_error) => error!(error = %accept_error, "admin accept failed"),
+                Err(accept_error) => {
+                    error!(error = %accept_error, retry_ms = accept_backoff.as_millis(), "admin accept failed");
+                    tokio::select! {
+                        () = shutdown.cancelled() => break,
+                        () = tokio::time::sleep(accept_backoff) => {}
+                    }
+                    accept_backoff = (accept_backoff * 2).min(std::time::Duration::from_secs(5));
+                },
             },
         }
     }

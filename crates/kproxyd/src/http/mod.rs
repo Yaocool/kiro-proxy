@@ -86,6 +86,7 @@ fn router_for_service(
     Router::new()
         .route("/", get(handlers::root))
         .route("/health", get(handlers::health))
+        .route("/ready", get(handlers::readiness))
         .route(
             "/v1/messages",
             post(handlers::claude_messages).fallback(handlers::claude_method_not_allowed),
@@ -569,6 +570,35 @@ mod tests {
             trace_ids.push(trace_id);
         }
         assert_ne!(trace_ids[0], trace_ids[1]);
+    }
+
+    #[tokio::test]
+    async fn readiness_degrades_without_making_liveness_fail() {
+        let (_directory, state) = test_state(Config::default()).await;
+        let app = router(Arc::clone(&state));
+        let health = app
+            .clone()
+            .oneshot(
+                Request::get("/health")
+                    .body(Body::empty())
+                    .expect("health request"),
+            )
+            .await
+            .expect("health response");
+        let ready = app
+            .oneshot(
+                Request::get("/ready")
+                    .body(Body::empty())
+                    .expect("ready request"),
+            )
+            .await
+            .expect("ready response");
+
+        assert_eq!(health.status(), StatusCode::OK);
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!body_json(ready).await["ready"]
+            .as_bool()
+            .expect("ready flag"));
     }
 
     #[tokio::test]

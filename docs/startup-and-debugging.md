@@ -119,7 +119,10 @@ deleted by a second daemon.
 
 A fresh daemon intentionally starts with no business API proxy. `kproxy health`
 still returns success because daemon health is independent of account and proxy
-service availability. Create a service explicitly when it is needed:
+service availability. Use `kproxy ready` (or a proxy listener's `/ready`
+endpoint) when monitoring business readiness; it reports unavailable accounts,
+failed listeners, metering recovery, and stale background tasks without stopping
+the daemon. Create a service explicitly when it is needed:
 
 ```bash
 cargo run -p kproxy -- service create --name main

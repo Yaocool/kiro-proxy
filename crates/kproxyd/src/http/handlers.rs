@@ -58,6 +58,36 @@ pub async fn health(State(service): State<ServiceHttpState>) -> Json<Value> {
     }))
 }
 
+pub async fn readiness(State(service): State<ServiceHttpState>) -> Response {
+    let counts = service.app.pool().health_counts().await;
+    let mut reasons = service.app.task_registry.readiness_issues(&service.app);
+    if counts[0] == 0 {
+        reasons.push("no account is currently available".to_string());
+    }
+    if let Some(error) = service.app.meter.recovery_error() {
+        reasons.push(format!("metering recovery required: {error}"));
+    }
+    let ready = reasons.is_empty();
+    let status = if ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(json!({
+            "status":if ready { "ready" } else { "not_ready" },
+            "ready":ready,
+            "reasons":reasons,
+            "service_id":service.service.id,
+            "service_name":service.service.name,
+            "available_accounts":counts[0],
+            "uptime_secs":service.app.uptime_secs()
+        })),
+    )
+        .into_response()
+}
+
 pub async fn claude_messages(
     State(service): State<ServiceHttpState>,
     request: Request,
@@ -1342,7 +1372,7 @@ async fn execute_upstream(
             Err(PoolError::NoAvailableAccount(_))
                 if pool.all_matching_credit_exhausted(&actual_model).await =>
             {
-                trigger_quota_shutdown(
+                notify_quota_degradation(
                     state,
                     "All compatible Kiro accounts have exhausted their credit allowance",
                 );
@@ -1362,7 +1392,7 @@ async fn execute_upstream(
                     Err(PoolError::NoAvailableAccount(_))
                         if pool.all_matching_credit_exhausted(&actual_model).await =>
                     {
-                        trigger_quota_shutdown(
+                        notify_quota_degradation(
                             state,
                             "All compatible Kiro accounts have exhausted their credit allowance",
                         );
@@ -1380,7 +1410,7 @@ async fn execute_upstream(
                 Err(PoolError::NoAvailableAccount(_))
                     if pool.all_matching_credit_exhausted("").await =>
                 {
-                    trigger_quota_shutdown(
+                    notify_quota_degradation(
                         state,
                         "All enabled Kiro accounts have exhausted their credit allowance",
                     );
@@ -1659,7 +1689,7 @@ async fn execute_upstream(
                     event.account_id = Some(account.id.clone());
                     state.notifier().emit(event);
                     if pool.all_matching_credit_exhausted(&actual_model).await {
-                        trigger_quota_shutdown(
+                        notify_quota_degradation(
                             state,
                             "All compatible Kiro accounts have exhausted their credit allowance",
                         );
@@ -2508,7 +2538,7 @@ async fn collect_nonstream_rounds(
             );
             if let Err(error) = reservation.extend(estimated_credits) {
                 if matches!(error, MeterError::DailyLimitExceeded) {
-                    trigger_quota_shutdown(
+                    notify_quota_degradation(
                         state,
                         "The service daily credit limit was reached during Tool Search",
                     );
@@ -2665,7 +2695,7 @@ async fn collect_nonstream_rounds(
             .map_err(ExecuteError::Upstream)?;
             if let Err(error) = reservation.extend(estimated_credits) {
                 if matches!(error, MeterError::DailyLimitExceeded) {
-                    trigger_quota_shutdown(
+                    notify_quota_degradation(
                         state,
                         "The service daily credit limit was reached during Web Search",
                     );
@@ -2743,7 +2773,7 @@ async fn collect_nonstream_rounds(
         debug_assert!(budget_available);
         if let Err(error) = reservation.extend(estimated_credits) {
             if matches!(error, MeterError::DailyLimitExceeded) {
-                trigger_quota_shutdown(
+                notify_quota_degradation(
                     state,
                     "The service daily credit limit was reached during auto-continuation",
                 );
@@ -4054,7 +4084,7 @@ fn reserve_credits(
     match state.meter.reserve(key_id, estimate) {
         Ok(reservation) => Ok(reservation),
         Err(MeterError::DailyLimitExceeded) => {
-            trigger_quota_shutdown(
+            notify_quota_degradation(
                 state,
                 "The configured service daily credit limit has been reached",
             );
@@ -4064,10 +4094,7 @@ fn reserve_credits(
     }
 }
 
-pub(super) fn trigger_quota_shutdown(state: &Arc<AppState>, reason: &str) {
-    if !state.begin_quota_shutdown() {
-        return;
-    }
+pub(super) fn notify_quota_degradation(state: &Arc<AppState>, reason: &str) {
     state.notifier().emit(WebhookEvent::new(
         WebhookEventKind::QuotaExhausted,
         "Proxy credit quota exhausted",
@@ -4075,15 +4102,9 @@ pub(super) fn trigger_quota_shutdown(state: &Arc<AppState>, reason: &str) {
     ));
     state.notifier().emit(WebhookEvent::new(
         WebhookEventKind::ServiceDegraded,
-        "Proxy service stopping",
-        "The service stopped accepting requests after quota exhaustion",
+        "Proxy service quota degraded",
+        "Quota-bound requests are being rejected while the daemon and administration plane remain available",
     ));
-    let shutdown = state.shutdown.clone();
-    tokio::spawn(async move {
-        // Let the current error response and queued webhook deliveries leave the process.
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        shutdown.cancel();
-    });
 }
 
 fn upstream_error(error: ExecuteError, format: ErrorFormat) -> ApiError {
@@ -4096,7 +4117,7 @@ fn upstream_error(error: ExecuteError, format: ErrorFormat) -> ApiError {
         }
         ExecuteError::Pool(PoolError::CreditsExhausted) => ApiError::new(
             StatusCode::UNAUTHORIZED,
-            "Credit quota exhausted; service is paused until credits reset",
+            "Credit quota exhausted; no compatible account currently has usable credit",
             format,
         ),
         ExecuteError::Meter(error) => meter_error(error, format),
@@ -4397,8 +4418,44 @@ fn is_payload_budget_error(lower: &str) -> bool {
 #[cfg(test)]
 mod model_tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::time::Duration;
 
     use super::*;
+
+    #[tokio::test]
+    async fn quota_degradation_does_not_cancel_the_daemon() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = kproxy_core::paths::Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        let accounts = kproxy_store::accounts::AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("accounts");
+        let state = Arc::new(AppState::new(
+            paths,
+            kproxy_store::config_loader::ConfigHandle::new(kproxy_core::config::Config::default()),
+            accounts,
+        ));
+
+        notify_quota_degradation(
+            &state,
+            "All compatible Kiro accounts are below the protection threshold",
+        );
+
+        let shutdown = state.shutdown.clone();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1_200), shutdown.cancelled())
+                .await
+                .is_err(),
+            "quota degradation must not stop the daemon or administration plane"
+        );
+    }
 
     #[tokio::test]
     async fn context_limits_use_the_resolved_kiro_model_alias() {

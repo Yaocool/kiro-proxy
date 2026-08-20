@@ -130,7 +130,7 @@ pub enum AlertEvent {
     TokenExpired,
     /// 账号或代理服务的可用额度耗尽。
     QuotaExhausted,
-    /// 额度耗尽触发代理停止流程。
+    /// 额度耗尽导致额度相关请求进入降级状态。
     ServiceDegraded,
 }
 
@@ -921,7 +921,7 @@ fn alert_event_catalog() -> [AlertEventInfo; 5] {
         },
         AlertEventInfo {
             event: AlertEvent::ServiceDegraded.as_str(),
-            condition: "额度耗尽触发代理停止流程时发送；普通上游 5xx、限流或手动重启不会触发。",
+            condition: "额度耗尽导致相关请求进入降级拒绝状态时发送；daemon、管理面和后台恢复任务保持运行。",
         },
     ]
 }
