@@ -666,6 +666,38 @@ mod tests {
     }
 
     #[test]
+    fn compact_mode_protects_system_prompt_even_before_compaction_triggers() {
+        let request: ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"source-large",
+            "max_tokens":256,
+            "system":"governing system instruction",
+            "messages":[
+                {"role":"user","content":"old request"},
+                {"role":"assistant","content":"old response"},
+                {"role":"user","content":"small current request"}
+            ]
+        }))
+        .expect("request");
+        let mut options = TranslationOptions::new("mapped-small", "AI_EDITOR");
+        options.compact_mode = true;
+
+        let payload = claude_to_kiro(&request, &options);
+        let current = &payload
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+        assert!(current.contains("governing system instruction"));
+        assert!(current.contains("small current request"));
+        assert!(payload
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| message.user_input_message.as_ref())
+            .all(|message| !message.content.contains("governing system instruction")));
+    }
+
+    #[test]
     fn authenticated_web_replay_is_marked_untrusted_and_escaped() {
         let codec = super::super::WebSearchReplayCodec::from_key([0x71; 32]);
         let record = crate::WebSearchResult {
