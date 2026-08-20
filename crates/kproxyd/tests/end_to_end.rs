@@ -2,6 +2,8 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kproxy_ipc::protocol::{decode_line, encode_line, Request, Response};
@@ -218,6 +220,221 @@ impl wiremock::Respond for CompactionResponder {
             .insert_header("content-type", "application/vnd.amazon.eventstream")
             .set_body_bytes(generation_body(content))
     }
+}
+
+#[derive(Clone)]
+struct LongCompactionResponder;
+
+impl wiremock::Respond for LongCompactionResponder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let payload =
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap_or_default();
+        let current = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+            .as_str()
+            .unwrap_or_default();
+        let content = if current.contains("durable conversation checkpoint") {
+            format!(
+                "<summary>{}</summary>",
+                "durable checkpoint detail ".repeat(2_000)
+            )
+        } else {
+            "main request completed".into()
+        };
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "application/vnd.amazon.eventstream")
+            .set_body_bytes(generation_body(&content))
+    }
+}
+
+#[derive(Clone)]
+struct SlowCompactionResponder;
+
+impl wiremock::Respond for SlowCompactionResponder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let payload =
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap_or_default();
+        let current = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+            .as_str()
+            .unwrap_or_default();
+        let summary = current.contains("durable conversation checkpoint");
+        let content = if summary {
+            "<summary>Task Overview: finish accounting after the caller timeout.</summary>"
+        } else {
+            "main request completed while summary accounting continued"
+        };
+        let response = ResponseTemplate::new(200)
+            .insert_header("content-type", "application/vnd.amazon.eventstream")
+            .set_body_bytes(generation_body(content));
+        if summary {
+            response.set_delay(Duration::from_millis(100))
+        } else {
+            response
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PartialFailureCompactionResponder;
+
+impl wiremock::Respond for PartialFailureCompactionResponder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let payload =
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap_or_default();
+        let current = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+            .as_str()
+            .unwrap_or_default();
+        let body = if current.contains("durable conversation checkpoint") {
+            let mut body = generation_body(
+                "<summary>This summary is discarded because the stream ends malformed.</summary>",
+            );
+            // Preserve two complete events (including authoritative usage),
+            // then force decode_eof to report a truncated trailing frame.
+            body.extend_from_slice(&[0, 0, 0, 32, 0, 0, 0, 0]);
+            body
+        } else {
+            generation_body("main request completed after the failed summary was accounted")
+        };
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "application/vnd.amazon.eventstream")
+            .set_body_bytes(body)
+    }
+}
+
+#[derive(Clone, Default)]
+struct RetryingCompactionStreamResponder {
+    main_calls: Arc<AtomicUsize>,
+}
+
+impl wiremock::Respond for RetryingCompactionStreamResponder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let payload =
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap_or_default();
+        let current = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+            .as_str()
+            .unwrap_or_default();
+        let body = if current.contains("durable conversation checkpoint") {
+            generation_body(
+                "<summary>Task Overview: preserve the compacted stream across a retry.</summary>",
+            )
+        } else if self.main_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            event_stream_frame(
+                "toolUseEvent",
+                serde_json::json!({
+                    "toolUseEvent": {
+                        "toolUseId":"broken-write",
+                        "name":"write_file",
+                        "input":"{\"path\":",
+                        "stop":false
+                    }
+                }),
+            )
+        } else {
+            generation_body("main request completed after retry")
+        };
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "application/vnd.amazon.eventstream")
+            .set_body_bytes(body)
+    }
+}
+
+async fn mount_context_alignment_models(mock: &MockServer) {
+    Mock::given(method("GET"))
+        .and(path("/ListAvailableModels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "models":[
+                {
+                    "modelId":"source-large",
+                    "tokenLimits":{"maxInputTokens":1000000,"maxOutputTokens":16384}
+                },
+                {
+                    "modelId":"mapped-small",
+                    "tokenLimits":{"maxInputTokens":128000,"maxOutputTokens":16384}
+                },
+                {
+                    "modelId":"resolved-small",
+                    "tokenLimits":{"maxInputTokens":64000,"maxOutputTokens":16384}
+                },
+                {
+                    "modelId":"resolved-tiny",
+                    "tokenLimits":{"maxInputTokens":500,"maxOutputTokens":16384}
+                },
+                {
+                    "modelId":"summary-large",
+                    "tokenLimits":{"maxInputTokens":1000000,"maxOutputTokens":16384}
+                }
+            ]
+        })))
+        .mount(mock)
+        .await;
+}
+
+async fn import_context_alignment_account(daemon: &Daemon, used_credits: f64) {
+    assert_eq!(
+        expect_ok(
+            daemon
+                .call(
+                    "account.import",
+                    serde_json::json!({
+                        "accounts": [{
+                            "id": "acc_99999999",
+                            "email": "alignment@example.com",
+                            "machine_id": "9".repeat(64),
+                            "credentials": {
+                                "access_token": "alignment-token",
+                                "region": "us-east-1",
+                                "expires_at": 4_000_000_000i64,
+                                "auth_method": "idc"
+                            },
+                            "usage": {
+                                "current": used_credits,
+                                "limit": 100.0,
+                                "percent_used": used_credits,
+                                "updated_at": 1
+                            },
+                            "subscription": {"kind": "pro"},
+                            "created_at": 1
+                        }]
+                    }),
+                )
+                .await,
+        )["imported"],
+        1
+    );
+    let models = expect_ok(daemon.call("models", serde_json::json!({})).await);
+    assert_eq!(models.as_array().map(Vec::len), Some(5));
+}
+
+async fn configure_context_alignment(daemon: &Daemon, summary_model: &str, mapping: &str) {
+    let config_path = daemon.home().join("config.toml");
+    let raw = tokio::fs::read_to_string(&config_path)
+        .await
+        .expect("read config");
+    let edited = raw
+        .replace("model_mapping = []", "")
+        .replace(
+            "auto_compact_on_overflow = false",
+            "auto_compact_on_overflow = true",
+        )
+        .replace(
+            "compaction_summary_model = \"\"",
+            &format!("compaction_summary_model = \"{summary_model}\""),
+        );
+    let edited = format!("{edited}\n{mapping}\n");
+    toml::from_str::<kproxy_core::config::Config>(&edited).expect("parse edited config");
+    tokio::fs::write(&config_path, edited)
+        .await
+        .expect("write config");
+    let reload = expect_ok(daemon.call("config.reload", serde_json::json!({})).await);
+    assert_eq!(reload["applied"], true, "config reload failed: {reload}");
+    let shown = expect_ok(daemon.call("config.show", serde_json::json!({})).await);
+    assert_eq!(
+        shown["effective_json"]["context"]["auto_compact_on_overflow"],
+        true
+    );
+    assert!(!shown["effective_json"]["model_mapping"]
+        .as_array()
+        .expect("model mappings")
+        .is_empty());
 }
 
 #[tokio::test]
@@ -439,6 +656,8 @@ async fn claude_compaction_uses_a_separate_semantic_kiro_request() {
         .as_str()
         .is_some_and(|content| content.contains("migrate compact to semantic Kiro summaries")));
     assert_eq!(body["content"][1]["text"], "main request completed");
+    assert_eq!(body["usage"]["iterations"][0]["type"], "compaction");
+    assert_eq!(body["usage"]["iterations"][1]["type"], "message");
 
     let requests = mock.received_requests().await.expect("received requests");
     let payloads = requests
@@ -475,6 +694,736 @@ async fn claude_compaction_uses_a_separate_semantic_kiro_request() {
         main_request["conversationState"]["history"][0]["userInputMessage"]["content"]
             .as_str()
             .is_some_and(|content| content.contains("System-generated conversation checkpoint"))
+    );
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn model_mapping_overflow_auto_compacts_before_the_first_generation() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(CompactionResponder)
+        .mount(&mock)
+        .await;
+
+    let port = unused_tcp_port();
+    let upstream_url = format!("{}/generateAssistantResponse", mock.uri());
+    let daemon = Daemon::start_http(port, &upstream_url).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    configure_context_alignment(
+        &daemon,
+        "summary-large",
+        r#"
+[[model_mapping]]
+name = "large-to-small"
+type = "replace"
+source_models = ["source-large"]
+target_models = ["mapped-small"]
+priority = 10
+"#,
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header(
+            "x-api-key",
+            daemon.api_key.as_deref().expect("service API key"),
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("user-agent", "claude-cli/2.1.235 (external, e2e)")
+        .json(&serde_json::json!({
+            "model":"source-large",
+            "max_tokens":64,
+            "stream":false,
+            "system":"Never lose this governing instruction.",
+            "messages":[
+                {"role":"user","content":"old context ".repeat(140000)},
+                {"role":"assistant","content":"an earlier conclusion"},
+                {"role":"user","content":"continue the implementation"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("call automatic compact path");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("Claude response JSON");
+    assert_eq!(body["content"][0]["type"], "compaction");
+    assert_eq!(body["content"][1]["text"], "main request completed");
+    assert_eq!(body["usage"]["iterations"][0]["type"], "compaction");
+    assert_eq!(body["usage"]["iterations"][1]["type"], "message");
+    let applied = &body["context_management"]["applied_edits"][0];
+    assert_eq!(applied["reason"], "model_mapping_overflow");
+    assert!(
+        applied["original_input_tokens"].as_u64().expect("original")
+            > applied["compacted_input_tokens"]
+                .as_u64()
+                .expect("compacted")
+    );
+
+    let requests = mock.received_requests().await.expect("received requests");
+    let payloads = requests
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+        .filter(|payload| payload.get("conversationState").is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(payloads.len(), 2, "one summary plus one main generation");
+    let summary = payloads
+        .iter()
+        .find(|payload| {
+            payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("durable conversation checkpoint"))
+        })
+        .expect("summary request");
+    assert_eq!(
+        summary["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
+        "summary-large"
+    );
+    let main = payloads
+        .iter()
+        .find(|payload| {
+            payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+                .as_str()
+                .is_some_and(|content| {
+                    content.contains("continue the implementation")
+                        && !content.contains("durable conversation checkpoint")
+                })
+        })
+        .expect("main request");
+    assert_eq!(
+        main["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
+        "mapped-small"
+    );
+    assert!(
+        main["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Never lose this governing instruction."))
+    );
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn compacted_stream_retries_before_flushing_the_compaction_block() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let responder = RetryingCompactionStreamResponder::default();
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(responder.clone())
+        .mount(&mock)
+        .await;
+
+    let port = unused_tcp_port();
+    let upstream_url = format!("{}/generateAssistantResponse", mock.uri());
+    let daemon = Daemon::start_http(port, &upstream_url).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    assert_eq!(
+        expect_ok(
+            daemon
+                .call(
+                    "account.import",
+                    serde_json::json!({
+                        "accounts": [{
+                            "id": "acc_77777777",
+                            "email": "stream-retry@example.com",
+                            "machine_id": "7".repeat(64),
+                            "credentials": {
+                                "access_token": "stream-retry-token",
+                                "region": "us-east-1",
+                                "expires_at": 4_000_000_000i64,
+                                "auth_method": "idc"
+                            },
+                            "usage": {
+                                "current": 0.0,
+                                "limit": 100.0,
+                                "percent_used": 0.0,
+                                "updated_at": 1
+                            },
+                            "subscription": {"kind": "pro"},
+                            "created_at": 1
+                        }]
+                    }),
+                )
+                .await,
+        )["imported"],
+        1
+    );
+    configure_context_alignment(
+        &daemon,
+        "summary-large",
+        r#"
+[[model_mapping]]
+name = "large-to-small-stream"
+type = "replace"
+source_models = ["source-large"]
+target_models = ["mapped-small"]
+priority = 10
+"#,
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header(
+            "x-api-key",
+            daemon.api_key.as_deref().expect("service API key"),
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("user-agent", "claude-cli/2.1.235 (external, e2e)")
+        .json(&serde_json::json!({
+            "model":"source-large",
+            "max_tokens":64,
+            "stream":true,
+            "messages":[
+                {"role":"user","content":"old context ".repeat(140000)},
+                {"role":"assistant","content":"an earlier conclusion"},
+                {"role":"user","content":"continue the streamed implementation"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("call compacted stream retry path");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.text().await.expect("stream body");
+    assert_eq!(responder.main_calls.load(Ordering::SeqCst), 2);
+    assert!(!body.contains("broken-write"), "{body}");
+    assert!(!body.contains("produced complete JSON"), "{body}");
+    assert!(body.contains("compaction_delta"), "{body}");
+    assert!(
+        body.contains("main request completed after retry"),
+        "{body}"
+    );
+    assert!(
+        body.find("compaction_delta").expect("compaction")
+            < body
+                .find("main request completed after retry")
+                .expect("retried content")
+    );
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn timed_out_compaction_summary_is_still_accounted() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(SlowCompactionResponder)
+        .mount(&mock)
+        .await;
+
+    let port = unused_tcp_port();
+    let upstream_url = format!("{}/generateAssistantResponse", mock.uri());
+    let daemon = Daemon::start_http(port, &upstream_url).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    configure_context_alignment(
+        &daemon,
+        "summary-large",
+        r#"
+[[model_mapping]]
+name = "large-to-small-timeout"
+type = "replace"
+source_models = ["source-large"]
+target_models = ["mapped-small"]
+priority = 10
+"#,
+    )
+    .await;
+    let config_path = daemon.home().join("config.toml");
+    let raw = tokio::fs::read_to_string(&config_path)
+        .await
+        .expect("read config");
+    tokio::fs::write(
+        &config_path,
+        raw.replace(
+            "compaction_summary_timeout_ms = 30000",
+            "compaction_summary_timeout_ms = 1",
+        ),
+    )
+    .await
+    .expect("write timeout config");
+    let reload = expect_ok(daemon.call("config.reload", serde_json::json!({})).await);
+    assert_eq!(reload["applied"], true, "config reload failed: {reload}");
+
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header(
+            "x-api-key",
+            daemon.api_key.as_deref().expect("service API key"),
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("user-agent", "claude-cli/2.1.235 (external, e2e)")
+        .json(&serde_json::json!({
+            "model":"source-large",
+            "max_tokens":64,
+            "stream":false,
+            "messages":[
+                {"role":"user","content":"old context ".repeat(140000)},
+                {"role":"assistant","content":"an earlier conclusion"},
+                {"role":"user","content":"continue after the summary timeout"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("call summary timeout path");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("Claude response JSON");
+    assert_eq!(body["content"][0]["type"], "compaction");
+    assert_eq!(
+        body["content"][1]["text"],
+        "main request completed while summary accounting continued"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        let stats = expect_ok(
+            daemon
+                .call("stats", serde_json::json!({"detail":true,"recent":20}))
+                .await,
+        );
+        let accounted = stats["stats"]["recent_requests"]
+            .as_array()
+            .is_some_and(|requests| {
+                requests.iter().any(|request| {
+                    request["path"] == "/internal/compact"
+                        && request["input_tokens"]
+                            .as_u64()
+                            .is_some_and(|tokens| tokens > 0)
+                        && request["credits"]
+                            .as_f64()
+                            .is_some_and(|credits| credits > 0.0)
+                })
+            });
+        if accounted {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed-out summary never reached stats accounting: {stats}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn failed_compaction_stream_preserves_partial_usage_accounting() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(PartialFailureCompactionResponder)
+        .mount(&mock)
+        .await;
+
+    let port = unused_tcp_port();
+    let upstream_url = format!("{}/generateAssistantResponse", mock.uri());
+    let daemon = Daemon::start_http(port, &upstream_url).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    configure_context_alignment(
+        &daemon,
+        "summary-large",
+        r#"
+[[model_mapping]]
+name = "large-to-small-partial-summary"
+type = "replace"
+source_models = ["source-large"]
+target_models = ["mapped-small"]
+priority = 10
+"#,
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header(
+            "x-api-key",
+            daemon.api_key.as_deref().expect("service API key"),
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("user-agent", "claude-cli/2.1.235 (external, e2e)")
+        .json(&serde_json::json!({
+            "model":"source-large",
+            "max_tokens":64,
+            "stream":false,
+            "messages":[
+                {"role":"user","content":"old context ".repeat(140000)},
+                {"role":"assistant","content":"an earlier conclusion"},
+                {"role":"user","content":"continue after the malformed summary stream"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("call malformed summary stream path");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("Claude response JSON");
+    assert_eq!(body["content"][0]["type"], "compaction");
+    assert_eq!(
+        body["content"][1]["text"],
+        "main request completed after the failed summary was accounted"
+    );
+    assert_eq!(body["usage"]["iterations"][0]["input_tokens"], 100);
+    assert_eq!(body["usage"]["iterations"][0]["output_tokens"], 20);
+
+    let stats = expect_ok(
+        daemon
+            .call("stats", serde_json::json!({"detail":true,"recent":20}))
+            .await,
+    );
+    let compact = stats["stats"]["recent_requests"]
+        .as_array()
+        .and_then(|requests| {
+            requests
+                .iter()
+                .find(|request| request["path"] == "/internal/compact")
+        })
+        .expect("failed compact request was recorded");
+    assert_eq!(compact["status"], 502);
+    assert_eq!(compact["input_tokens"], 100);
+    assert_eq!(compact["output_tokens"], 20);
+    assert_eq!(compact["credits"], 0.25);
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn resolved_account_window_replans_once_and_reuses_the_summary() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(CompactionResponder)
+        .mount(&mock)
+        .await;
+
+    let port = unused_tcp_port();
+    let upstream_url = format!("{}/generateAssistantResponse", mock.uri());
+    let daemon = Daemon::start_http(port, &upstream_url).await;
+    import_context_alignment_account(&daemon, 50.0).await;
+    configure_context_alignment(
+        &daemon,
+        "summary-large",
+        r#"
+[[model_mapping]]
+name = "low-credit-small-window"
+type = "replace"
+source_models = ["source-large"]
+target_models = ["resolved-small"]
+max_remaining_credit_percent = 90.0
+priority = 10
+"#,
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header(
+            "x-api-key",
+            daemon.api_key.as_deref().expect("service API key"),
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("user-agent", "claude-cli/2.1.235 (external, e2e)")
+        .json(&serde_json::json!({
+            "model":"source-large",
+            "max_tokens":64,
+            "stream":false,
+            "messages":[
+                {"role":"user","content":"resolved history ".repeat(35000)},
+                {"role":"assistant","content":"keep the decision"},
+                {"role":"user","content":"finish after replanning"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("call resolved-window compact path");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("Claude response JSON");
+    assert_eq!(body["content"][0]["type"], "compaction");
+
+    let requests = mock.received_requests().await.expect("received requests");
+    let payloads = requests
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+        .filter(|payload| payload.get("conversationState").is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        payloads.len(),
+        2,
+        "the failed context preflight must not reach Kiro and replanning must not resummarize"
+    );
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(
+                |payload| payload["conversationState"]["currentMessage"]["userInputMessage"]
+                    ["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("durable conversation checkpoint"))
+            )
+            .count(),
+        1
+    );
+    let main = payloads
+        .iter()
+        .find(|payload| {
+            payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+                .as_str()
+                .is_some_and(|content| {
+                    content.contains("finish after replanning")
+                        && !content.contains("durable conversation checkpoint")
+                })
+        })
+        .expect("main request");
+    assert_eq!(
+        main["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
+        "resolved-small"
+    );
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn mapped_compaction_is_reapplied_for_a_smaller_resolved_window_without_resummarizing() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(LongCompactionResponder)
+        .mount(&mock)
+        .await;
+
+    let port = unused_tcp_port();
+    let upstream_url = format!("{}/generateAssistantResponse", mock.uri());
+    let daemon = Daemon::start_http(port, &upstream_url).await;
+    import_context_alignment_account(&daemon, 50.0).await;
+    configure_context_alignment(
+        &daemon,
+        "summary-large",
+        r#"
+[[model_mapping]]
+name = "low-credit-tiny-window"
+type = "replace"
+source_models = ["source-large"]
+target_models = ["resolved-tiny"]
+max_remaining_credit_percent = 90.0
+priority = 5
+
+[[model_mapping]]
+name = "large-to-small"
+type = "replace"
+source_models = ["source-large"]
+target_models = ["mapped-small"]
+priority = 10
+"#,
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header(
+            "x-api-key",
+            daemon.api_key.as_deref().expect("service API key"),
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("user-agent", "claude-cli/2.1.235 (external, e2e)")
+        .json(&serde_json::json!({
+            "model":"source-large",
+            "max_tokens":64,
+            "stream":false,
+            "messages":[
+                {"role":"user","content":"mapped history ".repeat(140000)},
+                {"role":"assistant","content":"keep the decision"},
+                {"role":"user","content":"finish after semantic reuse"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("call two-window compact path");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("Claude response JSON");
+    assert_eq!(body["content"][0]["type"], "compaction");
+    assert!(body["content"][0]["content"]
+        .as_str()
+        .is_some_and(|content| content.contains("checkpoint shortened to fit context")));
+
+    let requests = mock.received_requests().await.expect("received requests");
+    let payloads = requests
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+        .filter(|payload| payload.get("conversationState").is_some())
+        .collect::<Vec<_>>();
+    assert_eq!(payloads.len(), 2, "one summary plus one main request");
+    assert_eq!(
+        payloads
+            .iter()
+            .filter(
+                |payload| payload["conversationState"]["currentMessage"]["userInputMessage"]
+                    ["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("durable conversation checkpoint"))
+            )
+            .count(),
+        1,
+        "resolved-window replanning must reuse the first summary"
+    );
+    let main = payloads
+        .iter()
+        .find(|payload| {
+            payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+                .as_str()
+                .is_some_and(|content| {
+                    content.contains("finish after semantic reuse")
+                        && !content.contains("durable conversation checkpoint")
+                })
+        })
+        .expect("main request");
+    assert_eq!(
+        main["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
+        "resolved-tiny"
+    );
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn a_second_smaller_resolved_window_fails_without_a_compaction_loop() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(CompactionResponder)
+        .mount(&mock)
+        .await;
+
+    let port = unused_tcp_port();
+    let upstream_url = format!("{}/generateAssistantResponse", mock.uri());
+    let daemon = Daemon::start_http(port, &upstream_url).await;
+    import_context_alignment_account(&daemon, 20.0).await;
+    assert_eq!(
+        expect_ok(
+            daemon
+                .call(
+                    "account.import",
+                    serde_json::json!({
+                        "accounts": [{
+                            "id": "acc_88888888",
+                            "email": "smaller-window@example.com",
+                            "machine_id": "8".repeat(64),
+                            "credentials": {
+                                "access_token": "smaller-window-token",
+                                "region": "us-east-1",
+                                "expires_at": 4_000_000_000i64,
+                                "auth_method": "idc"
+                            },
+                            "usage": {
+                                "current": 30.0,
+                                "limit": 100.0,
+                                "percent_used": 30.0,
+                                "updated_at": 1
+                            },
+                            "subscription": {"kind": "pro"},
+                            "created_at": 1
+                        }]
+                    }),
+                )
+                .await,
+        )["imported"],
+        1
+    );
+    configure_context_alignment(
+        &daemon,
+        // Force capacity preflight to choose extractive fallback so the
+        // summary operation cannot affect which account the second main
+        // preflight selects.
+        "resolved-tiny",
+        r#"
+[[model_mapping]]
+name = "lowest-credit-tiny-window"
+type = "replace"
+source_models = ["source-large"]
+target_models = ["resolved-tiny"]
+max_remaining_credit_percent = 75.0
+priority = 5
+
+[[model_mapping]]
+name = "low-credit-small-window"
+type = "replace"
+source_models = ["source-large"]
+target_models = ["resolved-small"]
+max_remaining_credit_percent = 85.0
+priority = 10
+"#,
+    )
+    .await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header(
+            "x-api-key",
+            daemon.api_key.as_deref().expect("service API key"),
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("user-agent", "claude-cli/2.1.235 (external, e2e)")
+        .json(&serde_json::json!({
+            "model":"source-large",
+            "max_tokens":64,
+            "stream":false,
+            "messages":[
+                {"role":"user","content":"resolved drift history ".repeat(35000)},
+                {"role":"assistant","content":"keep the decision"},
+                {"role":"user","content":"this must stop after one replan ".repeat(2000)}
+            ]
+        }))
+        .send()
+        .await
+        .expect("call bounded resolved-window path");
+    let status = response.status();
+    let body: serde_json::Value = response.json().await.expect("Claude error JSON");
+    let requests = mock.received_requests().await.expect("received requests");
+    let generated_models = requests
+        .iter()
+        .filter(|request| request.url.path() == "/generateAssistantResponse")
+        .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+        .filter_map(|payload| {
+            payload["conversationState"]["currentMessage"]["userInputMessage"]["modelId"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "unexpected response {body}; generated models: {generated_models:?}"
+    );
+    let message = body["error"]["message"].as_str().expect("error message");
+    assert!(
+        message.contains("resolved-tiny"),
+        "unexpected error: {message}; generated models: {generated_models:?}"
+    );
+    assert!(message.contains("prompt is too long"));
+    assert!(
+        message.contains(" > 495"),
+        "unexpected safe window: {message}"
+    );
+
+    assert_eq!(
+        generated_models.len(),
+        0,
+        "both account checks must fail before Kiro and no third attempt is allowed"
     );
 
     daemon.stop().await;

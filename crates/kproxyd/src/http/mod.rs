@@ -646,7 +646,8 @@ mod tests {
         assert_eq!(body["error"]["type"], "invalid_request_error");
         assert_eq!(body["request_id"], request_id);
         let message = body["error"]["message"].as_str().expect("message");
-        assert!(message.starts_with("prompt is too long: "));
+        assert!(message.starts_with("prompt is too long for model '"));
+        assert!(message.contains("claude-sonnet-4.6"));
         assert!(message.ends_with(" tokens > 128"));
     }
 
@@ -836,6 +837,38 @@ mod tests {
             .as_str()
             .expect("message")
             .contains("Claude Code"));
+    }
+
+    #[tokio::test]
+    async fn openai_overflow_remains_a_hard_context_error_when_auto_compact_is_enabled() {
+        let mut config = Config::default();
+        config.context.max_input_tokens = 1_000;
+        config.context.auto_compact_on_overflow = true;
+        let (_directory, state) = test_state(config).await;
+        let response = router(state)
+            .oneshot(
+                Request::post("/v1/chat/completions")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "model":"mapped-small",
+                            "messages":[{"role":"user","content":"large input ".repeat(2000)}],
+                            "max_tokens":1
+                        })
+                        .to_string(),
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = body_json(response).await;
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .expect("message")
+            .contains("prompt is too long"));
     }
 
     #[tokio::test]
