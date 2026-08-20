@@ -9,8 +9,9 @@ use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine;
+use bytes::BytesMut;
 use futures::StreamExt;
-use kproxy_kiro::{KiroError, KiroResponse};
+use kproxy_kiro::{EventStreamDecoder, KiroError, KiroEvent, KiroResponse};
 use kproxy_notify::{WebhookEvent, WebhookEventKind};
 use kproxy_pool::{AccountLease, PoolError};
 use kproxy_translate::model::{apply_adaptive_thinking, map_model, thinking_enabled_for_model};
@@ -21,11 +22,13 @@ use kproxy_translate::{
     openai_to_kiro, resume_tool_search_payload, resume_web_search_payload, sanitize_error_message,
     tool_search_continue_payload_batch, validate_claude, validate_openai,
     web_search_continue_payload_batch, ClaudeRequest, ClaudeToolSearchBudget,
-    ClaudeToolSearchCatalog, ClaudeWebSearchTrace, ErrorFormat, KiroToolUse, OpenAiRequest,
-    TranslationOptions, ValidationError,
+    ClaudeToolSearchCatalog, ClaudeWebSearchTrace, ErrorFormat, KiroCompactionPlan, KiroPayload,
+    KiroToolUse, OpenAiRequest, TranslationOptions, ValidationError,
 };
 use rand::Rng;
 use serde_json::{json, Value};
+use tokio_util::codec::Decoder;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
@@ -35,13 +38,91 @@ use crate::stats::{RequestDiagnostics, RequestLog, UpstreamAttemptLog};
 
 use super::prompt_cache::PromptCacheProfile;
 use super::request_trace_id;
-use super::response::{ClaudeServerEvent, DecodedResponse, OpenAiToolIdentity, ToolLeakFilter};
+use super::response::{
+    ClaudeServerEvent, CompactionIterationUsage, DecodedResponse, OpenAiToolIdentity,
+    ToolLeakFilter,
+};
 use super::stream::{self, StreamContext, StreamProtocol};
 use super::usage::{fallback_credits, fill_missing_usage};
 use super::ServiceHttpState;
 
 const MAX_STATS_MODEL_CHARS: usize = 128;
 const UNKNOWN_STATS_MODEL: &str = "unknown";
+const MIN_COMPACTION_BACKGROUND_GRACE: Duration = Duration::from_millis(250);
+const MAX_COMPACTION_BACKGROUND_GRACE: Duration = Duration::from_secs(5);
+const COMPACTION_CLEANUP_GRACE: Duration = Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CompactionReason {
+    ClientTrigger,
+    MappedWindowOverflow,
+    ResolvedWindowOverflow,
+}
+
+impl CompactionReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ClientTrigger => "client_trigger",
+            Self::MappedWindowOverflow => "mapped_overflow",
+            Self::ResolvedWindowOverflow => "resolved_overflow",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CompactionDecision {
+    reasons: Vec<CompactionReason>,
+    model: String,
+    trigger_tokens: u64,
+    target_tokens: u64,
+    maximum_tokens: u64,
+}
+
+impl CompactionDecision {
+    fn reason_names(&self) -> String {
+        self.reasons
+            .iter()
+            .map(|reason| reason.as_str())
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+}
+
+#[derive(Clone)]
+enum CompactionArtifact {
+    Semantic {
+        source_payload: KiroPayload,
+        plan: KiroCompactionPlan,
+        summary: String,
+        usage: CompactionIterationUsage,
+    },
+    Extractive {
+        source_payload: KiroPayload,
+        preserve_recent_turns: usize,
+        usage: Option<CompactionIterationUsage>,
+    },
+}
+
+struct CompactionRun {
+    payload: KiroPayload,
+    stats: kproxy_translate::ContextCompactionStats,
+    artifact: Option<CompactionArtifact>,
+    mode: &'static str,
+    summary_model: Option<String>,
+    summary_input_tokens: Option<u64>,
+    fallback_reason: Option<&'static str>,
+    iteration_usage: Option<CompactionIterationUsage>,
+}
+
+struct CompactionRequest<'a> {
+    trace_id: &'a str,
+    key_id: Option<&'a str>,
+    source_payload: &'a KiroPayload,
+    decision: &'a CompactionDecision,
+    summary_model: &'a str,
+    summary_timeout_ms: u64,
+    preserve_recent_turns: usize,
+}
 
 pub async fn root() -> Json<Value> {
     Json(json!({"name":"kiro-proxy","status":"ok","version":env!("CARGO_PKG_VERSION")}))
@@ -475,7 +556,7 @@ async fn handle_claude(
     );
     let mut options = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
     options.enhance_system_prompt = config.features.enhance_system_prompt;
-    options.compact_mode = compact_trigger.is_some();
+    options.compact_mode = compact_trigger.is_some() || config.context.auto_compact_on_overflow;
     options.web_search_replay = Some(state.web_search_replay.clone());
     let mut payload = claude_to_kiro(&request, &options);
     let original_tool_count = request.tools.len();
@@ -722,124 +803,66 @@ async fn handle_claude(
         })? as u64;
     let mut compacted = compact_boundary_applied;
     let mut compaction_summary = None;
-    let effective_compact_trigger =
-        compact_trigger.map(|trigger| trigger.min(context_maximum(&state, false, &route.mapped)));
-    if let Some(trigger) = effective_compact_trigger.filter(|trigger| input_tokens >= *trigger) {
-        let target = compact_target_tokens(&state, &route.mapped, trigger);
-        let preserve_recent_turns = config.context.compaction_preserve_recent_turns;
-        let source_payload = payload.clone();
-        let plan = state
-            .tokenizer
-            .plan_kiro_compaction(&source_payload, target as usize, preserve_recent_turns)
-            .await
-            .map_err(|error| {
-                ApiError::new(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    error,
-                    ErrorFormat::Claude,
-                )
-            })?;
-        let mut compaction_mode = "none";
-        let stats = if let Some(plan) = plan {
-            let summary_model = if config.context.compaction_summary_model.trim().is_empty() {
-                route.mapped.as_str()
-            } else {
-                config.context.compaction_summary_model.trim()
-            };
-            let summary_payload = compaction_summary_payload(&source_payload, &plan, summary_model);
-            let semantic = generate_compaction_summary(
-                &state,
-                &trace_id,
-                key_id.as_deref(),
-                summary_model,
-                summary_payload,
-                config.context.compaction_summary_timeout_ms,
-            )
-            .await;
-            match semantic {
-                Ok(summary) => {
-                    payload.clone_from(&source_payload);
-                    match state
-                        .tokenizer
-                        .apply_semantic_compaction(&mut payload, &plan, &summary, target as usize)
-                        .await
-                    {
-                        Ok(stats) => {
-                            compaction_mode = "semantic";
-                            stats
-                        }
-                        Err(error) => {
-                            tracing::warn!(
-                                trace_id = %trace_id,
-                                reason = %sanitize_error_message(&error),
-                                "semantic compaction could not satisfy the target; using extractive fallback"
-                            );
-                            payload.clone_from(&source_payload);
-                            compaction_mode = "extractive_fallback";
-                            state
-                                .tokenizer
-                                .compact_kiro_payload(
-                                    &mut payload,
-                                    target as usize,
-                                    preserve_recent_turns,
-                                )
-                                .await
-                                .map_err(|error| {
-                                    ApiError::new(
-                                        StatusCode::INTERNAL_SERVER_ERROR,
-                                        error,
-                                        ErrorFormat::Claude,
-                                    )
-                                })?
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        trace_id = %trace_id,
-                        reason = %sanitize_error_message(&error),
-                        "semantic compaction request failed; using extractive fallback"
-                    );
-                    payload.clone_from(&source_payload);
-                    compaction_mode = "extractive_fallback";
-                    state
-                        .tokenizer
-                        .compact_kiro_payload(&mut payload, target as usize, preserve_recent_turns)
-                        .await
-                        .map_err(|error| {
-                            ApiError::new(
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                error,
-                                ErrorFormat::Claude,
-                            )
-                        })?
-                }
-            }
+    let initial_input_tokens = input_tokens;
+    let mut compaction_artifact = None;
+    let mut auto_compaction_original_input_tokens = None;
+    let mut compaction_iteration = None;
+    if let Some(decision) = initial_compaction_decision(
+        &state,
+        &route.mapped,
+        input_tokens,
+        compact_trigger,
+        config.context.auto_compact_on_overflow,
+    ) {
+        let summary_model = if config.context.compaction_summary_model.trim().is_empty() {
+            route.mapped.as_str()
         } else {
-            kproxy_translate::ContextCompactionStats {
-                original_tokens: input_tokens as usize,
-                compacted_tokens: input_tokens as usize,
-                ..kproxy_translate::ContextCompactionStats::default()
-            }
+            config.context.compaction_summary_model.trim()
         };
-        input_tokens = stats.compacted_tokens as u64;
-        compacted |= stats.removed_messages > 0;
-        compaction_summary = stats.summary;
+        let run = run_compaction(
+            &state,
+            CompactionRequest {
+                trace_id: &trace_id,
+                key_id: key_id.as_deref(),
+                source_payload: &payload,
+                decision: &decision,
+                summary_model,
+                summary_timeout_ms: config.context.compaction_summary_timeout_ms,
+                preserve_recent_turns: config.context.compaction_preserve_recent_turns,
+            },
+        )
+        .await?;
+        if decision
+            .reasons
+            .contains(&CompactionReason::MappedWindowOverflow)
+            && run.stats.removed_messages > 0
+        {
+            auto_compaction_original_input_tokens = Some(initial_input_tokens);
+        }
+        payload = run.payload;
+        input_tokens = run.stats.compacted_tokens as u64;
+        compacted |= run.stats.removed_messages > 0;
+        compaction_summary = run.stats.summary.clone();
+        compaction_iteration = run.iteration_usage;
+        compaction_artifact = run.artifact;
         tracing::info!(
             trace_id = %trace_id,
-            original_input_tokens = stats.original_tokens,
-            compacted_input_tokens = stats.compacted_tokens,
-            removed_messages = stats.removed_messages,
-            target_tokens = target,
-            compaction_mode,
+            compaction_reason = %decision.reason_names(),
+            compaction_model = %decision.model,
+            trigger_tokens = decision.trigger_tokens,
+            target_tokens = decision.target_tokens,
+            maximum_tokens = decision.maximum_tokens,
+            original_input_tokens = run.stats.original_tokens,
+            compacted_input_tokens = run.stats.compacted_tokens,
+            removed_messages = run.stats.removed_messages,
+            compaction_mode = run.mode,
+            compaction_summary_model = run.summary_model.as_deref().unwrap_or("none"),
+            summary_input_tokens = run.summary_input_tokens.unwrap_or(0),
+            summary_output_tokens = run.iteration_usage.map_or(0, |usage| usage.output_tokens),
+            fallback_reason = run.fallback_reason.unwrap_or("none"),
             "request context compacted"
         );
     }
-    let prompt_cache = config
-        .features
-        .enable_prompt_cache
-        .then(|| state.prompt_cache.claude_profile(&request, input_tokens))
-        .flatten();
     let full_tool_tokens = state
         .tokenizer
         .estimate_claude_tools(&claude_loaded_tools(&request))
@@ -864,7 +887,7 @@ async fn handle_claude(
         })? as u64)
         .max(full_tool_tokens);
     let payload_bytes = serialized_payload_bytes(&payload, ErrorFormat::Claude)?;
-    let diagnostics = RequestDiagnostics {
+    let mut diagnostics = RequestDiagnostics {
         original_tool_count,
         loaded_tool_count: loaded_tool_count(&payload),
         deferred_tool_count: tool_search
@@ -891,7 +914,7 @@ async fn handle_claude(
         &route.mapped,
         ErrorFormat::Claude,
     )?;
-    let estimate = estimated_credits(input_tokens, request.max_tokens, &config.pool);
+    let mut estimate = estimated_credits(input_tokens, request.max_tokens, &config.pool);
     let reservation = reserve_credits(&state, key_id.as_deref(), estimate, ErrorFormat::Claude)?;
     tracing::info!(
         trace_id = %trace_id,
@@ -911,16 +934,7 @@ async fn handle_claude(
     );
     drop(body);
     let request_id = format!("msg_{}", Uuid::new_v4().simple());
-    let UpstreamExecution {
-        lease,
-        response: upstream,
-        mapped_model,
-        kiro_model,
-        model_path,
-        model_mapping_rule,
-        attempts,
-        payload,
-    } = execute_upstream(
+    let first_execution = execute_upstream(
         &state,
         &trace_id,
         &route.mapped,
@@ -932,8 +946,134 @@ async fn handle_claude(
         compacted,
         &payload,
     )
-    .await
-    .map_err(|error| upstream_error(error, ErrorFormat::Claude))?;
+    .await;
+    let (execution, reservation) = match first_execution {
+        Ok(execution) => (execution, reservation),
+        Err(ExecuteError::ContextLimit(limit)) if config.context.auto_compact_on_overflow => {
+            drop(reservation);
+            let decision = resolved_compaction_decision(&limit);
+            let summary_model = if config.context.compaction_summary_model.trim().is_empty() {
+                route.mapped.as_str()
+            } else {
+                config.context.compaction_summary_model.trim()
+            };
+            let run = if let Some(artifact) = compaction_artifact.as_ref() {
+                reapply_compaction(&state, artifact, &decision).await?
+            } else {
+                run_compaction(
+                    &state,
+                    CompactionRequest {
+                        trace_id: &trace_id,
+                        key_id: key_id.as_deref(),
+                        source_payload: &payload,
+                        decision: &decision,
+                        summary_model,
+                        summary_timeout_ms: config.context.compaction_summary_timeout_ms,
+                        preserve_recent_turns: config.context.compaction_preserve_recent_turns,
+                    },
+                )
+                .await?
+            };
+            if run.stats.removed_messages > 0 {
+                auto_compaction_original_input_tokens.get_or_insert(initial_input_tokens);
+            }
+            payload = run.payload;
+            input_tokens = run.stats.compacted_tokens as u64;
+            compacted |= run.stats.removed_messages > 0;
+            compaction_summary = run.stats.summary.clone();
+            compaction_iteration = run.iteration_usage;
+            let replanned_tool_tokens = (state
+                .tokenizer
+                .estimate_kiro_tools(&payload)
+                .await
+                .map_err(|error| {
+                    ApiError::new(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        error,
+                        ErrorFormat::Claude,
+                    )
+                })? as u64)
+                .max(full_tool_tokens);
+            let replanned_payload_bytes = serialized_payload_bytes(&payload, ErrorFormat::Claude)?;
+            enforce_payload_budget(
+                &state,
+                replanned_tool_tokens,
+                replanned_payload_bytes,
+                loaded_tool_count(&payload),
+                tool_search.is_some(),
+                ErrorFormat::Claude,
+            )?;
+            enforce_context(
+                &state,
+                input_tokens,
+                true,
+                &decision.model,
+                ErrorFormat::Claude,
+            )?;
+            diagnostics.tool_tokens = replanned_tool_tokens;
+            diagnostics.payload_bytes = replanned_payload_bytes;
+            diagnostics.loaded_tool_count = loaded_tool_count(&payload);
+            diagnostics.loaded_tool_bytes = loaded_tool_bytes(&payload);
+            estimate = estimated_credits(input_tokens, request.max_tokens, &config.pool);
+            let reservation =
+                reserve_credits(&state, key_id.as_deref(), estimate, ErrorFormat::Claude)?;
+            tracing::info!(
+                trace_id = %trace_id,
+                compaction_reason = %decision.reason_names(),
+                resolved_model = %decision.model,
+                resolved_context_maximum = decision.maximum_tokens,
+                target_tokens = decision.target_tokens,
+                original_input_tokens = run.stats.original_tokens,
+                compacted_input_tokens = run.stats.compacted_tokens,
+                removed_messages = run.stats.removed_messages,
+                compaction_mode = run.mode,
+                compaction_summary_model = run.summary_model.as_deref().unwrap_or("reused"),
+                summary_input_tokens = run.summary_input_tokens.unwrap_or(0),
+                summary_output_tokens = run.iteration_usage.map_or(0, |usage| usage.output_tokens),
+                fallback_reason = run.fallback_reason.unwrap_or("none"),
+                resolved_replanned = true,
+                "request context replanned for resolved account model"
+            );
+            let execution = execute_upstream(
+                &state,
+                &trace_id,
+                &route.mapped,
+                &request.model,
+                key_id.as_deref(),
+                &config.features.default_model_id,
+                estimate,
+                input_tokens,
+                true,
+                &payload,
+            )
+            .await
+            .map_err(|error| upstream_error(error, ErrorFormat::Claude))?;
+            (execution, reservation)
+        }
+        Err(error) => return Err(upstream_error(error, ErrorFormat::Claude)),
+    };
+    let prompt_cache = if config.features.enable_prompt_cache {
+        if compaction_summary.is_some() {
+            state
+                .prompt_cache
+                .claude_compacted_profile(&state.tokenizer, &request, input_tokens)
+                .await
+        } else {
+            state.prompt_cache.claude_profile(&request, input_tokens)
+        }
+    } else {
+        None
+    };
+    let UpstreamExecution {
+        lease,
+        response: upstream,
+        mapped_model,
+        kiro_model,
+        model_path,
+        model_mapping_rule,
+        attempts,
+        payload,
+    } = execution;
     if request.stream {
         return Ok(stream::response(
             upstream,
@@ -956,6 +1096,8 @@ async fn handle_claude(
                 input_tokens,
                 compact: compacted,
                 compaction_summary,
+                compaction_iteration,
+                auto_compaction_original_input_tokens,
                 estimated_credits: estimate,
                 max_tokens: request.max_tokens,
                 started,
@@ -1004,6 +1146,8 @@ async fn handle_claude(
         started,
         prompt_cache,
         compaction_summary,
+        compaction_iteration,
+        auto_compaction_original_input_tokens,
         tool_search,
         max_tool_search_operations,
         tool_search_operations,
@@ -1228,6 +1372,8 @@ async fn handle_openai(
                 input_tokens,
                 compact: false,
                 compaction_summary: None,
+                compaction_iteration: None,
+                auto_compaction_original_input_tokens: None,
                 estimated_credits: estimate,
                 max_tokens,
                 started,
@@ -1414,6 +1560,25 @@ fn is_public_address(address: IpAddr) -> bool {
 
 const COMPACTION_USAGE_PATH: &str = "/internal/compact";
 
+struct GeneratedCompactionSummary {
+    content: String,
+    usage: CompactionIterationUsage,
+}
+
+struct CompactionSummaryFailure {
+    message: String,
+    usage: Option<CompactionIterationUsage>,
+}
+
+impl From<String> for CompactionSummaryFailure {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            usage: None,
+        }
+    }
+}
+
 async fn generate_compaction_summary(
     state: &Arc<AppState>,
     trace_id: &str,
@@ -1421,17 +1586,117 @@ async fn generate_compaction_summary(
     summary_model: &str,
     payload: kproxy_translate::KiroPayload,
     timeout_ms: u64,
-) -> Result<String, String> {
-    match tokio::time::timeout(
-        Duration::from_millis(timeout_ms),
-        generate_compaction_summary_inner(state, trace_id, key_id, summary_model, payload),
+) -> Result<GeneratedCompactionSummary, CompactionSummaryFailure> {
+    let owned_state = Arc::clone(state);
+    let owned_trace_id = trace_id.to_owned();
+    let owned_key_id = key_id.map(str::to_owned);
+    let owned_summary_model = summary_model.to_owned();
+    let cancel = CancellationToken::new();
+    let task_cancel = cancel.clone();
+    let task = tokio::spawn(async move {
+        generate_compaction_summary_inner(
+            &owned_state,
+            &owned_trace_id,
+            owned_key_id.as_deref(),
+            &owned_summary_model,
+            payload,
+            task_cancel,
+        )
+        .await
+    });
+    await_compaction_summary_task_with_policy(
+        task,
+        timeout_ms,
+        cancel,
+        compaction_background_grace(timeout_ms),
+        COMPACTION_CLEANUP_GRACE,
     )
     .await
-    {
-        Ok(result) => result,
-        Err(_) => Err(format!(
-            "Kiro compaction summary timed out after {timeout_ms} ms"
-        )),
+}
+
+#[cfg(test)]
+async fn await_compaction_summary_task(
+    task: tokio::task::JoinHandle<Result<GeneratedCompactionSummary, CompactionSummaryFailure>>,
+    timeout_ms: u64,
+) -> Result<GeneratedCompactionSummary, CompactionSummaryFailure> {
+    await_compaction_summary_task_with_policy(
+        task,
+        timeout_ms,
+        CancellationToken::new(),
+        compaction_background_grace(timeout_ms),
+        COMPACTION_CLEANUP_GRACE,
+    )
+    .await
+}
+
+fn compaction_background_grace(timeout_ms: u64) -> Duration {
+    Duration::from_millis(timeout_ms)
+        .max(MIN_COMPACTION_BACKGROUND_GRACE)
+        .min(MAX_COMPACTION_BACKGROUND_GRACE)
+}
+
+async fn await_compaction_summary_task_with_policy(
+    mut task: tokio::task::JoinHandle<Result<GeneratedCompactionSummary, CompactionSummaryFailure>>,
+    timeout_ms: u64,
+    cancel: CancellationToken,
+    background_grace: Duration,
+    cleanup_grace: Duration,
+) -> Result<GeneratedCompactionSummary, CompactionSummaryFailure> {
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), &mut task).await {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => Err(CompactionSummaryFailure {
+            message: format!("Kiro compaction summary task failed: {error}"),
+            usage: None,
+        }),
+        Err(_) => {
+            tokio::spawn(async move {
+                match tokio::time::timeout(background_grace, &mut task).await {
+                    Ok(result) => log_late_compaction_result(result),
+                    Err(_) => {
+                        cancel.cancel();
+                        match tokio::time::timeout(cleanup_grace, &mut task).await {
+                            Ok(result) => log_late_compaction_result(result),
+                            Err(_) => {
+                                task.abort();
+                                let _ = task.await;
+                                tracing::warn!(
+                                    background_grace_ms = background_grace.as_millis() as u64,
+                                    cleanup_grace_ms = cleanup_grace.as_millis() as u64,
+                                    "timed-out compaction summary exceeded its bounded accounting grace and was aborted"
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+            Err(CompactionSummaryFailure {
+                message: format!("Kiro compaction summary timed out after {timeout_ms} ms"),
+                usage: None,
+            })
+        }
+    }
+}
+
+fn log_late_compaction_result(
+    result: Result<
+        Result<GeneratedCompactionSummary, CompactionSummaryFailure>,
+        tokio::task::JoinError,
+    >,
+) {
+    match result {
+        Ok(Ok(summary)) => tracing::info!(
+            input_tokens = summary.usage.input_tokens,
+            output_tokens = summary.usage.output_tokens,
+            "timed-out compaction summary completed and was accounted"
+        ),
+        Ok(Err(error)) => tracing::warn!(
+            reason = %sanitize_error_message(&error.message),
+            "timed-out compaction summary finished with an error"
+        ),
+        Err(error) => tracing::warn!(
+            %error,
+            "timed-out compaction summary task could not be joined"
+        ),
     }
 }
 
@@ -1441,7 +1706,8 @@ async fn generate_compaction_summary_inner(
     key_id: Option<&str>,
     summary_model: &str,
     payload: kproxy_translate::KiroPayload,
-) -> Result<String, String> {
+    cancel: CancellationToken,
+) -> Result<GeneratedCompactionSummary, CompactionSummaryFailure> {
     let started = Instant::now();
     let input_tokens = state.tokenizer.estimate_kiro_payload(&payload).await? as u64;
     let max_output_tokens = payload
@@ -1457,6 +1723,27 @@ async fn generate_compaction_summary_inner(
         .meter
         .reserve(key_id, estimate)
         .map_err(|error| error.to_string())?;
+    let default_model = state.config.current().features.default_model_id.clone();
+    let execution = tokio::select! {
+        result = execute_upstream(
+            state,
+            trace_id,
+            summary_model,
+            summary_model,
+            key_id,
+            &default_model,
+            estimate,
+            input_tokens,
+            true,
+            &payload,
+        ) => result.map_err(execute_error_message)?,
+        _ = cancel.cancelled() => {
+            return Err(CompactionSummaryFailure {
+                message: "Kiro compaction summary canceled after its accounting grace expired".into(),
+                usage: None,
+            });
+        }
+    };
     let UpstreamExecution {
         mut lease,
         response,
@@ -1466,42 +1753,90 @@ async fn generate_compaction_summary_inner(
         model_mapping_rule,
         attempts,
         payload,
-    } = execute_upstream(
-        state,
-        trace_id,
-        summary_model,
-        summary_model,
-        key_id,
-        &state.config.current().features.default_model_id,
-        estimate,
-        input_tokens,
-        true,
-        &payload,
-    )
-    .await
-    .map_err(execute_error_message)?;
+    } = execution;
     let account_id = lease.account_id();
     let account_name = lease.account().await.display_name().to_owned();
-    let (endpoint_definition, response, _upstream_permit) = response.into_parts();
+    let (endpoint_definition, response, upstream_permit) = response.into_parts();
     let endpoint = endpoint_definition.name.to_string();
-    let events = state
-        .kiro()
-        .collect_events(response)
-        .await
-        .map_err(|error| error.to_string())?;
+    let mut source = response.bytes_stream();
+    let mut buffer = BytesMut::new();
+    let mut decoder = EventStreamDecoder;
     let mut decoded = DecodedResponse::default();
-    for event in events {
-        decoded.push(event)?;
+    let mut collection_error = None;
+    'collect: loop {
+        let chunk = tokio::select! {
+            chunk = source.next() => chunk,
+            _ = cancel.cancelled() => {
+                collection_error = Some(
+                    "Kiro compaction summary canceled after its accounting grace expired".into(),
+                );
+                break 'collect;
+            }
+        };
+        match chunk {
+            Some(Ok(chunk)) => {
+                buffer.extend_from_slice(&chunk);
+                loop {
+                    match decoder.decode(&mut buffer) {
+                        Ok(Some(KiroEvent::Error { kind, message })) => {
+                            collection_error = Some(format!("{kind}: {message}"));
+                            break 'collect;
+                        }
+                        Ok(Some(event)) => {
+                            if let Err(error) = decoded.push(event) {
+                                collection_error = Some(error);
+                                break 'collect;
+                            }
+                        }
+                        Ok(None) => break,
+                        Err(error) => {
+                            collection_error = Some(error.to_string());
+                            break 'collect;
+                        }
+                    }
+                }
+            }
+            Some(Err(error)) => {
+                collection_error = Some(error.to_string());
+                break 'collect;
+            }
+            None => break,
+        }
     }
+    if collection_error.is_none() {
+        loop {
+            match decoder.decode_eof(&mut buffer) {
+                Ok(Some(KiroEvent::Error { kind, message })) => {
+                    collection_error = Some(format!("{kind}: {message}"));
+                    break;
+                }
+                Ok(Some(event)) => {
+                    if let Err(error) = decoded.push(event) {
+                        collection_error = Some(error);
+                        break;
+                    }
+                }
+                Ok(None) => break,
+                Err(error) => {
+                    collection_error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+    }
+    drop(source);
+    drop(upstream_permit);
     fill_missing_usage(state, &mut decoded, &payload).await;
-    let parsed_summary = if decoded.tools.is_empty() {
+    let parsed_summary = if let Some(error) = collection_error.clone() {
+        Err(error)
+    } else if decoded.tools.is_empty() {
         parse_compaction_summary(&decoded.text)
     } else {
         Err("Kiro compaction summary unexpectedly returned a tool call".into())
     };
     let credits = credits(state, &kiro_model, &decoded);
     lease.settle_credits(credits).await;
-    reservation
+    let settlement_error = reservation
         .settle(usage_record(
             &mapped_model,
             summary_model,
@@ -1511,8 +1846,9 @@ async fn generate_compaction_summary_inner(
             credits,
         ))
         .await
-        .map_err(|error| error.to_string())?;
-    state.stats.record(request_log(
+        .err()
+        .map(|error| error.to_string());
+    let mut log = request_log(
         trace_id,
         &format!("cmp_{}", Uuid::new_v4().simple()),
         COMPACTION_USAGE_PATH,
@@ -1532,22 +1868,72 @@ async fn generate_compaction_summary_inner(
         },
         &decoded,
         credits,
-    ));
-    tracing::info!(
-        trace_id,
-        account_id,
-        account_name,
-        summary_model,
-        mapped_model,
-        kiro_model,
-        endpoint,
-        input_tokens = decoded.usage.input_tokens,
-        output_tokens = decoded.usage.output_tokens,
-        credits,
-        duration_ms = started.elapsed().as_millis() as u64,
-        "Kiro semantic compaction summary completed"
     );
-    parsed_summary
+    if let Some(error) = collection_error.as_deref() {
+        log.status = 502;
+        log.error = Some(sanitize_error_message(error));
+        log.diagnostics.client_status = 502;
+        log.diagnostics.upstream_status = None;
+        log.diagnostics.error_code = "compaction_stream_error".into();
+        log.diagnostics.error_stage = "upstream_stream".into();
+    }
+    state.stats.record(log);
+    let usage = CompactionIterationUsage {
+        input_tokens: decoded.usage.input_tokens,
+        output_tokens: decoded.usage.output_tokens,
+    };
+    if let Some(error) = settlement_error {
+        tracing::error!(
+            trace_id,
+            account_id,
+            summary_model,
+            reason = %sanitize_error_message(&error),
+            "Kiro compaction summary usage settlement failed"
+        );
+        return Err(CompactionSummaryFailure {
+            message: error,
+            usage: Some(usage),
+        });
+    }
+    if let Some(error) = collection_error.as_deref() {
+        tracing::warn!(
+            trace_id,
+            account_id,
+            account_name,
+            summary_model,
+            mapped_model,
+            kiro_model,
+            endpoint,
+            input_tokens = decoded.usage.input_tokens,
+            output_tokens = decoded.usage.output_tokens,
+            credits,
+            duration_ms = started.elapsed().as_millis() as u64,
+            reason = %sanitize_error_message(error),
+            "Kiro semantic compaction summary failed after partial usage was accounted"
+        );
+    } else {
+        tracing::info!(
+            trace_id,
+            account_id,
+            account_name,
+            summary_model,
+            mapped_model,
+            kiro_model,
+            endpoint,
+            input_tokens = decoded.usage.input_tokens,
+            output_tokens = decoded.usage.output_tokens,
+            credits,
+            duration_ms = started.elapsed().as_millis() as u64,
+            "Kiro semantic compaction summary completed"
+        );
+    }
+    match parsed_summary {
+        Ok(content) => Ok(GeneratedCompactionSummary { content, usage }),
+        Err(message) => Err(CompactionSummaryFailure {
+            message,
+            usage: Some(usage),
+        }),
+    }
 }
 
 fn parse_compaction_summary(output: &str) -> Result<String, String> {
@@ -1577,6 +1963,427 @@ fn parse_compaction_summary(output: &str) -> Result<String, String> {
     } else {
         Ok(output.to_owned())
     }
+}
+
+fn initial_compaction_decision(
+    state: &Arc<AppState>,
+    model: &str,
+    input_tokens: u64,
+    client_trigger: Option<u64>,
+    auto_compact_on_overflow: bool,
+) -> Option<CompactionDecision> {
+    let mapped_maximum = context_maximum(state, false, model);
+    let mut reasons = Vec::new();
+    let mut triggers = Vec::new();
+    if let Some(trigger) = client_trigger
+        .map(|trigger| trigger.min(mapped_maximum))
+        .filter(|trigger| input_tokens >= *trigger)
+    {
+        reasons.push(CompactionReason::ClientTrigger);
+        triggers.push(trigger);
+    }
+    if auto_compact_on_overflow && input_tokens > mapped_maximum {
+        reasons.push(CompactionReason::MappedWindowOverflow);
+        triggers.push(mapped_maximum);
+    }
+    let trigger_tokens = triggers.into_iter().min()?;
+    Some(CompactionDecision {
+        reasons,
+        model: model.to_owned(),
+        trigger_tokens,
+        target_tokens: compact_target_tokens(state, model, trigger_tokens),
+        maximum_tokens: context_maximum(state, true, model),
+    })
+}
+
+fn resolved_compaction_decision(limit: &ContextLimitError) -> CompactionDecision {
+    CompactionDecision {
+        reasons: vec![CompactionReason::ResolvedWindowOverflow],
+        model: limit.model.clone(),
+        trigger_tokens: limit.maximum,
+        target_tokens: compact_target_from_maximum(limit.maximum),
+        maximum_tokens: limit.maximum,
+    }
+}
+
+async fn extractive_compaction(
+    state: &Arc<AppState>,
+    source_payload: &KiroPayload,
+    target_tokens: u64,
+    preserve_recent_turns: usize,
+) -> Result<(KiroPayload, kproxy_translate::ContextCompactionStats), ApiError> {
+    let mut payload = source_payload.clone();
+    let stats = state
+        .tokenizer
+        .compact_kiro_payload(&mut payload, target_tokens as usize, preserve_recent_turns)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error,
+                ErrorFormat::Claude,
+            )
+        })?;
+    Ok((payload, stats))
+}
+
+async fn compaction_operation_target(
+    state: &Arc<AppState>,
+    source_payload: &KiroPayload,
+    decision: &CompactionDecision,
+) -> Result<u64, ApiError> {
+    let mut minimum_payload = source_payload.clone();
+    minimum_payload.conversation_state.history.clear();
+    let minimum_tokens = state
+        .tokenizer
+        .estimate_kiro_payload(&minimum_payload)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error,
+                ErrorFormat::Claude,
+            )
+        })? as u64;
+    if minimum_tokens > decision.maximum_tokens {
+        return Err(upstream_error(
+            ExecuteError::ContextLimit(ContextLimitError {
+                model: decision.model.clone(),
+                input_tokens: minimum_tokens,
+                maximum: decision.maximum_tokens,
+            }),
+            ErrorFormat::Claude,
+        ));
+    }
+    Ok(if minimum_tokens > decision.target_tokens {
+        // The 75% target is desirable headroom, not a smaller model window.
+        // Prefer the trigger as the relaxed target, but never turn a client
+        // trigger into a false hard limit when the indivisible current turn
+        // still fits the model's real safe window.
+        let relaxed_trigger = decision.trigger_tokens.min(decision.maximum_tokens);
+        if minimum_tokens <= relaxed_trigger {
+            relaxed_trigger
+        } else {
+            decision.maximum_tokens
+        }
+    } else {
+        decision.target_tokens
+    })
+}
+
+async fn run_compaction(
+    state: &Arc<AppState>,
+    request: CompactionRequest<'_>,
+) -> Result<CompactionRun, ApiError> {
+    let CompactionRequest {
+        trace_id,
+        key_id,
+        source_payload,
+        decision,
+        summary_model,
+        summary_timeout_ms,
+        preserve_recent_turns,
+    } = request;
+    let operation_target = compaction_operation_target(state, source_payload, decision).await?;
+    let plan = state
+        .tokenizer
+        .plan_kiro_compaction(
+            source_payload,
+            operation_target as usize,
+            preserve_recent_turns,
+        )
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error,
+                ErrorFormat::Claude,
+            )
+        })?;
+    let Some(plan) = plan else {
+        let original_tokens = state
+            .tokenizer
+            .estimate_kiro_payload(source_payload)
+            .await
+            .map_err(|error| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error,
+                    ErrorFormat::Claude,
+                )
+            })?;
+        return Ok(CompactionRun {
+            payload: source_payload.clone(),
+            stats: kproxy_translate::ContextCompactionStats {
+                original_tokens,
+                compacted_tokens: original_tokens,
+                ..kproxy_translate::ContextCompactionStats::default()
+            },
+            artifact: None,
+            mode: "none",
+            summary_model: None,
+            summary_input_tokens: None,
+            fallback_reason: None,
+            iteration_usage: None,
+        });
+    };
+
+    let summary_payload = compaction_summary_payload(source_payload, &plan, summary_model);
+    let summary_input_tokens = state
+        .tokenizer
+        .estimate_kiro_payload(&summary_payload)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error,
+                ErrorFormat::Claude,
+            )
+        })? as u64;
+    let capacity_insufficient =
+        check_context_limit(state, summary_input_tokens, true, summary_model).is_err();
+    let mut fallback_reason = None;
+    let mut semantic_summary = None;
+    let mut iteration_usage = None;
+    if capacity_insufficient {
+        fallback_reason = Some("summary_capacity_insufficient");
+        tracing::warn!(
+            trace_id,
+            summary_model,
+            summary_input_tokens,
+            summary_context_maximum = context_maximum(state, true, summary_model),
+            "semantic compaction summary cannot fit its model; using extractive fallback"
+        );
+    } else {
+        match generate_compaction_summary(
+            state,
+            trace_id,
+            key_id,
+            summary_model,
+            summary_payload,
+            summary_timeout_ms,
+        )
+        .await
+        {
+            Ok(summary) => semantic_summary = Some(summary),
+            Err(error) => {
+                iteration_usage = error.usage;
+                fallback_reason = Some(if error.message.contains("timed out") {
+                    "summary_timeout"
+                } else {
+                    "summary_upstream_error"
+                });
+                tracing::warn!(
+                    trace_id,
+                    reason = %sanitize_error_message(&error.message),
+                    "semantic compaction request failed; using extractive fallback"
+                );
+            }
+        }
+    }
+
+    if let Some(generated) = semantic_summary {
+        iteration_usage = Some(generated.usage);
+        let mut payload = source_payload.clone();
+        match state
+            .tokenizer
+            .apply_semantic_compaction(
+                &mut payload,
+                &plan,
+                &generated.content,
+                operation_target as usize,
+            )
+            .await
+        {
+            Ok(stats) => {
+                return Ok(CompactionRun {
+                    payload,
+                    stats,
+                    artifact: Some(CompactionArtifact::Semantic {
+                        source_payload: source_payload.clone(),
+                        plan,
+                        summary: generated.content,
+                        usage: generated.usage,
+                    }),
+                    mode: "semantic",
+                    summary_model: Some(summary_model.to_owned()),
+                    summary_input_tokens: Some(summary_input_tokens),
+                    fallback_reason: None,
+                    iteration_usage: Some(generated.usage),
+                });
+            }
+            Err(error) => {
+                fallback_reason = Some("semantic_target_not_reached");
+                tracing::warn!(
+                    trace_id,
+                    reason = %sanitize_error_message(&error),
+                    "semantic compaction could not satisfy the target; using extractive fallback"
+                );
+            }
+        }
+    }
+
+    let (payload, stats) = extractive_compaction(
+        state,
+        source_payload,
+        operation_target,
+        preserve_recent_turns,
+    )
+    .await?;
+    if stats.compacted_tokens as u64 > decision.maximum_tokens {
+        return Err(upstream_error(
+            ExecuteError::ContextLimit(ContextLimitError {
+                model: decision.model.clone(),
+                input_tokens: stats.compacted_tokens as u64,
+                maximum: decision.maximum_tokens,
+            }),
+            ErrorFormat::Claude,
+        ));
+    }
+    Ok(CompactionRun {
+        payload,
+        stats,
+        artifact: Some(CompactionArtifact::Extractive {
+            source_payload: source_payload.clone(),
+            preserve_recent_turns,
+            usage: iteration_usage,
+        }),
+        mode: "extractive_fallback",
+        summary_model: Some(summary_model.to_owned()),
+        summary_input_tokens: Some(summary_input_tokens),
+        fallback_reason,
+        iteration_usage,
+    })
+}
+
+async fn reapply_compaction(
+    state: &Arc<AppState>,
+    artifact: &CompactionArtifact,
+    decision: &CompactionDecision,
+) -> Result<CompactionRun, ApiError> {
+    let source_payload = match artifact {
+        CompactionArtifact::Semantic { source_payload, .. }
+        | CompactionArtifact::Extractive { source_payload, .. } => source_payload,
+    };
+    let operation_target = compaction_operation_target(state, source_payload, decision).await?;
+    let (payload, stats, mode, iteration_usage) = match artifact {
+        CompactionArtifact::Semantic {
+            source_payload,
+            plan,
+            summary,
+            usage,
+        } => {
+            let mut payload = source_payload.clone();
+            let first = state
+                .tokenizer
+                .apply_semantic_compaction(&mut payload, plan, summary, operation_target as usize)
+                .await;
+            let stats = match first {
+                Ok(stats) => stats,
+                Err(error) if operation_target < decision.maximum_tokens => {
+                    tracing::warn!(
+                        model = %decision.model,
+                        target_tokens = operation_target,
+                        safe_window = decision.maximum_tokens,
+                        reason = %sanitize_error_message(&error),
+                        "semantic artifact missed the preferred target; retrying at the safe window"
+                    );
+                    payload.clone_from(source_payload);
+                    match state
+                        .tokenizer
+                        .apply_semantic_compaction(
+                            &mut payload,
+                            plan,
+                            summary,
+                            decision.maximum_tokens as usize,
+                        )
+                        .await
+                    {
+                        Ok(stats) => stats,
+                        Err(error) => {
+                            let actual = state
+                                .tokenizer
+                                .estimate_kiro_payload(&payload)
+                                .await
+                                .unwrap_or(decision.maximum_tokens as usize + 1)
+                                as u64;
+                            tracing::warn!(
+                                model = %decision.model,
+                                safe_window = decision.maximum_tokens,
+                                reason = %sanitize_error_message(&error),
+                                "semantic artifact could not fit the resolved context window"
+                            );
+                            return Err(upstream_error(
+                                ExecuteError::ContextLimit(ContextLimitError {
+                                    model: decision.model.clone(),
+                                    input_tokens: actual,
+                                    maximum: decision.maximum_tokens,
+                                }),
+                                ErrorFormat::Claude,
+                            ));
+                        }
+                    }
+                }
+                Err(error) => {
+                    let actual = state
+                        .tokenizer
+                        .estimate_kiro_payload(&payload)
+                        .await
+                        .unwrap_or(decision.maximum_tokens as usize + 1)
+                        as u64;
+                    tracing::warn!(
+                        model = %decision.model,
+                        safe_window = decision.maximum_tokens,
+                        reason = %sanitize_error_message(&error),
+                        "semantic artifact could not fit the resolved context window"
+                    );
+                    return Err(upstream_error(
+                        ExecuteError::ContextLimit(ContextLimitError {
+                            model: decision.model.clone(),
+                            input_tokens: actual,
+                            maximum: decision.maximum_tokens,
+                        }),
+                        ErrorFormat::Claude,
+                    ));
+                }
+            };
+            (payload, stats, "semantic", Some(*usage))
+        }
+        CompactionArtifact::Extractive {
+            source_payload,
+            preserve_recent_turns,
+            usage,
+        } => {
+            let (payload, stats) = extractive_compaction(
+                state,
+                source_payload,
+                operation_target,
+                *preserve_recent_turns,
+            )
+            .await?;
+            (payload, stats, "extractive_fallback", *usage)
+        }
+    };
+    if stats.compacted_tokens as u64 > decision.maximum_tokens {
+        return Err(upstream_error(
+            ExecuteError::ContextLimit(ContextLimitError {
+                model: decision.model.clone(),
+                input_tokens: stats.compacted_tokens as u64,
+                maximum: decision.maximum_tokens,
+            }),
+            ErrorFormat::Claude,
+        ));
+    }
+    Ok(CompactionRun {
+        payload,
+        stats,
+        artifact: Some(artifact.clone()),
+        mode,
+        summary_model: None,
+        summary_input_tokens: None,
+        fallback_reason: None,
+        iteration_usage,
+    })
 }
 
 fn execute_error_message(error: ExecuteError) -> String {
@@ -3284,12 +4091,14 @@ async fn nonstream_claude(
     model_path: Vec<String>,
     model_mapping_rule: Option<String>,
     attempts: Vec<UpstreamAttemptLog>,
-    _input_tokens: u64,
+    input_tokens: u64,
     compact: bool,
     estimated_credits: f64,
     started: Instant,
     prompt_cache: Option<PromptCacheProfile>,
     compaction_summary: Option<String>,
+    compaction_iteration: Option<CompactionIterationUsage>,
+    auto_compaction_original_input_tokens: Option<u64>,
     tool_search: Option<Arc<ClaudeToolSearchCatalog>>,
     max_tool_search_operations: u32,
     tool_search_operations: u32,
@@ -3379,12 +4188,15 @@ async fn nonstream_claude(
         duration_ms = started.elapsed().as_millis() as u64,
         "client non-stream response completed"
     );
-    Ok(Json(decoded.claude_json(
+    Ok(Json(decoded.claude_json_with_context_management(
         &request_id,
         &request.model,
         request.max_tokens,
         current_round_output_tokens,
         compaction_summary.as_deref(),
+        compaction_iteration,
+        auto_compaction_original_input_tokens,
+        input_tokens,
         &state.web_search_replay,
     ))
     .into_response())
@@ -3756,7 +4568,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         );
         let mut normal = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
         normal.enhance_system_prompt = config.features.enhance_system_prompt;
-        normal.compact_mode = compact_trigger.is_some();
+        normal.compact_mode = compact_trigger.is_some() || config.context.auto_compact_on_overflow;
         let mut original_payload = claude_to_kiro(&original_request, &normal);
         let thinking_limit = model_token_limit(&state, &route.mapped, false)
             .unwrap_or(config.features.max_thinking_budget_tokens)
@@ -4036,8 +4848,8 @@ fn enforce_context(
         let mut error = ApiError::new(
             StatusCode::BAD_REQUEST,
             format!(
-                "prompt is too long: {} tokens > {}",
-                limit.input_tokens, limit.maximum
+                "prompt is too long for model '{}': {} tokens > {}",
+                limit.model, limit.input_tokens, limit.maximum
             ),
             format,
         );
@@ -4257,11 +5069,16 @@ fn context_maximum(state: &Arc<AppState>, compact: bool, model: &str) -> u64 {
 fn compact_target_tokens(state: &Arc<AppState>, model: &str, trigger: u64) -> u64 {
     // Leave meaningful room for subsequent tool turns rather than compacting
     // to just below the trigger and immediately repeating the operation.
-    trigger
+    compact_target_from_maximum(trigger)
+        .min(context_maximum(state, true, model))
+        .max(1)
+}
+
+fn compact_target_from_maximum(maximum: u64) -> u64 {
+    maximum
         .saturating_mul(3)
         .checked_div(4)
-        .unwrap_or(trigger)
-        .min(context_maximum(state, true, model))
+        .unwrap_or(maximum)
         .max(1)
 }
 
@@ -4359,8 +5176,8 @@ fn upstream_error(error: ExecuteError, format: ErrorFormat) -> ApiError {
             let mut error = ApiError::new(
                 StatusCode::BAD_REQUEST,
                 format!(
-                    "prompt is too long: {} tokens > {}",
-                    limit.input_tokens, limit.maximum
+                    "prompt is too long for resolved model '{}': {} tokens > {}",
+                    limit.model, limit.input_tokens, limit.maximum
                 ),
                 format,
             );
@@ -4652,9 +5469,80 @@ fn is_payload_budget_error(lower: &str) -> bool {
 #[cfg(test)]
 mod model_tests {
     use std::net::{Ipv4Addr, Ipv6Addr};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
     use super::*;
+
+    #[tokio::test]
+    async fn timed_out_summary_task_still_runs_its_accounting_tail() {
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let task_completed = Arc::clone(&completed);
+        let task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            task_completed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(GeneratedCompactionSummary {
+                content: "late summary".into(),
+                usage: CompactionIterationUsage {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                },
+            })
+        });
+
+        let error = match await_compaction_summary_task(task, 1).await {
+            Ok(_) => panic!("summary should time out"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("timed out"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !completed.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("detached accounting tail completed");
+    }
+
+    #[tokio::test]
+    async fn timed_out_summary_task_is_aborted_after_the_bounded_grace() {
+        struct DropMarker(Arc<AtomicBool>);
+
+        impl Drop for DropMarker {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task_dropped = Arc::clone(&dropped);
+        let task = tokio::spawn(async move {
+            let _marker = DropMarker(task_dropped);
+            std::future::pending::<Result<GeneratedCompactionSummary, CompactionSummaryFailure>>()
+                .await
+        });
+
+        let result = await_compaction_summary_task_with_policy(
+            task,
+            1,
+            CancellationToken::new(),
+            Duration::from_millis(5),
+            Duration::from_millis(5),
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("summary should time out"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("timed out"));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("summary task was aborted after the bounded grace");
+    }
 
     #[tokio::test]
     async fn quota_degradation_does_not_cancel_the_daemon() {
@@ -5025,6 +5913,265 @@ mod model_tests {
             .expect_err("unterminated summaries must fall back")
             .contains("unterminated"));
         assert!(parse_compaction_summary("   ").is_err());
+    }
+
+    #[tokio::test]
+    async fn mapped_overflow_decision_uses_the_mapped_safe_window() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = kproxy_core::paths::Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        let accounts = kproxy_store::accounts::AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("accounts");
+        let state = Arc::new(AppState::new(
+            paths,
+            kproxy_store::config_loader::ConfigHandle::new(kproxy_core::config::Config::default()),
+            accounts,
+        ));
+        state.models.finish_refresh(vec![kproxy_kiro::ModelInfo {
+            model_id: "mapped-small".into(),
+            model_name: String::new(),
+            description: String::new(),
+            rate_multiplier: None,
+            token_limits: Some(kproxy_kiro::client::TokenLimits {
+                max_input_tokens: Some(128_000),
+                max_output_tokens: Some(16_384),
+            }),
+        }]);
+
+        let decision = initial_compaction_decision(&state, "mapped-small", 180_000, None, true)
+            .expect("overflow decision");
+        assert_eq!(decision.trigger_tokens, 121_600);
+        assert_eq!(decision.target_tokens, 91_200);
+        assert_eq!(decision.maximum_tokens, 126_720);
+        assert_eq!(
+            decision.reasons,
+            vec![CompactionReason::MappedWindowOverflow]
+        );
+    }
+
+    #[tokio::test]
+    async fn summary_capacity_preflight_skips_a_doomed_semantic_request() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = kproxy_core::paths::Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        let accounts = kproxy_store::accounts::AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("accounts");
+        let state = Arc::new(AppState::new(
+            paths,
+            kproxy_store::config_loader::ConfigHandle::new(kproxy_core::config::Config::default()),
+            accounts,
+        ));
+        state.models.finish_refresh(vec![kproxy_kiro::ModelInfo {
+            model_id: "mapped-tiny".into(),
+            model_name: String::new(),
+            description: String::new(),
+            rate_multiplier: None,
+            token_limits: Some(kproxy_kiro::client::TokenLimits {
+                max_input_tokens: Some(10_000),
+                max_output_tokens: Some(4_096),
+            }),
+        }]);
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"source-large",
+            "max_tokens":64,
+            "messages":[
+                {"role":"user","content":"old history ".repeat(12000)},
+                {"role":"assistant","content":"retain this conclusion"},
+                {"role":"user","content":"continue"}
+            ]
+        }))
+        .expect("request");
+        let mut options = TranslationOptions::new("mapped-tiny", "AI_EDITOR");
+        options.compact_mode = true;
+        let source_payload = claude_to_kiro(&request, &options);
+        let decision = CompactionDecision {
+            reasons: vec![CompactionReason::MappedWindowOverflow],
+            model: "mapped-tiny".into(),
+            trigger_tokens: 9_500,
+            target_tokens: 7_125,
+            maximum_tokens: 9_900,
+        };
+
+        let run = match run_compaction(
+            &state,
+            CompactionRequest {
+                trace_id: "trace_capacity",
+                key_id: None,
+                source_payload: &source_payload,
+                decision: &decision,
+                summary_model: "mapped-tiny",
+                summary_timeout_ms: 30_000,
+                preserve_recent_turns: 3,
+            },
+        )
+        .await
+        {
+            Ok(run) => run,
+            Err(error) => panic!("extractive fallback failed: {}", error.message),
+        };
+        assert_eq!(run.mode, "extractive_fallback");
+        assert_eq!(run.fallback_reason, Some("summary_capacity_insufficient"));
+        assert!(run.summary_input_tokens.expect("summary tokens") > 9_900);
+        assert!(run.stats.compacted_tokens <= decision.target_tokens as usize);
+        assert!(matches!(
+            run.artifact,
+            Some(CompactionArtifact::Extractive { .. })
+        ));
+
+        let mut minimum_payload = source_payload.clone();
+        minimum_payload.conversation_state.history.clear();
+        let indivisible_tokens = state
+            .tokenizer
+            .estimate_kiro_payload(&minimum_payload)
+            .await
+            .expect("minimum payload") as u64;
+        let relaxed = CompactionDecision {
+            reasons: vec![CompactionReason::MappedWindowOverflow],
+            model: "mapped-tiny".into(),
+            trigger_tokens: indivisible_tokens + 100,
+            target_tokens: indivisible_tokens.saturating_sub(1).max(1),
+            maximum_tokens: indivisible_tokens + 1_000,
+        };
+        let relaxed_target =
+            match compaction_operation_target(&state, &source_payload, &relaxed).await {
+                Ok(target) => target,
+                Err(error) => panic!("safe-window relaxation failed: {}", error.message),
+            };
+        assert_eq!(relaxed_target, relaxed.trigger_tokens);
+
+        let client_trigger_below_current = CompactionDecision {
+            reasons: vec![CompactionReason::ClientTrigger],
+            model: "mapped-tiny".into(),
+            trigger_tokens: indivisible_tokens.saturating_sub(1).max(1),
+            target_tokens: indivisible_tokens.saturating_sub(2).max(1),
+            maximum_tokens: indivisible_tokens + 1_000,
+        };
+        let client_relaxed_target =
+            compaction_operation_target(&state, &source_payload, &client_trigger_below_current)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("client trigger became a hard limit: {}", error.message)
+                });
+        assert_eq!(
+            client_relaxed_target,
+            client_trigger_below_current.maximum_tokens
+        );
+
+        let oversized_request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"source-large",
+            "max_tokens":64,
+            "messages":[
+                {"role":"user","content":"small old turn"},
+                {"role":"assistant","content":"small old response"},
+                {"role":"user","content":"oversized current turn ".repeat(12000)}
+            ]
+        }))
+        .expect("request");
+        let oversized_payload = claude_to_kiro(&oversized_request, &options);
+        let error = match run_compaction(
+            &state,
+            CompactionRequest {
+                trace_id: "trace_oversized_current",
+                key_id: None,
+                source_payload: &oversized_payload,
+                decision: &decision,
+                summary_model: "mapped-tiny",
+                summary_timeout_ms: 30_000,
+                preserve_recent_turns: 3,
+            },
+        )
+        .await
+        {
+            Ok(_) => panic!("an indivisible current turn must not be summarized away"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("mapped-tiny"));
+        assert!(error.message.contains(" > 9900"));
+        assert!(!error.message.contains(" > 7125"));
+    }
+
+    #[tokio::test]
+    async fn semantic_reapply_failure_keeps_the_context_limit_contract() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = kproxy_core::paths::Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        let accounts = kproxy_store::accounts::AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("accounts");
+        let state = Arc::new(AppState::new(
+            paths,
+            kproxy_store::config_loader::ConfigHandle::new(kproxy_core::config::Config::default()),
+            accounts,
+        ));
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"source-large",
+            "max_tokens":64,
+            "messages":[
+                {"role":"user","content":"old history ".repeat(4000)},
+                {"role":"assistant","content":"old conclusion"},
+                {"role":"user","content":"continue"}
+            ]
+        }))
+        .expect("request");
+        let source_payload = claude_to_kiro(
+            &request,
+            &TranslationOptions::new("mapped-model", "AI_EDITOR"),
+        );
+        let plan = state
+            .tokenizer
+            .plan_kiro_compaction(&source_payload, 1_000, 1)
+            .await
+            .expect("plan")
+            .expect("history plan");
+        let artifact = CompactionArtifact::Semantic {
+            source_payload,
+            plan,
+            summary: "durable semantic checkpoint ".repeat(100),
+            usage: CompactionIterationUsage {
+                input_tokens: 4_000,
+                output_tokens: 400,
+            },
+        };
+        let decision = CompactionDecision {
+            reasons: vec![CompactionReason::ResolvedWindowOverflow],
+            model: "resolved-micro".into(),
+            trigger_tokens: 60,
+            target_tokens: 45,
+            maximum_tokens: 60,
+        };
+
+        let error = match reapply_compaction(&state, &artifact, &decision).await {
+            Ok(_) => panic!("semantic checkpoint must not fit the micro window"),
+            Err(error) => error,
+        };
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert!(error.message.contains("resolved-micro"));
+        assert!(error.message.contains(" > 60"));
+        assert_eq!(error.error_code, "context_length_exceeded");
     }
 
     #[test]

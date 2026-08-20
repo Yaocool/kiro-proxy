@@ -12,6 +12,12 @@ pub struct OpenAiToolIdentity {
     pub name: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactionIterationUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+}
+
 #[derive(Debug, Default)]
 pub struct DecodedResponse {
     pub text: String,
@@ -379,6 +385,7 @@ impl DecodedResponse {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn claude_json(
         &self,
         id: &str,
@@ -386,6 +393,32 @@ impl DecodedResponse {
         max_tokens: u32,
         current_round_output_tokens: u64,
         compaction_summary: Option<&str>,
+        web_search_replay: &WebSearchReplayCodec,
+    ) -> Value {
+        self.claude_json_with_context_management(
+            id,
+            model,
+            max_tokens,
+            current_round_output_tokens,
+            compaction_summary,
+            None,
+            None,
+            self.usage.input_tokens,
+            web_search_replay,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn claude_json_with_context_management(
+        &self,
+        id: &str,
+        model: &str,
+        max_tokens: u32,
+        current_round_output_tokens: u64,
+        compaction_summary: Option<&str>,
+        compaction_iteration: Option<CompactionIterationUsage>,
+        auto_compaction_original_input_tokens: Option<u64>,
+        effective_input_tokens: u64,
         web_search_replay: &WebSearchReplayCodec,
     ) -> Value {
         let mut content = Vec::new();
@@ -483,6 +516,30 @@ impl DecodedResponse {
                 "web_search_requests":self.web_searches.iter()
                     .filter(|search| search.executed)
                     .count()
+            });
+        }
+        if let Some(compaction) = compaction_iteration {
+            response["usage"]["iterations"] = json!([
+                {
+                    "type":"compaction",
+                    "input_tokens":compaction.input_tokens,
+                    "output_tokens":compaction.output_tokens
+                },
+                {
+                    "type":"message",
+                    "input_tokens":self.usage.input_tokens,
+                    "output_tokens":self.usage.output_tokens
+                }
+            ]);
+        }
+        if let Some(original_input_tokens) = auto_compaction_original_input_tokens {
+            response["context_management"] = json!({
+                "applied_edits":[{
+                    "type":"compact_20260112",
+                    "reason":"model_mapping_overflow",
+                    "original_input_tokens":original_input_tokens,
+                    "compacted_input_tokens":effective_input_tokens
+                }]
             });
         }
         response
@@ -1238,6 +1295,46 @@ mod tests {
             "compacted conversation summary"
         );
         assert_eq!(response["content"][1]["type"], "text");
+    }
+
+    #[test]
+    fn automatic_compaction_reports_original_and_effective_input_sizes() {
+        let decoded = DecodedResponse {
+            text: "continued answer".into(),
+            usage: UsageInfo {
+                // Internal Tool Search/continuation rounds accumulate here;
+                // the applied edit must still report the first compacted
+                // payload size passed separately below.
+                input_tokens: 47_000,
+                output_tokens: 100,
+                ..UsageInfo::default()
+            },
+            ..DecodedResponse::default()
+        };
+        let response = decoded.claude_json_with_context_management(
+            "msg",
+            "source-large",
+            100,
+            100,
+            Some("summary"),
+            Some(CompactionIterationUsage {
+                input_tokens: 180_500,
+                output_tokens: 3_500,
+            }),
+            Some(180_000),
+            23_000,
+            &replay_codec(),
+        );
+
+        let edit = &response["context_management"]["applied_edits"][0];
+        assert_eq!(edit["type"], "compact_20260112");
+        assert_eq!(edit["reason"], "model_mapping_overflow");
+        assert_eq!(edit["original_input_tokens"], 180_000);
+        assert_eq!(edit["compacted_input_tokens"], 23_000);
+        assert_eq!(response["usage"]["input_tokens"], 47_000);
+        assert_eq!(response["usage"]["iterations"][0]["type"], "compaction");
+        assert_eq!(response["usage"]["iterations"][0]["input_tokens"], 180_500);
+        assert_eq!(response["usage"]["iterations"][1]["type"], "message");
     }
 
     #[test]

@@ -26,7 +26,8 @@ use crate::stats::{RequestDiagnostics, RequestLog, UpstreamAttemptLog};
 
 use super::prompt_cache::PromptCacheProfile;
 use super::response::{
-    repair_json, web_search_citations, DecodedResponse, OpenAiToolIdentity, ToolLeakFilter,
+    repair_json, web_search_citations, CompactionIterationUsage, DecodedResponse,
+    OpenAiToolIdentity, ToolLeakFilter,
 };
 use super::usage::{fallback_credits, fill_missing_usage, produced_output};
 
@@ -87,6 +88,9 @@ pub struct StreamContext {
     pub input_tokens: u64,
     pub compact: bool,
     pub compaction_summary: Option<String>,
+    pub compaction_iteration: Option<CompactionIterationUsage>,
+    /// Effective input size before proxy-triggered model-mapping compaction.
+    pub auto_compaction_original_input_tokens: Option<u64>,
     pub estimated_credits: f64,
     pub max_tokens: u32,
     pub started: Instant,
@@ -118,6 +122,41 @@ pub struct StreamContext {
     pub openai_tools: std::collections::HashMap<String, OpenAiToolIdentity>,
     pub _connection_guard: crate::state::AdmissionGuard,
     pub _admission_guard: crate::state::AdmissionGuard,
+}
+
+fn claude_initial_events(
+    claude: &mut ClaudeState,
+    compaction_summary: Option<&str>,
+    resumed_server_events: &[super::response::ClaudeServerEvent],
+    searches: &[ClaudeToolSearchTrace],
+    web_searches: &[ClaudeWebSearchTrace],
+) -> Vec<String> {
+    let mut output = Vec::new();
+    if let Some(summary) = compaction_summary {
+        output.extend(claude.compaction(summary));
+    }
+    for event in resumed_server_events {
+        output.extend(match event {
+            super::response::ClaudeServerEvent::ToolSearch { index, .. } => searches
+                .get(*index)
+                .map(|trace| claude.tool_search(trace))
+                .unwrap_or_default(),
+            super::response::ClaudeServerEvent::WebSearch { index, .. } => web_searches
+                .get(*index)
+                .map(|trace| claude.web_search(trace))
+                .unwrap_or_default(),
+        });
+    }
+    output
+}
+
+fn prepend_pending_initial(pending: &mut Vec<String>, mut output: Vec<String>) -> Vec<String> {
+    if output.is_empty() || pending.is_empty() {
+        return output;
+    }
+    let mut combined = std::mem::take(pending);
+    combined.append(&mut output);
+    combined
 }
 
 pub fn response(
@@ -152,33 +191,23 @@ pub fn response(
             context.state.web_search_replay.clone(),
         );
         claude.openai_include_usage = context.include_usage_chunk;
+        claude.auto_compaction_original_input_tokens =
+            context.auto_compaction_original_input_tokens;
+        claude.compaction_iteration = context.compaction_iteration;
         let mut accumulated_searches = std::mem::take(&mut context.resumed_tool_searches);
         let mut accumulated_web_searches = std::mem::take(&mut context.resumed_web_searches);
         let mut data_started = false;
-        if matches!(protocol, StreamProtocol::Claude) {
-            for event in &context.resumed_server_events {
-                let output = match event {
-                    super::response::ClaudeServerEvent::ToolSearch { index, .. } => accumulated_searches
-                        .get(*index)
-                        .map(|trace| claude.tool_search(trace))
-                        .unwrap_or_default(),
-                    super::response::ClaudeServerEvent::WebSearch { index, .. } => accumulated_web_searches
-                        .get(*index)
-                        .map(|trace| claude.web_search(trace))
-                        .unwrap_or_default(),
-                };
-                data_started |= !output.is_empty();
-                for data in output {
-                    yield Ok::<Bytes, Infallible>(Bytes::from(data));
-                }
-            }
-            if let Some(summary) = context.compaction_summary.as_deref() {
-                for data in claude.compaction(summary) {
-                    data_started = true;
-                    yield Ok::<Bytes, Infallible>(Bytes::from(data));
-                }
-            }
-        }
+        let mut pending_initial = if matches!(protocol, StreamProtocol::Claude) {
+            claude_initial_events(
+                &mut claude,
+                context.compaction_summary.as_deref(),
+                &context.resumed_server_events,
+                &accumulated_searches,
+                &accumulated_web_searches,
+            )
+        } else {
+            Vec::new()
+        };
         let created = now_secs();
         let mut failed = None;
         let mut pre_data_retries = 0;
@@ -189,9 +218,12 @@ pub fn response(
         let mut payload = context.payload.clone();
         // Server calls must be emitted before client tool calls in mixed
         // turns, so buffering is mandatory whenever a server tool is active.
+        // A pending Claude prelude also forces buffering: a tool event is not
+        // a successful semantic boundary until its complete JSON validates.
         let buffer_tool_calls = context.buffer_tool_calls
             || context.tool_search.is_some()
-            || context.web_search_max_rounds > 0;
+            || context.web_search_max_rounds > 0
+            || !pending_initial.is_empty();
         let client_has_tools = payload.conversation_state.current_message.user_input_message
             .user_input_message_context.as_ref().is_some_and(|context| !context.tools.is_empty());
         let mut auto_round = 0;
@@ -246,6 +278,10 @@ pub fn response(
                                                     &context.model,
                                                     context.thinking_output_format,
                                                     &context.openai_tools,
+                                                );
+                                                let output = prepend_pending_initial(
+                                                    &mut pending_initial,
+                                                    output,
                                                 );
                                                 data_started |= !output.is_empty();
                                                 for data in output {
@@ -318,6 +354,7 @@ pub fn response(
                         context.thinking_output_format,
                         &context.openai_tools,
                     );
+                    let output = prepend_pending_initial(&mut pending_initial, output);
                     data_started |= !output.is_empty();
                     for data in output {
                         yield Ok::<Bytes, Infallible>(Bytes::from(data));
@@ -326,6 +363,15 @@ pub fn response(
                 if let Err(error) = decoded.push(event) {
                     failed = Some(error);
                     break;
+                }
+            }
+            // Buffered tool calls have not produced client-visible data yet.
+            // Validate them before committing the pending message/compaction
+            // prelude so malformed tool JSON can still use the pre-data retry
+            // path and cannot publish a failed compaction boundary.
+            if failed.is_none() {
+                if let Err(error) = decoded.validate_tool_inputs() {
+                    failed = Some(error);
                 }
             }
             if failed.is_some() {
@@ -641,16 +687,17 @@ pub fn response(
                 break 'rounds;
             }
             pre_data_retries = 0;
+            if !pending_initial.is_empty() {
+                data_started = true;
+                for data in std::mem::take(&mut pending_initial) {
+                    yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                }
+            }
             fill_missing_usage(&context.state, &mut decoded, &payload).await;
             let output_exhausted = accumulated_usage
                 .output_tokens
                 .saturating_add(decoded.usage.output_tokens)
                 >= u64::from(context.max_tokens);
-            if let Err(error) = decoded.validate_tool_inputs() {
-                failed = Some(error.clone());
-                yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
-                break 'rounds;
-            }
             let search_keys = context.tool_search.as_ref().map(|catalog| {
                 decoded.tools.iter().filter(|(_, tool)| catalog.is_search_tool(&tool.name))
                     .map(|(id, _)| id.clone()).collect::<Vec<_>>()
@@ -1466,6 +1513,8 @@ struct ClaudeState {
     request_id: String,
     model: String,
     input_tokens: u64,
+    auto_compaction_original_input_tokens: Option<u64>,
+    compaction_iteration: Option<CompactionIterationUsage>,
     message_started: bool,
     block: Option<(usize, &'static str)>,
     next_index: usize,
@@ -1486,6 +1535,8 @@ impl ClaudeState {
             request_id,
             model,
             input_tokens,
+            auto_compaction_original_input_tokens: None,
+            compaction_iteration: None,
             message_started: false,
             block: None,
             next_index: 0,
@@ -1796,10 +1847,35 @@ fn stream_finish(
                         .count()
                 });
             }
-            output.push(sse(&json!({
+            if let Some(compaction) = claude.compaction_iteration {
+                usage["iterations"] = json!([
+                    {
+                        "type":"compaction",
+                        "input_tokens":compaction.input_tokens,
+                        "output_tokens":compaction.output_tokens
+                    },
+                    {
+                        "type":"message",
+                        "input_tokens":decoded.usage.input_tokens,
+                        "output_tokens":decoded.usage.output_tokens
+                    }
+                ]);
+            }
+            let mut event = json!({
                 "type":"message_delta","delta":{"stop_reason":stop,"stop_sequence":Value::Null},
                 "usage":usage
-            })));
+            });
+            if let Some(original_input_tokens) = claude.auto_compaction_original_input_tokens {
+                event["context_management"] = json!({
+                    "applied_edits":[{
+                        "type":"compact_20260112",
+                        "reason":"model_mapping_overflow",
+                        "original_input_tokens":original_input_tokens,
+                        "compacted_input_tokens":claude.input_tokens
+                    }]
+                });
+            }
+            output.push(sse(&event));
             output.push(sse(&json!({"type":"message_stop"})));
             output
         }
@@ -2203,6 +2279,98 @@ mod tests {
         assert!(
             joined.find("compaction_delta").expect("compaction")
                 < joined.find("text_delta").expect("text")
+        );
+    }
+
+    #[test]
+    fn compaction_precedes_resumed_server_events() {
+        let mut state = ClaudeState::new("msg_test".into(), "model".into(), 10, replay_codec());
+        let search = ClaudeToolSearchTrace {
+            id: "srvtoolu_1".into(),
+            name: "tool_search_tool_regex".into(),
+            input: json!({"pattern":"github"}),
+            references: vec!["mcp__github__list_issues".into()],
+            error: None,
+            requested_limit: 5,
+            matched_count: 1,
+            budget_truncated: false,
+            emission: ClaudeServerToolEmission::ResultOnly,
+        };
+        let output = claude_initial_events(
+            &mut state,
+            Some("summary"),
+            &[crate::http::response::ClaudeServerEvent::ToolSearch {
+                index: 0,
+                preceding_text: String::new(),
+            }],
+            &[search],
+            &[],
+        )
+        .join("");
+
+        assert!(
+            output.find("compaction_delta").expect("compaction")
+                < output
+                    .find("tool_search_tool_result")
+                    .expect("resumed result")
+        );
+    }
+
+    #[test]
+    fn compaction_prelude_waits_for_the_first_semantic_event() {
+        let mut pending = vec!["message_start".into(), "compaction".into()];
+
+        assert!(prepend_pending_initial(&mut pending, Vec::new()).is_empty());
+        assert_eq!(pending, ["message_start", "compaction"]);
+
+        let output = prepend_pending_initial(&mut pending, vec!["text".into()]);
+        assert_eq!(output, ["message_start", "compaction", "text"]);
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn automatic_compaction_stats_are_emitted_in_the_final_message_delta() {
+        let mut state = ClaudeState::new("msg_test".into(), "model".into(), 23_000, replay_codec());
+        state.auto_compaction_original_input_tokens = Some(180_000);
+        state.compaction_iteration = Some(CompactionIterationUsage {
+            input_tokens: 180_500,
+            output_tokens: 3_500,
+        });
+        let decoded = DecodedResponse {
+            usage: kproxy_kiro::UsageInfo {
+                input_tokens: 47_000,
+                output_tokens: 900,
+                ..kproxy_kiro::UsageInfo::default()
+            },
+            ..DecodedResponse::default()
+        };
+        let output = stream_finish(
+            &StreamProtocol::Claude,
+            &mut state,
+            &decoded,
+            0,
+            "model",
+            100,
+            0,
+            ThinkingOutputFormat::Claude,
+            false,
+        )
+        .join("");
+
+        assert!(output.contains("\"reason\":\"model_mapping_overflow\""));
+        assert!(output.contains("\"original_input_tokens\":180000"));
+        assert!(output.contains("\"compacted_input_tokens\":23000"));
+        assert!(output.contains("\"type\":\"compaction\""));
+        assert!(output.contains("\"input_tokens\":180500"));
+        let final_delta = output
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+            .find(|event| event["type"] == "message_delta")
+            .expect("message delta");
+        assert_eq!(
+            final_delta["usage"]["iterations"][1]["input_tokens"],
+            47_000
         );
     }
 

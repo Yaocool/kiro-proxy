@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use kproxy_kiro::UsageInfo;
-use kproxy_translate::{ClaudeRequest, OpenAiRequest};
+use kproxy_translate::{ClaudeRequest, OpenAiRequest, TokenCountCache};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -48,6 +48,27 @@ impl PromptCacheTracker {
             append_value(&mut blocks, Some(&message.content));
         }
         build_profile(blocks, total_tokens, &request.model)
+    }
+
+    /// Builds a conservative profile after proxy-side compaction. Historical
+    /// message breakpoints no longer describe the payload sent upstream, but
+    /// an explicit system breakpoint remains a stable independent prefix.
+    pub async fn claude_compacted_profile(
+        &self,
+        tokenizer: &TokenCountCache,
+        request: &ClaudeRequest,
+        total_tokens: u64,
+    ) -> Option<PromptCacheProfile> {
+        let mut blocks = Vec::new();
+        append_value(&mut blocks, request.system.as_ref());
+        let last_breakpoint = blocks.iter().rposition(|block| block.ttl.is_some())?;
+        let cacheable_text = blocks[..=last_breakpoint]
+            .iter()
+            .map(|block| stable_json(&block.value))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let cacheable_tokens = tokenizer.count(cacheable_text).await.ok()? as u64;
+        build_profile_with_tokens(blocks, total_tokens, cacheable_tokens, &request.model)
     }
 
     pub fn openai_profile(
@@ -158,7 +179,18 @@ fn build_profile(
         .sum::<usize>()
         .max(1);
     let estimated = ((total_tokens as f64) * cacheable_chars as f64 / all_chars as f64) as u64;
-    let tokens = estimated.min((total_tokens as f64 * MAX_CACHE_RATIO) as u64);
+    build_profile_with_tokens(blocks, total_tokens, estimated, model)
+}
+
+fn build_profile_with_tokens(
+    blocks: Vec<CacheBlock>,
+    total_tokens: u64,
+    cacheable_tokens: u64,
+    model: &str,
+) -> Option<PromptCacheProfile> {
+    let last_breakpoint = blocks.iter().rposition(|block| block.ttl.is_some())?;
+    let cacheable = &blocks[..=last_breakpoint];
+    let tokens = cacheable_tokens.min((total_tokens as f64 * MAX_CACHE_RATIO) as u64);
     let minimum = if model.to_ascii_lowercase().contains("opus") {
         4096
     } else {
@@ -291,5 +323,59 @@ mod tests {
         let second = tracker.claude_profile(&second, 8_000).expect("profile");
         assert_eq!(first.fingerprint, second.fingerprint);
         assert_eq!(first.tokens, second.tokens);
+    }
+
+    #[tokio::test]
+    async fn compacted_profiles_keep_only_the_explicit_system_breakpoint() {
+        let tracker = PromptCacheTracker::default();
+        let tokenizer = TokenCountCache::new(32).expect("tokenizer");
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4","max_tokens":128,
+            "system":[{"type":"text","text":"stable system ".repeat(1500),
+                "cache_control":{"type":"ephemeral"}}],
+            "messages":[
+                {"role":"user","content":[{"type":"text","text":"stale history ".repeat(2000),
+                    "cache_control":{"type":"ephemeral"}}]},
+                {"role":"assistant","content":"old response"},
+                {"role":"user","content":"continue"}
+            ]
+        }))
+        .expect("request");
+        let compacted = tracker
+            .claude_compacted_profile(&tokenizer, &request, 8_000)
+            .await
+            .expect("system cache profile");
+        let system_only: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4","max_tokens":128,
+            "system":[{"type":"text","text":"stable system ".repeat(1500),
+                "cache_control":{"type":"ephemeral"}}],
+            "messages":[{"role":"user","content":"different future request"}]
+        }))
+        .expect("request");
+        let expected = tracker
+            .claude_compacted_profile(&tokenizer, &system_only, 8_000)
+            .await
+            .expect("system cache profile");
+        assert_eq!(compacted.fingerprint, expected.fingerprint);
+        assert_eq!(compacted.tokens, expected.tokens);
+        assert!(compacted.tokens < 6_800);
+    }
+
+    #[tokio::test]
+    async fn compacted_profile_does_not_invent_a_large_cache_for_a_small_system() {
+        let tracker = PromptCacheTracker::default();
+        let tokenizer = TokenCountCache::new(32).expect("tokenizer");
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4","max_tokens":128,
+            "system":[{"type":"text","text":"small stable prefix",
+                "cache_control":{"type":"ephemeral"}}],
+            "messages":[{"role":"user","content":"large compacted checkpoint"}]
+        }))
+        .expect("request");
+
+        assert!(tracker
+            .claude_compacted_profile(&tokenizer, &request, 50_000)
+            .await
+            .is_none());
     }
 }
