@@ -16,7 +16,10 @@ pub use context::{
 };
 pub use error::{error_envelope, sanitize_error_message, ErrorFormat};
 pub use protocol::*;
-pub use tokenizer::{ContextCompactionStats, TokenCountCache, TokenCountStats};
+pub use tokenizer::{
+    compaction_summary_payload, ContextCompactionStats, KiroCompactionPlan, TokenCountCache,
+    TokenCountStats,
+};
 pub use translate::{
     auto_continue_payload, claude_loaded_tools, claude_pending_server_tool_uses, claude_to_kiro,
     claude_tool_name_map, format_web_search_results, is_tool_search_tool, is_tool_search_type,
