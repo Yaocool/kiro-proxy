@@ -39,8 +39,19 @@ pub fn sanitize_error_message(message: &str) -> String {
     {
         if let Some((actual, maximum)) = context_token_counts(message, &lower) {
             // Claude Code recognizes this stable shape and can explain how far
-            // the request exceeded the context window. Only numeric values are
-            // retained, so arbitrary upstream text is never reflected.
+            // the request exceeded the context window. A locally formatted,
+            // strictly validated model identifier is safe to retain as well;
+            // arbitrary upstream prose is never reflected.
+            if let Some(model) = context_model_name(message, &lower) {
+                // The sanitizer is also called for arbitrary upstream text.
+                // Do not let the trusted local context shape bypass the
+                // endpoint redaction that normally runs at the end.
+                if redact_endpoint_names(model) == model {
+                    return format!(
+                        "prompt is too long for model '{model}': {actual} tokens > {maximum}"
+                    );
+                }
+            }
             return format!("prompt is too long: {actual} tokens > {maximum}");
         }
         return "prompt is too long: context length exceeded".into();
@@ -73,6 +84,30 @@ pub fn sanitize_error_message(message: &str) -> String {
         return "Service temporarily unavailable, please retry".into();
     }
     redact_endpoint_names(message)
+}
+
+fn context_model_name<'a>(message: &'a str, lower: &str) -> Option<&'a str> {
+    const MARKERS: [&str; 2] = [
+        "prompt is too long for resolved model '",
+        "prompt is too long for model '",
+    ];
+    for marker in MARKERS {
+        let Some(offset) = lower.find(marker) else {
+            continue;
+        };
+        let start = offset + marker.len();
+        let end = start + message[start..].find('\'')?;
+        let model = &message[start..end];
+        if !model.is_empty()
+            && model.len() <= 128
+            && model
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"._-".contains(&byte))
+        {
+            return Some(model);
+        }
+    }
+    None
 }
 
 fn context_token_counts(message: &str, lower: &str) -> Option<(u64, u64)> {
@@ -279,6 +314,30 @@ mod tests {
         assert_eq!(
             sanitize_error_message(
                 "prompt is too long for resolved model claude-sonnet-4.6: 196000 input tokens exceeds 190000"
+            ),
+            "prompt is too long: 196000 tokens > 190000"
+        );
+        assert_eq!(
+            sanitize_error_message(
+                "prompt is too long for resolved model 'claude-sonnet-4.6': 196000 input tokens exceeds 190000"
+            ),
+            "prompt is too long for model 'claude-sonnet-4.6': 196000 tokens > 190000"
+        );
+        assert_eq!(
+            sanitize_error_message(
+                "prompt is too long for model 'bad model<script>': 196000 input tokens exceeds 190000"
+            ),
+            "prompt is too long: 196000 tokens > 190000"
+        );
+        assert_eq!(
+            sanitize_error_message(
+                "prompt is too long for model 'q.us-east-1.amazonaws.com/private': 196000 input tokens exceeds 190000"
+            ),
+            "prompt is too long: 196000 tokens > 190000"
+        );
+        assert_eq!(
+            sanitize_error_message(
+                "prompt is too long for model 'provider/private-model': 196000 input tokens exceeds 190000"
             ),
             "prompt is too long: 196000 tokens > 190000"
         );
