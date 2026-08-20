@@ -177,6 +177,14 @@ Kiro 上下文或上游 payload。Catalog 构建和搜索运行在 blocking work
 `413/request_too_large` 仅用于真实入站请求体超过 50 MiB；工具、上下文及转换后 payload 的
 语义预算错误使用 400，以免 Claude Code 将其误显示成 32MB 附件错误。
 
+Claude Messages 可通过 `context.auto_compact_on_overflow = true` 开启模型映射感知的自动上下文
+压缩；该开关默认关闭。首次上游生成前，代理会按映射模型的安全窗口压缩，并按摘要模型窗口预检
+语义摘要请求；如果选定账号最终解析出的窗口更小，同一份压缩产物最多重新应用一次。生产环境应把
+`context.compaction_summary_model` 配置成足以容纳预期原始会话的模型。OpenAI Chat Completions
+以及 Tool Search 已开始输出后的上下文增长仍返回明确的上下文错误，因为这些路径无法安全回传位于
+Claude 响应首部的 `compaction` 边界。摘要超时会立即释放主请求；后台仅在有界宽限期内继续结算，
+到期后主动取消摘要流，并结算此前已经解码的 usage。
+
 `features.tool_search_max_rounds` 默认 4、硬上限 8；单次请求达到内部轮次上限时返回 Claude
 `pause_turn` 续轮状态，不再把合法的 server call 转换成 HTTP 5xx。
 `features.tool_search_max_operations` 默认 32（有效范围 1–256），统一限制历史待续调用及所有内部
