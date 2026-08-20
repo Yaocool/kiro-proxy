@@ -74,7 +74,7 @@ enum Command {
         #[arg(long, conflicts_with = "keep_backup")]
         delete_backup: bool,
     },
-    /// 配置查看与重载。
+    /// 配置查看、编辑、重载与重置。
     #[command(subcommand)]
     Config(ConfigCommand),
     /// 账号管理。
@@ -294,6 +294,11 @@ enum ConfigCommand {
     /// 用 $VISUAL/$EDITOR 打开配置并在保存后校验、重载。
     #[command(after_help = "示例：\n  kproxy config edit\n  EDITOR=vim kproxy config edit")]
     Edit,
+    /// 备份当前配置并恢复全部默认设置，执行前需输入 y 或 yes 确认。
+    #[command(
+        after_help = "示例：\n  kproxy config reset\n\n会清除配置中的代理服务、API key、模型映射和告警目标；原配置自动备份。"
+    )]
+    Reset,
     /// 只校验配置，不应用。
     #[command(
         after_help = "示例：\n  kproxy config validate\n  kproxy config validate ./config.toml"
@@ -443,6 +448,28 @@ async fn main() -> Result<()> {
         }
         Command::Config(ConfigCommand::Edit) => {
             crate::commands::runtime::edit_config(&mut client).await?;
+        }
+        Command::Config(ConfigCommand::Reset) => {
+            if let Some(result) = crate::commands::runtime::reset_config(&mut client).await? {
+                if cli.json {
+                    print_json(&serde_json::json!({
+                        "config_file": result.config_file,
+                        "backup_file": result.backup_file,
+                        "applied": true,
+                        "needs_restart": result.needs_restart,
+                    }))?;
+                } else {
+                    println!("配置已恢复为默认设置并重载");
+                    println!("原配置备份 {}", result.backup_file.display());
+                    for field in result.needs_restart {
+                        println!("注意：{field} 需重启 kproxyd 才能生效");
+                    }
+                }
+            } else if cli.json {
+                print_json(&serde_json::json!({"cancelled": true}))?;
+            } else {
+                println!("已取消");
+            }
         }
         Command::Config(ConfigCommand::Validate { file }) => {
             crate::commands::runtime::validate_config(file.as_deref()).await?;
@@ -660,6 +687,15 @@ fn print_status(status: &StatusResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn config_reset_is_available_as_a_subcommand() {
+        let cli = Cli::try_parse_from(["kproxy", "config", "reset"]).expect("config reset");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Config(ConfigCommand::Reset))
+        ));
+    }
 
     #[test]
     fn alert_command_replaces_the_webhook_entrypoint() {

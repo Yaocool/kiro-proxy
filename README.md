@@ -364,6 +364,7 @@ kproxy config show --effective
 kproxy config path
 kproxy config validate
 kproxy config reload
+kproxy config reset             # confirms, backs up config.toml, restores defaults, and reloads
 
 kproxy pool --watch --explain
 kproxy diagnose endpoints
