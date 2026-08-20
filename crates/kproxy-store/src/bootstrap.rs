@@ -48,11 +48,7 @@ pub async fn ensure_layout(paths: &Paths) -> Result<BootstrapReport> {
 
     // DEFAULT_CONFIG_TOML 面向生产默认使用 /run。开发与容器使用 KPROXY_HOME 时，
     // 将首次生成配置中的 socket 写成环境解析结果，保证裸启动无需 root 权限。
-    let socket = Config::default().admin.socket;
-    let generated_config = DEFAULT_CONFIG_TOML.replace(
-        "socket = \"/run/kproxy/admin.sock\"",
-        &format!("socket = \"{socket}\""),
-    );
+    let generated_config = render_default_config(&Config::default().admin.socket);
 
     let mut replay_key = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut replay_key);
@@ -75,6 +71,15 @@ pub async fn ensure_layout(paths: &Paths) -> Result<BootstrapReport> {
         )
         .await?,
     })
+}
+
+/// Render the commented default configuration for a resolved administration socket.
+pub fn render_default_config(admin_socket: &str) -> String {
+    let socket = toml::Value::String(admin_socket.into());
+    DEFAULT_CONFIG_TOML.replace(
+        "socket = \"/run/kproxy/admin.sock\"",
+        &format!("socket = {socket}"),
+    )
 }
 
 async fn create_if_absent(path: &Path, contents: &[u8], mode: Option<u32>) -> Result<bool> {
@@ -173,6 +178,14 @@ mod tests {
                 .len(),
             32
         );
+    }
+
+    #[test]
+    fn rendered_default_config_uses_and_escapes_the_resolved_socket() {
+        let rendered = render_default_config("/tmp/kproxy/quoted\"socket.sock");
+        let parsed: Config = toml::from_str(&rendered).expect("rendered default config");
+        assert_eq!(parsed.admin.socket, "/tmp/kproxy/quoted\"socket.sock");
+        parsed.validate().expect("valid rendered defaults");
     }
 
     #[tokio::test]

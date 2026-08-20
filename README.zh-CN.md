@@ -303,6 +303,7 @@ kproxy config show --effective
 kproxy config path
 kproxy config validate
 kproxy config reload
+kproxy config reset             # 确认后备份 config.toml、恢复默认设置并重载
 
 kproxy pool --watch --explain
 kproxy diagnose endpoints

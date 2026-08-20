@@ -1697,6 +1697,119 @@ pub async fn edit_config(client: &mut AdminClient) -> Result<()> {
     Ok(())
 }
 
+/// Successful `config reset` result.
+pub struct ConfigResetResult {
+    pub config_file: PathBuf,
+    pub backup_file: PathBuf,
+    pub needs_restart: Vec<String>,
+}
+
+/// Back up the current configuration, replace it with the commented defaults, and reload it.
+pub async fn reset_config(client: &mut AdminClient) -> Result<Option<ConfigResetResult>> {
+    let paths: ConfigPathResult = client
+        .call(method::CONFIG_PATH, serde_json::json!({}))
+        .await?;
+    let path = PathBuf::from(paths.config_file);
+    if !crate::commands::confirm(
+        "确认将全部配置恢复为默认设置？代理服务、API key、模型映射和告警目标会被清除",
+    )
+    .await?
+    {
+        return Ok(None);
+    }
+
+    let original = tokio::fs::read(&path)
+        .await
+        .with_context(|| format!("读取 {} 失败", path.display()))?;
+    let defaults = kproxy_store::bootstrap::render_default_config(
+        &kproxy_core::config::Config::default().admin.socket,
+    );
+    let config: kproxy_core::config::Config =
+        toml::from_str(&defaults).context("内置默认配置无法解析")?;
+    config.validate().context("内置默认配置校验失败")?;
+
+    let backup_file = write_config_backup(&path, &original).await?;
+    kproxy_store::atomic::write_bytes_atomically(&path, defaults.as_bytes(), Some(0o600)).await?;
+    let result: ConfigReloadResult = match client
+        .call(method::CONFIG_RELOAD, serde_json::json!({}))
+        .await
+    {
+        Ok(result) => result,
+        Err(reload_error) => {
+            kproxy_store::atomic::write_bytes_atomically(&path, &original, Some(0o600)).await?;
+            let rollback = client
+                .call::<ConfigReloadResult>(method::CONFIG_RELOAD, serde_json::json!({}))
+                .await;
+            return match rollback {
+                Ok(rollback) if rollback.applied => Err(reload_error.context(format!(
+                    "默认配置重载请求失败，磁盘文件已回滚；原配置备份位于 {}",
+                    backup_file.display()
+                ))),
+                Ok(rollback) => Err(anyhow!(
+                    "默认配置重载请求失败，且回滚后的配置也无法重载；原配置备份位于 {}：{}；回滚错误：{}",
+                    backup_file.display(),
+                    reload_error,
+                    rollback.error.unwrap_or_else(|| "未知错误".into())
+                )),
+                Err(rollback_error) => Err(anyhow!(
+                    "默认配置重载请求失败，且无法确认回滚配置已生效；原配置备份位于 {}：{}；回滚错误：{}",
+                    backup_file.display(),
+                    reload_error,
+                    rollback_error
+                )),
+            };
+        }
+    };
+    if result.applied {
+        return Ok(Some(ConfigResetResult {
+            config_file: path,
+            backup_file,
+            needs_restart: result.needs_restart,
+        }));
+    }
+
+    kproxy_store::atomic::write_bytes_atomically(&path, &original, Some(0o600)).await?;
+    let rollback: ConfigReloadResult = client
+        .call(method::CONFIG_RELOAD, serde_json::json!({}))
+        .await?;
+    if !rollback.applied {
+        return Err(anyhow!(
+            "默认配置重载失败，且回滚后的配置也无法重载；原配置备份位于 {}：{}",
+            backup_file.display(),
+            rollback.error.unwrap_or_else(|| "未知错误".into())
+        ));
+    }
+    Err(anyhow!(
+        "默认配置重载失败，磁盘文件已回滚；原配置备份位于 {}：{}",
+        backup_file.display(),
+        result.error.unwrap_or_else(|| "未知错误".into())
+    ))
+}
+
+async fn write_config_backup(path: &Path, contents: &[u8]) -> Result<PathBuf> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| anyhow!("配置路径缺少文件名：{}", path.display()))?
+        .to_string_lossy();
+    for index in 0..10_000usize {
+        let suffix = if index == 0 {
+            ".bak".to_owned()
+        } else {
+            format!(".bak.{index}")
+        };
+        let candidate = path.with_file_name(format!("{file_name}{suffix}"));
+        if kproxy_store::atomic::write_bytes_if_absent_atomically(&candidate, contents, Some(0o600))
+            .await?
+        {
+            return Ok(candidate);
+        }
+    }
+    Err(anyhow!(
+        "无法为 {} 分配备份文件名：已有备份数量过多",
+        path.display()
+    ))
+}
+
 const DEFAULT_EDITORS: [&str; 3] = ["vi", "vim", "nano"];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -2050,7 +2163,7 @@ pub fn print_topic(topic: Option<&str>) -> Result<()> {
             "`kproxy service create/list/apikeys/delete` 管理独立代理监听。创建时生成专用 API key；删除时级联删除专用 key，共享 key 保留，并要求 y/yes 确认。"
         }
         "config" => {
-            "配置默认位于 $KPROXY_HOME/config.toml，修改后热重载；server.host/port、admin.socket 和 TLS 监听变更需要重启。\n`kproxy config validate [file]` 只校验，`kproxy config edit` 保存后校验并重载，`kproxy config show --effective` 查看合并默认值的结果。"
+            "配置默认位于 $KPROXY_HOME/config.toml，修改后热重载；server.host/port、admin.socket 和 TLS 监听变更需要重启。\n`kproxy config validate [file]` 只校验，`kproxy config edit` 保存后校验并重载，`kproxy config show --effective` 查看合并默认值的结果。`kproxy config reset` 确认后备份原文件、恢复全部默认设置并重载。"
         }
         "apikey" => {
             "API key 限额采用在途预留：请求进入时预留估算 credits，结束后按上游实际用量结算，避免并发突破限额。\n`kproxy apikey list` 只显示基本汇总，增加 `--detail` 查看每个 key 的 token/credits 消耗；日维度、模型、路径和历史可用 `kproxy apikey usage <id>` 与 `history` 查询。"
@@ -2093,6 +2206,25 @@ pub fn print_topic(topic: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn config_backup_never_overwrites_an_existing_backup() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let config = directory.path().join("config.toml");
+        std::fs::write(config.with_file_name("config.toml.bak"), b"first")
+            .expect("existing backup");
+
+        let backup = write_config_backup(&config, b"current")
+            .await
+            .expect("new backup");
+
+        assert_eq!(backup, config.with_file_name("config.toml.bak.1"));
+        assert_eq!(std::fs::read(backup).expect("backup contents"), b"current");
+        assert_eq!(
+            std::fs::read(config.with_file_name("config.toml.bak")).expect("original backup"),
+            b"first"
+        );
+    }
 
     #[test]
     fn configured_editor_preserves_quoted_arguments() {
