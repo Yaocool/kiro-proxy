@@ -15,6 +15,15 @@ services:
     # reachable from the host immediately, without recreating the container.
     network_mode: host
     restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    mem_limit: "${KPROXY_MEMORY_LIMIT:-1g}"
+    pids_limit: ${KPROXY_PIDS_LIMIT:-512}
+    logging:
+      driver: json-file
+      options:
+        max-size: "${KPROXY_DOCKER_LOG_MAX_SIZE:-10m}"
+        max-file: "${KPROXY_DOCKER_LOG_MAX_FILES:-5}"
     labels:
       io.kiro-proxy.role: daemon
     volumes:

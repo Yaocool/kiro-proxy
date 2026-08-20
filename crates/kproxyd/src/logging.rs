@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -19,6 +19,7 @@ type FilterHandle = tracing_subscriber::reload::Handle<EnvFilter, tracing_subscr
 
 static FILTER_HANDLE: OnceLock<FilterHandle> = OnceLock::new();
 static LOG_RUNTIME: OnceLock<RuntimeLogConfig> = OnceLock::new();
+static DROPPED_LOG_RECORDS: AtomicU64 = AtomicU64::new(0);
 
 struct RuntimeLogConfig {
     json: Arc<AtomicBool>,
@@ -30,7 +31,8 @@ pub fn init(config: &LogConfig, default_file_path: PathBuf) -> Result<()> {
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(&config.level));
     let (filter, filter_handle) = tracing_subscriber::reload::Layer::new(filter);
     let file = ReconfigurableFileWriter::new(config, default_file_path)?;
-    let buffered = BufferedMakeWriter::new(file.clone())?;
+    let buffered_file = BufferedMakeWriter::file(file.clone())?;
+    let buffered_stdout = BufferedMakeWriter::stdout()?;
     let json = Arc::new(AtomicBool::new(config.format != "pretty"));
     let pretty_switch = Arc::clone(&json);
     let json_switch = Arc::clone(&json);
@@ -39,7 +41,7 @@ pub fn init(config: &LogConfig, default_file_path: PathBuf) -> Result<()> {
         .with(
             tracing_subscriber::fmt::layer()
                 .pretty()
-                .with_writer(std::io::stdout.and(buffered.clone()))
+                .with_writer(buffered_stdout.clone().and(buffered_file.clone()))
                 .with_filter(tracing_subscriber::filter::filter_fn(move |_| {
                     !pretty_switch.load(Ordering::Acquire)
                 })),
@@ -47,7 +49,7 @@ pub fn init(config: &LogConfig, default_file_path: PathBuf) -> Result<()> {
         .with(
             tracing_subscriber::fmt::layer()
                 .json()
-                .with_writer(std::io::stdout.and(buffered))
+                .with_writer(buffered_stdout.and(buffered_file))
                 .with_filter(tracing_subscriber::filter::filter_fn(move |_| {
                     json_switch.load(Ordering::Acquire)
                 })),
@@ -91,10 +93,29 @@ struct BufferedMakeWriter {
 }
 
 impl BufferedMakeWriter {
-    fn new(writer: ReconfigurableFileWriter) -> Result<Self> {
+    fn file(writer: ReconfigurableFileWriter) -> Result<Self> {
+        Self::spawn("kproxy-log-file", move |records| {
+            writer.write_batch(records)
+        })
+    }
+
+    fn stdout() -> Result<Self> {
+        let mut stdout = std::io::stdout();
+        Self::spawn("kproxy-log-stdout", move |records| {
+            for record in records {
+                stdout.write_all(&record.bytes)?;
+            }
+            stdout.flush()
+        })
+    }
+
+    fn spawn<F>(thread_name: &str, mut write_batch: F) -> Result<Self>
+    where
+        F: FnMut(&[BufferedRecord]) -> io::Result<()> + Send + 'static,
+    {
         let (sender, receiver) = std::sync::mpsc::sync_channel::<BufferedRecord>(4_096);
         std::thread::Builder::new()
-            .name("kproxy-log-writer".into())
+            .name(thread_name.into())
             .spawn(move || loop {
                 let first = match receiver.recv_timeout(Duration::from_millis(100)) {
                     Ok(record) => record,
@@ -112,7 +133,7 @@ impl BufferedMakeWriter {
                         Err(_) => break,
                     }
                 }
-                let _result = writer.write_batch(&batch);
+                let _result = write_batch(&batch);
             })
             .context("start buffered log writer")?;
         Ok(Self { sender })
@@ -151,11 +172,10 @@ impl Write for BufferedWriter {
         };
         match self.sender.try_send(record) {
             Ok(()) => Ok(buffer.len()),
-            Err(std::sync::mpsc::TrySendError::Full(record)) => self
-                .sender
-                .send(record)
-                .map(|()| buffer.len())
-                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "log writer stopped")),
+            Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                DROPPED_LOG_RECORDS.fetch_add(1, Ordering::Relaxed);
+                Ok(buffer.len())
+            }
             Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Err(io::Error::new(
                 io::ErrorKind::BrokenPipe,
                 "log writer stopped",
@@ -182,6 +202,7 @@ impl ReconfigurableFileWriter {
                 path,
                 maximum_bytes(config),
                 config.retention_days,
+                config.max_files_per_day,
             )?)),
             default_path: Arc::new(default_path),
         })
@@ -192,6 +213,7 @@ impl ReconfigurableFileWriter {
             configured_path(config, &self.default_path),
             maximum_bytes(config),
             config.retention_days,
+            config.max_files_per_day,
         )?;
         *self
             .state
@@ -237,12 +259,18 @@ struct DatedLogFiles {
     base_path: PathBuf,
     maximum: u64,
     retention_days: u64,
+    max_files_per_day: usize,
     current_day: Option<i64>,
     files: BTreeMap<&'static str, DatedRotationState>,
 }
 
 impl DatedLogFiles {
-    fn new(base_path: PathBuf, maximum: u64, retention_days: u64) -> Result<Self> {
+    fn new(
+        base_path: PathBuf,
+        maximum: u64,
+        retention_days: u64,
+        max_files_per_day: u64,
+    ) -> Result<Self> {
         if let Some(parent) = base_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("create log directory {}", parent.display()))?;
@@ -251,6 +279,7 @@ impl DatedLogFiles {
             base_path,
             maximum: maximum.max(1),
             retention_days: retention_days.max(1),
+            max_files_per_day: usize::try_from(max_files_per_day.max(1)).unwrap_or(usize::MAX),
             current_day: None,
             files: BTreeMap::new(),
         };
@@ -268,7 +297,13 @@ impl DatedLogFiles {
         let name = level_name(level);
         if !self.files.contains_key(name) {
             let date = date_string(day);
-            let state = DatedRotationState::open(self.base_path.clone(), date, name, self.maximum)?;
+            let state = DatedRotationState::open(
+                self.base_path.clone(),
+                date,
+                name,
+                self.maximum,
+                self.max_files_per_day,
+            )?;
             self.files.insert(name, state);
         }
         self.files
@@ -306,9 +341,11 @@ struct DatedRotationState {
     date: String,
     level: &'static str,
     maximum: u64,
+    max_files: usize,
     index: usize,
     size: u64,
     file: File,
+    discarding: bool,
 }
 
 impl DatedRotationState {
@@ -317,6 +354,7 @@ impl DatedRotationState {
         date: String,
         level: &'static str,
         maximum: u64,
+        max_files: usize,
     ) -> io::Result<Self> {
         let mut index = 0;
         loop {
@@ -329,22 +367,44 @@ impl DatedRotationState {
                     date,
                     level,
                     maximum,
+                    max_files,
                     index,
                     size,
                     file,
+                    discarding: false,
+                });
+            }
+            if index.saturating_add(1) >= max_files {
+                return Ok(Self {
+                    base_path,
+                    date,
+                    level,
+                    maximum,
+                    max_files,
+                    index,
+                    size,
+                    file,
+                    discarding: true,
                 });
             }
             index = index.saturating_add(1);
         }
     }
 
-    fn prepare(&mut self, incoming: u64) -> io::Result<()> {
+    fn prepare(&mut self, incoming: u64) -> io::Result<bool> {
+        if self.discarding {
+            return Ok(false);
+        }
         if self.size == 0 || self.size.saturating_add(incoming) <= self.maximum {
-            return Ok(());
+            return Ok(true);
         }
         self.file.flush()?;
         self.file.sync_data()?;
         loop {
+            if self.index.saturating_add(1) >= self.max_files {
+                self.discarding = true;
+                return Ok(false);
+            }
             self.index = self.index.saturating_add(1);
             let path = dated_path(&self.base_path, &self.date, self.level, self.index);
             let file = open_append(&path)?;
@@ -352,7 +412,7 @@ impl DatedRotationState {
             if size < self.maximum || size == 0 {
                 self.file = file;
                 self.size = size;
-                return Ok(());
+                return Ok(true);
             }
         }
     }
@@ -360,7 +420,9 @@ impl DatedRotationState {
 
 impl Write for DatedRotationState {
     fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        self.prepare(buffer.len() as u64)?;
+        if !self.prepare(buffer.len() as u64)? {
+            return Ok(buffer.len());
+        }
         let written = self.file.write(buffer)?;
         self.size = self.size.saturating_add(written as u64);
         Ok(written)
@@ -493,12 +555,34 @@ mod tests {
     use super::*;
 
     #[test]
+    fn full_log_queue_drops_without_blocking_the_caller() {
+        let (sender, _receiver) = std::sync::mpsc::sync_channel(1);
+        sender
+            .send(BufferedRecord {
+                level: Level::INFO,
+                bytes: b"first".to_vec(),
+            })
+            .expect("fill queue");
+        let mut writer = BufferedWriter {
+            sender,
+            level: Level::INFO,
+        };
+        let dropped_before = DROPPED_LOG_RECORDS.load(Ordering::Relaxed);
+
+        assert_eq!(writer.write(b"second").expect("drop succeeds"), 6);
+        assert_eq!(
+            DROPPED_LOG_RECORDS.load(Ordering::Relaxed),
+            dropped_before + 1
+        );
+    }
+
+    #[test]
     fn splits_levels_and_rotates_each_day_independently() {
         let directory = tempfile::tempdir().expect("tempdir");
         let base = directory.path().join("kproxyd.log");
         let day = 20_000;
         let date = date_string(day);
-        let mut files = DatedLogFiles::new(base.clone(), 8, 3).expect("writer");
+        let mut files = DatedLogFiles::new(base.clone(), 8, 3, 3).expect("writer");
         for _ in 0..3 {
             files.write_at(&Level::INFO, b"12345\n", day).expect("info");
         }
@@ -529,7 +613,7 @@ mod tests {
         }
         std::fs::write(directory.path().join("unrelated.log"), b"keep").expect("unrelated");
 
-        let files = DatedLogFiles::new(base.clone(), 100, 3).expect("writer");
+        let files = DatedLogFiles::new(base.clone(), 100, 3, 3).expect("writer");
         files.cleanup(current).expect("cleanup");
 
         assert!(!dated_path(&base, &date_string(current - 3), "info", 0).exists());
@@ -569,5 +653,24 @@ mod tests {
 
         assert!(dated_path(&first, &date, "info", 0).exists());
         assert!(dated_path(&second, &date, "info", 0).exists());
+    }
+
+    #[test]
+    fn stops_creating_file_shards_at_the_daily_limit() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let base = directory.path().join("kproxyd.log");
+        let day = 20_000;
+        let date = date_string(day);
+        let mut files = DatedLogFiles::new(base.clone(), 8, 3, 2).expect("writer");
+        for _ in 0..10 {
+            files
+                .write_at(&Level::INFO, b"12345\n", day)
+                .expect("write");
+        }
+        files.flush().expect("flush");
+
+        assert!(dated_path(&base, &date, "info", 0).exists());
+        assert!(dated_path(&base, &date, "info", 1).exists());
+        assert!(!dated_path(&base, &date, "info", 2).exists());
     }
 }

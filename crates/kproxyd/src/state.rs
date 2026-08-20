@@ -2,10 +2,11 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use kproxy_core::account::Account;
 use kproxy_core::config::Config;
 use kproxy_core::paths::Paths;
@@ -18,7 +19,9 @@ use kproxy_store::config_loader::ConfigHandle;
 use kproxy_translate::{
     model::resolve_dynamic_model, KiroPayload, TokenCountCache, WebSearchReplayCodec,
 };
+use rand::RngCore;
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 use crate::http::prompt_cache::PromptCacheTracker;
 use crate::http::stream::KeepaliveHub;
@@ -138,9 +141,8 @@ pub struct AppState {
     pub task_registry: TaskRegistry,
     /// Dynamically managed API proxy listeners.
     pub proxy_services: Arc<crate::http::ProxyServiceManager>,
-    /// Shared graceful-shutdown token, including automatic quota shutdown.
+    /// Shared graceful-shutdown token for process lifecycle events.
     pub shutdown: CancellationToken,
-    quota_shutdown_started: AtomicBool,
     /// 启动时刻。
     pub started_at: Instant,
     config_reloaded_at: AtomicI64,
@@ -174,18 +176,32 @@ impl AppState {
         let current = config.current();
         accounts.set_compression_threshold(current.storage.compression_threshold);
         accounts.set_incremental_write(current.storage.incremental_write);
-        let meter = Meter::load(&paths.daily_file, &current.api_key).await?;
-        let stats = Arc::new(StatsStore::load(&paths.stats_file).await?);
-        let replay_key = tokio::fs::read_to_string(&paths.web_search_replay_key_file)
-            .await
-            .map_err(|error| {
-                anyhow::anyhow!(
-                    "read web-search replay key {}: {error}",
-                    paths.web_search_replay_key_file.display()
-                )
-            })?;
-        let web_search_replay = WebSearchReplayCodec::from_base64(&replay_key)
-            .map_err(|error| anyhow::anyhow!(error))?;
+        let meter = match Meter::load(&paths.daily_file, &current.api_key).await {
+            Ok(meter) => meter,
+            Err(error) => {
+                quarantine_corrupt_state(&paths.daily_file, "metering", &error.to_string()).await;
+                warn!(
+                    error = %error,
+                    path = %paths.daily_file.display(),
+                    "metering state is unavailable; starting management plane in fail-closed recovery mode"
+                );
+                Meter::fail_closed(&paths.daily_file, &current.api_key, error.to_string())
+            }
+        };
+        let stats = match StatsStore::load(&paths.stats_file).await {
+            Ok(stats) => Arc::new(stats),
+            Err(error) => {
+                quarantine_corrupt_state(&paths.stats_file, "statistics", &error.to_string()).await;
+                warn!(
+                    error = %error,
+                    path = %paths.stats_file.display(),
+                    "statistics state is unavailable; starting with empty statistics"
+                );
+                Arc::new(StatsStore::empty(&paths.stats_file))
+            }
+        };
+        let web_search_replay =
+            load_or_regenerate_replay_key(&paths.web_search_replay_key_file).await;
         Self::build(paths, config, accounts, meter, stats, web_search_replay)
     }
 
@@ -240,7 +256,6 @@ impl AppState {
             task_registry: TaskRegistry::default(),
             proxy_services: Arc::new(crate::http::ProxyServiceManager::default()),
             shutdown: CancellationToken::new(),
-            quota_shutdown_started: AtomicBool::new(false),
             started_at: Instant::now(),
             config_reloaded_at: AtomicI64::new(0),
             account_mutation: tokio::sync::Mutex::new(()),
@@ -262,13 +277,6 @@ impl AppState {
     pub fn config_reloaded_at(&self) -> Option<i64> {
         let value = self.config_reloaded_at.load(Ordering::Relaxed);
         (value != 0).then_some(value)
-    }
-
-    /// Ensures quota exhaustion notifications and shutdown are initiated once.
-    pub fn begin_quota_shutdown(&self) -> bool {
-        self.quota_shutdown_started
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
     }
 
     /// 只读访问账号库。
@@ -634,6 +642,87 @@ impl AppState {
     }
 }
 
+async fn quarantine_corrupt_state(path: &std::path::Path, kind: &str, error: &str) {
+    if !tokio::fs::try_exists(path).await.unwrap_or(false) {
+        return;
+    }
+    let timestamp = crate::meter::now_secs();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("state");
+    for suffix in 0..100u32 {
+        let unique = if suffix == 0 {
+            timestamp.to_string()
+        } else {
+            format!("{timestamp}-{suffix}")
+        };
+        let quarantine = path.with_file_name(format!("{file_name}.corrupt-{unique}"));
+        if tokio::fs::try_exists(&quarantine).await.unwrap_or(true) {
+            continue;
+        }
+        match tokio::fs::rename(path, &quarantine).await {
+            Ok(()) => {
+                warn!(
+                    state_kind = kind,
+                    source = %path.display(),
+                    quarantine = %quarantine.display(),
+                    reason = error,
+                    "quarantined unreadable state file"
+                );
+                return;
+            }
+            Err(rename_error) => {
+                warn!(
+                    state_kind = kind,
+                    path = %path.display(),
+                    reason = error,
+                    error = %rename_error,
+                    "failed to quarantine unreadable state file"
+                );
+                return;
+            }
+        }
+    }
+    warn!(
+        state_kind = kind,
+        path = %path.display(),
+        reason = error,
+        "failed to quarantine unreadable state file because all backup names are occupied"
+    );
+}
+
+async fn load_or_regenerate_replay_key(path: &std::path::Path) -> WebSearchReplayCodec {
+    match tokio::fs::read_to_string(path).await {
+        Ok(encoded) => match WebSearchReplayCodec::from_base64(&encoded) {
+            Ok(codec) => return codec,
+            Err(error) => quarantine_corrupt_state(path, "web-search replay key", &error).await,
+        },
+        Err(error) => {
+            quarantine_corrupt_state(path, "web-search replay key", &error.to_string()).await
+        }
+    }
+
+    let mut key = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut key);
+    let encoded = format!("{}\n", URL_SAFE_NO_PAD.encode(key));
+    if let Err(error) =
+        kproxy_store::atomic::write_bytes_atomically(path, encoded.as_bytes(), Some(0o600)).await
+    {
+        warn!(
+            path = %path.display(),
+            %error,
+            "failed to persist regenerated web-search replay key; using an ephemeral key"
+        );
+    } else {
+        warn!(
+            path = %path.display(),
+            "regenerated web-search replay key; replay tokens issued before recovery are invalid"
+        );
+    }
+    WebSearchReplayCodec::from_key(key)
+}
+
 fn format_service_failures(failures: &[(String, String)]) -> String {
     failures
         .iter()
@@ -840,5 +929,57 @@ mod tests {
         );
         assert_eq!(state.adjust_admission(None, 1).await, 224);
         assert_eq!(state.adjust_admission(None, 0).await, 224);
+    }
+
+    #[tokio::test]
+    async fn corrupt_auxiliary_state_starts_in_recoverable_mode() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        tokio::fs::write(&paths.daily_file, "{not-json")
+            .await
+            .expect("corrupt daily");
+        tokio::fs::write(&paths.stats_file, r#"{"total":{}}"#)
+            .await
+            .expect("corrupt stats");
+        tokio::fs::write(&paths.web_search_replay_key_file, "not-a-valid-key")
+            .await
+            .expect("corrupt replay key");
+        let accounts = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("accounts");
+
+        let state = AppState::load(
+            paths.clone(),
+            ConfigHandle::new(Config::default()),
+            accounts,
+        )
+        .await
+        .expect("management state remains available");
+
+        assert!(state.meter.recovery_error().is_some());
+        assert_eq!(state.stats.snapshot(None).total.requests, 0);
+        let mut entries = tokio::fs::read_dir(&paths.data_dir)
+            .await
+            .expect("data directory");
+        let mut quarantined = Vec::new();
+        while let Some(entry) = entries.next_entry().await.expect("directory entry") {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.contains(".corrupt-") {
+                quarantined.push(name);
+            }
+        }
+        assert_eq!(quarantined.len(), 3);
+        let replay_key = tokio::fs::read_to_string(&paths.web_search_replay_key_file)
+            .await
+            .expect("regenerated replay key");
+        WebSearchReplayCodec::from_base64(&replay_key).expect("valid regenerated replay key");
     }
 }

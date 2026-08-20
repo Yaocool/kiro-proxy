@@ -12,6 +12,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+const MAX_USAGE_DAYS: usize = 366;
+const MAX_USAGE_DIMENSION_KEYS: usize = 256;
+const OTHER_USAGE_DIMENSION: &str = "other";
+
 #[derive(Debug, Error)]
 pub enum MeterError {
     #[error("invalid API key")]
@@ -38,6 +42,13 @@ impl UsageBucket {
         self.credits += record.credits;
         self.input_tokens += record.input_tokens;
         self.output_tokens += record.output_tokens;
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.requests = self.requests.saturating_add(other.requests);
+        self.credits += other.credits;
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
     }
 }
 
@@ -81,30 +92,59 @@ impl ApiKeyUsage {
             .entry(utc_day(record.timestamp))
             .or_default()
             .add(&record);
-        self.by_model
-            .entry(record.model.clone())
-            .or_default()
-            .add(&record);
+        while self.daily.len() > MAX_USAGE_DAYS {
+            self.daily.pop_first();
+        }
+        usage_dimension_entry(&mut self.by_model, &record.model).add(&record);
         if let Some(model) = &record.original_model {
-            self.by_original_model
-                .entry(model.clone())
-                .or_default()
-                .add(&record);
+            usage_dimension_entry(&mut self.by_original_model, model).add(&record);
         }
         if let Some(model) = &record.kiro_model {
-            self.by_kiro_model
-                .entry(model.clone())
-                .or_default()
-                .add(&record);
+            usage_dimension_entry(&mut self.by_kiro_model, model).add(&record);
         }
-        self.by_path
-            .entry(record.path.clone())
-            .or_default()
-            .add(&record);
+        usage_dimension_entry(&mut self.by_path, &record.path).add(&record);
         self.history.push_back(record);
         while self.history.len() > 100 {
             self.history.pop_front();
         }
+    }
+
+    fn bound(&mut self) {
+        while self.daily.len() > MAX_USAGE_DAYS {
+            self.daily.pop_first();
+        }
+        bound_usage_dimensions(&mut self.by_model);
+        bound_usage_dimensions(&mut self.by_original_model);
+        bound_usage_dimensions(&mut self.by_kiro_model);
+        bound_usage_dimensions(&mut self.by_path);
+        while self.history.len() > 100 {
+            self.history.pop_front();
+        }
+    }
+}
+
+fn usage_dimension_entry<'a>(
+    dimensions: &'a mut HashMap<String, UsageBucket>,
+    key: &str,
+) -> &'a mut UsageBucket {
+    let bounded_key = if dimensions.contains_key(key)
+        || (key != OTHER_USAGE_DIMENSION
+            && dimensions.len() < MAX_USAGE_DIMENSION_KEYS.saturating_sub(1))
+    {
+        key
+    } else {
+        OTHER_USAGE_DIMENSION
+    };
+    dimensions.entry(bounded_key.to_string()).or_default()
+}
+
+fn bound_usage_dimensions(dimensions: &mut HashMap<String, UsageBucket>) {
+    if dimensions.len() < MAX_USAGE_DIMENSION_KEYS {
+        return;
+    }
+    let entries = std::mem::take(dimensions);
+    for (key, bucket) in entries {
+        usage_dimension_entry(dimensions, &key).merge(&bucket);
     }
 }
 
@@ -154,6 +194,7 @@ pub struct Meter {
     persist_lock: tokio::sync::Mutex<()>,
     persist_scheduled: AtomicBool,
     dirty_generation: AtomicU64,
+    recovery_error: Mutex<Option<String>>,
 }
 
 pub struct CreditReservation {
@@ -192,6 +233,42 @@ impl Meter {
             persist_lock: tokio::sync::Mutex::new(()),
             persist_scheduled: AtomicBool::new(false),
             dirty_generation: AtomicU64::new(0),
+            recovery_error: Mutex::new(None),
+        })
+    }
+
+    pub fn fail_closed(
+        path: &Path,
+        configs: &[ApiKeyConfig],
+        error: impl Into<String>,
+    ) -> Arc<Self> {
+        let keys = configs
+            .iter()
+            .cloned()
+            .map(|config| {
+                let id = config.id.clone().unwrap_or_else(|| key_id(&config.key));
+                (
+                    id.clone(),
+                    KeyState {
+                        id,
+                        config,
+                        usage: ApiKeyUsage::default(),
+                        reserved: 0.0,
+                    },
+                )
+            })
+            .collect();
+        Arc::new(Self {
+            path: path.into(),
+            keys: Mutex::new(keys),
+            service: Mutex::new(ServiceCreditState {
+                day: utc_day(now_secs()),
+                ..ServiceCreditState::default()
+            }),
+            persist_lock: tokio::sync::Mutex::new(()),
+            persist_scheduled: AtomicBool::new(false),
+            dirty_generation: AtomicU64::new(0),
+            recovery_error: Mutex::new(Some(error.into())),
         })
     }
 
@@ -223,7 +300,7 @@ impl Meter {
             .map(|config| {
                 let generated = config.id.is_none();
                 let id = config.id.clone().unwrap_or_else(|| key_id(&config.key));
-                let usage = persisted
+                let mut usage = persisted
                     .api_keys
                     .get(&id)
                     .or_else(|| {
@@ -233,6 +310,7 @@ impl Meter {
                     })
                     .cloned()
                     .unwrap_or_default();
+                usage.bound();
                 (
                     id.clone(),
                     KeyState {
@@ -256,6 +334,7 @@ impl Meter {
             persist_lock: tokio::sync::Mutex::new(()),
             persist_scheduled: AtomicBool::new(false),
             dirty_generation: AtomicU64::new(0),
+            recovery_error: Mutex::new(None),
         }))
     }
 
@@ -273,13 +352,24 @@ impl Meter {
         )
     }
 
+    pub fn recovery_error(&self) -> Option<String> {
+        lock(&self.recovery_error).clone()
+    }
+
     pub async fn reset_daily(&self) -> Result<(), MeterError> {
+        let previous_recovery = lock(&self.recovery_error).take();
         {
             let mut service = lock(&self.service);
             service.day = utc_day(now_secs());
             service.used = 0.0;
         }
-        self.persist().await
+        if let Err(error) = self.persist().await {
+            if let Some(previous) = previous_recovery {
+                *lock(&self.recovery_error) = Some(previous);
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     pub fn authenticate(&self, presented: Option<&str>) -> Result<Option<String>, MeterError> {
@@ -299,6 +389,11 @@ impl Meter {
         key_id: Option<&str>,
         estimate: f64,
     ) -> Result<CreditReservation, MeterError> {
+        if let Some(error) = self.recovery_error() {
+            return Err(MeterError::Persist(format!(
+                "metering is in fail-closed recovery mode: {error}"
+            )));
+        }
         let estimate = estimate.max(0.0);
         {
             let mut service = lock(&self.service);
@@ -386,6 +481,11 @@ impl Meter {
     }
 
     pub async fn persist(&self) -> Result<(), MeterError> {
+        if let Some(error) = self.recovery_error() {
+            return Err(MeterError::Persist(format!(
+                "metering is in fail-closed recovery mode: {error}"
+            )));
+        }
         let _persist_guard = self.persist_lock.lock().await;
         let persisted = Persisted {
             api_keys: lock(&self.keys)
@@ -610,6 +710,27 @@ mod tests {
         }
     }
 
+    #[test]
+    fn usage_history_and_dimensions_are_bounded() {
+        let mut aggregate = ApiKeyUsage::default();
+        for index in 0..(MAX_USAGE_DIMENSION_KEYS + MAX_USAGE_DAYS + 100) {
+            let mut record = usage(1.0);
+            record.timestamp = index as i64 * 86_400;
+            record.model = format!("model-{index}");
+            record.original_model = Some(format!("original-{index}"));
+            record.kiro_model = Some(format!("kiro-{index}"));
+            record.path = format!("/path/{index}");
+            aggregate.add(record);
+        }
+
+        assert_eq!(aggregate.daily.len(), MAX_USAGE_DAYS);
+        assert_eq!(aggregate.by_model.len(), MAX_USAGE_DIMENSION_KEYS);
+        assert_eq!(aggregate.by_original_model.len(), MAX_USAGE_DIMENSION_KEYS);
+        assert_eq!(aggregate.by_kiro_model.len(), MAX_USAGE_DIMENSION_KEYS);
+        assert_eq!(aggregate.by_path.len(), MAX_USAGE_DIMENSION_KEYS);
+        assert_eq!(aggregate.history.len(), 100);
+    }
+
     #[tokio::test]
     async fn reservations_prevent_concurrent_limit_overshoot() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -667,6 +788,26 @@ mod tests {
             Meter::load(&path, &[]).await,
             Err(MeterError::Persist(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn recovery_meter_blocks_requests_until_an_explicit_daily_reset() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("daily.json");
+        let meter = Meter::fail_closed(&path, &[], "corrupt usage state");
+
+        assert!(matches!(
+            meter.reserve(None, 1.0),
+            Err(MeterError::Persist(_))
+        ));
+        assert!(meter.recovery_error().is_some());
+
+        meter.reset_daily().await.expect("explicit recovery reset");
+        assert!(meter.recovery_error().is_none());
+        assert!(meter.reserve(None, 1.0).is_ok());
+        Meter::load(&path, &[])
+            .await
+            .expect("recovery state persisted");
     }
 
     #[tokio::test]

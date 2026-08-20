@@ -50,6 +50,23 @@ pub struct AccountLease {
     notify: Arc<Notify>,
 }
 
+struct QueueGuard {
+    queued: Arc<AtomicUsize>,
+}
+
+impl QueueGuard {
+    fn enter(queued: Arc<AtomicUsize>) -> (Self, usize) {
+        let position = queued.fetch_add(1, Ordering::AcqRel);
+        (Self { queued }, position)
+    }
+}
+
+impl Drop for QueueGuard {
+    fn drop(&mut self) {
+        self.queued.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 impl AccountLease {
     pub async fn account(&self) -> Account {
         self.state.account.read().await.clone()
@@ -132,11 +149,10 @@ impl AccountPool {
             return Ok(lease);
         }
         let config = self.config();
-        let queue_position = self.queued.fetch_add(1, Ordering::AcqRel);
+        let (_queue_guard, queue_position) = QueueGuard::enter(Arc::clone(&self.queued));
         let queue_disabled = config.max_queue_size == 0;
         let overflow = queue_disabled || queue_position >= config.max_queue_size;
         if overflow && config.queue_full_wait_ms == 0 {
-            self.queued.fetch_sub(1, Ordering::AcqRel);
             return Err(PoolError::QueueFull);
         }
         let wait = if queue_disabled {
@@ -149,7 +165,6 @@ impl AccountPool {
         let deadline = Instant::now() + Duration::from_millis(wait);
         loop {
             if wait == 0 {
-                self.queued.fetch_sub(1, Ordering::AcqRel);
                 return Err(if overflow {
                     PoolError::QueueFull
                 } else {
@@ -158,18 +173,15 @@ impl AccountPool {
             }
             let now = Instant::now();
             if now >= deadline {
-                self.queued.fetch_sub(1, Ordering::AcqRel);
                 return Err(PoolError::QueueTimeout);
             }
             if tokio::time::timeout(deadline - now, self.notify.notified())
                 .await
                 .is_err()
             {
-                self.queued.fetch_sub(1, Ordering::AcqRel);
                 return Err(PoolError::QueueTimeout);
             }
             if let Some(lease) = self.try_acquire(model, estimated_credits, prefer_ids).await {
-                self.queued.fetch_sub(1, Ordering::AcqRel);
                 return Ok(lease);
             }
         }
@@ -700,6 +712,34 @@ mod tests {
         tokio::task::yield_now().await;
         let next = pool.acquire("claude-sonnet", 0.3, &[]).await.expect("next");
         assert_eq!(next.account().await.id, "only");
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_waiter_releases_its_queue_slot() {
+        let config = PoolConfig {
+            max_concurrent_per_account: 1,
+            max_queue_size: 1,
+            max_queue_wait_ms: 2_000,
+            ..PoolConfig::default()
+        };
+        let pool = AccountPool::new(vec![account("only", 0.0, SubscriptionKind::Pro)], config);
+        let held = pool.acquire("claude-sonnet", 0.0, &[]).await.expect("held");
+        let waiting_pool = pool.clone();
+        let waiter =
+            tokio::spawn(async move { waiting_pool.acquire("claude-sonnet", 0.0, &[]).await });
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while pool.queued() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waiter entered queue");
+        waiter.abort();
+        let _cancelled = waiter.await;
+
+        assert_eq!(pool.queued(), 0);
+        drop(held);
     }
 
     #[tokio::test]

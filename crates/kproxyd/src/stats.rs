@@ -8,6 +8,9 @@ use kproxy_kiro::ModelInfo;
 use serde::{Deserialize, Serialize};
 
 const MAX_DIMENSION_KEYS: usize = 1_024;
+const MAX_BUCKET_DIMENSION_KEYS: usize = 64;
+const MAX_BUCKET_LATENCIES: usize = 256;
+const MAX_MINUTE_BUCKETS: usize = 7 * 24 * 60;
 const OTHER_DIMENSION: &str = "other";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -148,11 +151,26 @@ pub struct WindowBucket {
 impl WindowBucket {
     fn record(&mut self, request: &RequestLog) {
         self.total.record(request);
-        record_dimension(&mut self.by_account, &request.account_id, request);
-        record_dimension(&mut self.by_endpoint, &request.endpoint, request);
-        record_dimension(&mut self.by_model, &request.model, request);
+        record_dimension_with_limit(
+            &mut self.by_account,
+            &request.account_id,
+            request,
+            MAX_BUCKET_DIMENSION_KEYS,
+        );
+        record_dimension_with_limit(
+            &mut self.by_endpoint,
+            &request.endpoint,
+            request,
+            MAX_BUCKET_DIMENSION_KEYS,
+        );
+        record_dimension_with_limit(
+            &mut self.by_model,
+            &request.model,
+            request,
+            MAX_BUCKET_DIMENSION_KEYS,
+        );
         self.latencies_ms.push_back(request.duration_ms);
-        while self.latencies_ms.len() > 2_000 {
+        while self.latencies_ms.len() > MAX_BUCKET_LATENCIES {
             self.latencies_ms.pop_front();
         }
     }
@@ -176,10 +194,14 @@ impl ProxyStats {
         bound_dimensions(&mut self.by_endpoint);
         bound_dimensions(&mut self.by_model);
         for bucket in self.minute_buckets.values_mut() {
-            bound_dimensions(&mut bucket.by_account);
-            bound_dimensions(&mut bucket.by_endpoint);
-            bound_dimensions(&mut bucket.by_model);
+            bound_dimensions_to(&mut bucket.by_account, MAX_BUCKET_DIMENSION_KEYS);
+            bound_dimensions_to(&mut bucket.by_endpoint, MAX_BUCKET_DIMENSION_KEYS);
+            bound_dimensions_to(&mut bucket.by_model, MAX_BUCKET_DIMENSION_KEYS);
+            while bucket.latencies_ms.len() > MAX_BUCKET_LATENCIES {
+                bucket.latencies_ms.pop_front();
+            }
         }
+        bound_minute_buckets(&mut self.minute_buckets);
     }
 
     pub fn percentiles(&self) -> (u64, u64, u64) {
@@ -220,7 +242,6 @@ impl StatsStore {
         })
     }
 
-    #[cfg(test)]
     pub fn empty(path: &Path) -> Self {
         let (sender, _) = tokio::sync::broadcast::channel(1_024);
         Self {
@@ -244,8 +265,7 @@ impl StatsStore {
             .entry(minute)
             .or_default()
             .record(&request);
-        let oldest = minute - 60 * 24 * 30;
-        state.minute_buckets.retain(|bucket, _| *bucket >= oldest);
+        bound_minute_buckets(&mut state.minute_buckets);
         state.recent_requests.push_back(request);
         while state.recent_requests.len() > 1_000 {
             state.recent_requests.pop_front();
@@ -381,7 +401,16 @@ fn merge_dimensions(target: &mut HashMap<String, Counter>, source: &HashMap<Stri
 }
 
 fn record_dimension(dimensions: &mut HashMap<String, Counter>, key: &str, request: &RequestLog) {
-    dimension_entry(dimensions, key).record(request);
+    record_dimension_with_limit(dimensions, key, request, MAX_DIMENSION_KEYS);
+}
+
+fn record_dimension_with_limit(
+    dimensions: &mut HashMap<String, Counter>,
+    key: &str,
+    request: &RequestLog,
+    maximum: usize,
+) {
+    dimension_entry_with_limit(dimensions, key, maximum).record(request);
 }
 
 fn merge_dimension(dimensions: &mut HashMap<String, Counter>, key: &str, counter: &Counter) {
@@ -389,8 +418,17 @@ fn merge_dimension(dimensions: &mut HashMap<String, Counter>, key: &str, counter
 }
 
 fn dimension_entry<'a>(dimensions: &'a mut HashMap<String, Counter>, key: &str) -> &'a mut Counter {
+    dimension_entry_with_limit(dimensions, key, MAX_DIMENSION_KEYS)
+}
+
+fn dimension_entry_with_limit<'a>(
+    dimensions: &'a mut HashMap<String, Counter>,
+    key: &str,
+    maximum: usize,
+) -> &'a mut Counter {
+    let maximum = maximum.max(2);
     let bounded_key = if dimensions.contains_key(key)
-        || (key != OTHER_DIMENSION && dimensions.len() < MAX_DIMENSION_KEYS - 1)
+        || (key != OTHER_DIMENSION && dimensions.len() < maximum - 1)
     {
         key
     } else {
@@ -400,12 +438,22 @@ fn dimension_entry<'a>(dimensions: &'a mut HashMap<String, Counter>, key: &str) 
 }
 
 fn bound_dimensions(dimensions: &mut HashMap<String, Counter>) {
-    if dimensions.len() < MAX_DIMENSION_KEYS {
+    bound_dimensions_to(dimensions, MAX_DIMENSION_KEYS);
+}
+
+fn bound_dimensions_to(dimensions: &mut HashMap<String, Counter>, maximum: usize) {
+    if dimensions.len() < maximum {
         return;
     }
     let entries = std::mem::take(dimensions);
     for (key, counter) in entries {
-        merge_dimension(dimensions, &key, &counter);
+        dimension_entry_with_limit(dimensions, &key, maximum).merge(&counter);
+    }
+}
+
+fn bound_minute_buckets(buckets: &mut BTreeMap<i64, WindowBucket>) {
+    while buckets.len() > MAX_MINUTE_BUCKETS {
+        buckets.pop_first();
     }
 }
 
@@ -557,9 +605,10 @@ mod tests {
             );
         }
         assert!(snapshot.minute_buckets.values().all(|bucket| {
-            bucket.by_account.len() <= MAX_DIMENSION_KEYS
-                && bucket.by_endpoint.len() <= MAX_DIMENSION_KEYS
-                && bucket.by_model.len() <= MAX_DIMENSION_KEYS
+            bucket.by_account.len() <= MAX_BUCKET_DIMENSION_KEYS
+                && bucket.by_endpoint.len() <= MAX_BUCKET_DIMENSION_KEYS
+                && bucket.by_model.len() <= MAX_BUCKET_DIMENSION_KEYS
+                && bucket.latencies_ms.len() <= MAX_BUCKET_LATENCIES
         }));
 
         let window = store.window(Some(0), None);
@@ -567,6 +616,45 @@ mod tests {
         assert!(window.by_account.len() <= MAX_DIMENSION_KEYS);
         assert!(window.by_endpoint.len() <= MAX_DIMENSION_KEYS);
         assert!(window.by_model.len() <= MAX_DIMENSION_KEYS);
+    }
+
+    #[test]
+    fn minute_buckets_have_hard_cardinality_and_retention_bounds() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = StatsStore::empty(&directory.path().join("stats.json"));
+        for index in 0..(MAX_BUCKET_DIMENSION_KEYS + 100) {
+            let mut entry = request(&format!("same-minute-{index}"), 1_000_000, 200);
+            entry.account_id = format!("account-{index}");
+            entry.endpoint = format!("endpoint-{index}");
+            entry.model = format!("model-{index}");
+            store.record(entry);
+        }
+        let high_cardinality = store.snapshot(None);
+        let bucket = high_cardinality
+            .minute_buckets
+            .values()
+            .next()
+            .expect("minute bucket");
+        assert_eq!(bucket.by_account.len(), MAX_BUCKET_DIMENSION_KEYS);
+        assert_eq!(bucket.by_endpoint.len(), MAX_BUCKET_DIMENSION_KEYS);
+        assert_eq!(bucket.by_model.len(), MAX_BUCKET_DIMENSION_KEYS);
+        assert_eq!(bucket.latencies_ms.len(), MAX_BUCKET_LATENCIES.min(164));
+        for minute in 0..(MAX_MINUTE_BUCKETS + 100) {
+            store.record(request(
+                &format!("minute-{minute}"),
+                2_000_000 + minute as i64 * 60,
+                200,
+            ));
+        }
+
+        let snapshot = store.snapshot(None);
+        assert_eq!(snapshot.minute_buckets.len(), MAX_MINUTE_BUCKETS);
+        assert!(snapshot.minute_buckets.values().all(|bucket| {
+            bucket.by_account.len() <= MAX_BUCKET_DIMENSION_KEYS
+                && bucket.by_endpoint.len() <= MAX_BUCKET_DIMENSION_KEYS
+                && bucket.by_model.len() <= MAX_BUCKET_DIMENSION_KEYS
+                && bucket.latencies_ms.len() <= MAX_BUCKET_LATENCIES
+        }));
     }
 
     #[tokio::test]

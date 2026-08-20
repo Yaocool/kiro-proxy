@@ -44,6 +44,9 @@ enum Command {
     /// 供容器和 systemd 使用的健康检查。
     #[command(after_help = "示例：\n  kproxy health\n  kproxy --json health")]
     Health,
+    /// 检查业务代理是否已具备接收请求的条件。
+    #[command(after_help = "示例：\n  kproxy ready\n  kproxy --json ready")]
+    Ready,
     /// 显示版本与默认上游端点。
     #[command(after_help = "示例：\n  kproxy version\n  kproxy --json version")]
     Version,
@@ -355,6 +358,23 @@ async fn main() -> Result<()> {
                 println!("ok");
             }
         }
+        Command::Ready => {
+            let status: StatusResult = client.call(method::STATUS, serde_json::json!({})).await?;
+            if cli.json {
+                print_json(&serde_json::json!({
+                    "ready":status.ready,
+                    "reasons":status.readiness_reasons.clone(),
+                    "status":status
+                }))?;
+            } else if status.ready {
+                println!("ready");
+            } else {
+                anyhow::bail!("not ready: {}", status.readiness_reasons.join("; "));
+            }
+            if !status.ready {
+                anyhow::bail!("business proxy is not ready");
+            }
+        }
         Command::Version => {
             let value = serde_json::json!({
                 "version":env!("CARGO_PKG_VERSION"),
@@ -602,6 +622,11 @@ fn print_status(status: &StatusResult) {
         status.account_banned,
         status.account_total.saturating_sub(status.account_enabled)
     );
+    if status.ready {
+        println!("就绪    是");
+    } else {
+        println!("就绪    否（{}）", status.readiness_reasons.join("；"));
+    }
     println!(
         "并发    {} 进行中 / 上限 {}     队列 {} 等待",
         status.active_requests, status.max_concurrent_requests, status.queued_requests

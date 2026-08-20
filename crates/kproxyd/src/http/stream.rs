@@ -528,7 +528,7 @@ pub fn response(
                                     .all_matching_credit_exhausted(&context.kiro_model)
                                     .await
                                 {
-                                    super::handlers::trigger_quota_shutdown(
+                                    super::handlers::notify_quota_degradation(
                                         &context.state,
                                         "All compatible Kiro accounts have exhausted their credit allowance",
                                     );
@@ -1179,7 +1179,7 @@ pub fn response(
             debug_assert!(budget_available);
             if let Err(error) = context.reservation.extend(context.estimated_credits) {
                 if matches!(error, crate::meter::MeterError::DailyLimitExceeded) {
-                    super::handlers::trigger_quota_shutdown(
+                    super::handlers::notify_quota_degradation(
                         &context.state,
                         "The service daily credit limit was reached during auto-continuation",
                     );
