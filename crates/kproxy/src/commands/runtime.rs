@@ -1810,7 +1810,7 @@ async fn write_config_backup(path: &Path, contents: &[u8]) -> Result<PathBuf> {
     ))
 }
 
-const DEFAULT_EDITORS: [&str; 3] = ["vi", "vim", "nano"];
+const DEFAULT_EDITORS: [&str; 3] = ["vim", "vi", "nano"];
 
 #[derive(Debug, PartialEq, Eq)]
 struct EditorCommand {
@@ -1830,7 +1830,7 @@ fn resolve_editor() -> Result<EditorCommand> {
     let path = std::env::var_os("PATH");
     let program = find_default_editor(path.as_deref()).ok_or_else(|| {
         anyhow!(
-            "未找到可用编辑器（已尝试 {}）；请安装编辑器，或设置 $VISUAL/$EDITOR，例如 EDITOR=nano kproxy config edit",
+            "未找到可用编辑器（已尝试 {}）；请安装编辑器，或设置 $VISUAL/$EDITOR，例如 EDITOR=vim kproxy config edit",
             DEFAULT_EDITORS.join("、")
         )
     })?;
@@ -2236,6 +2236,27 @@ mod tests {
             }
         );
         assert!(parse_editor("code '").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_editor_prefers_vim_over_vi() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let vim = directory.path().join("vim");
+        let vi = directory.path().join("vi");
+        std::fs::write(&vim, "").expect("vim");
+        std::fs::write(&vi, "").expect("vi");
+        std::fs::set_permissions(&vim, std::fs::Permissions::from_mode(0o755))
+            .expect("vim executable permissions");
+        std::fs::set_permissions(&vi, std::fs::Permissions::from_mode(0o755))
+            .expect("vi executable permissions");
+
+        assert_eq!(
+            find_default_editor(Some(directory.path().as_os_str())),
+            Some(vim)
+        );
     }
 
     #[cfg(unix)]

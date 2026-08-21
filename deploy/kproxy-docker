@@ -317,10 +317,23 @@ if [ -t 0 ] && [ -t 1 ]; then
   # Full-screen terminal programs such as vi need the host terminal type to
   # interpret cursor and function keys correctly inside the container.
   case "${TERM:-}" in
-    ""|dumb) terminal_type="xterm" ;;
+    ""|dumb) terminal_type="xterm-256color" ;;
     *) terminal_type="$TERM" ;;
   esac
-  exec docker exec -it -e "TERM=$terminal_type" "$container_id" /usr/local/bin/kproxy "$@"
+  # Minimal images do not necessarily contain host-specific terminfo entries
+  # such as xterm-kitty or wezterm. Fall back to the broadly supported xterm
+  # definition instead of letting Vim interpret cursor-key escape sequences as
+  # literal input.
+  if ! docker exec "$container_id" infocmp "$terminal_type" >/dev/null 2>&1; then
+    terminal_type="xterm-256color"
+  fi
+  editor="${EDITOR:-vim}"
+  visual="${VISUAL:-$editor}"
+  exec docker exec -it \
+    -e "TERM=$terminal_type" \
+    -e "EDITOR=$editor" \
+    -e "VISUAL=$visual" \
+    "$container_id" /usr/local/bin/kproxy "$@"
 else
   exec docker exec -i "$container_id" /usr/local/bin/kproxy "$@"
 fi
