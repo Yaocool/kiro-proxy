@@ -686,9 +686,9 @@ async fn handle_account_add_sso(state: &Arc<AppState>, params: serde_json::Value
     })
     .await
     .map_err(|error| RpcError::internal(error.to_string()))?;
-    let account = Account {
+    let mut account = Account {
         id: new_account_id(),
-        email,
+        email: email.clone(),
         label: None,
         enabled: true,
         machine_id: new_machine_id(),
@@ -700,6 +700,22 @@ async fn handle_account_add_sso(state: &Arc<AppState>, params: serde_json::Value
         created_at: now_secs(),
         credit_exhausted: false,
     };
+    let limits = state
+        .kiro()
+        .get_usage_limits(&account)
+        .await
+        .map_err(|error| {
+            RpcError::internal(format!(
+                "SSO login succeeded, but Kiro account validation failed; account was not saved: {}",
+                kproxy_translate::sanitize_error_message(&error.to_string())
+            ))
+        })?;
+    validate_sso_identity(&email, &limits)?;
+    if let Some(usage) = limits.normalized_usage(now_secs()) {
+        account.credit_exhausted = usage.limit > 0.0 && usage.current >= usage.limit;
+        account.usage = Some(usage);
+    }
+    account.subscription = limits.normalized_subscription();
     let summary = summarize(&account);
     commit_account_change(state, move |store| {
         store
@@ -708,6 +724,54 @@ async fn handle_account_add_sso(state: &Arc<AppState>, params: serde_json::Value
     })
     .await?;
     to_value(summary)
+}
+
+fn validate_sso_identity(
+    expected_email: &str,
+    limits: &kproxy_kiro::UsageLimits,
+) -> Result<(), RpcError> {
+    let actual = limits
+        .user_info
+        .as_ref()
+        .map(|identity| identity.email.trim())
+        .filter(|email| !email.is_empty())
+        .ok_or_else(|| {
+            RpcError::internal(
+                "Kiro account validation did not return an authenticated identity; account was not saved",
+            )
+        })?;
+    if sso_identities_match(expected_email, actual) {
+        return Ok(());
+    }
+    Err(RpcError::bad_params(format!(
+        "SSO identity mismatch: requested {expected_email}, but Kiro authenticated {actual}; account was not saved"
+    )))
+}
+
+fn sso_identities_match(expected_email: &str, actual_identity: &str) -> bool {
+    let expected_email = expected_email.trim();
+    let actual_identity = actual_identity.trim();
+    if expected_email.is_empty() || actual_identity.is_empty() {
+        return false;
+    }
+    if expected_email.eq_ignore_ascii_case(actual_identity) {
+        return true;
+    }
+    let expected = canonical_sso_identity(expected_email);
+    let actual = canonical_sso_identity(actual_identity);
+    !expected.is_empty() && expected == actual
+}
+
+fn canonical_sso_identity(value: &str) -> String {
+    value
+        .trim()
+        .split('@')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(|character| *character != '.')
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 async fn handle_account_remove(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
@@ -1540,6 +1604,32 @@ mod tests {
             created_at: 0,
             credit_exhausted: false,
         }
+    }
+
+    #[test]
+    fn sso_identity_matching_accepts_idc_username_variants_but_rejects_other_users() {
+        assert!(sso_identities_match(
+            "alice@example.com",
+            "ALICE@example.com"
+        ));
+        assert!(sso_identities_match(
+            "kiro.svc.70@patsnap.com",
+            "kirosvc.70"
+        ));
+        assert!(!sso_identities_match(
+            "kiro.svc.70@patsnap.com",
+            "kirosvc.41"
+        ));
+        assert!(!sso_identities_match("", ""));
+    }
+
+    #[test]
+    fn sso_identity_validation_fails_closed_when_upstream_omits_identity() {
+        let error =
+            validate_sso_identity("alice@example.com", &kproxy_kiro::UsageLimits::default())
+                .expect_err("missing upstream identity must be rejected");
+        assert!(error.message.contains("did not return"));
+        assert!(error.message.contains("not saved"));
     }
 
     async fn state_with(accounts: Vec<Account>) -> (TempDir, Arc<AppState>) {

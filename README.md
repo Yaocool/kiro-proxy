@@ -445,6 +445,10 @@ password file. A container path is still read normally when no host file with
 the same name exists. Passwords are accepted only from stdin or a two-column
 CSV file. Add
 `--headful` when MFA or an upstream page change requires manual interaction.
+Every login uses a dedicated incognito Chromium context and temporary profile,
+which are destroyed before the next account is processed. Before saving an
+account, kproxy also verifies that Kiro's authenticated identity matches the
+requested CSV email; mismatches fail without modifying the account store.
 This flow does not add support for non-enterprise or non-SSO accounts.
 
 ## Docker and systemd

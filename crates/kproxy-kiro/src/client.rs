@@ -239,6 +239,17 @@ pub struct UsageLimits {
     pub days_until_reset: Option<i64>,
     #[serde(default)]
     pub subscription_info: Option<UsageSubscription>,
+    #[serde(default)]
+    pub user_info: Option<UsageUserInfo>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UsageUserInfo {
+    #[serde(default)]
+    pub email: String,
+    #[serde(default)]
+    pub user_id: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -2032,6 +2043,10 @@ mod tests {
             "subscriptionInfo":{
                 "subscriptionTitle":"Kiro Pro+",
                 "type":"Q_DEVELOPER_STANDALONE_PRO_PLUS"
+            },
+            "userInfo":{
+                "email":"alice@example.com",
+                "userId":"user-123"
             }
         }))
         .expect("usage response");
@@ -2043,6 +2058,9 @@ mod tests {
         assert_eq!(subscription.kind, SubscriptionKind::ProPlus);
         assert_eq!(subscription.days_remaining, Some(7));
         assert_eq!(subscription.expires_at, Some(2_000_000_000));
+        let identity = limits.user_info.expect("authenticated identity");
+        assert_eq!(identity.email, "alice@example.com");
+        assert_eq!(identity.user_id, "user-123");
     }
 
     #[test]
