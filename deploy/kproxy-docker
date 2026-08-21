@@ -313,6 +313,43 @@ case "$lifecycle_action" in
     ;;
 esac
 
+# A host path is not visible inside an already-running container. For SSO CSV
+# imports, stream a readable host file through stdin and tell the container CLI
+# to consume that stream. Container paths continue to work when no host file
+# with the supplied name exists.
+is_sso_batch=0
+previous_argument=""
+for argument in "$@"; do
+  if [ "$previous_argument" = "account" ] && [ "$argument" = "add-sso" ]; then
+    is_sso_batch=1
+    break
+  fi
+  previous_argument="$argument"
+done
+
+host_batch_file=""
+if [ "$is_sso_batch" -eq 1 ]; then
+  expect_batch_file=0
+  for argument in "$@"; do
+    if [ "$expect_batch_file" -eq 1 ]; then
+      host_batch_file="$argument"
+      break
+    fi
+    case "$argument" in
+      --batch) expect_batch_file=1 ;;
+      --batch=*) host_batch_file="${argument#*=}"; break ;;
+    esac
+  done
+fi
+
+if [ -n "$host_batch_file" ] && [ "$host_batch_file" != "-" ] && [ -e "$host_batch_file" ]; then
+  [ -f "$host_batch_file" ] || fail "host batch path is not a regular file: $host_batch_file"
+  [ -r "$host_batch_file" ] || fail "host batch file is not readable: $host_batch_file"
+  exec docker exec -i \
+    -e KPROXY_WRAPPER_BATCH_STDIN=1 \
+    "$container_id" /usr/local/bin/kproxy "$@" < "$host_batch_file"
+fi
+
 if [ -t 0 ] && [ -t 1 ]; then
   # Full-screen terminal programs such as vi need the host terminal type to
   # interpret cursor and function keys correctly inside the container.
