@@ -96,7 +96,7 @@ async fn handle_logs(state: &Arc<AppState>, params: serde_json::Value) -> Handle
 
 fn handle_webhook_list(state: &Arc<AppState>) -> Handled {
     let logs = state.notifier().logs(1_000);
-    let targets = state
+    let mut targets = state
         .config
         .current()
         .webhook
@@ -113,6 +113,12 @@ fn handle_webhook_list(state: &Arc<AppState>) -> Handled {
             })
         })
         .collect::<Vec<_>>();
+    targets.sort_by(|left, right| {
+        compare_display_text(
+            left["name"].as_str().unwrap_or_default(),
+            right["name"].as_str().unwrap_or_default(),
+        )
+    });
     to_value(targets)
 }
 
@@ -128,6 +134,9 @@ fn handle_account_export(state: &Arc<AppState>, params: serde_json::Value) -> Ha
         parse_params(params)?
     };
     let mut accounts = state.with_accounts(|store| store.all().to_vec());
+    accounts.sort_by(|left, right| {
+        compare_account_identity(&left.email, &left.id, &right.email, &right.id)
+    });
     if params.redact {
         for account in &mut accounts {
             account.credentials.access_token = "<redacted>".into();
@@ -233,6 +242,12 @@ fn to_value<T: serde::Serialize>(value: T) -> Handled {
 
 fn parse_params<T: serde::de::DeserializeOwned>(params: serde_json::Value) -> Result<T, RpcError> {
     serde_json::from_value(params).map_err(|error| RpcError::bad_params(error.to_string()))
+}
+
+fn compare_display_text(left: &str, right: &str) -> std::cmp::Ordering {
+    left.to_ascii_lowercase()
+        .cmp(&right.to_ascii_lowercase())
+        .then_with(|| left.cmp(right))
 }
 
 async fn handle_status(state: &Arc<AppState>) -> Handled {
@@ -415,13 +430,15 @@ fn now_secs() -> i64 {
 }
 
 fn summarize(account: &Account) -> AccountSummary {
+    let mut tags = account.tags.clone();
+    tags.sort();
     AccountSummary {
         id: account.id.clone(),
         email: account.email.clone(),
         label: account.label.clone(),
         enabled: account.enabled,
         health: None,
-        tags: account.tags.clone(),
+        tags,
         subscription: account
             .subscription
             .as_ref()
@@ -431,6 +448,15 @@ fn summarize(account: &Account) -> AccountSummary {
         token_expires_at: account.credentials.expires_at,
         credit_exhausted: account.credit_exhausted,
     }
+}
+
+fn compare_account_identity(
+    left_email: &str,
+    left_id: &str,
+    right_email: &str,
+    right_id: &str,
+) -> std::cmp::Ordering {
+    compare_display_text(left_email, right_email).then_with(|| left_id.cmp(right_id))
 }
 
 async fn handle_account_list(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
@@ -473,14 +499,22 @@ async fn handle_account_list(state: &Arc<AppState>, params: serde_json::Value) -
     }
     match params.sort.as_deref() {
         Some("credit") => accounts.sort_by(|left, right| {
-            let left = left.credit_current.unwrap_or(f64::INFINITY);
-            let right = right.credit_current.unwrap_or(f64::INFINITY);
-            left.partial_cmp(&right)
-                .unwrap_or(std::cmp::Ordering::Equal)
+            left.credit_current
+                .unwrap_or(f64::INFINITY)
+                .total_cmp(&right.credit_current.unwrap_or(f64::INFINITY))
+                .then_with(|| {
+                    compare_account_identity(&left.email, &left.id, &right.email, &right.id)
+                })
         }),
-        Some("email") => accounts.sort_by(|left, right| left.email.cmp(&right.email)),
-        Some("id") | None => accounts.sort_by(|left, right| left.id.cmp(&right.id)),
-        Some(_) => {}
+        Some("email") | None => accounts.sort_by(|left, right| {
+            compare_account_identity(&left.email, &left.id, &right.email, &right.id)
+        }),
+        Some("id") => accounts.sort_by(|left, right| left.id.cmp(&right.id)),
+        Some(other) => {
+            return Err(RpcError::bad_params(format!(
+                "unsupported account sort field: {other}"
+            )))
+        }
     }
     to_value(AccountListResult { accounts })
 }
@@ -718,6 +752,7 @@ async fn handle_account_tag(state: &Arc<AppState>, params: serde_json::Value) ->
                 }
             }
             account.tags.retain(|tag| !remove.contains(tag));
+            account.tags.sort();
         });
         if !updated {
             return Err(RpcError::bad_params(format!("account not found: {id}")));
@@ -1083,10 +1118,13 @@ async fn handle_task_run(state: &Arc<AppState>, params: serde_json::Value) -> Ha
 async fn handle_models(state: &Arc<AppState>) -> Handled {
     let config = state.config.current();
     if !config.models.dynamic_discovery {
-        return to_value(crate::http::fallback_models(&config));
+        let mut models = crate::http::fallback_models(&config);
+        sort_models_for_display(&mut models);
+        return to_value(models);
     }
-    let (cached, fresh) = state.models.get(config.models.cache_ttl_ms);
+    let (mut cached, fresh) = state.models.get(config.models.cache_ttl_ms);
     if fresh {
+        sort_models_for_display(&mut cached);
         return to_value(cached);
     }
     let account = state
@@ -1107,7 +1145,16 @@ async fn handle_models(state: &Arc<AppState>) -> Handled {
             .await;
     }
     state.models.finish_refresh(models.clone());
-    to_value(models)
+    let mut output = models;
+    sort_models_for_display(&mut output);
+    to_value(output)
+}
+
+fn sort_models_for_display(models: &mut [kproxy_kiro::ModelInfo]) {
+    models.sort_by(|left, right| {
+        compare_display_text(&left.model_id, &right.model_id)
+            .then_with(|| compare_display_text(&left.model_name, &right.model_name))
+    });
 }
 
 #[derive(serde::Deserialize)]
@@ -1162,9 +1209,11 @@ fn handle_webhook_logs(state: &Arc<AppState>, params: serde_json::Value) -> Hand
 
 async fn handle_service_list(state: &Arc<AppState>) -> Handled {
     let config = state.config.current();
-    to_value(ProxyServiceListResult {
-        services: state.proxy_services.views(&config.proxy_service).await,
-    })
+    let mut services = state.proxy_services.views(&config.proxy_service).await;
+    services.sort_by(|left, right| {
+        compare_display_text(&left.name, &right.name).then_with(|| left.id.cmp(&right.id))
+    });
+    to_value(ProxyServiceListResult { services })
 }
 
 fn handle_service_apikeys(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
@@ -1179,7 +1228,7 @@ fn handle_service_apikeys(state: &Arc<AppState>, params: serde_json::Value) -> H
         .iter()
         .find(|service| service.id == selector || service.name == selector)
         .ok_or_else(|| RpcError::bad_params(format!("proxy service not found: {selector}")))?;
-    let api_keys = service
+    let mut api_keys = service
         .api_key_ids
         .iter()
         .filter_map(|key_id| {
@@ -1201,7 +1250,10 @@ fn handle_service_apikeys(state: &Arc<AppState>, params: serde_json::Value) -> H
                     key: params.show_secret.then(|| key.key.clone()),
                 })
         })
-        .collect();
+        .collect::<Vec<_>>();
+    api_keys.sort_by(|left, right| {
+        compare_display_text(&left.name, &right.name).then_with(|| left.id.cmp(&right.id))
+    });
     to_value(ProxyServiceApiKeysResult {
         service_id: service.id.clone(),
         service_name: service.name.clone(),
@@ -1852,6 +1904,200 @@ mod tests {
             .await
             .expect("read disk");
         assert!(raw.contains("prod"));
+    }
+
+    #[tokio::test]
+    async fn account_lists_and_exports_default_to_email_order() {
+        let (_directory, state) = state_with(vec![
+            sample_account("acc_00000001", "z@example.com", true),
+            sample_account("acc_00000002", "a@example.com", true),
+            sample_account("acc_00000003", "B@example.com", true),
+        ])
+        .await;
+
+        let list: AccountListResult = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(1, method::ACCOUNT_LIST, serde_json::json!({})),
+            )
+            .await,
+        ))
+        .expect("account list");
+        assert_eq!(
+            list.accounts
+                .iter()
+                .map(|account| account.email.as_str())
+                .collect::<Vec<_>>(),
+            ["a@example.com", "B@example.com", "z@example.com"]
+        );
+
+        let by_id: AccountListResult = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(2, method::ACCOUNT_LIST, serde_json::json!({"sort":"id"})),
+            )
+            .await,
+        ))
+        .expect("account list by ID");
+        assert_eq!(
+            by_id
+                .accounts
+                .iter()
+                .map(|account| account.email.as_str())
+                .collect::<Vec<_>>(),
+            ["z@example.com", "a@example.com", "B@example.com"]
+        );
+
+        let exported = expect_ok(
+            dispatch(
+                &state,
+                Request::new(
+                    3,
+                    method::ACCOUNT_EXPORT,
+                    serde_json::json!({"redact":true}),
+                ),
+            )
+            .await,
+        );
+        assert_eq!(
+            exported
+                .as_array()
+                .expect("exported accounts")
+                .iter()
+                .map(|account| account["email"].as_str().expect("email"))
+                .collect::<Vec<_>>(),
+            ["a@example.com", "B@example.com", "z@example.com"]
+        );
+
+        let invalid = dispatch(
+            &state,
+            Request::new(
+                4,
+                method::ACCOUNT_LIST,
+                serde_json::json!({"sort":"unknown"}),
+            ),
+        )
+        .await;
+        assert!(matches!(
+            invalid,
+            Response::Err { error, .. } if error.message.contains("unsupported account sort field")
+        ));
+    }
+
+    #[tokio::test]
+    async fn administrative_lists_use_stable_name_order() {
+        let (_directory, state) = state_with(vec![]).await;
+        let mut config = Config::default();
+        config.webhook = ["Zulu", "alpha"]
+            .map(|name| kproxy_core::config::WebhookConfig {
+                name: name.into(),
+                kind: "custom".into(),
+                url: format!("https://example.com/{name}"),
+                enabled: true,
+                events: vec![],
+                dingtalk_sign: None,
+                telegram_chat_id: None,
+                custom_template: None,
+            })
+            .into();
+        config.api_key = [
+            ("ak_zulu", "Zulu key", "secret-zulu"),
+            ("ak_alpha", "alpha key", "secret-alpha"),
+        ]
+        .map(|(id, name, key)| ApiKeyConfig {
+            id: Some(id.into()),
+            name: name.into(),
+            key: key.into(),
+            format: ApiKeyFormat::Sk,
+            enabled: true,
+            credits_limit: None,
+        })
+        .into();
+        config.proxy_service = [
+            ("svc_zulu", "Zulu service", 6001),
+            ("svc_alpha", "alpha service", 6002),
+        ]
+        .map(|(id, name, port)| ProxyServiceConfig {
+            id: id.into(),
+            name: name.into(),
+            host: "127.0.0.1".into(),
+            port,
+            enabled: false,
+            api_key_ids: vec!["ak_zulu".into(), "ak_alpha".into()],
+            created_at: 0,
+        })
+        .into();
+        state.config.replace(config);
+
+        let services: ProxyServiceListResult = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(1, method::SERVICE_LIST, serde_json::json!({})),
+            )
+            .await,
+        ))
+        .expect("service list");
+        assert_eq!(
+            services
+                .services
+                .iter()
+                .map(|service| service.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha service", "Zulu service"]
+        );
+
+        let keys: ProxyServiceApiKeysResult = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(
+                    2,
+                    method::SERVICE_APIKEYS,
+                    serde_json::json!({"service":"svc_alpha","show_secret":false}),
+                ),
+            )
+            .await,
+        ))
+        .expect("service API keys");
+        assert_eq!(
+            keys.api_keys
+                .iter()
+                .map(|key| key.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alpha key", "Zulu key"]
+        );
+
+        let webhooks = expect_ok(
+            dispatch(
+                &state,
+                Request::new(3, method::WEBHOOK_LIST, serde_json::json!({})),
+            )
+            .await,
+        );
+        assert_eq!(
+            webhooks
+                .as_array()
+                .expect("webhook list")
+                .iter()
+                .map(|target| target["name"].as_str().expect("name"))
+                .collect::<Vec<_>>(),
+            ["alpha", "Zulu"]
+        );
+
+        let mut models = ["z-model", "A-model", "b-model"].map(|model_id| kproxy_kiro::ModelInfo {
+            model_id: model_id.into(),
+            model_name: model_id.into(),
+            description: String::new(),
+            rate_multiplier: None,
+            token_limits: None,
+        });
+        sort_models_for_display(&mut models);
+        assert_eq!(
+            models
+                .iter()
+                .map(|model| model.model_id.as_str())
+                .collect::<Vec<_>>(),
+            ["A-model", "b-model", "z-model"]
+        );
     }
 
     #[tokio::test]

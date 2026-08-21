@@ -587,7 +587,7 @@ pub struct AccountListParams {
     /// 状态过滤：available/disabled/exhausted。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
-    /// 排序字段：credit/email/id。
+    /// 排序字段：email（默认）/credit/id。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sort: Option<String>,
 }

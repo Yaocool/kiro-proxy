@@ -430,7 +430,7 @@ impl Meter {
     }
 
     pub fn list(&self) -> Vec<ApiKeyView> {
-        lock(&self.keys)
+        let mut entries = lock(&self.keys)
             .values()
             .map(|state| ApiKeyView {
                 id: state.id.clone(),
@@ -440,7 +440,15 @@ impl Meter {
                 reserved_credits: state.reserved,
                 usage: state.usage.clone(),
             })
-            .collect()
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            left.name
+                .to_ascii_lowercase()
+                .cmp(&right.name.to_ascii_lowercase())
+                .then_with(|| left.name.cmp(&right.name))
+                .then_with(|| left.id.cmp(&right.id))
+        });
+        entries
     }
 
     pub async fn reset_usage(self: &Arc<Self>, id_or_name: &str) -> Result<bool, MeterError> {
@@ -754,6 +762,36 @@ mod tests {
         ));
         drop(first);
         assert!(meter.reserve(Some("ak_test"), 6.0).is_ok());
+    }
+
+    #[tokio::test]
+    async fn api_key_list_is_sorted_by_name_and_id() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let configs = [
+            ("ak_bravo", "Bravo"),
+            ("ak_lower", "alpha"),
+            ("ak_upper", "Alpha"),
+        ]
+        .map(|(id, name)| ApiKeyConfig {
+            id: Some(id.into()),
+            name: name.into(),
+            key: format!("secret-{id}"),
+            format: ApiKeyFormat::Sk,
+            enabled: true,
+            credits_limit: None,
+        });
+        let meter = Meter::load(&directory.path().join("daily.json"), &configs)
+            .await
+            .expect("load");
+
+        assert_eq!(
+            meter
+                .list()
+                .iter()
+                .map(|entry| entry.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Alpha", "alpha", "Bravo"]
+        );
     }
 
     #[tokio::test]
