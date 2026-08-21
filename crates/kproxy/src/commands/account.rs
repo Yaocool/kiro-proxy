@@ -63,7 +63,7 @@ pub enum AccountCommand {
     },
     /// 通过 IAM Identity Center 登录并添加账号。
     #[command(
-        after_help = "示例：\n  printf '%s\\n' \"$PASSWORD\" | kproxy account add-sso --email user@example.com --start-url https://example.awsapps.com/start --password-stdin\n  kproxy account add-sso --batch accounts.csv --start-url https://example.awsapps.com/start"
+        after_help = "示例：\n  printf '%s\\n' \"$PASSWORD\" | kproxy account add-sso --email user@example.com --start-url https://example.awsapps.com/start --password-stdin\n  kproxy account add-sso --batch accounts.csv --start-url https://example.awsapps.com/start\n  kproxy account add-sso --batch - --start-url https://example.awsapps.com/start < accounts.csv"
     )]
     AddSso {
         #[arg(long)]
@@ -76,7 +76,7 @@ pub enum AccountCommand {
         /// 必须显式声明，从标准输入读取一行密码；密码不会进入命令行历史。
         #[arg(long)]
         password_stdin: bool,
-        /// 两列 CSV（email,password）批量登录。
+        /// 两列 CSV（email,password）批量登录；PATH 为 - 时从 stdin 读取。
         #[arg(long, value_name = "PATH", conflicts_with_all = ["email", "password_stdin"])]
         batch: Option<String>,
         /// 批量登录并发数，范围 1..8。
@@ -631,9 +631,7 @@ async fn run_sso_batch(
     if !(1..=8).contains(&concurrency) {
         return Err(anyhow!("并发数必须在 1..=8 之间"));
     }
-    let raw = tokio::fs::read_to_string(file)
-        .await
-        .with_context(|| format!("读取 {file} 失败"))?;
+    let raw = read_sso_batch_source(file).await?;
     let rows = parse_sso_csv(&raw)?;
     let socket = client.socket_path();
     let start_url = start_url.to_string();
@@ -679,6 +677,28 @@ async fn run_sso_batch(
             failures.join("\n")
         ))
     }
+}
+
+const WRAPPER_BATCH_STDIN_ENV: &str = "KPROXY_WRAPPER_BATCH_STDIN";
+
+fn sso_batch_reads_stdin(file: &str, wrapper_override: Option<&std::ffi::OsStr>) -> bool {
+    file == "-" || wrapper_override == Some(std::ffi::OsStr::new("1"))
+}
+
+async fn read_sso_batch_source(file: &str) -> Result<String> {
+    if sso_batch_reads_stdin(file, std::env::var_os(WRAPPER_BATCH_STDIN_ENV).as_deref()) {
+        use tokio::io::AsyncReadExt;
+
+        let mut raw = String::new();
+        tokio::io::stdin()
+            .read_to_string(&mut raw)
+            .await
+            .context("读取批量 CSV 标准输入失败")?;
+        return Ok(raw);
+    }
+    tokio::fs::read_to_string(file)
+        .await
+        .with_context(|| format!("读取 {file} 失败"))
 }
 
 fn parse_sso_csv(raw: &str) -> Result<Vec<(String, String)>> {
@@ -875,5 +895,19 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[1], ("b@example.com".into(), "p,a".into()));
         assert!(parse_sso_csv("a@example.com,\"unterminated").is_err());
+    }
+
+    #[test]
+    fn sso_batch_accepts_explicit_and_wrapper_managed_stdin() {
+        assert!(sso_batch_reads_stdin("-", None));
+        assert!(sso_batch_reads_stdin(
+            "accounts.csv",
+            Some(std::ffi::OsStr::new("1"))
+        ));
+        assert!(!sso_batch_reads_stdin(
+            "accounts.csv",
+            Some(std::ffi::OsStr::new("0"))
+        ));
+        assert!(!sso_batch_reads_stdin("accounts.csv", None));
     }
 }

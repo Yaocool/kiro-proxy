@@ -2157,7 +2157,7 @@ pub fn print_topic(topic: Option<&str>) -> Result<()> {
         }
         "sso" => {
             r#"先在配置中设置 `[sso] start_url = "https://..."`。单账号：`printf '%s\n' "$PASSWORD" | kproxy account add-sso --email user@example.com --password-stdin`。
-批量：CSV 仅含 email,password 两列，运行 `kproxy account add-sso --batch accounts.csv -c 1`。`--start-url` 可覆盖全局值，`--headful` 可手工完成额外验证。默认/full 构建包含 SSO。"#
+批量：CSV 仅含 email,password 两列，运行 `kproxy account add-sso --batch accounts.csv -c 1`；也可用 `--batch - < accounts.csv` 从 stdin 读取。`--start-url` 可覆盖全局值，`--headful` 可手工完成额外验证。默认/full 构建包含 SSO。"#
         }
         "service" => {
             "`kproxy service create/list/apikeys/delete` 管理独立代理监听。创建时生成专用 API key；删除时级联删除专用 key，共享 key 保留，并要求 y/yes 确认。"
