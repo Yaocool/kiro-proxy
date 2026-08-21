@@ -754,12 +754,11 @@ fn sso_identities_match(expected_email: &str, actual_identity: &str) -> bool {
     if expected_email.is_empty() || actual_identity.is_empty() {
         return false;
     }
-    if expected_email.eq_ignore_ascii_case(actual_identity) {
-        return true;
-    }
     let expected = canonical_sso_identity(expected_email);
-    let actual = canonical_sso_identity(actual_identity);
-    !expected.is_empty() && expected == actual
+    !expected.is_empty()
+        && actual_identity
+            .split_whitespace()
+            .any(|candidate| expected == canonical_sso_identity(candidate))
 }
 
 fn canonical_sso_identity(value: &str) -> String {
@@ -1616,9 +1615,21 @@ mod tests {
             "kiro.svc.70@patsnap.com",
             "kirosvc.70"
         ));
+        assert!(sso_identities_match(
+            "kiro.svc.51@patsnap.com",
+            "kirosvc.51 kirosvc.51"
+        ));
+        assert!(sso_identities_match(
+            "kiro.svc.59@patsnap.com",
+            "kirosvc.59 kirosvc.5"
+        ));
         assert!(!sso_identities_match(
             "kiro.svc.70@patsnap.com",
             "kirosvc.41"
+        ));
+        assert!(!sso_identities_match(
+            "kiro.svc.70@patsnap.com",
+            "kirosvc.41 kirosvc.41"
         ));
         assert!(!sso_identities_match("", ""));
     }
