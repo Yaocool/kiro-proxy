@@ -427,8 +427,10 @@ kproxy service list
 
 The wrapper locates the running daemon by the `io.kiro-proxy.role=daemon`
 container label, preserves command exit codes, forwards stdin, and allocates a
-TTY only for interactive use. This keeps the admin Unix socket private and
-avoids host/container binary compatibility problems.
+TTY only for interactive use. Interactive commands also receive the host
+`TERM` value (falling back to `xterm` when it is unset or `dumb`) so full-screen
+editors such as `vi` handle cursor keys correctly. This keeps the admin Unix
+socket private and avoids host/container binary compatibility problems.
 
 To install only the wrapper, invoke the low-level installer directly. It updates
 a wrapper managed by this project but refuses to overwrite other commands by

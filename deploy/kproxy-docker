@@ -314,7 +314,13 @@ case "$lifecycle_action" in
 esac
 
 if [ -t 0 ] && [ -t 1 ]; then
-  exec docker exec -it "$container_id" /usr/local/bin/kproxy "$@"
+  # Full-screen terminal programs such as vi need the host terminal type to
+  # interpret cursor and function keys correctly inside the container.
+  case "${TERM:-}" in
+    ""|dumb) terminal_type="xterm" ;;
+    *) terminal_type="$TERM" ;;
+  esac
+  exec docker exec -it -e "TERM=$terminal_type" "$container_id" /usr/local/bin/kproxy "$@"
 else
   exec docker exec -i "$container_id" /usr/local/bin/kproxy "$@"
 fi
