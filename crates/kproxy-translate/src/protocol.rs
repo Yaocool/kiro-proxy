@@ -23,6 +23,8 @@ pub struct ClaudeRequest {
     #[serde(default)]
     pub top_p: Option<f64>,
     #[serde(default)]
+    pub stop_sequences: Vec<String>,
+    #[serde(default)]
     pub stream: bool,
     #[serde(default)]
     pub system: Option<Value>,

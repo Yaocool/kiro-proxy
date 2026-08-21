@@ -16,6 +16,9 @@ pub const MAX_LOADED_TOOL_BYTES: usize = 4 * 1024 * 1024;
 pub const MAX_DEFERRED_TOOL_BYTES: usize = 32 * 1024 * 1024;
 pub const MAX_TOOL_BYTES: usize = 256 * 1024;
 pub const MAX_TOOL_NAME_CHARS: usize = 128;
+pub const MAX_STOP_SEQUENCES: usize = 64;
+pub const MAX_STOP_SEQUENCE_BYTES: usize = 4 * 1024;
+pub const MAX_STOP_SEQUENCE_TOTAL_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ValidationError {
@@ -53,6 +56,36 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
     common(&request.model, request.messages.is_empty())?;
     if request.max_tokens == 0 {
         return Err(ValidationError::InvalidMaxTokens);
+    }
+    if request.stop_sequences.iter().any(String::is_empty) {
+        return invalid("stop_sequences", "sequences must not be empty");
+    }
+    if request.stop_sequences.len() > MAX_STOP_SEQUENCES {
+        return invalid(
+            "stop_sequences",
+            format!("must contain at most {MAX_STOP_SEQUENCES} sequences"),
+        );
+    }
+    if request
+        .stop_sequences
+        .iter()
+        .any(|sequence| sequence.len() > MAX_STOP_SEQUENCE_BYTES)
+    {
+        return invalid(
+            "stop_sequences",
+            format!("each sequence must be at most {MAX_STOP_SEQUENCE_BYTES} bytes"),
+        );
+    }
+    let stop_sequence_bytes = request
+        .stop_sequences
+        .iter()
+        .map(String::len)
+        .fold(0usize, usize::saturating_add);
+    if stop_sequence_bytes > MAX_STOP_SEQUENCE_TOTAL_BYTES {
+        return invalid(
+            "stop_sequences",
+            format!("sequences must total at most {MAX_STOP_SEQUENCE_TOTAL_BYTES} bytes"),
+        );
     }
     validate_claude_system(request.system.as_ref())?;
     for (index, message) in request.messages.iter().enumerate() {
@@ -1484,6 +1517,7 @@ mod tests {
             max_tokens: 100,
             temperature: None,
             top_p: None,
+            stop_sequences: vec![],
             stream: false,
             system: None,
             tools: vec![],
@@ -1512,6 +1546,48 @@ mod tests {
             response_inclusion: None,
             extra: Default::default(),
         }
+    }
+
+    #[test]
+    fn claude_stop_sequences_must_not_be_empty() {
+        let mut input = request();
+        input.stop_sequences = vec!["END".into(), String::new()];
+        assert_eq!(
+            validate_claude(&input),
+            Err(ValidationError::InvalidField {
+                field: "stop_sequences".into(),
+                message: "sequences must not be empty".into(),
+            })
+        );
+
+        input.stop_sequences = vec!["END".into()];
+        validate_claude(&input).expect("non-empty stop sequence");
+    }
+
+    #[test]
+    fn claude_stop_sequences_are_bounded() {
+        let mut input = request();
+        input.stop_sequences = vec!["x".into(); MAX_STOP_SEQUENCES + 1];
+        assert!(matches!(
+            validate_claude(&input),
+            Err(ValidationError::InvalidField { field, .. }) if field == "stop_sequences"
+        ));
+
+        input.stop_sequences = vec!["x".repeat(MAX_STOP_SEQUENCE_BYTES + 1)];
+        assert!(matches!(
+            validate_claude(&input),
+            Err(ValidationError::InvalidField { field, .. }) if field == "stop_sequences"
+        ));
+
+        input.stop_sequences =
+            vec![
+                "x".repeat(MAX_STOP_SEQUENCE_TOTAL_BYTES / MAX_STOP_SEQUENCES + 1);
+                MAX_STOP_SEQUENCES
+            ];
+        assert!(matches!(
+            validate_claude(&input),
+            Err(ValidationError::InvalidField { field, .. }) if field == "stop_sequences"
+        ));
     }
 
     #[test]

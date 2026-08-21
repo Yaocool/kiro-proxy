@@ -22,6 +22,23 @@ pub struct PromptCacheProfile {
     ttl: Duration,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct PromptCachePlan {
+    profile: Option<PromptCacheProfile>,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+}
+
+impl PromptCachePlan {
+    pub fn cache_read_tokens(&self) -> u64 {
+        self.cache_read_tokens
+    }
+
+    pub fn cache_write_tokens(&self) -> u64 {
+        self.cache_write_tokens
+    }
+}
+
 #[derive(Debug, Clone)]
 struct Entry {
     expires_at: Instant,
@@ -92,27 +109,59 @@ impl PromptCacheTracker {
         profile: Option<&PromptCacheProfile>,
         usage: &mut UsageInfo,
     ) {
+        let plan = self.plan(account_id, profile);
+        self.commit(account_id, &plan, usage);
+    }
+
+    pub fn plan(&self, account_id: &str, profile: Option<&PromptCacheProfile>) -> PromptCachePlan {
         let Some(profile) = profile else {
-            return;
+            return PromptCachePlan::default();
         };
-        if usage.cache_read_tokens > 0 || usage.cache_write_tokens > 0 {
-            return;
-        }
         let now = Instant::now();
         let mut entries = self
             .entries
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        entries.retain(|_, account| {
-            account.retain(|_, entry| entry.expires_at > now);
-            !account.is_empty()
-        });
+        prune_expired(&mut entries, now);
+        let cache_hit = entries
+            .get(account_id)
+            .is_some_and(|account| account.contains_key(&profile.fingerprint));
+        PromptCachePlan {
+            profile: Some(profile.clone()),
+            cache_read_tokens: if cache_hit { profile.tokens } else { 0 },
+            cache_write_tokens: if cache_hit { 0 } else { profile.tokens },
+        }
+    }
+
+    pub fn commit(&self, account_id: &str, plan: &PromptCachePlan, usage: &mut UsageInfo) {
+        if usage.cache_read_tokens > 0 || usage.cache_write_tokens > 0 {
+            return;
+        }
+        usage.cache_read_tokens = plan.cache_read_tokens;
+        usage.cache_write_tokens = plan.cache_write_tokens;
+        let Some(profile) = plan.profile.as_ref() else {
+            return;
+        };
+        let now = Instant::now();
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        prune_expired(&mut entries, now);
         let account = entries.entry(account_id.into()).or_default();
-        if let Some(entry) = account.get_mut(&profile.fingerprint) {
-            entry.expires_at = now + entry.ttl;
-            usage.cache_read_tokens = profile.tokens;
+        if plan.cache_read_tokens > 0 {
+            if let Some(entry) = account.get_mut(&profile.fingerprint) {
+                entry.expires_at = now + entry.ttl;
+            } else {
+                account.insert(
+                    profile.fingerprint.clone(),
+                    Entry {
+                        expires_at: now + profile.ttl,
+                        ttl: profile.ttl,
+                    },
+                );
+            }
         } else {
-            usage.cache_write_tokens = profile.tokens;
             account.insert(
                 profile.fingerprint.clone(),
                 Entry {
@@ -120,17 +169,24 @@ impl PromptCacheTracker {
                     ttl: profile.ttl,
                 },
             );
-            if account.len() > MAX_ENTRIES_PER_ACCOUNT {
-                if let Some(oldest) = account
-                    .iter()
-                    .min_by_key(|(_, entry)| entry.expires_at)
-                    .map(|(fingerprint, _)| fingerprint.clone())
-                {
-                    account.remove(&oldest);
-                }
+        }
+        if account.len() > MAX_ENTRIES_PER_ACCOUNT {
+            if let Some(oldest) = account
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(fingerprint, _)| fingerprint.clone())
+            {
+                account.remove(&oldest);
             }
         }
     }
+}
+
+fn prune_expired(entries: &mut HashMap<String, HashMap<String, Entry>>, now: Instant) {
+    entries.retain(|_, account| {
+        account.retain(|_, entry| entry.expires_at > now);
+        !account.is_empty()
+    });
 }
 
 #[derive(Debug)]
@@ -294,6 +350,32 @@ mod tests {
         let mut other = UsageInfo::default();
         tracker.apply("two", Some(&profile), &mut other);
         assert_eq!(other.cache_write_tokens, first.cache_write_tokens);
+    }
+
+    #[test]
+    fn cache_plan_is_stable_until_committed() {
+        let tracker = PromptCacheTracker::default();
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet-4","max_tokens":128,
+            "system":[{"type":"text","text":"cacheable context ".repeat(1500),
+                "cache_control":{"type":"ephemeral"}}],
+            "messages":[{"role":"user","content":"summarize"}]
+        }))
+        .expect("request");
+        let profile = tracker
+            .claude_profile(&request, 8_000)
+            .expect("cache profile");
+
+        let first = tracker.plan("one", Some(&profile));
+        let concurrent = tracker.plan("one", Some(&profile));
+        assert_eq!(first.cache_write_tokens(), profile.tokens);
+        assert_eq!(concurrent.cache_write_tokens(), profile.tokens);
+
+        let mut usage = UsageInfo::default();
+        tracker.commit("one", &first, &mut usage);
+        assert_eq!(usage.cache_write_tokens, profile.tokens);
+        let subsequent = tracker.plan("one", Some(&profile));
+        assert_eq!(subsequent.cache_read_tokens(), profile.tokens);
     }
 
     #[test]

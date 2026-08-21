@@ -580,6 +580,98 @@ async fn inbound_openai_request_runs_through_translation_pool_and_mock_upstream(
 }
 
 #[tokio::test]
+async fn claude_stream_stops_before_later_frames_in_the_same_upstream_chunk() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let mut upstream_body = event_stream_frame(
+        "assistantResponseEvent",
+        serde_json::json!({"content":"before <END> ignored"}),
+    );
+    upstream_body.extend(event_stream_frame(
+        "reasoningContentEvent",
+        serde_json::json!({"reasoningContentEvent":{"text":"must not leak"}}),
+    ));
+    upstream_body.extend(event_stream_frame(
+        "messageMetadataEvent",
+        serde_json::json!({
+            "messageMetadataEvent": {
+                "usage": {
+                    "inputTokens": 100,
+                    "outputTokens": 20,
+                    "creditsConsumed": 0.25
+                }
+            }
+        }),
+    ));
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(upstream_body),
+        )
+        .mount(&mock)
+        .await;
+
+    let port = unused_tcp_port();
+    let upstream_url = format!("{}/generateAssistantResponse", mock.uri());
+    let daemon = Daemon::start_http(port, &upstream_url).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    let config_path = daemon.home().join("config.toml");
+    let config = tokio::fs::read_to_string(&config_path)
+        .await
+        .expect("read config")
+        .replace("enable_prompt_cache = false", "enable_prompt_cache = true");
+    tokio::fs::write(&config_path, config)
+        .await
+        .expect("enable prompt cache");
+    let reload = expect_ok(daemon.call("config.reload", serde_json::json!({})).await);
+    assert_eq!(reload["applied"], true, "config reload failed: {reload}");
+
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header(
+            "x-api-key",
+            daemon.api_key.as_deref().expect("service API key"),
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("user-agent", "claude-cli/2.1.235 (external, e2e)")
+        .json(&serde_json::json!({
+            "model":"source-large",
+            "max_tokens":64,
+            "stop_sequences":["<END>"],
+            "stream":true,
+            "system":[{"type":"text","text":"cacheable system ".repeat(1500),
+                "cache_control":{"type":"ephemeral"}}],
+            "messages":[{"role":"user","content":"stop at the delimiter"}]
+        }))
+        .send()
+        .await
+        .expect("call Claude stop sequence stream");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body = response.text().await.expect("stream body");
+    assert!(body.contains("before "), "{body}");
+    assert!(!body.contains("ignored"), "{body}");
+    assert!(!body.contains("must not leak"), "{body}");
+    assert!(body.contains(r#""stop_reason":"stop_sequence""#), "{body}");
+    assert!(body.contains(r#""stop_sequence":"<END>""#), "{body}");
+    let message_start = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .find(|event| event["type"] == "message_start")
+        .expect("message_start event");
+    assert!(
+        message_start["message"]["usage"]["cache_creation_input_tokens"]
+            .as_u64()
+            .is_some_and(|tokens| tokens >= 1024)
+    );
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn claude_compaction_uses_a_separate_semantic_kiro_request() {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;

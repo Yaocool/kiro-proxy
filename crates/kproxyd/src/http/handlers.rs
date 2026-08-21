@@ -40,7 +40,7 @@ use super::prompt_cache::PromptCacheProfile;
 use super::request_trace_id;
 use super::response::{
     ClaudeServerEvent, CompactionIterationUsage, DecodedResponse, OpenAiToolIdentity,
-    ToolLeakFilter,
+    StopSequenceFilter, ToolLeakFilter,
 };
 use super::stream::{self, StreamContext, StreamProtocol};
 use super::usage::{fallback_credits, fill_missing_usage};
@@ -1111,6 +1111,7 @@ async fn handle_claude(
                 auto_compaction_original_input_tokens,
                 estimated_credits: estimate,
                 max_tokens: request.max_tokens,
+                stop_sequences: request.stop_sequences.clone(),
                 started,
                 prompt_cache,
                 payload,
@@ -1387,6 +1388,7 @@ async fn handle_openai(
                 auto_compaction_original_input_tokens: None,
                 estimated_credits: estimate,
                 max_tokens,
+                stop_sequences: Vec::new(),
                 started,
                 prompt_cache,
                 payload,
@@ -3162,6 +3164,29 @@ pub(super) struct ContextLimitError {
     pub(super) maximum: u64,
 }
 
+fn push_nonstream_event(
+    decoded: &mut DecodedResponse,
+    stop_filter: &mut StopSequenceFilter,
+    visible_text: &mut String,
+    event: KiroEvent,
+) -> Result<bool, String> {
+    if matches!(
+        event,
+        KiroEvent::Reasoning { .. } | KiroEvent::ToolUse { .. }
+    ) {
+        visible_text.push_str(&stop_filter.finish());
+    }
+    if let KiroEvent::AssistantResponse { content } = &event {
+        visible_text.push_str(&stop_filter.push(content));
+    }
+    decoded.push(event)?;
+    let Some(sequence) = stop_filter.matched().map(str::to_owned) else {
+        return Ok(false);
+    };
+    decoded.stop_at_sequence(std::mem::take(visible_text), sequence);
+    Ok(true)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn collect_nonstream_rounds(
     state: &Arc<AppState>,
@@ -3173,6 +3198,7 @@ async fn collect_nonstream_rounds(
     mut payload: kproxy_translate::KiroPayload,
     compact: bool,
     max_output_tokens: u32,
+    stop_sequences: &[String],
     tool_search: Option<&Arc<ClaudeToolSearchCatalog>>,
     max_tool_search_operations: u32,
     mut tool_search_operations: u32,
@@ -3214,19 +3240,46 @@ async fn collect_nonstream_rounds(
             .map_err(ExecuteError::Upstream)?;
         let event_count = events.len();
         let mut leak_filter = ToolLeakFilter::new(config.features.enable_tool_leak_filter);
-        for event in events {
+        let mut stop_filter = StopSequenceFilter::new(stop_sequences);
+        let mut visible_text = String::new();
+        let mut stop_matched = false;
+        'events: for event in events {
             for event in leak_filter.push(event) {
-                decoded.push(event).map_err(|message| {
-                    ExecuteError::Upstream(KiroError {
-                        status: None,
-                        endpoint: endpoint.clone(),
-                        message,
-                    })
-                })?;
+                if push_nonstream_event(&mut decoded, &mut stop_filter, &mut visible_text, event)
+                    .map_err(|message| {
+                        ExecuteError::Upstream(KiroError {
+                            status: None,
+                            endpoint: endpoint.clone(),
+                            message,
+                        })
+                    })?
+                {
+                    stop_matched = true;
+                    break 'events;
+                }
             }
         }
-        for event in leak_filter.finish() {
-            decoded.push(event).map_err(|message| {
+        if !stop_matched {
+            for event in leak_filter.finish() {
+                if push_nonstream_event(&mut decoded, &mut stop_filter, &mut visible_text, event)
+                    .map_err(|message| {
+                        ExecuteError::Upstream(KiroError {
+                            status: None,
+                            endpoint: endpoint.clone(),
+                            message,
+                        })
+                    })?
+                {
+                    stop_matched = true;
+                    break;
+                }
+            }
+        }
+        if !stop_matched {
+            let _trailing = stop_filter.finish();
+        }
+        if decoded.stop_sequence.is_none() {
+            decoded.validate_tool_inputs().map_err(|message| {
                 ExecuteError::Upstream(KiroError {
                     status: None,
                     endpoint: endpoint.clone(),
@@ -3234,14 +3287,19 @@ async fn collect_nonstream_rounds(
                 })
             })?;
         }
-        decoded.validate_tool_inputs().map_err(|message| {
-            ExecuteError::Upstream(KiroError {
-                status: None,
-                endpoint: endpoint.clone(),
-                message,
-            })
-        })?;
         fill_missing_usage(state, &mut decoded, &payload).await;
+        if decoded.stop_sequence.is_some() {
+            accumulated_text.push_str(&decoded.text);
+            accumulated_reasoning.push_str(&decoded.reasoning);
+            decoded.text = accumulated_text;
+            decoded.reasoning = accumulated_reasoning;
+            decoded.tool_searches = accumulated_searches;
+            decoded.web_searches = accumulated_web_searches;
+            decoded.claude_server_events = accumulated_server_events;
+            merge_round_usage(&mut decoded.usage, &accumulated_usage);
+            let total_output_tokens = decoded.usage.output_tokens;
+            return Ok((decoded, endpoint, total_output_tokens));
+        }
         let output_exhausted = accumulated_usage
             .output_tokens
             .saturating_add(decoded.usage.output_tokens)
@@ -4131,6 +4189,7 @@ async fn nonstream_claude(
         payload,
         compact,
         request.max_tokens,
+        &request.stop_sequences,
         tool_search.as_ref(),
         max_tool_search_operations,
         tool_search_operations,
@@ -4247,6 +4306,7 @@ async fn nonstream_openai(
         payload,
         false,
         max_tokens,
+        &[],
         None,
         0,
         0,
@@ -6214,6 +6274,36 @@ mod model_tests {
             Some(65)
         );
         assert!(!apply_remaining_output_budget(&mut payload, 100, 100));
+    }
+
+    #[test]
+    fn nonstream_stop_discards_events_after_a_cross_chunk_match() {
+        let mut decoded = DecodedResponse::default();
+        let mut filter = StopSequenceFilter::new(&["<END>".into()]);
+        let mut visible = String::new();
+        let events = [
+            KiroEvent::AssistantResponse {
+                content: "before <E".into(),
+            },
+            KiroEvent::AssistantResponse {
+                content: "ND>ignored".into(),
+            },
+            KiroEvent::Reasoning {
+                content: "must not be retained".into(),
+            },
+        ];
+        for event in events {
+            if push_nonstream_event(&mut decoded, &mut filter, &mut visible, event)
+                .expect("decoded event")
+            {
+                break;
+            }
+        }
+
+        assert_eq!(decoded.text, "before ");
+        assert!(decoded.reasoning.is_empty());
+        assert_eq!(decoded.stop_reason.as_deref(), Some("stop_sequence"));
+        assert_eq!(decoded.stop_sequence.as_deref(), Some("<END>"));
     }
 
     #[test]

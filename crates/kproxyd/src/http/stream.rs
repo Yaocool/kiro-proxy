@@ -24,10 +24,10 @@ use crate::meter::{now_secs, CreditReservation, UsageRecord};
 use crate::state::AppState;
 use crate::stats::{RequestDiagnostics, RequestLog, UpstreamAttemptLog};
 
-use super::prompt_cache::PromptCacheProfile;
+use super::prompt_cache::{PromptCachePlan, PromptCacheProfile};
 use super::response::{
     repair_json, web_search_citations, CompactionIterationUsage, DecodedResponse,
-    OpenAiToolIdentity, ToolLeakFilter,
+    OpenAiToolIdentity, StopSequenceFilter, ToolLeakFilter,
 };
 use super::usage::{fallback_credits, fill_missing_usage, produced_output};
 
@@ -93,6 +93,7 @@ pub struct StreamContext {
     pub auto_compaction_original_input_tokens: Option<u64>,
     pub estimated_credits: f64,
     pub max_tokens: u32,
+    pub stop_sequences: Vec<String>,
     pub started: Instant,
     pub prompt_cache: Option<PromptCacheProfile>,
     pub payload: KiroPayload,
@@ -159,6 +160,20 @@ fn prepend_pending_initial(pending: &mut Vec<String>, mut output: Vec<String>) -
     combined
 }
 
+fn build_claude_state(context: &StreamContext, prompt_cache: &PromptCachePlan) -> ClaudeState {
+    let mut claude = ClaudeState::new(
+        context.request_id.clone(),
+        context.model.clone(),
+        context.input_tokens,
+        context.state.web_search_replay.clone(),
+    );
+    claude.openai_include_usage = context.include_usage_chunk;
+    claude.auto_compaction_original_input_tokens = context.auto_compaction_original_input_tokens;
+    claude.compaction_iteration = context.compaction_iteration;
+    claude.set_prompt_cache_plan(prompt_cache);
+    claude
+}
+
 pub fn response(
     upstream: KiroResponse,
     protocol: StreamProtocol,
@@ -183,17 +198,13 @@ pub fn response(
         let mut buffer = BytesMut::new();
         let mut decoder = EventStreamDecoder;
         let mut decoded = DecodedResponse::default();
+        let mut stop_filter = StopSequenceFilter::new(&context.stop_sequences);
         let mut accumulated_usage = kproxy_kiro::UsageInfo::default();
-        let mut claude = ClaudeState::new(
-            context.request_id.clone(),
-            context.model.clone(),
-            context.input_tokens,
-            context.state.web_search_replay.clone(),
+        let mut prompt_cache_plan = context.state.prompt_cache.plan(
+            &context.lease.account_id(),
+            context.prompt_cache.as_ref(),
         );
-        claude.openai_include_usage = context.include_usage_chunk;
-        claude.auto_compaction_original_input_tokens =
-            context.auto_compaction_original_input_tokens;
-        claude.compaction_iteration = context.compaction_iteration;
+        let mut claude = build_claude_state(&context, &prompt_cache_plan);
         let mut accumulated_searches = std::mem::take(&mut context.resumed_tool_searches);
         let mut accumulated_web_searches = std::mem::take(&mut context.resumed_web_searches);
         let mut data_started = false;
@@ -265,33 +276,69 @@ pub fn response(
                                             if !internal_search && !internal_web_search {
                                                 restore_web_tool_name(&mut event, &context.web_tool_names);
                                             }
-                                            if !internal_search && !internal_web_search && !should_buffer_tool_event(
+                                            if matches!(&event, KiroEvent::Reasoning { .. } | KiroEvent::ToolUse { .. }) {
+                                                let pending = stop_filter.finish();
+                                                if !pending.is_empty() {
+                                                    let output = stream_event(
+                                                        &protocol,
+                                                        &mut claude,
+                                                        &KiroEvent::AssistantResponse { content: pending },
+                                                        created,
+                                                        &context.model,
+                                                        context.thinking_output_format,
+                                                        &context.openai_tools,
+                                                    );
+                                                    let output = prepend_pending_initial(
+                                                        &mut pending_initial,
+                                                        output,
+                                                    );
+                                                    data_started |= !output.is_empty();
+                                                    for data in output {
+                                                        yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                                                    }
+                                                }
+                                            }
+                                            let visible_event = client_visible_event(
                                                 &event,
-                                                buffer_tool_calls,
-                                                &context.openai_tools,
-                                            ) {
-                                                let output = stream_event(
-                                                    &protocol,
-                                                    &mut claude,
-                                                    &event,
-                                                    created,
-                                                    &context.model,
-                                                    context.thinking_output_format,
-                                                    &context.openai_tools,
-                                                );
-                                                let output = prepend_pending_initial(
-                                                    &mut pending_initial,
-                                                    output,
-                                                );
-                                                data_started |= !output.is_empty();
-                                                for data in output {
-                                                    yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                                                &mut stop_filter,
+                                            );
+                                            if !internal_search && !internal_web_search {
+                                                if let Some(visible_event) = visible_event.as_ref().filter(|event| {
+                                                    !should_buffer_tool_event(
+                                                        event,
+                                                        buffer_tool_calls,
+                                                        &context.openai_tools,
+                                                    )
+                                                }) {
+                                                    let output = stream_event(
+                                                        &protocol,
+                                                        &mut claude,
+                                                        visible_event,
+                                                        created,
+                                                        &context.model,
+                                                        context.thinking_output_format,
+                                                        &context.openai_tools,
+                                                    );
+                                                    let output = prepend_pending_initial(
+                                                        &mut pending_initial,
+                                                        output,
+                                                    );
+                                                    data_started |= !output.is_empty();
+                                                    for data in output {
+                                                        yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                                                    }
                                                 }
                                             }
                                             if let Err(error) = decoded.push(event) {
                                                 failed = Some(error);
                                                 break;
                                             }
+                                            if stop_filter.matched().is_some() {
+                                                break;
+                                            }
+                                        }
+                                        if failed.is_some() || stop_filter.matched().is_some() {
+                                            break;
                                         }
                                     }
                                     Ok(None) => break,
@@ -301,7 +348,7 @@ pub fn response(
                                     }
                                 }
                             }
-                            if failed.is_some() { break; }
+                            if failed.is_some() || stop_filter.matched().is_some() { break; }
                         }
                         Some(Err(error)) => {
                             failed = Some(error.to_string());
@@ -330,46 +377,76 @@ pub fn response(
                     }
                 }
             }
-            for mut event in leak_filter.finish() {
-                let internal_search = event_is_tool_search(
-                    &event,
-                    context.tool_search.as_deref(),
-                );
-                let internal_web_search =
-                    event_is_web_search(&event, context.web_search_max_rounds);
-                if !internal_search && !internal_web_search {
-                    restore_web_tool_name(&mut event, &context.web_tool_names);
-                }
-                if !internal_search && !internal_web_search && !should_buffer_tool_event(
-                    &event,
-                    buffer_tool_calls,
-                    &context.openai_tools,
-                ) {
-                    let output = stream_event(
-                        &protocol,
-                        &mut claude,
-                        &event,
-                        created,
-                        &context.model,
-                        context.thinking_output_format,
-                        &context.openai_tools,
-                    );
-                    let output = prepend_pending_initial(&mut pending_initial, output);
-                    data_started |= !output.is_empty();
-                    for data in output {
-                        yield Ok::<Bytes, Infallible>(Bytes::from(data));
+            if stop_filter.matched().is_none() {
+                for mut event in leak_filter.finish() {
+                    let internal_search =
+                        event_is_tool_search(&event, context.tool_search.as_deref());
+                    let internal_web_search =
+                        event_is_web_search(&event, context.web_search_max_rounds);
+                    if !internal_search && !internal_web_search {
+                        restore_web_tool_name(&mut event, &context.web_tool_names);
                     }
-                }
-                if let Err(error) = decoded.push(event) {
-                    failed = Some(error);
-                    break;
+                    if matches!(
+                        &event,
+                        KiroEvent::Reasoning { .. } | KiroEvent::ToolUse { .. }
+                    ) {
+                        let pending = stop_filter.finish();
+                        if !pending.is_empty() {
+                            let output = stream_event(
+                                &protocol,
+                                &mut claude,
+                                &KiroEvent::AssistantResponse { content: pending },
+                                created,
+                                &context.model,
+                                context.thinking_output_format,
+                                &context.openai_tools,
+                            );
+                            let output = prepend_pending_initial(&mut pending_initial, output);
+                            data_started |= !output.is_empty();
+                            for data in output {
+                                yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                            }
+                        }
+                    }
+                    let visible_event = client_visible_event(&event, &mut stop_filter);
+                    if !internal_search && !internal_web_search {
+                        if let Some(visible_event) = visible_event.as_ref().filter(|event| {
+                            !should_buffer_tool_event(
+                                event,
+                                buffer_tool_calls,
+                                &context.openai_tools,
+                            )
+                        }) {
+                            let output = stream_event(
+                                &protocol,
+                                &mut claude,
+                                visible_event,
+                                created,
+                                &context.model,
+                                context.thinking_output_format,
+                                &context.openai_tools,
+                            );
+                            let output = prepend_pending_initial(&mut pending_initial, output);
+                            data_started |= !output.is_empty();
+                            for data in output {
+                                yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                            }
+                        }
+                    }
+                    if let Err(error) = decoded.push(event) {
+                        failed = Some(error);
+                        break;
+                    }
+                    if stop_filter.matched().is_some() {
+                        break;
+                    }
                 }
             }
             // Buffered tool calls have not produced client-visible data yet.
             // Validate them before committing the pending message/compaction
             // prelude so malformed tool JSON can still use the pre-data retry
             // path and cannot publish a failed compaction boundary.
-            if failed.is_none() {
+            if failed.is_none() && stop_filter.matched().is_none() {
                 if let Err(error) = decoded.validate_tool_inputs() {
                     failed = Some(error);
                 }
@@ -434,6 +511,7 @@ pub fn response(
                                     buffer.clear();
                                     decoder = EventStreamDecoder;
                                     decoded = DecodedResponse::default();
+                                    stop_filter = StopSequenceFilter::new(&context.stop_sequences);
                                     failed = None;
                                     pre_data_retries += 1;
                                     tracing::info!(
@@ -510,6 +588,7 @@ pub fn response(
                                     buffer.clear();
                                     decoder = EventStreamDecoder;
                                     decoded = DecodedResponse::default();
+                                    stop_filter = StopSequenceFilter::new(&context.stop_sequences);
                                     failed = None;
                                     pre_data_retries += 1;
                                     continue 'rounds;
@@ -651,6 +730,22 @@ pub fn response(
                         break (new_lease, account);
                     };
                     context.lease = new_lease;
+                    prompt_cache_plan = context.state.prompt_cache.plan(
+                        &context.lease.account_id(),
+                        context.prompt_cache.as_ref(),
+                    );
+                    claude = build_claude_state(&context, &prompt_cache_plan);
+                    pending_initial = if matches!(protocol, StreamProtocol::Claude) {
+                        claude_initial_events(
+                            &mut claude,
+                            context.compaction_summary.as_deref(),
+                            &context.resumed_server_events,
+                            &accumulated_searches,
+                            &accumulated_web_searches,
+                        )
+                    } else {
+                        Vec::new()
+                    };
                     tracing::info!(
                         trace_id = %context.trace_id,
                         request_id = %context.request_id,
@@ -674,6 +769,7 @@ pub fn response(
                             buffer.clear();
                             decoder = EventStreamDecoder;
                             decoded = DecodedResponse::default();
+                            stop_filter = StopSequenceFilter::new(&context.stop_sequences);
                             failed = None;
                             pre_data_retries += 1;
                             continue 'rounds;
@@ -694,6 +790,9 @@ pub fn response(
                 }
             }
             fill_missing_usage(&context.state, &mut decoded, &payload).await;
+            if stop_filter.matched().is_some() {
+                break 'rounds;
+            }
             let output_exhausted = accumulated_usage
                 .output_tokens
                 .saturating_add(decoded.usage.output_tokens)
@@ -1253,6 +1352,21 @@ pub fn response(
                 }
             }
         }
+        let trailing = stop_filter.finish();
+        if failed.is_none() && !trailing.is_empty() {
+            let output = stream_event(
+                &protocol,
+                &mut claude,
+                &KiroEvent::AssistantResponse { content: trailing },
+                created,
+                &context.model,
+                context.thinking_output_format,
+                &context.openai_tools,
+            );
+            for data in prepend_pending_initial(&mut pending_initial, output) {
+                yield Ok::<Bytes, Infallible>(Bytes::from(data));
+            }
+        }
         accumulated_text.push_str(&decoded.text);
         accumulated_reasoning.push_str(&decoded.reasoning);
         decoded.text = accumulated_text;
@@ -1260,7 +1374,14 @@ pub fn response(
         decoded.tool_searches = accumulated_searches;
         decoded.web_searches = accumulated_web_searches;
         accumulate_usage(&mut decoded.usage, &accumulated_usage);
+        apply_stream_stop(&mut decoded, &stop_filter);
         let current_round_output_tokens = decoded.usage.output_tokens;
+        context.state.prompt_cache.commit(
+            &context.lease.account_id(),
+            &prompt_cache_plan,
+            &mut decoded.usage,
+        );
+        context.prompt_cache = None;
         if failed.is_none() {
             if matches!(protocol, StreamProtocol::Claude) && !decoded.text.is_empty() {
                 for data in claude.citations(&decoded.web_searches, &decoded.text) {
@@ -1387,6 +1508,31 @@ fn stream_event(
             openai_event(event, claude, created, model, thinking_format, openai_tools)
         }
     }
+}
+
+fn client_visible_event(
+    event: &KiroEvent,
+    stop_filter: &mut StopSequenceFilter,
+) -> Option<KiroEvent> {
+    match event {
+        KiroEvent::AssistantResponse { content } => {
+            let content = stop_filter.push(content);
+            (!content.is_empty()).then_some(KiroEvent::AssistantResponse { content })
+        }
+        _ => Some(event.clone()),
+    }
+}
+
+fn apply_stream_stop(decoded: &mut DecodedResponse, stop_filter: &StopSequenceFilter) {
+    let Some(sequence) = stop_filter.matched().map(str::to_owned) else {
+        return;
+    };
+    let visible_text = decoded
+        .text
+        .get(..stop_filter.visible_bytes())
+        .unwrap_or(&decoded.text)
+        .to_owned();
+    decoded.stop_at_sequence(visible_text, sequence);
 }
 
 fn event_kind(event: &KiroEvent) -> &'static str {
@@ -1521,6 +1667,8 @@ struct ClaudeState {
     tool_indices: std::collections::HashMap<String, usize>,
     openai_thinking_open: bool,
     openai_include_usage: bool,
+    cache_creation_input_tokens: u64,
+    cache_read_input_tokens: u64,
     web_search_replay: WebSearchReplayCodec,
 }
 
@@ -1543,17 +1691,33 @@ impl ClaudeState {
             tool_indices: std::collections::HashMap::new(),
             openai_thinking_open: false,
             openai_include_usage: false,
+            cache_creation_input_tokens: 0,
+            cache_read_input_tokens: 0,
             web_search_replay,
         }
     }
 
+    fn set_prompt_cache_plan(&mut self, plan: &PromptCachePlan) {
+        self.cache_creation_input_tokens = plan.cache_write_tokens();
+        self.cache_read_input_tokens = plan.cache_read_tokens();
+    }
+
     fn ensure_message(&mut self, output: &mut Vec<String>) {
         if !self.message_started {
+            let uncached_input_tokens = self
+                .input_tokens
+                .saturating_sub(self.cache_creation_input_tokens)
+                .saturating_sub(self.cache_read_input_tokens);
             output.push(sse(&json!({
                 "type":"message_start","message":{
                     "id":self.request_id,"type":"message","role":"assistant","content":[],
                     "model":self.model,"stop_reason":Value::Null,"stop_sequence":Value::Null,
-                    "usage":{"input_tokens":self.input_tokens,"output_tokens":0}
+                    "usage":{
+                        "input_tokens":uncached_input_tokens,
+                        "output_tokens":0,
+                        "cache_creation_input_tokens":self.cache_creation_input_tokens,
+                        "cache_read_input_tokens":self.cache_read_input_tokens
+                    }
                 }
             })));
             self.message_started = true;
@@ -1839,7 +2003,17 @@ fn stream_finish(
             } else {
                 "end_turn"
             };
-            let mut usage = json!({"output_tokens":decoded.usage.output_tokens});
+            let uncached_input_tokens = decoded
+                .usage
+                .input_tokens
+                .saturating_sub(decoded.usage.cache_read_tokens)
+                .saturating_sub(decoded.usage.cache_write_tokens);
+            let mut usage = json!({
+                "input_tokens":uncached_input_tokens,
+                "output_tokens":decoded.usage.output_tokens,
+                "cache_creation_input_tokens":decoded.usage.cache_write_tokens,
+                "cache_read_input_tokens":decoded.usage.cache_read_tokens
+            });
             if !decoded.web_searches.is_empty() {
                 usage["server_tool_use"] = json!({
                     "web_search_requests":decoded.web_searches.iter()
@@ -1862,7 +2036,10 @@ fn stream_finish(
                 ]);
             }
             let mut event = json!({
-                "type":"message_delta","delta":{"stop_reason":stop,"stop_sequence":Value::Null},
+                "type":"message_delta","delta":{
+                    "stop_reason":stop,
+                    "stop_sequence":decoded.stop_sequence.as_deref()
+                },
                 "usage":usage
             });
             if let Some(original_input_tokens) = claude.auto_compaction_original_input_tokens {
@@ -1893,10 +2070,19 @@ fn stream_finish(
                 }
                 output.push(format!("data: {chunk}\n\n"));
             }
+            let finish_reason = if !decoded.tools.is_empty() {
+                "tool_calls"
+            } else if decoded.stop_reason.as_deref() == Some("max_tokens")
+                || current_round_output_tokens >= u64::from(max_tokens)
+            {
+                "length"
+            } else {
+                "stop"
+            };
             let mut final_chunk = json!({
                 "id":claude.request_id,"object":"chat.completion.chunk",
                 "created":created,"model":model,"choices":[{"index":0,"delta":{},
-                    "finish_reason":if decoded.tools.is_empty(){"stop"}else{"tool_calls"}}]
+                    "finish_reason":finish_reason}]
             });
             if include_usage_chunk {
                 final_chunk["usage"] = Value::Null;
@@ -1910,7 +2096,13 @@ fn stream_finish(
                         "created":created,"model":model,"choices":[],
                         "usage":{"prompt_tokens":decoded.usage.input_tokens,
                             "completion_tokens":decoded.usage.output_tokens,
-                            "total_tokens":decoded.usage.input_tokens+decoded.usage.output_tokens}
+                            "total_tokens":decoded.usage.input_tokens+decoded.usage.output_tokens,
+                            "prompt_tokens_details":{
+                                "cached_tokens":decoded.usage.cache_read_tokens
+                            },
+                            "completion_tokens_details":{
+                                "reasoning_tokens":decoded.usage.reasoning_tokens
+                            }}
                     })
                 ));
             }
@@ -2196,6 +2388,16 @@ mod tests {
         WebSearchReplayCodec::from_key([0x6B; 32])
     }
 
+    fn streamed_values(output: &[String]) -> Vec<Value> {
+        output
+            .iter()
+            .flat_map(|event| event.lines())
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter(|line| *line != "[DONE]")
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
     #[test]
     fn stream_failures_keep_real_upstream_status_and_account_scope() {
         let rejected = classify_stream_failure(
@@ -2448,6 +2650,140 @@ mod tests {
         )
         .join("");
         assert!(output.contains("\"stop_reason\":\"pause_turn\""));
+    }
+
+    #[test]
+    fn claude_stream_reports_stop_sequences_and_cache_usage() {
+        let mut state = ClaudeState::new("msg_stop".into(), "model".into(), 100, replay_codec());
+        state.cache_creation_input_tokens = 5;
+        state.cache_read_input_tokens = 20;
+        let mut filter = StopSequenceFilter::new(&["<END>".into()]);
+        let first = client_visible_event(
+            &KiroEvent::AssistantResponse {
+                content: "hello <E".into(),
+            },
+            &mut filter,
+        )
+        .expect("visible prefix");
+        assert_eq!(
+            first,
+            KiroEvent::AssistantResponse {
+                content: "hello ".into()
+            }
+        );
+        assert!(client_visible_event(
+            &KiroEvent::AssistantResponse {
+                content: "ND>ignored".into(),
+            },
+            &mut filter,
+        )
+        .is_none());
+
+        let mut decoded = DecodedResponse {
+            text: "hello <END>ignored".into(),
+            usage: kproxy_kiro::UsageInfo {
+                input_tokens: 100,
+                output_tokens: 10,
+                cache_read_tokens: 20,
+                cache_write_tokens: 5,
+                ..kproxy_kiro::UsageInfo::default()
+            },
+            ..DecodedResponse::default()
+        };
+        decoded.stop_at_sequence("hello ".into(), "<END>".into());
+        let output = stream_finish(
+            &StreamProtocol::Claude,
+            &mut state,
+            &decoded,
+            123,
+            "model",
+            100,
+            10,
+            ThinkingOutputFormat::Claude,
+            false,
+        );
+        let values = streamed_values(&output);
+        let start = values
+            .iter()
+            .find(|value| value["type"] == "message_start")
+            .expect("message start");
+        assert_eq!(start["message"]["usage"]["input_tokens"], 75);
+        assert_eq!(start["message"]["usage"]["cache_creation_input_tokens"], 5);
+        assert_eq!(start["message"]["usage"]["cache_read_input_tokens"], 20);
+        let delta = values
+            .iter()
+            .find(|value| value["type"] == "message_delta")
+            .expect("message delta");
+        assert_eq!(delta["delta"]["stop_reason"], "stop_sequence");
+        assert_eq!(delta["delta"]["stop_sequence"], "<END>");
+        assert_eq!(delta["usage"]["input_tokens"], 75);
+        assert_eq!(delta["usage"]["cache_creation_input_tokens"], 5);
+        assert_eq!(delta["usage"]["cache_read_input_tokens"], 20);
+    }
+
+    #[test]
+    fn stream_stop_position_does_not_cross_non_text_boundaries() {
+        let mut filter = StopSequenceFilter::new(&["END".into()]);
+        assert_eq!(filter.push("E"), "");
+        assert_eq!(filter.finish(), "E");
+        assert_eq!(filter.push("ND"), "ND");
+
+        let mut decoded = DecodedResponse {
+            text: "END".into(),
+            ..DecodedResponse::default()
+        };
+        apply_stream_stop(&mut decoded, &filter);
+        assert_eq!(decoded.text, "END");
+        assert!(decoded.stop_sequence.is_none());
+
+        assert_eq!(filter.push(" END ignored"), " ");
+        decoded.text.push_str(" END ignored");
+        apply_stream_stop(&mut decoded, &filter);
+        assert_eq!(decoded.text, "END ");
+        assert_eq!(decoded.stop_sequence.as_deref(), Some("END"));
+    }
+
+    #[test]
+    fn openai_stream_reports_length_and_detailed_usage() {
+        let mut state = ClaudeState::new(
+            "chatcmpl-length".into(),
+            "model".into(),
+            100,
+            replay_codec(),
+        );
+        let decoded = DecodedResponse {
+            stop_reason: Some("max_tokens".into()),
+            usage: kproxy_kiro::UsageInfo {
+                input_tokens: 100,
+                output_tokens: 50,
+                cache_read_tokens: 20,
+                reasoning_tokens: 7,
+                ..kproxy_kiro::UsageInfo::default()
+            },
+            ..DecodedResponse::default()
+        };
+        let output = stream_finish(
+            &StreamProtocol::OpenAi,
+            &mut state,
+            &decoded,
+            123,
+            "model",
+            50,
+            50,
+            ThinkingOutputFormat::Claude,
+            true,
+        );
+        let values = streamed_values(&output);
+        assert_eq!(values[0]["choices"][0]["finish_reason"], "length");
+        assert_eq!(values[1]["choices"], json!([]));
+        assert_eq!(
+            values[1]["usage"]["prompt_tokens_details"]["cached_tokens"],
+            20
+        );
+        assert_eq!(
+            values[1]["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            7
+        );
     }
 
     #[test]

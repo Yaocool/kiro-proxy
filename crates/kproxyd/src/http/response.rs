@@ -33,6 +33,145 @@ pub struct DecodedResponse {
     /// Explicit Claude stop reason for proxy-managed server loops (for example
     /// `pause_turn`). When absent the ordinary tool/max/end inference applies.
     pub stop_reason: Option<String>,
+    /// Custom Claude stop sequence matched by the proxy response filter.
+    pub stop_sequence: Option<String>,
+}
+
+#[derive(Debug, Default)]
+pub struct StopSequenceFilter {
+    sequences: Vec<CompiledStopSequence>,
+    pending: String,
+    matched: Option<String>,
+    visible_bytes: usize,
+}
+
+#[derive(Debug)]
+struct CompiledStopSequence {
+    value: String,
+    failure: Vec<usize>,
+    state: usize,
+}
+
+impl CompiledStopSequence {
+    fn new(value: String) -> Self {
+        let bytes = value.as_bytes();
+        let mut failure = vec![0; bytes.len()];
+        let mut prefix = 0;
+        for index in 1..bytes.len() {
+            while prefix > 0 && bytes[index] != bytes[prefix] {
+                prefix = failure[prefix - 1];
+            }
+            if bytes[index] == bytes[prefix] {
+                prefix += 1;
+            }
+            failure[index] = prefix;
+        }
+        Self {
+            value,
+            failure,
+            state: 0,
+        }
+    }
+
+    fn advance(&mut self, byte: u8) -> bool {
+        let bytes = self.value.as_bytes();
+        while self.state > 0 && byte != bytes[self.state] {
+            self.state = self.failure[self.state - 1];
+        }
+        if byte == bytes[self.state] {
+            self.state += 1;
+        }
+        self.state == bytes.len()
+    }
+
+    fn reset(&mut self) {
+        self.state = 0;
+    }
+}
+
+impl StopSequenceFilter {
+    pub fn new(sequences: &[String]) -> Self {
+        let mut compiled = Vec::with_capacity(sequences.len());
+        for sequence in sequences.iter().filter(|sequence| !sequence.is_empty()) {
+            if compiled
+                .iter()
+                .any(|candidate: &CompiledStopSequence| candidate.value == *sequence)
+            {
+                continue;
+            }
+            compiled.push(CompiledStopSequence::new(sequence.clone()));
+        }
+        Self {
+            sequences: compiled,
+            pending: String::new(),
+            matched: None,
+            visible_bytes: 0,
+        }
+    }
+
+    /// Returns the portion that is safe to publish. A suffix that could begin
+    /// a stop sequence is retained until the next chunk resolves it.
+    pub fn push(&mut self, text: &str) -> String {
+        if self.matched.is_some() {
+            return String::new();
+        }
+        if self.sequences.is_empty() {
+            self.visible_bytes = self.visible_bytes.saturating_add(text.len());
+            return text.into();
+        }
+        let pending_len = self.pending.len();
+        self.pending.push_str(text);
+        for (offset, byte) in text.bytes().enumerate() {
+            let matched = self
+                .sequences
+                .iter_mut()
+                .enumerate()
+                .find_map(|(index, sequence)| sequence.advance(byte).then_some(index));
+            if let Some(index) = matched {
+                let sequence_len = self.sequences[index].value.len();
+                let match_end = pending_len + offset + 1;
+                let match_start = match_end.saturating_sub(sequence_len);
+                let visible = self.pending[..match_start].to_owned();
+                self.pending.clear();
+                self.matched = Some(self.sequences[index].value.clone());
+                self.visible_bytes = self.visible_bytes.saturating_add(visible.len());
+                return visible;
+            }
+        }
+        let retained = self
+            .sequences
+            .iter()
+            .map(|sequence| sequence.state)
+            .max()
+            .unwrap_or_default();
+        let split = self.pending.len().saturating_sub(retained);
+        let visible = self.pending[..split].to_owned();
+        self.pending = self.pending[split..].to_owned();
+        self.visible_bytes = self.visible_bytes.saturating_add(visible.len());
+        visible
+    }
+
+    pub fn finish(&mut self) -> String {
+        for sequence in &mut self.sequences {
+            sequence.reset();
+        }
+        if self.matched.is_some() {
+            self.pending.clear();
+            String::new()
+        } else {
+            let visible = std::mem::take(&mut self.pending);
+            self.visible_bytes = self.visible_bytes.saturating_add(visible.len());
+            visible
+        }
+    }
+
+    pub fn matched(&self) -> Option<&str> {
+        self.matched.as_deref()
+    }
+
+    pub fn visible_bytes(&self) -> usize {
+        self.visible_bytes
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -319,6 +458,13 @@ fn decode_xml(value: &str) -> String {
 }
 
 impl DecodedResponse {
+    pub fn stop_at_sequence(&mut self, visible_text: String, sequence: String) {
+        self.text = visible_text;
+        self.tools.clear();
+        self.stop_reason = Some("stop_sequence".into());
+        self.stop_sequence = Some(sequence);
+    }
+
     pub fn restore_tool_names(&mut self, names: &std::collections::HashMap<String, String>) {
         for tool in self.tools.values_mut() {
             if let Some(original) = names.get(&tool.name) {
@@ -503,7 +649,7 @@ impl DecodedResponse {
             .saturating_sub(self.usage.cache_write_tokens);
         let mut response = json!({
             "id":id,"type":"message","role":"assistant","content":content,
-            "model":model,"stop_reason":stop,"stop_sequence":Value::Null,
+            "model":model,"stop_reason":stop,"stop_sequence":self.stop_sequence.as_deref(),
             "usage":{
                 "input_tokens":uncached_input_tokens,
                 "output_tokens":self.usage.output_tokens,
@@ -594,20 +740,19 @@ impl DecodedResponse {
             _ if self.text.is_empty() => Value::Null,
             _ => json!(self.text),
         };
-        let reasoning_content = match thinking_format {
-            kproxy_core::config::ThinkingOutputFormat::Openai if !self.reasoning.is_empty() => {
-                json!(self.reasoning)
-            }
-            _ => Value::Null,
-        };
+        let mut message = json!({
+            "role":"assistant",
+            "content":content,
+            "tool_calls":tools
+        });
+        if thinking_format == kproxy_core::config::ThinkingOutputFormat::Openai
+            && !self.reasoning.is_empty()
+        {
+            message["reasoning_content"] = json!(self.reasoning);
+        }
         json!({
             "id":id,"object":"chat.completion","created":created,"model":model,
-            "choices":[{"index":0,"message":{
-                "role":"assistant",
-                "content":content,
-                "reasoning_content":reasoning_content,
-                "tool_calls":tools
-            },"finish_reason":finish}],
+            "choices":[{"index":0,"message":message,"finish_reason":finish}],
             "usage":{
                 "prompt_tokens":self.usage.input_tokens,
                 "completion_tokens":self.usage.output_tokens,
@@ -1001,6 +1146,50 @@ mod tests {
     }
 
     #[test]
+    fn stop_sequence_filter_matches_across_chunks_without_leaking_the_sequence() {
+        let mut filter = StopSequenceFilter::new(&["<END>".into(), "结束".into()]);
+        assert_eq!(filter.push("hello <E"), "hello ");
+        assert_eq!(filter.push("ND>ignored"), "");
+        assert_eq!(filter.matched(), Some("<END>"));
+        assert_eq!(filter.visible_bytes(), "hello ".len());
+        assert_eq!(filter.finish(), "");
+
+        let mut unicode = StopSequenceFilter::new(&["结束".into()]);
+        assert_eq!(unicode.push("完成结"), "完成");
+        assert_eq!(unicode.push("束ignored"), "");
+        assert_eq!(unicode.matched(), Some("结束"));
+    }
+
+    #[test]
+    fn stop_sequence_filter_uses_generation_order_and_resets_at_block_boundaries() {
+        let mut earliest = StopSequenceFilter::new(&["abc".into(), "b".into()]);
+        assert_eq!(earliest.push("abc"), "a");
+        assert_eq!(earliest.matched(), Some("b"));
+
+        let mut boundary = StopSequenceFilter::new(&["END".into()]);
+        assert_eq!(boundary.push("E"), "");
+        assert_eq!(boundary.finish(), "E");
+        assert_eq!(boundary.push("ND"), "ND");
+        assert_eq!(boundary.finish(), "");
+        assert_eq!(boundary.matched(), None);
+        assert_eq!(boundary.visible_bytes(), "END".len());
+    }
+
+    #[test]
+    fn claude_response_truncates_and_reports_a_matched_stop_sequence() {
+        let mut decoded = DecodedResponse {
+            text: "before END after".into(),
+            ..DecodedResponse::default()
+        };
+        decoded.stop_at_sequence("before ".into(), "END".into());
+        let response = decoded.claude_json("msg", "model", 100, 1, None, &replay_codec());
+
+        assert_eq!(response["content"][0]["text"], "before ");
+        assert_eq!(response["stop_reason"], "stop_sequence");
+        assert_eq!(response["stop_sequence"], "END");
+    }
+
+    #[test]
     fn response_format_and_stop_reason_use_config_and_current_round() {
         let decoded = DecodedResponse {
             text: "answer".into(),
@@ -1033,7 +1222,9 @@ mod tests {
             tagged["choices"][0]["message"]["content"],
             "<thinking>thought</thinking>answer"
         );
-        assert!(tagged["choices"][0]["message"]["reasoning_content"].is_null());
+        assert!(tagged["choices"][0]["message"]
+            .get("reasoning_content")
+            .is_none());
         let openai = decoded.openai_json(
             "chat",
             "model",
