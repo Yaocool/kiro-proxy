@@ -372,7 +372,9 @@ kproxy account add-sso --batch - -c 1 < accounts.csv
 Docker 宿主机 wrapper 会自动识别可读的宿主机 CSV，并通过 stdin 流式传入容器，不复制或
 残留密码文件；容器内路径在宿主机没有同名文件时仍按原样读取。密码只从 stdin 或两列 CSV
 文件读取。遇到 MFA 或上游页面变化需要手工操作时，增加
-`--headful`。该流程不会增加对非企业账号或非 SSO 认证方式的支持。
+`--headful`。每个账号都会使用独立的 Chromium 无痕 context 和临时 profile，并在处理下一个
+账号前销毁；写入账号前还会核对 Kiro 返回的真实身份与 CSV 邮箱，身份不一致时直接失败且
+不会修改账号存储。该流程不会增加对非企业账号或非 SSO 认证方式的支持。
 
 ## Docker 与 systemd
 

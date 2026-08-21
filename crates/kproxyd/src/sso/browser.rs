@@ -3,6 +3,7 @@
 use anyhow::{Context, Result};
 use chromiumoxide::{Browser, BrowserConfig, Page};
 use futures::StreamExt;
+use tempfile::TempDir;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 
@@ -12,6 +13,7 @@ pub struct BrowserSession {
     handler: JoinHandle<()>,
     injector: JoinHandle<()>,
     cancel: CancellationToken,
+    profile_dir: Option<TempDir>,
 }
 
 impl BrowserSession {
@@ -21,8 +23,12 @@ impl BrowserSession {
         password: &str,
         headful: bool,
     ) -> Result<Self> {
+        // Chromiumoxide otherwise reuses /tmp/chromiumoxide-runner. A unique
+        // profile prevents concurrent or sequential SSO logins from inheriting
+        // another account's browser process, cookies, or local storage.
+        let profile_dir = isolated_profile_dir()?;
         let mut builder = BrowserConfig::builder()
-            .incognito()
+            .user_data_dir(profile_dir.path())
             .window_size(1100, 800)
             .launch_timeout(std::time::Duration::from_secs(20));
         if std::env::var("KPROXY_CHROMIUM_NO_SANDBOX").as_deref() == Ok("1") {
@@ -46,8 +52,22 @@ impl BrowserSession {
             }
             tracing::debug!("Chromium event stream closed");
         });
-        browser.start_incognito_context().await?;
-        let page = browser.new_page(authorize_url).await?;
+        // Do not set BrowserConfig::incognito(): chromiumoxide treats that as
+        // already isolated and makes start_incognito_context() a no-op. Creating
+        // a CDP browser context here gives every login an actual ephemeral
+        // cookie/cache partition.
+        let page_result = match browser.start_incognito_context().await {
+            Ok(browser) => browser.new_page(authorize_url).await,
+            Err(error) => Err(error),
+        };
+        let page = match page_result {
+            Ok(page) => page,
+            Err(error) => {
+                handler.abort();
+                let _ = browser.kill().await;
+                return Err(error).context("unable to create an incognito Chromium page");
+            }
+        };
         tracing::info!(headful, "Chromium SSO browser launched");
         let cancel = CancellationToken::new();
         let injector = spawn_injector(page, email, password, cancel.clone())?;
@@ -56,12 +76,16 @@ impl BrowserSession {
             handler,
             injector,
             cancel,
+            profile_dir: Some(profile_dir),
         })
     }
 
     pub async fn close(&mut self) {
         self.cancel.cancel();
         self.injector.abort();
+        if let Err(error) = self.browser.quit_incognito_context().await {
+            tracing::warn!(%error, "unable to dispose Chromium incognito context");
+        }
         if let Err(error) = self.browser.close().await {
             tracing::warn!(%error, "unable to close Chromium cleanly; killing it");
             if let Some(Err(error)) = self.browser.kill().await {
@@ -87,7 +111,19 @@ impl BrowserSession {
             }
         }
         self.handler.abort();
+        if let Some(profile_dir) = self.profile_dir.take() {
+            if let Err(error) = profile_dir.close() {
+                tracing::warn!(%error, "unable to remove isolated Chromium profile");
+            }
+        }
     }
+}
+
+fn isolated_profile_dir() -> Result<TempDir> {
+    tempfile::Builder::new()
+        .prefix("kproxy-sso-")
+        .tempdir()
+        .context("unable to create an isolated Chromium profile")
 }
 
 impl Drop for BrowserSession {
@@ -188,4 +224,20 @@ fn automation_script(email: &str, password: &str) -> String {
           return 'waiting:page';
         }})()"#
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn chromium_profiles_are_unique_and_removed_after_close() {
+        let first = isolated_profile_dir().expect("first profile");
+        let second = isolated_profile_dir().expect("second profile");
+        assert_ne!(first.path(), second.path());
+
+        let first_path = first.path().to_path_buf();
+        first.close().expect("remove first profile");
+        assert!(!first_path.exists());
+    }
 }
