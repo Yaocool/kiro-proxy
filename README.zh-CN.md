@@ -358,11 +358,16 @@ printf '%s\n' "$PASSWORD" | kproxy account add-sso \
   --password-stdin
 
 kproxy account add-sso --batch accounts.csv -c 1
+
+# 显式从 stdin 读取，适合管道和自动化：
+kproxy account add-sso --batch - -c 1 < accounts.csv
 ```
 
 单次登录仍可用 `--start-url` 覆盖全局值。若明确需要更小且不含浏览器 SSO 的二进制，可用
 `cargo build --workspace --no-default-features` 或 Docker 的 `runtime-slim` target。
-密码只从 stdin 或两列 CSV 文件读取。遇到 MFA 或上游页面变化需要手工操作时，增加
+Docker 宿主机 wrapper 会自动识别可读的宿主机 CSV，并通过 stdin 流式传入容器，不复制或
+残留密码文件；容器内路径在宿主机没有同名文件时仍按原样读取。密码只从 stdin 或两列 CSV
+文件读取。遇到 MFA 或上游页面变化需要手工操作时，增加
 `--headful`。该流程不会增加对非企业账号或非 SSO 认证方式的支持。
 
 ## Docker 与 systemd

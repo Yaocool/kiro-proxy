@@ -430,10 +430,36 @@ kproxy service list
 
 The wrapper locates the running daemon by the `io.kiro-proxy.role=daemon`
 container label, preserves command exit codes, forwards stdin, and allocates a
-TTY only for interactive use. Interactive commands also receive the host
-`TERM` value (falling back to `xterm` when it is unset or `dumb`) so full-screen
-editors such as `vi` handle cursor keys correctly. This keeps the admin Unix
-socket private and avoids host/container binary compatibility problems.
+TTY only for interactive use. Interactive commands receive the host `TERM`
+value and fall back to `xterm-256color` when the image has no matching terminfo
+entry. The image includes full Vim and extended terminfo, and
+`kproxy config edit` uses Vim by default so cursor keys work correctly. This
+keeps the admin Unix socket private and avoids host/container binary
+compatibility problems.
+
+Update both the wrapper and the container image for an existing deployment:
+
+```bash
+sudo ./deploy/install-kproxy-wrapper.sh
+docker compose up -d --build
+kproxy config edit
+```
+
+You can also explicitly select an editor installed in the container, for
+example `EDITOR=vim kproxy config edit` on the host.
+
+For batch SSO imports, the wrapper recognizes a readable host file passed to
+`--batch` and streams it directly to the container through stdin. No `docker cp`
+step or container-side CSV remains:
+
+```bash
+kproxy account add-sso --batch ./accounts.csv --start-url 'https://example.awsapps.com/start'
+```
+
+The CLI also accepts `-` as stdin, so both host and container invocations can
+explicitly use `kproxy account add-sso --batch - < accounts.csv`. When the named
+file does not exist on the host, the wrapper leaves the argument unchanged for
+the container filesystem to resolve.
 
 To install only the wrapper, invoke the low-level installer directly. It updates
 a wrapper managed by this project but refuses to overwrite other commands by

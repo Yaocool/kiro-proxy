@@ -380,9 +380,31 @@ kproxy service list
 ```
 
 包装器通过容器的 `io.kiro-proxy.role=daemon` 标签发现运行中的 daemon，保留命令退出码、
-透传 stdin，并且只在交互场景分配 TTY。交互命令还会透传宿主机的 `TERM`（未设置时使用
-`xterm`，`dumb` 也会规范化为 `xterm`），使 `vi` 等全屏编辑器能够正确处理方向键。这样既
-不需要暴露管理 Unix socket，也不存在宿主机与容器二进制兼容问题。
+透传 stdin，并且只在交互场景分配 TTY。交互命令会把宿主机的 `TERM` 传入容器；如果镜像
+不支持该终端类型，则自动回退为 `xterm-256color`。镜像内置完整的 `vim` 和扩展 terminfo，
+`kproxy config edit` 默认直接使用 `vim`，可正常处理方向键。这样既不需要暴露管理 Unix
+socket，也不存在宿主机与容器二进制兼容问题。
+
+升级已有部署时，wrapper 和容器镜像都需要更新：
+
+```bash
+sudo ./deploy/install-kproxy-wrapper.sh
+docker compose up -d --build
+kproxy config edit
+```
+
+也可在宿主机显式选择容器内已安装的编辑器，例如 `EDITOR=vim kproxy config edit`。
+
+批量 SSO 导入时，wrapper 会识别 `--batch` 指向的可读宿主机文件，并通过 stdin 直接流式
+传入容器，不需要 `docker cp`，也不会在容器中留下 CSV：
+
+```bash
+kproxy account add-sso --batch ./accounts.csv --start-url 'https://example.awsapps.com/start'
+```
+
+CLI 也原生支持 `-` 表示 stdin，因此在宿主机和容器内都可显式使用
+`kproxy account add-sso --batch - < accounts.csv`。如果宿主机不存在指定文件，wrapper 会保留
+参数，由容器按自己的文件系统解析该路径。
 
 需要只安装包装器时可直接运行底层安装器。它会自动更新由本项目管理的包装器，并默认拒绝
 覆盖其他已有命令：
