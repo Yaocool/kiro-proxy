@@ -424,13 +424,20 @@ printf '%s\n' "$PASSWORD" | kproxy account add-sso \
   --password-stdin
 
 kproxy account add-sso --batch accounts.csv -c 1
+
+# Read explicitly from stdin for pipelines and automation:
+kproxy account add-sso --batch - -c 1 < accounts.csv
 ```
 
 Use `--start-url` to override the global value for one login. When a smaller
 binary without browser SSO is explicitly desired, build with
 `cargo build --workspace --no-default-features` or select Docker's
 `runtime-slim` target.
-Passwords are accepted only from stdin or a two-column CSV file. Add
+The Docker host wrapper automatically recognizes a readable host CSV and
+streams it into the container through stdin, without copying or retaining a
+password file. A container path is still read normally when no host file with
+the same name exists. Passwords are accepted only from stdin or a two-column
+CSV file. Add
 `--headful` when MFA or an upstream page change requires manual interaction.
 This flow does not add support for non-enterprise or non-SSO accounts.
 
