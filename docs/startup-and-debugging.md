@@ -210,9 +210,12 @@ curl -i http://127.0.0.1:5580/v1/messages/count_tokens \
 ```
 
 `GET /health` returns `status: ok` even before an upstream account is available;
-account counts are diagnostics, not application-health criteria. Local token
-counting still requires the service API key. A generation request returning
-`503` is expected when no account is schedulable.
+account counts are diagnostics, not application-health criteria. It reports
+`total_accounts` plus the health-state counts. `used_credits` and
+`total_credits` sum the latest upstream usage snapshots for every configured
+account in the shared pool; accounts without a usage snapshot contribute zero
+to both credit sums. Local token counting still requires the service API key. A
+generation request returning `503` is expected when no account is schedulable.
 
 Every newly created service requires its generated API key:
 

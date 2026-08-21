@@ -194,7 +194,9 @@ curl -i http://127.0.0.1:5580/v1/messages/count_tokens \
 ```
 
 没有可用上游账号时，`GET /health` 仍返回 `status: ok`；账号数量只是诊断信息，不参与
-应用健康判断。本地 Token 计数仍需使用服务 API Key。此时生成请求返回 `503` 属于预期行为。
+应用健康判断。响应包含 `total_accounts` 和各健康状态数量；`used_credits`、`total_credits`
+聚合共享账号池内全部已配置账号的最近一次上游用量快照，尚无用量快照的账号对两项 credits
+合计均按零处理。本地 Token 计数仍需使用服务 API Key。此时生成请求返回 `503` 属于预期行为。
 
 所有新建服务都必须使用创建时生成的 API Key：
 

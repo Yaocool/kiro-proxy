@@ -129,13 +129,24 @@ pub async fn root() -> Json<Value> {
 }
 
 pub async fn health(State(service): State<ServiceHttpState>) -> Json<Value> {
-    let counts = service.app.pool().health_counts().await;
+    let pool = service.app.pool();
+    let counts = pool.health_counts().await;
+    let accounts = pool.snapshot().await;
+    let (used_credits, total_credits) = accounts
+        .iter()
+        .filter_map(|account| account.usage.as_ref())
+        .fold((0.0, 0.0), |(used, total), usage| {
+            (used + usage.current, total + usage.limit)
+        });
     Json(json!({
         "status":"ok",
         "service_id":service.service.id,
         "service_name":service.service.name,
+        "total_accounts":accounts.len(),
         "available_accounts":counts[0],"cooling_accounts":counts[1],
         "exhausted_accounts":counts[2],"banned_accounts":counts[3],
+        "used_credits":used_credits,
+        "total_credits":total_credits,
         "uptime_secs":service.app.uptime_secs()
     }))
 }

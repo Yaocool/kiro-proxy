@@ -504,6 +504,7 @@ fn write_lock<T>(lock: &RwLock<T>) -> std::sync::RwLockWriteGuard<'_, T> {
 mod tests {
     use axum::body::{to_bytes, Body};
     use axum::http::{header, Method, Request, StatusCode};
+    use kproxy_core::account::{Account, AuthMethod, Credentials, Usage};
     use kproxy_core::config::{ApiKeyConfig, ApiKeyFormat, Config, ProxyServiceConfig};
     use kproxy_core::paths::Paths;
     use kproxy_store::accounts::AccountStore;
@@ -536,6 +537,31 @@ mod tests {
             .await
             .expect("body");
         serde_json::from_slice(&bytes).expect("json")
+    }
+
+    fn account_with_usage(id: &str, email: &str, enabled: bool, usage: Option<Usage>) -> Account {
+        Account {
+            id: id.into(),
+            email: email.into(),
+            label: None,
+            enabled,
+            machine_id: "0".repeat(64),
+            profile_arn: None,
+            credentials: Credentials {
+                access_token: format!("token-{id}"),
+                refresh_token: None,
+                client_id: None,
+                client_secret: None,
+                region: "us-east-1".into(),
+                expires_at: i64::MAX,
+                auth_method: AuthMethod::Idc,
+            },
+            usage,
+            subscription: None,
+            tags: Vec::new(),
+            created_at: 0,
+            credit_exhausted: false,
+        }
     }
 
     #[tokio::test]
@@ -599,6 +625,65 @@ mod tests {
         assert!(!body_json(ready).await["ready"]
             .as_bool()
             .expect("ready flag"));
+    }
+
+    #[tokio::test]
+    async fn health_reports_total_accounts_and_aggregate_upstream_credits() {
+        let (_directory, state) = test_state(Config::default()).await;
+        let mut accounts = AccountStore::load(&state.paths.accounts_file)
+            .await
+            .expect("accounts");
+        accounts
+            .insert(account_with_usage(
+                "acc_one",
+                "one@example.com",
+                true,
+                Some(Usage {
+                    current: 1.25,
+                    limit: 10.0,
+                    percent_used: 12.5,
+                    next_reset_date: None,
+                    updated_at: 1,
+                }),
+            ))
+            .expect("first account");
+        accounts
+            .insert(account_with_usage(
+                "acc_two",
+                "two@example.com",
+                false,
+                Some(Usage {
+                    current: 2.75,
+                    limit: 20.0,
+                    percent_used: 13.75,
+                    next_reset_date: None,
+                    updated_at: 2,
+                }),
+            ))
+            .expect("second account");
+        accounts
+            .insert(account_with_usage(
+                "acc_unknown",
+                "unknown@example.com",
+                true,
+                None,
+            ))
+            .expect("account without usage");
+        state.apply_account_file_reload(accounts).await;
+
+        let response = router(state)
+            .oneshot(
+                Request::get("/health")
+                    .body(Body::empty())
+                    .expect("health request"),
+            )
+            .await
+            .expect("health response");
+        let health = body_json(response).await;
+
+        assert_eq!(health["total_accounts"], 3);
+        assert_eq!(health["used_credits"], 4.0);
+        assert_eq!(health["total_credits"], 30.0);
     }
 
     #[tokio::test]
