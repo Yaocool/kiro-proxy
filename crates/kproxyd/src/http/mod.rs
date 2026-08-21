@@ -925,6 +925,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_responses_api_is_not_exposed() {
+        let (_directory, state) = test_state(Config::default()).await;
+        let response = router(state)
+            .oneshot(
+                Request::post("/v1/responses")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"model":"test","input":"hello"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
     async fn openai_overflow_remains_a_hard_context_error_when_auto_compact_is_enabled() {
         let mut config = Config::default();
         config.context.max_input_tokens = 1_000;
