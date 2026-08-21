@@ -1930,10 +1930,12 @@ pub async fn run_model_map(
     match command {
         ModelMapCommand::List => {
             let config = effective_config(client).await?;
+            let mut rules = config.model_mapping;
+            rules.sort_by_key(|rule| rule.priority);
             if json {
-                print_json(&config.model_mapping)
+                print_json(&rules)
             } else {
-                for rule in config.model_mapping {
+                for rule in rules {
                     let credits = rule
                         .max_remaining_credit_percent
                         .map(|value| format!("剩余<{value}%"))

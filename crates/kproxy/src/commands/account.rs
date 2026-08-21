@@ -16,7 +16,7 @@ use crate::output::{format_timestamp, print_json, render_table};
 pub enum AccountCommand {
     /// 列出账号。
     #[command(
-        long_about = "列出账号。\n\n示例：\n  kproxy account list\n  kproxy account list --tag prod --enabled-only"
+        long_about = "列出账号，默认按邮箱排序。\n\n示例：\n  kproxy account list\n  kproxy account list --tag prod --enabled-only\n  kproxy account list --sort credit"
     )]
     List {
         /// 只显示带该标签的账号。
@@ -28,8 +28,8 @@ pub enum AccountCommand {
         /// 状态过滤：available/disabled/exhausted。
         #[arg(long)]
         status: Option<String>,
-        /// 排序字段：credit/email/id。
-        #[arg(long)]
+        /// 排序字段：email（默认）/credit/id。
+        #[arg(long, value_parser = ["email", "credit", "id"])]
         sort: Option<String>,
     },
     /// 显示单账号详情。

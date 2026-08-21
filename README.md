@@ -397,6 +397,12 @@ Destructive commands have no `--yes` bypass and require an interactive `y` or
 `yes` confirmation. Running bare `kproxy` prints the main help; `kproxy help` lists
 the available topic guides.
 
+`kproxy account list` sorts by email by default so batch imports are easy to
+audit. Use `--sort credit` or `--sort id` when those views are needed. Service,
+API key, alert-target, and model lists also use stable name or identifier
+ordering; logs, recent requests, and pool scores retain their semantic time or
+priority order.
+
 `kproxy stats` reports aggregate operational traffic, success, token, credit, and
 latency metrics; it does not replace per-request logs. Its default output is a
 compact summary. Add `--detail` for grouped counters and recent requests.
