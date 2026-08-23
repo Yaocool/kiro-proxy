@@ -103,6 +103,7 @@ pub enum AccountCommand {
     },
     /// 删除账号。
     #[command(
+        visible_alias = "delete",
         long_about = "删除账号，执行前需输入 y 或 yes 确认。\n\n示例：\n  kproxy account rm acc_7f3a2b1c\n  kproxy account rm user@example.com"
     )]
     Rm {

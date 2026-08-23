@@ -149,11 +149,16 @@ enum Command {
     #[command(name = "alert", subcommand)]
     Alert(crate::commands::runtime::AlertCommand),
     /// 显示上游动态模型。
-    #[command(after_help = "示例：\n  kproxy models\n  kproxy models --mapped")]
+    #[command(
+        after_help = "示例：\n  kproxy models\n  kproxy models --mapped\n  kproxy models --refresh"
+    )]
     Models {
         /// 同时显示每个模型经过映射规则后的结果。
         #[arg(long)]
         mapped: bool,
+        /// 先立即执行一次上游模型发现，再显示结果。
+        #[arg(long)]
+        refresh: bool,
     },
     /// 模型映射规则。
     #[command(name = "model-map", subcommand)]
@@ -710,7 +715,15 @@ async fn main() -> Result<()> {
         Command::Alert(command) => {
             crate::commands::runtime::run_alert(&mut client, command, cli.json).await?;
         }
-        Command::Models { mapped } => {
+        Command::Models { mapped, refresh } => {
+            if refresh {
+                let _: serde_json::Value = client
+                    .call(
+                        method::TASK_RUN,
+                        serde_json::json!({"name":"model_cache_refresh"}),
+                    )
+                    .await?;
+            }
             crate::commands::runtime::show_models(&mut client, mapped, cli.json).await?;
         }
         Command::ModelMap(command) => {
@@ -790,6 +803,83 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Config(ConfigCommand::Reset))
+        ));
+    }
+
+    #[test]
+    fn logs_support_legacy_flags_and_discovery_subcommands() {
+        let legacy = Cli::try_parse_from([
+            "kproxy",
+            "logs",
+            "--tail",
+            "25",
+            "--follow",
+            "--account",
+            "alice@example.com",
+        ])
+        .expect("legacy logs syntax");
+        let Some(Command::Logs {
+            command: None,
+            query,
+            follow: true,
+        }) = legacy.command
+        else {
+            panic!("expected legacy logs command");
+        };
+        assert_eq!(query.tail, 25);
+        assert_eq!(query.account.as_deref(), Some("alice@example.com"));
+
+        let files = Cli::try_parse_from(["kproxy", "logs", "files", "--level", "error"])
+            .expect("log files command");
+        assert!(matches!(
+            files.command,
+            Some(Command::Logs {
+                command: Some(LogsCommand::Files {
+                    level: Some(LogFileLevel::Error)
+                }),
+                ..
+            })
+        ));
+        assert!(Cli::try_parse_from(["kproxy", "logs", "--tail", "10", "files"]).is_err());
+    }
+
+    #[test]
+    fn service_edit_and_apikey_limit_clear_have_convenient_syntax() {
+        let service = Cli::try_parse_from([
+            "kproxy",
+            "service",
+            "edit",
+            "main",
+            "--port",
+            "5581",
+            "--add-api-key",
+            "ci,team",
+        ])
+        .expect("service edit");
+        let Some(Command::Service(crate::commands::runtime::ServiceCommand::Edit {
+            service,
+            port,
+            add_api_key,
+            ..
+        })) = service.command
+        else {
+            panic!("expected service edit command");
+        };
+        assert_eq!(service, "main");
+        assert_eq!(port, Some(5581));
+        assert_eq!(add_api_key, vec!["ci", "team"]);
+
+        let limit = Cli::try_parse_from(["kproxy", "apikey", "limit", "ci", "--clear"])
+            .expect("clear API key limit");
+        assert!(matches!(
+            limit.command,
+            Some(Command::ApiKey(
+                crate::commands::runtime::ApiKeyCommand::Limit {
+                    clear: true,
+                    credits: None,
+                    ..
+                }
+            ))
         ));
     }
 
