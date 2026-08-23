@@ -178,6 +178,7 @@ printf '%s\n' "$PASSWORD" | cargo run -p kproxy -- account add-sso \
 ```bash
 kproxy service create --name main --port 5580
 kproxy service list
+kproxy service show main
 kproxy service apikeys main --show-secret
 ```
 
@@ -207,6 +208,18 @@ curl -i http://127.0.0.1:5580/v1/models \
 
 创建或配置监听非回环地址的服务时，该服务必须引用至少一个已启用的 API Key，否则配置
 校验会拒绝，以避免意外对公网暴露未鉴权服务。
+
+无需编辑 TOML 即可调整服务监听和 API Key 绑定：
+
+```bash
+kproxy service edit main --host 127.0.0.1 --port 5581
+kproxy service edit main --add-api-key ci --remove-api-key old-key
+kproxy service disable main
+kproxy service enable main
+```
+
+API Key 参数可使用 ID 或名称。`kproxy apikey show ci` 可查看单个 Key；已经设置过额度上限时，
+使用 `kproxy apikey limit ci --clear` 恢复为不限。上限设为零会有意阻止新的 Credits 消耗。
 
 每个业务 HTTP 响应都包含 `x-trace-id`，排查错误时应先保存这个值。
 

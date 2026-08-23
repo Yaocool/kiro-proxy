@@ -285,7 +285,11 @@ kproxy --json account export --redact
 kproxy status
 kproxy health
 kproxy service list
+kproxy service show main
 kproxy service create --name main --port 5580
+kproxy service edit main --port 5581 --add-api-key ci
+kproxy service disable main
+kproxy service enable main
 kproxy service apikeys main
 kproxy service apikeys main --show-secret
 kproxy service delete main
@@ -309,7 +313,7 @@ kproxy pool --watch --explain
 kproxy diagnose endpoints
 kproxy diagnose account --all -c 4 --timeout 45s
 kproxy subscriptions
-kproxy models --mapped
+kproxy models --refresh --mapped
 kproxy model-map add --name low-credit --source 'claude-opus-*' --target claude-sonnet-4.6 --below-credits-percent 10
 kproxy model-map edit low-credit --below-credits-percent 15
 kproxy model-map delete low-credit
@@ -317,6 +321,9 @@ kproxy model-map test claude-opus-4
 
 kproxy apikey list
 kproxy apikey list --detail
+kproxy apikey show ci
+kproxy apikey limit ci --credits 100
+kproxy apikey limit ci --clear
 kproxy alert events
 kproxy alert config --low-credit-threshold-percent 10 --max-notifications 5 --suppress-window 30m
 kproxy alert add --name alerts --kind dingtalk --url https://example/hook --event token-expired,quota-exhausted

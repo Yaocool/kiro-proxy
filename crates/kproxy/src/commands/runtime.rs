@@ -23,6 +23,14 @@ pub enum ServiceCommand {
     /// 列出 API 代理服务。
     #[command(after_help = "示例：\n  kproxy service list\n  kproxy --json service list")]
     List,
+    /// 显示单个 API 代理服务详情。
+    #[command(
+        after_help = "示例：\n  kproxy service show main\n  kproxy --json service show svc_abcd"
+    )]
+    Show {
+        /// 服务 ID 或名称。
+        service: String,
+    },
     /// 创建并启动服务，同时生成首个 API key。
     #[command(
         after_help = "示例：\n  kproxy service create --name main\n  kproxy service create --name team --host 127.0.0.1 --port 5581"
@@ -38,6 +46,41 @@ pub enum ServiceCommand {
         api_key_name: Option<String>,
         #[arg(long, default_value = "sk")]
         api_key_format: String,
+    },
+    /// 修改服务名称、监听地址、端口或绑定的 API key。
+    #[command(
+        after_help = "API key 参数接受 ID 或名称，可重复使用。\n\n示例：\n  kproxy service edit main --host 127.0.0.1 --port 5581\n  kproxy service edit main --add-api-key ci\n  kproxy service edit main --remove-api-key ak_ab12"
+    )]
+    Edit {
+        /// 当前服务 ID 或名称。
+        service: String,
+        /// 新服务名称。
+        #[arg(long)]
+        rename: Option<String>,
+        /// 新监听地址。
+        #[arg(long)]
+        host: Option<String>,
+        /// 新监听端口。
+        #[arg(long)]
+        port: Option<u16>,
+        /// 增加绑定的 API key ID 或名称，可重复或逗号分隔。
+        #[arg(long, value_delimiter = ',', value_name = "KEY")]
+        add_api_key: Vec<String>,
+        /// 移除绑定的 API key ID 或名称，可重复或逗号分隔。
+        #[arg(long, value_delimiter = ',', value_name = "KEY")]
+        remove_api_key: Vec<String>,
+    },
+    /// 启动已停用的 API 代理服务。
+    #[command(after_help = "示例：\n  kproxy service enable main")]
+    Enable {
+        /// 服务 ID 或名称。
+        service: String,
+    },
+    /// 停止并停用 API 代理服务，但保留配置和 API key。
+    #[command(after_help = "示例：\n  kproxy service disable main")]
+    Disable {
+        /// 服务 ID 或名称。
+        service: String,
     },
     /// 删除并停止服务；一并删除未被其他服务共享的 API key。
     #[command(
@@ -65,6 +108,7 @@ pub enum ServiceCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ApiKeyCommand {
+    /// 列出全部 API key；默认显示汇总，--detail 增加逐 key 用量。
     #[command(
         after_help = "示例：\n  kproxy apikey list\n  kproxy apikey list --detail\n  kproxy --json apikey list --detail"
     )]
@@ -73,6 +117,12 @@ pub enum ApiKeyCommand {
         #[arg(long)]
         detail: bool,
     },
+    /// 显示单个 API key 的配置和累计用量，不显示密钥明文。
+    #[command(
+        after_help = "参数接受 API key ID 或名称。\n\n示例：\n  kproxy apikey show ci\n  kproxy --json apikey show ak_ab12"
+    )]
+    Show { id: String },
+    /// 创建 API key；明文只在创建结果中显示一次。
     #[command(
         after_help = "示例：\n  kproxy apikey add --name ci\n  kproxy apikey add --name team --credits-limit 100"
     )]
@@ -84,28 +134,40 @@ pub enum ApiKeyCommand {
         #[arg(long)]
         credits_limit: Option<f64>,
     },
-    #[command(after_help = "示例：\n  kproxy apikey rm ak_ab12\n\n执行前需输入 y 或 yes 确认。")]
+    /// 删除 API key，执行前需输入 y 或 yes 确认。
+    #[command(
+        visible_alias = "delete",
+        after_help = "参数接受 API key ID 或名称。\n\n示例：\n  kproxy apikey rm ak_ab12\n  kproxy apikey delete ci\n\n执行前需输入 y 或 yes 确认。"
+    )]
     Rm { id: String },
+    /// 启用 API key。
     #[command(
         after_help = "示例：\n  kproxy apikey enable ak_ab12\n  kproxy --json apikey enable ak_ab12"
     )]
     Enable { id: String },
+    /// 停用 API key，但保留配置与历史用量。
     #[command(
         after_help = "示例：\n  kproxy apikey disable ak_ab12\n  kproxy --json apikey disable ak_ab12"
     )]
     Disable { id: String },
+    /// 设置或清除 API key 的累计 Credits 上限。
     #[command(
-        after_help = "示例：\n  kproxy apikey limit ak_ab12 --credits 100\n  kproxy apikey limit ak_ab12 --credits 0"
+        after_help = "参数接受 API key ID 或名称。`--clear` 恢复为不限；`--credits 0` 会阻止任何新消耗。\n\n示例：\n  kproxy apikey limit ci --credits 100\n  kproxy apikey limit ci --clear"
     )]
     Limit {
         id: String,
+        #[arg(long, required_unless_present = "clear", conflicts_with = "clear")]
+        credits: Option<f64>,
+        /// 删除累计 credits 上限，恢复为不限。
         #[arg(long)]
-        credits: f64,
+        clear: bool,
     },
+    /// 查看 API key 的聚合与分维度用量。
     #[command(
         after_help = "示例：\n  kproxy apikey usage ak_ab12\n  kproxy --json apikey usage ak_ab12"
     )]
     Usage { id: String },
+    /// 查看 API key 的最近请求历史。
     #[command(
         after_help = "示例：\n  kproxy apikey history ak_ab12\n  kproxy apikey history ak_ab12 --tail 200"
     )]
@@ -114,6 +176,7 @@ pub enum ApiKeyCommand {
         #[arg(long, default_value_t = 50)]
         tail: usize,
     },
+    /// 清除 API key 的全部累计用量，执行前需确认。
     #[command(
         after_help = "示例：\n  kproxy apikey reset-usage ak_ab12\n\n执行前需输入 y 或 yes 确认。"
     )]
@@ -167,6 +230,7 @@ pub enum AlertCommand {
     /// 列出可订阅事件及其触发条件。
     #[command(after_help = "示例：\n  kproxy alert events\n  kproxy --json alert events")]
     Events,
+    /// 列出全部告警通知目标。
     #[command(after_help = "示例：\n  kproxy alert list\n  kproxy --json alert list")]
     List,
     /// 添加告警目标。
@@ -238,12 +302,14 @@ pub enum AlertCommand {
     /// 删除告警目标，执行前需输入 y 或 yes 确认。
     #[command(name = "delete", visible_alias = "rm")]
     Delete { name: String },
+    /// 向一个或全部目标发送测试通知。
     #[command(after_help = "示例：\n  kproxy alert test alerts\n  kproxy alert test --all")]
     Test {
         name: Option<String>,
         #[arg(long, conflicts_with = "name")]
         all: bool,
     },
+    /// 查看最近的告警投递记录。
     #[command(after_help = "示例：\n  kproxy alert logs\n  kproxy alert logs --tail 200")]
     Logs {
         #[arg(long, default_value_t = 50)]
@@ -1039,6 +1105,7 @@ pub async fn run_apikey(
 ) -> Result<()> {
     match command {
         ApiKeyCommand::List { detail } => show_key_list(client, detail, json).await,
+        ApiKeyCommand::Show { id } => show_keys(client, Some(&id), None, json).await,
         ApiKeyCommand::Usage { id } => show_keys(client, Some(&id), None, json).await,
         ApiKeyCommand::History { id, tail } => show_keys(client, Some(&id), Some(tail), json).await,
         ApiKeyCommand::ResetUsage { id } => {
@@ -1095,17 +1162,50 @@ pub async fn run_apikey(
                     .then_some(())
                     .ok_or_else(|| anyhow!("API key not found: {id}"))
             })
-            .await
+            .await?;
+            if json {
+                print_json(&serde_json::json!({"removed":true,"id":id}))
+            } else {
+                println!("已删除 API key {id}");
+                Ok(())
+            }
         }
         ApiKeyCommand::Enable { id } => {
-            mutate_key_and_reload(client, &id, "enabled", toml::Value::Boolean(true)).await
+            mutate_key_and_reload(client, &id, "enabled", toml::Value::Boolean(true)).await?;
+            report_apikey_change(client, &id, "已启用", json).await
         }
         ApiKeyCommand::Disable { id } => {
-            mutate_key_and_reload(client, &id, "enabled", toml::Value::Boolean(false)).await
+            mutate_key_and_reload(client, &id, "enabled", toml::Value::Boolean(false)).await?;
+            report_apikey_change(client, &id, "已停用", json).await
         }
-        ApiKeyCommand::Limit { id, credits } => {
-            mutate_key_and_reload(client, &id, "credits_limit", toml::Value::Float(credits)).await
+        ApiKeyCommand::Limit { id, credits, clear } => {
+            if clear {
+                clear_key_field_and_reload(client, &id, "credits_limit").await?;
+            } else {
+                mutate_key_and_reload(
+                    client,
+                    &id,
+                    "credits_limit",
+                    toml::Value::Float(credits.expect("clap requires --credits")),
+                )
+                .await?;
+            }
+            report_apikey_change(client, &id, "已更新额度上限", json).await
         }
+    }
+}
+
+async fn report_apikey_change(
+    client: &mut AdminClient,
+    id: &str,
+    message: &str,
+    json: bool,
+) -> Result<()> {
+    if json {
+        show_keys(client, Some(id), None, true).await
+    } else {
+        println!("{message} API key {id}");
+        Ok(())
     }
 }
 
@@ -1337,6 +1437,7 @@ pub async fn run_service(
             }
             Ok(())
         }
+        ServiceCommand::Show { service } => show_service(client, &service, json).await,
         ServiceCommand::Create {
             name,
             host,
@@ -1375,6 +1476,77 @@ pub async fn run_service(
                 );
             }
             Ok(())
+        }
+        ServiceCommand::Edit {
+            service,
+            rename,
+            host,
+            port,
+            add_api_key,
+            remove_api_key,
+        } => {
+            if rename.is_none()
+                && host.is_none()
+                && port.is_none()
+                && add_api_key.is_empty()
+                && remove_api_key.is_empty()
+            {
+                return Err(anyhow!(
+                    "没有指定修改项；请使用 --rename、--host、--port、--add-api-key 或 --remove-api-key"
+                ));
+            }
+            let add_api_key = resolve_api_key_ids(client, &add_api_key).await?;
+            let remove_api_key = resolve_api_key_ids(client, &remove_api_key).await?;
+            let result_selector = rename.clone().unwrap_or_else(|| service.clone());
+            mutate_config_array(client, "proxy_service", |array| {
+                let table = find_service_table_mut(array, &service)?;
+                replace_optional_string(table, "name", rename.as_deref());
+                replace_optional_string(table, "host", host.as_deref());
+                if let Some(port) = port {
+                    table.insert("port".into(), toml::Value::Integer(i64::from(port)));
+                }
+                let key_ids = table
+                    .entry("api_key_ids")
+                    .or_insert_with(|| toml::Value::Array(Vec::new()))
+                    .as_array_mut()
+                    .ok_or_else(|| anyhow!("proxy service api_key_ids must be an array"))?;
+                for key_id in add_api_key {
+                    if !key_ids.iter().any(|value| value.as_str() == Some(&key_id)) {
+                        key_ids.push(toml::Value::String(key_id));
+                    }
+                }
+                key_ids.retain(|value| {
+                    !value
+                        .as_str()
+                        .is_some_and(|id| remove_api_key.iter().any(|removed| removed == id))
+                });
+                Ok(())
+            })
+            .await?;
+            if json {
+                show_service(client, &result_selector, true).await
+            } else {
+                println!("已更新 API 代理服务 {result_selector}");
+                Ok(())
+            }
+        }
+        ServiceCommand::Enable { service } => {
+            set_service_enabled(client, &service, true).await?;
+            if json {
+                show_service(client, &service, true).await
+            } else {
+                println!("已启用 API 代理服务 {service}");
+                Ok(())
+            }
+        }
+        ServiceCommand::Disable { service } => {
+            set_service_enabled(client, &service, false).await?;
+            if json {
+                show_service(client, &service, true).await
+            } else {
+                println!("已停用 API 代理服务 {service}");
+                Ok(())
+            }
         }
         ServiceCommand::Delete { service } => {
             if !crate::commands::confirm(&format!(
@@ -1460,6 +1632,106 @@ pub async fn run_service(
     }
 }
 
+async fn show_service(client: &mut AdminClient, selector: &str, json: bool) -> Result<()> {
+    let result: ProxyServiceListResult = client
+        .call(method::SERVICE_LIST, serde_json::json!({}))
+        .await?;
+    let service = result
+        .services
+        .into_iter()
+        .find(|service| service.id == selector || service.name == selector)
+        .ok_or_else(|| anyhow!("proxy service not found: {selector}"))?;
+    if json {
+        return print_json(&service);
+    }
+    println!("ID        {}", service.id);
+    println!("名称      {}", service.name);
+    println!("监听      {}:{}", service.host, service.port);
+    println!(
+        "配置状态  {}",
+        if service.enabled {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "运行状态  {}",
+        if service.running {
+            "running"
+        } else {
+            "stopped"
+        }
+    );
+    println!(
+        "API Keys  {}",
+        if service.api_key_ids.is_empty() {
+            "-".into()
+        } else {
+            service.api_key_ids.join(",")
+        }
+    );
+    if let Some(error) = service.error.filter(|error| !error.is_empty()) {
+        println!("错误      {error}");
+    }
+    Ok(())
+}
+
+async fn set_service_enabled(
+    client: &mut AdminClient,
+    selector: &str,
+    enabled: bool,
+) -> Result<()> {
+    mutate_config_array(client, "proxy_service", |array| {
+        find_service_table_mut(array, selector)?
+            .insert("enabled".into(), toml::Value::Boolean(enabled));
+        Ok(())
+    })
+    .await
+}
+
+fn find_service_table_mut<'a>(
+    array: &'a mut [toml::Value],
+    selector: &str,
+) -> Result<&'a mut toml::map::Map<String, toml::Value>> {
+    array
+        .iter_mut()
+        .find(|value| {
+            value.as_table().is_some_and(|table| {
+                table.get("id").and_then(toml::Value::as_str) == Some(selector)
+                    || table.get("name").and_then(toml::Value::as_str) == Some(selector)
+            })
+        })
+        .and_then(toml::Value::as_table_mut)
+        .ok_or_else(|| anyhow!("proxy service not found: {selector}"))
+}
+
+async fn resolve_api_key_ids(
+    client: &mut AdminClient,
+    selectors: &[String],
+) -> Result<Vec<String>> {
+    if selectors.is_empty() {
+        return Ok(Vec::new());
+    }
+    let config = effective_config(client).await?;
+    let mut ids = Vec::with_capacity(selectors.len());
+    for selector in selectors {
+        let key = config
+            .api_key
+            .iter()
+            .find(|key| key.id.as_deref() == Some(selector) || key.name == *selector)
+            .ok_or_else(|| anyhow!("API key not found: {selector}"))?;
+        let id = key
+            .id
+            .clone()
+            .ok_or_else(|| anyhow!("API key {selector} does not have a stable ID"))?;
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
 async fn show_keys(
     client: &mut AdminClient,
     selected: Option<&str>,
@@ -1510,6 +1782,19 @@ async fn mutate_key_and_reload(
             .and_then(toml::Value::as_table_mut)
             .ok_or_else(|| anyhow!("API key not found: {id}"))?;
         table.insert(field.into(), value);
+        Ok(())
+    })
+    .await
+}
+
+async fn clear_key_field_and_reload(client: &mut AdminClient, id: &str, field: &str) -> Result<()> {
+    mutate_config_array(client, "api_key", |array| {
+        let table = array
+            .iter_mut()
+            .find(|item| matches_key(item, id))
+            .and_then(toml::Value::as_table_mut)
+            .ok_or_else(|| anyhow!("API key not found: {id}"))?;
+        table.remove(field);
         Ok(())
     })
     .await
@@ -2234,13 +2519,13 @@ pub fn print_topic(topic: Option<&str>) -> Result<()> {
 批量：CSV 仅含 email,password 两列，运行 `kproxy account add-sso --batch accounts.csv -c 1`；也可用 `--batch - < accounts.csv` 从 stdin 读取。`--start-url` 可覆盖全局值，`--headful` 可手工完成额外验证。默认/full 构建包含 SSO。"#
         }
         "service" => {
-            "`kproxy service create/list/apikeys/delete` 管理独立代理监听。创建时生成专用 API key；删除时级联删除专用 key，共享 key 保留，并要求 y/yes 确认。"
+            "`kproxy service list/show/create/edit/enable/disable/apikeys/delete` 管理独立代理监听。edit 可修改监听并按 API key ID 或名称增删绑定；disable 会保留配置和 key；删除时仅级联删除未共享 key，并要求 y/yes 确认。"
         }
         "config" => {
             "配置默认位于 $KPROXY_HOME/config.toml，修改后热重载；server.host/port、admin.socket 和 TLS 监听变更需要重启。\n`kproxy config validate [file]` 只校验，`kproxy config edit` 保存后校验并重载，`kproxy config show --effective` 查看合并默认值的结果。`kproxy config reset` 确认后备份原文件、恢复全部默认设置并重载。"
         }
         "apikey" => {
-            "API key 限额采用在途预留：请求进入时预留估算 credits，结束后按上游实际用量结算，避免并发突破限额。\n`kproxy apikey list` 只显示基本汇总，增加 `--detail` 查看每个 key 的 token/credits 消耗；日维度、模型、路径和历史可用 `kproxy apikey usage <id>` 与 `history` 查询。"
+            "API key 限额采用在途预留：请求进入时预留估算 credits，结束后按上游实际用量结算，避免并发突破限额。\n`kproxy apikey show <ID|名称>` 查看单项，`list --detail` 查看 token/credits 消耗；`limit <ID|名称> --clear` 可恢复不限，`rm`/`delete` 均可删除。日维度、模型、路径和历史可用 `usage` 与 `history` 查询。"
         }
         "diagnose" => {
             "`kproxy diagnose endpoints` 检查 CodeWhisperer/AmazonQ/OIDC 端点；`kproxy diagnose account <id>` 或 `--all` 拉取模型并发起真实推理。"
@@ -2261,7 +2546,7 @@ pub fn print_topic(topic: Option<&str>) -> Result<()> {
             "`kproxy alert events` 列出全部事件和触发条件；`kproxy alert config` 查看或修改低额度阈值、递进档位和重复告警抑制窗口；`kproxy alert add/edit/delete/list/test/logs` 管理钉钉、飞书等告警目标。`--event` 可重复传入或使用逗号分隔实现多选。"
         }
         "models" => {
-            "`kproxy models` 显示账号自动探测到的 Kiro 模型；`--mapped` 同时显示显式映射结果。自动别名解析与强制 model-map 是两层机制。"
+            "`kproxy models` 显示账号自动探测到的 Kiro 模型；`--refresh` 先立即刷新缓存，`--mapped` 同时显示显式映射结果。自动别名解析与强制 model-map 是两层机制。"
         }
         "docker" => {
             "默认 `docker compose up -d --build` 构建 runtime-full，启用全部 feature 并包含 Chromium SSO 运行时。数据保存在 kproxy-data 命名卷。"

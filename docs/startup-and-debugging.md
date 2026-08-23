@@ -193,6 +193,7 @@ If one has not been created yet, create a proxy and save the returned API key:
 ```bash
 kproxy service create --name main --port 5580
 kproxy service list
+kproxy service show main
 kproxy service apikeys main --show-secret
 ```
 
@@ -227,6 +228,19 @@ curl -i http://127.0.0.1:5580/v1/models \
 Creating or configuring a service on a non-loopback address is rejected unless
 that service references at least one enabled API key. This prevents accidental
 unauthenticated public exposure.
+
+Service listeners and API-key bindings can be changed without editing TOML:
+
+```bash
+kproxy service edit main --host 127.0.0.1 --port 5581
+kproxy service edit main --add-api-key ci --remove-api-key old-key
+kproxy service disable main
+kproxy service enable main
+```
+
+API-key arguments accept either an ID or a name. Use `kproxy apikey show ci` for
+one key, and `kproxy apikey limit ci --clear` to remove a previously configured
+credit limit. A limit of zero intentionally blocks new credit consumption.
 
 Every business HTTP response includes `x-trace-id`. Save that value when
 investigating an error.
