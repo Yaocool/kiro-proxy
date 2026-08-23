@@ -547,6 +547,7 @@ mod tests {
             enabled,
             machine_id: "0".repeat(64),
             profile_arn: None,
+            upstream_user_id: None,
             credentials: Credentials {
                 access_token: format!("token-{id}"),
                 refresh_token: None,

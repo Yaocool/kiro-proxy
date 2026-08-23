@@ -693,6 +693,7 @@ async fn handle_account_add_sso(state: &Arc<AppState>, params: serde_json::Value
         enabled: true,
         machine_id: new_machine_id(),
         profile_arn: None,
+        upstream_user_id: None,
         credentials,
         usage: None,
         subscription: None,
@@ -710,7 +711,21 @@ async fn handle_account_add_sso(state: &Arc<AppState>, params: serde_json::Value
                 kproxy_translate::sanitize_error_message(&error.to_string())
             ))
         })?;
-    validate_sso_identity(&email, &limits)?;
+    let upstream_user_id = authenticated_sso_user_id(&limits)?;
+    if let Some(actual_identity) = limits
+        .user_info
+        .as_ref()
+        .map(|identity| identity.email.trim())
+        .filter(|identity| !identity.is_empty())
+        .filter(|identity| !sso_identities_match(&email, identity))
+    {
+        warn!(
+            requested_email = %email,
+            kiro_identity = %actual_identity,
+            "Kiro identity name differs from the requested email; using the stable user ID"
+        );
+    }
+    account.upstream_user_id = Some(upstream_user_id);
     if let Some(usage) = limits.normalized_usage(now_secs()) {
         account.credit_exhausted = usage.limit > 0.0 && usage.current >= usage.limit;
         account.usage = Some(usage);
@@ -726,26 +741,18 @@ async fn handle_account_add_sso(state: &Arc<AppState>, params: serde_json::Value
     to_value(summary)
 }
 
-fn validate_sso_identity(
-    expected_email: &str,
-    limits: &kproxy_kiro::UsageLimits,
-) -> Result<(), RpcError> {
-    let actual = limits
+fn authenticated_sso_user_id(limits: &kproxy_kiro::UsageLimits) -> Result<String, RpcError> {
+    limits
         .user_info
         .as_ref()
-        .map(|identity| identity.email.trim())
-        .filter(|email| !email.is_empty())
+        .map(|identity| identity.user_id.trim())
+        .filter(|user_id| !user_id.is_empty())
+        .map(str::to_owned)
         .ok_or_else(|| {
             RpcError::internal(
-                "Kiro account validation did not return an authenticated identity; account was not saved",
+                "Kiro account validation did not return a stable user ID; account was not saved",
             )
-        })?;
-    if sso_identities_match(expected_email, actual) {
-        return Ok(());
-    }
-    Err(RpcError::bad_params(format!(
-        "SSO identity mismatch: requested {expected_email}, but Kiro authenticated {actual}; account was not saved"
-    )))
+        })
 }
 
 fn sso_identities_match(expected_email: &str, actual_identity: &str) -> bool {
@@ -1588,6 +1595,7 @@ mod tests {
             enabled,
             machine_id: "a".repeat(64),
             profile_arn: None,
+            upstream_user_id: None,
             credentials: Credentials {
                 access_token: "at-secret".into(),
                 refresh_token: Some("rt-secret".into()),
@@ -1635,11 +1643,22 @@ mod tests {
     }
 
     #[test]
-    fn sso_identity_validation_fails_closed_when_upstream_omits_identity() {
-        let error =
-            validate_sso_identity("alice@example.com", &kproxy_kiro::UsageLimits::default())
-                .expect_err("missing upstream identity must be rejected");
-        assert!(error.message.contains("did not return"));
+    fn sso_identity_validation_uses_stable_user_id_instead_of_display_name() {
+        let limits: kproxy_kiro::UsageLimits = serde_json::from_value(serde_json::json!({
+            "userInfo": {
+                "email": "unrelated display name",
+                "userId": "stable-user-71"
+            }
+        }))
+        .expect("usage limits");
+        assert_eq!(
+            authenticated_sso_user_id(&limits).expect("stable identity"),
+            "stable-user-71"
+        );
+
+        let error = authenticated_sso_user_id(&kproxy_kiro::UsageLimits::default())
+            .expect_err("missing stable identity must be rejected");
+        assert!(error.message.contains("stable user ID"));
         assert!(error.message.contains("not saved"));
     }
 

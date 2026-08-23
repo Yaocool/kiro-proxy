@@ -358,6 +358,7 @@ mod tests {
             enabled: true,
             machine_id: "0".repeat(64),
             profile_arn: None,
+            upstream_user_id: None,
             credentials: Credentials {
                 access_token: "token".into(),
                 refresh_token: None,

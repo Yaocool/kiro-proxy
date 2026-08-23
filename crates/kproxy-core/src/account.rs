@@ -137,6 +137,9 @@ pub struct Account {
     /// Kiro IDC/Enterprise 请求所需的 profile ARN。
     #[serde(default, alias = "profileArn", skip_serializing_if = "Option::is_none")]
     pub profile_arn: Option<String>,
+    /// Kiro 返回的稳定用户 ID，用于防止同一真实身份重复入库。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub upstream_user_id: Option<String>,
     /// 认证凭据。
     pub credentials: Credentials,
     /// 最近一次额度数据。
@@ -195,6 +198,7 @@ mod tests {
             enabled: true,
             machine_id: "0".repeat(64),
             profile_arn: None,
+            upstream_user_id: None,
             credentials: sample_credentials(),
             usage: None,
             subscription: None,

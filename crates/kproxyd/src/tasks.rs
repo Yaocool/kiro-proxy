@@ -660,10 +660,47 @@ pub(crate) async fn refresh_account_usage(
     let limits = state.kiro().get_usage_limits(&account).await?;
     let usage = limits.normalized_usage(crate::meter::now_secs());
     let subscription = limits.normalized_subscription();
-    if usage.is_none() && subscription.is_none() {
+    let upstream_user_id = limits
+        .user_info
+        .as_ref()
+        .map(|identity| identity.user_id.trim())
+        .filter(|user_id| !user_id.is_empty())
+        .map(str::to_owned);
+    if let (Some(bound), Some(received)) = (
+        account.upstream_user_id.as_deref(),
+        upstream_user_id.as_deref(),
+    ) {
+        anyhow::ensure!(
+            bound == received,
+            "Kiro identity changed for account {account_id}; refusing to replace the stored binding"
+        );
+    }
+    let duplicate_identity = if let Some(user_id) = upstream_user_id.as_deref() {
+        pool.snapshot().await.into_iter().find(|existing| {
+            existing.id != account.id
+                && existing.upstream_user_id.as_deref().map(str::trim) == Some(user_id)
+        })
+    } else {
+        None
+    };
+    let upstream_user_id = if let Some(existing) = duplicate_identity {
+        warn!(
+            account_id,
+            existing_account_id = %existing.id,
+            existing_account_name = %existing.display_name(),
+            "Kiro user ID is already bound to another account; not updating identity binding"
+        );
+        None
+    } else {
+        upstream_user_id
+    };
+    if usage.is_none() && subscription.is_none() && upstream_user_id.is_none() {
         return Ok(false);
     }
     let mut account = runtime.account.write().await;
+    if let Some(user_id) = upstream_user_id {
+        account.upstream_user_id = Some(user_id);
+    }
     if let Some(usage) = usage {
         account.credit_exhausted = usage.limit > 0.0 && usage.current >= usage.limit;
         account.usage = Some(usage);
