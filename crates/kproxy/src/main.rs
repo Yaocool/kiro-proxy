@@ -659,12 +659,12 @@ fn print_status(status: &StatusResult) {
         status.active_requests, status.max_concurrent_requests, status.queued_requests
     );
     println!(
-        "统计    {} 请求   {:.1}% 成功   均值 {}ms   credits {:.3}",
+        "统计    {} 请求   {:.1}% 成功   均值 {}ms   credits {:.2}",
         status.request_count, status.success_rate, status.average_latency_ms, status.credits
     );
     if status.daily_credit_limit > 0.0 {
         println!(
-            "日额度  {}   {:.3} 已用 + {:.3} 在途 / {:.3}",
+            "日额度  {}   {:.2} 已用 + {:.2} 在途 / {:.2}",
             status.daily_credit_day,
             status.daily_credit_used,
             status.daily_credit_reserved,

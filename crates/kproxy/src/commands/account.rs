@@ -183,9 +183,7 @@ pub fn build_list_rows(accounts: &[AccountSummary]) -> Vec<Vec<String>> {
         .map(|account| {
             let status = display_health(account);
             let credit = match (account.credit_current, account.credit_limit) {
-                (Some(current), Some(limit)) => {
-                    format!("{}/{}", current.round() as i64, limit.round() as i64)
-                }
+                (Some(current), Some(limit)) => format!("{current:.2}/{limit:.2}"),
                 _ => "-".into(),
             };
             vec![
@@ -777,9 +775,7 @@ fn print_detail(detail: &AccountDetail) {
     );
     match (summary.credit_current, summary.credit_limit) {
         (Some(current), Some(limit)) if limit > 0.0 => println!(
-            "额度      {} / {}（{:.0}% 已用）",
-            current.round() as i64,
-            limit.round() as i64,
+            "额度      {current:.2} / {limit:.2}（{:.0}% 已用）",
             current / limit * 100.0
         ),
         _ => println!("额度      -（尚未拉取）"),
@@ -831,8 +827,8 @@ mod tests {
             health: Some(if enabled { "available" } else { "disabled" }.into()),
             tags: vec!["prod".into()],
             subscription: Some("Pro".into()),
-            credit_current: Some(120.0),
-            credit_limit: Some(500.0),
+            credit_current: Some(120.126),
+            credit_limit: Some(500.5),
             token_expires_at: 1_767_225_600,
             credit_exhausted: false,
         }
@@ -846,7 +842,7 @@ mod tests {
         let rows = build_list_rows(&[enabled, disabled]);
         assert_eq!(rows[0][2], "启用");
         assert_eq!(rows[1][2], "停用");
-        assert_eq!(rows[0][3], "120/500");
+        assert_eq!(rows[0][3], "120.13/500.50");
         assert_eq!(rows[0][5], "prod,pro");
 
         let mut exhausted = summary(true);

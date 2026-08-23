@@ -328,7 +328,7 @@ impl Default for PoolConfig {
             max_queue_wait_ms: 30_000,
             queue_full_wait_ms: 5_000,
             low_credit_ratio: 0.0,
-            low_credit_min_remaining: 7.0,
+            low_credit_min_remaining: 4.0,
             daily_credit_limit: 0.0,
             credit_estimate_per_1k_tokens: 1.0,
             credit_estimate_output_token_cap: 8_192,
@@ -1495,7 +1495,7 @@ mod tests {
         assert_eq!(config.pool.max_queue_wait_ms, 30_000);
         assert_eq!(config.pool.queue_full_wait_ms, 5_000);
         assert_eq!(config.pool.low_credit_ratio, 0.0);
-        assert_eq!(config.pool.low_credit_min_remaining, 7.0);
+        assert_eq!(config.pool.low_credit_min_remaining, 4.0);
         assert_eq!(config.pool.credit_estimate_per_1k_tokens, 1.0);
         assert_eq!(config.pool.credit_estimate_output_token_cap, 8_192);
         assert!(config.pool.auto_switch_on_quota_exhausted);
