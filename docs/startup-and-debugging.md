@@ -332,13 +332,29 @@ Search by the response trace ID:
 rg 'trace_f028' .kproxy-dev/logs/
 ```
 
-Or follow records through the administration API:
+Inspect the active log destination and discover physical shards through the
+administration API:
 
 ```bash
-cargo run -p kproxy -- logs -f --level warn
+kproxy logs path
+kproxy logs files
+kproxy logs files --level error
+```
+
+`logs files` reports complete paths from the daemon's filesystem. For a Docker
+deployment these are container paths in the persistent data volume, and the host
+wrapper can invoke the same commands without entering the container.
+
+View or follow structured request records:
+
+```bash
+cargo run -p kproxy -- logs show --tail 100
+cargo run -p kproxy -- logs follow --level warn
 cargo run -p kproxy -- stats --since 1h
 cargo run -p kproxy -- stats --detail --since 1h --by endpoint
 ```
+
+The legacy `kproxy logs --tail ...` and `kproxy logs -f` forms remain supported.
 
 `kproxy stats` reports aggregate request, success, token, credit, and latency
 metrics. The default is a compact summary; `--detail` adds recent requests and

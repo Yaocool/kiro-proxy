@@ -54,6 +54,8 @@ pub mod method {
     pub const STATS: &str = "stats";
     /// Request-log long polling over the admin socket.
     pub const LOGS: &str = "logs.follow";
+    /// List physical daemon log files and their resolved locations.
+    pub const LOG_FILES: &str = "logs.files";
     /// 动态模型列表。
     pub const MODELS: &str = "models";
     /// API key 列表与用量。
@@ -101,6 +103,7 @@ pub mod method {
         TASK_RUN,
         STATS,
         LOGS,
+        LOG_FILES,
         MODELS,
         APIKEY_LIST,
         APIKEY_RESET_USAGE,
@@ -514,6 +517,43 @@ pub struct ConfigPathResult {
     pub stats_file: String,
     /// 管理 socket。
     pub admin_socket: String,
+    /// daemon 日志基础路径；实际文件会附加日期、级别和分片号。
+    #[serde(default)]
+    pub log_base_path: String,
+    /// daemon 日志目录。
+    #[serde(default)]
+    pub log_directory: String,
+}
+
+/// A physical daemon log file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogFileView {
+    /// Absolute or daemon-working-directory-relative file path.
+    pub path: String,
+    /// Log level partition represented by this file.
+    pub level: String,
+    /// UTC date partition in YYYY-MM-DD form.
+    pub date: String,
+    /// File size in bytes.
+    pub size_bytes: u64,
+    /// Last modification time as Unix seconds when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub modified_at: Option<i64>,
+}
+
+/// `logs.files` result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogFilesResult {
+    /// Configured base path before date/level partition suffixes are added.
+    pub base_path: String,
+    /// Directory containing physical log files.
+    pub directory: String,
+    /// Active formatter (`json` or `pretty`).
+    pub format: String,
+    /// Active tracing filter expression.
+    pub level_filter: String,
+    /// Physical files, sorted newest first.
+    pub files: Vec<LogFileView>,
 }
 
 /// `config.reload` 结果。

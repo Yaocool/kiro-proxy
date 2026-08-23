@@ -5,8 +5,9 @@ use clap::{Subcommand, ValueEnum};
 use kproxy_core::paths::Paths;
 use kproxy_ipc::protocol::method;
 use kproxy_ipc::protocol::{
-    ConfigPathResult, ConfigReloadResult, ConfigShowResult, ProxyServiceApiKeysResult,
-    ProxyServiceCreateResult, ProxyServiceDeleteResult, ProxyServiceListResult,
+    ConfigPathResult, ConfigReloadResult, ConfigShowResult, LogFilesResult,
+    ProxyServiceApiKeysResult, ProxyServiceCreateResult, ProxyServiceDeleteResult,
+    ProxyServiceListResult,
 };
 use rand::RngCore;
 use serde::Deserialize;
@@ -679,6 +680,77 @@ pub async fn show_logs(
         if !follow {
             return Ok(());
         }
+    }
+}
+
+pub async fn show_log_files(
+    client: &mut AdminClient,
+    level: Option<&str>,
+    paths_only: bool,
+    json: bool,
+) -> Result<()> {
+    let mut result: LogFilesResult = client
+        .call(method::LOG_FILES, serde_json::json!({}))
+        .await?;
+    if let Some(level) = level {
+        result.files.retain(|file| file.level == level);
+    }
+    if json {
+        if paths_only {
+            return print_json(&serde_json::json!({
+                "base_path":result.base_path,
+                "directory":result.directory,
+                "format":result.format,
+                "level_filter":result.level_filter,
+            }));
+        }
+        return print_json(&result);
+    }
+    println!("日志目录    {}", result.directory);
+    println!("基础路径    {}", result.base_path);
+    println!("格式/过滤   {} / {}", result.format, result.level_filter);
+    if paths_only {
+        return Ok(());
+    }
+    if result.files.is_empty() {
+        println!("暂无匹配的日志文件；对应级别产生日志后会自动创建。");
+        return Ok(());
+    }
+    let rows = result
+        .files
+        .into_iter()
+        .map(|file| {
+            vec![
+                file.date,
+                file.level,
+                format_bytes(file.size_bytes),
+                file.modified_at
+                    .map(format_timestamp)
+                    .unwrap_or_else(|| "-".into()),
+                file.path,
+            ]
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        render_table(&["日期", "级别", "大小", "修改时间", "文件路径"], &rows)
+    );
+    Ok(())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KIB: f64 = 1024.0;
+    const MIB: f64 = KIB * 1024.0;
+    const GIB: f64 = MIB * 1024.0;
+    let bytes = bytes as f64;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes / GIB)
+    } else if bytes >= MIB {
+        format!("{:.2} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{:.2} KiB", bytes / KIB)
+    } else {
+        format!("{bytes:.0} B")
     }
 }
 
@@ -2183,7 +2255,7 @@ pub fn print_topic(topic: Option<&str>) -> Result<()> {
             "`kproxy stats [--since 1h]` 默认只显示请求、成功率、tokens、credits 和延迟汇总。`--detail` 显示最近请求，并可用 `--by model|account|apikey|endpoint` 分组。"
         }
         "logs" => {
-            "`kproxy logs` 按请求显示 trace ID、账号名称、模型路由和上游尝试；支持 `--level`、`--account`、`--tail` 和 `-f/--follow`。"
+            "`kproxy logs show` 查看内存中的结构化请求日志，`follow` 持续跟踪；支持 `--level`、`--account` 和 `--tail`。`kproxy logs files [--level error]` 列出实际日志文件，`logs path` 显示目录、基础路径和当前日志配置。旧的 `kproxy logs --tail ...` 与 `kproxy logs -f` 继续兼容。"
         }
         "alert" => {
             "`kproxy alert events` 列出全部事件和触发条件；`kproxy alert config` 查看或修改低额度阈值、递进档位和重复告警抑制窗口；`kproxy alert add/edit/delete/list/test/logs` 管理钉钉、飞书等告警目标。`--event` 可重复传入或使用逗号分隔实现多选。"
