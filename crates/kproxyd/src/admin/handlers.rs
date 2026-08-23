@@ -48,6 +48,7 @@ pub async fn dispatch(state: &Arc<AppState>, request: Request) -> Response {
         method::TASK_RUN => handle_task_run(state, request.params).await,
         method::STATS => handle_stats(state, request.params),
         method::LOGS => handle_logs(state, request.params).await,
+        method::LOG_FILES => handle_log_files(state).await,
         method::MODELS => handle_models(state).await,
         method::APIKEY_LIST => to_value(state.meter.list()),
         method::APIKEY_RESET_USAGE => handle_apikey_reset(state, request.params).await,
@@ -92,6 +93,52 @@ async fn handle_logs(state: &Arc<AppState>, params: serde_json::Value) -> Handle
         )
         .await;
     to_value(serde_json::json!({"entries":entries}))
+}
+
+async fn handle_log_files(state: &Arc<AppState>) -> Handled {
+    let config = state.config.current();
+    let base_path = resolved_log_base_path(state, &config.log);
+    let scan_path = base_path.clone();
+    let files = tokio::task::spawn_blocking(move || crate::logging::discover_log_files(&scan_path))
+        .await
+        .map_err(|error| RpcError::internal(format!("log file scan failed: {error}")))?
+        .map_err(|error| RpcError::internal(format!("log file scan failed: {error}")))?
+        .into_iter()
+        .map(|file| LogFileView {
+            path: file.path.display().to_string(),
+            level: file.level,
+            date: file.date,
+            size_bytes: file.size_bytes,
+            modified_at: file.modified_at,
+        })
+        .collect();
+    let directory = base_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    to_value(LogFilesResult {
+        base_path: base_path.display().to_string(),
+        directory: directory.display().to_string(),
+        format: config.log.format.clone(),
+        level_filter: config.log.level.clone(),
+        files,
+    })
+}
+
+fn resolved_log_base_path(
+    state: &AppState,
+    config: &kproxy_core::config::LogConfig,
+) -> std::path::PathBuf {
+    let path = crate::logging::configured_log_path(
+        config,
+        &state.paths.data_dir.join("logs").join("kproxyd.log"),
+    );
+    if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .join(path)
+    }
 }
 
 fn handle_webhook_list(state: &Arc<AppState>) -> Handled {
@@ -369,12 +416,19 @@ async fn handle_config_show(state: &Arc<AppState>) -> Handled {
 }
 
 fn handle_config_path(state: &Arc<AppState>) -> ConfigPathResult {
+    let config = state.config.current();
+    let log_base_path = resolved_log_base_path(state, &config.log);
+    let log_directory = log_base_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
     ConfigPathResult {
         config_file: state.paths.config_file.display().to_string(),
         accounts_file: state.paths.accounts_file.display().to_string(),
         daily_file: state.paths.daily_file.display().to_string(),
         stats_file: state.paths.stats_file.display().to_string(),
         admin_socket: state.admin_socket().display().to_string(),
+        log_base_path: log_base_path.display().to_string(),
+        log_directory: log_directory.display().to_string(),
     }
 }
 
@@ -1736,6 +1790,52 @@ mod tests {
         .expect("empty status");
         assert!(empty_status.hint.is_some());
         assert!(!empty_status.ready);
+    }
+
+    #[tokio::test]
+    async fn log_files_reports_resolved_paths_and_physical_partitions() {
+        let (_directory, state) = state_with(vec![]).await;
+        let log_directory = state.paths.data_dir.join("logs");
+        std::fs::create_dir_all(&log_directory).expect("log directory");
+        let info = log_directory.join("kproxyd-2026-08-23-info.log");
+        let error = log_directory.join("kproxyd-2026-08-23-error.1.log");
+        std::fs::write(&info, b"info\n").expect("info log");
+        std::fs::write(&error, b"failure\n").expect("error log");
+        std::fs::write(log_directory.join("unrelated.log"), b"ignore").expect("unrelated log");
+
+        let result: LogFilesResult = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(1, method::LOG_FILES, serde_json::json!({})),
+            )
+            .await,
+        ))
+        .expect("log files result");
+        assert_eq!(result.directory, log_directory.display().to_string());
+        assert_eq!(
+            result.base_path,
+            log_directory.join("kproxyd.log").display().to_string()
+        );
+        assert_eq!(result.files.len(), 2);
+        assert!(result.files.iter().any(|file| {
+            file.path == info.display().to_string() && file.level == "info" && file.size_bytes == 5
+        }));
+        assert!(result.files.iter().any(|file| {
+            file.path == error.display().to_string()
+                && file.level == "error"
+                && file.size_bytes == 8
+        }));
+
+        let paths: ConfigPathResult = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(2, method::CONFIG_PATH, serde_json::json!({})),
+            )
+            .await,
+        ))
+        .expect("config paths");
+        assert_eq!(paths.log_directory, result.directory);
+        assert_eq!(paths.log_base_path, result.base_path);
     }
 
     #[tokio::test]

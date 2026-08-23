@@ -5,7 +5,7 @@ mod commands;
 mod output;
 
 use anyhow::Result;
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use kproxy_ipc::protocol::{
     method, ConfigPathResult, ConfigReloadResult, ConfigShowResult, StatusResult,
 };
@@ -125,19 +125,19 @@ enum Command {
         #[arg(long, requires = "detail")]
         by: Option<String>,
     },
-    /// 显示最近请求日志。
+    /// 查看请求日志，发现 daemon 日志文件及其路径。
     #[command(
-        after_help = "示例：\n  kproxy logs --tail 100\n  kproxy logs --follow --level error"
+        args_conflicts_with_subcommands = true,
+        after_help = "兼容旧用法：`kproxy logs --tail 100` 和 `kproxy logs -f` 仍然可用。\n\n示例：\n  kproxy logs show --tail 100\n  kproxy logs follow --level error\n  kproxy logs files\n  kproxy logs path"
     )]
     Logs {
-        #[arg(long, default_value_t = 50)]
-        tail: usize,
+        #[command(subcommand)]
+        command: Option<LogsCommand>,
+        #[command(flatten)]
+        query: RequestLogArgs,
+        /// 兼容旧用法；等价于 `kproxy logs follow`。
         #[arg(short = 'f', long)]
         follow: bool,
-        #[arg(long)]
-        level: Option<String>,
-        #[arg(long)]
-        account: Option<String>,
     },
     /// API key 管理。
     #[command(name = "apikey", subcommand)]
@@ -161,6 +161,65 @@ enum Command {
     /// 查看主题帮助。不指定主题时列出全部主题。
     #[command(after_help = "示例：\n  kproxy help\n  kproxy help stats\n  kproxy help model-map")]
     Help { topic: Option<String> },
+}
+
+#[derive(Debug, Args)]
+struct RequestLogArgs {
+    /// 最多显示多少条最近请求。
+    #[arg(long, default_value_t = 50)]
+    tail: usize,
+    /// 只显示指定级别，例如 error。
+    #[arg(long)]
+    level: Option<String>,
+    /// 按账号 ID、邮箱或名称过滤。
+    #[arg(long)]
+    account: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "lowercase")]
+enum LogFileLevel {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+impl LogFileLevel {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Trace => "trace",
+            Self::Debug => "debug",
+            Self::Info => "info",
+            Self::Warn => "warn",
+            Self::Error => "error",
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum LogsCommand {
+    /// 显示 daemon 内存中的结构化请求日志。
+    #[command(
+        after_help = "示例：\n  kproxy logs show\n  kproxy logs show --tail 200 --account user@example.com"
+    )]
+    Show(RequestLogArgs),
+    /// 持续跟踪新的结构化请求日志。
+    #[command(after_help = "示例：\n  kproxy logs follow\n  kproxy logs follow --level error")]
+    Follow(RequestLogArgs),
+    /// 列出所有实际 daemon 日志文件、大小、级别和完整路径。
+    #[command(
+        after_help = "示例：\n  kproxy logs files\n  kproxy logs files --level error\n  kproxy --json logs files"
+    )]
+    Files {
+        /// 只列出指定级别的日志文件。
+        #[arg(long, value_enum)]
+        level: Option<LogFileLevel>,
+    },
+    /// 显示日志目录、基础路径、格式和过滤级别。
+    #[command(after_help = "示例：\n  kproxy logs path\n  kproxy --json logs path")]
+    Path,
 }
 
 #[derive(Debug, Subcommand)]
@@ -425,6 +484,8 @@ async fn main() -> Result<()> {
                 println!("账号库      {}", paths.accounts_file);
                 println!("日用量      {}", paths.daily_file);
                 println!("统计        {}", paths.stats_file);
+                println!("日志目录    {}", paths.log_directory);
+                println!("日志基础路径 {}", paths.log_base_path);
                 println!("管理 socket {}", paths.admin_socket);
             }
         }
@@ -590,21 +651,56 @@ async fn main() -> Result<()> {
             .await?;
         }
         Command::Logs {
-            tail,
+            command,
+            query,
             follow,
-            level,
-            account,
-        } => {
-            crate::commands::runtime::show_logs(
-                &mut client,
-                tail,
-                follow,
-                level.as_deref(),
-                account.as_deref(),
-                cli.json,
-            )
-            .await?;
-        }
+        } => match command {
+            Some(LogsCommand::Show(query)) => {
+                crate::commands::runtime::show_logs(
+                    &mut client,
+                    query.tail,
+                    false,
+                    query.level.as_deref(),
+                    query.account.as_deref(),
+                    cli.json,
+                )
+                .await?;
+            }
+            Some(LogsCommand::Follow(query)) => {
+                crate::commands::runtime::show_logs(
+                    &mut client,
+                    query.tail,
+                    true,
+                    query.level.as_deref(),
+                    query.account.as_deref(),
+                    cli.json,
+                )
+                .await?;
+            }
+            Some(LogsCommand::Files { level }) => {
+                crate::commands::runtime::show_log_files(
+                    &mut client,
+                    level.map(LogFileLevel::as_str),
+                    false,
+                    cli.json,
+                )
+                .await?;
+            }
+            Some(LogsCommand::Path) => {
+                crate::commands::runtime::show_log_files(&mut client, None, true, cli.json).await?;
+            }
+            None => {
+                crate::commands::runtime::show_logs(
+                    &mut client,
+                    query.tail,
+                    follow,
+                    query.level.as_deref(),
+                    query.account.as_deref(),
+                    cli.json,
+                )
+                .await?;
+            }
+        },
         Command::ApiKey(command) => {
             crate::commands::runtime::run_apikey(&mut client, command, cli.json).await?;
         }

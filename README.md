@@ -385,7 +385,11 @@ kproxy alert edit alerts --event token-expired --event quota-exhausted
 kproxy alert delete alerts
 kproxy stats --since 1h
 kproxy stats --detail --since 1h --by endpoint
-kproxy logs -f --level warn
+kproxy logs show --tail 100
+kproxy logs follow --level warn
+kproxy logs files
+kproxy logs files --level error
+kproxy logs path
 kproxy tasks
 kproxy tasks run status_check
 kproxy help
@@ -402,6 +406,12 @@ audit. Use `--sort credit` or `--sort id` when those views are needed. Service,
 API key, alert-target, and model lists also use stable name or identifier
 ordering; logs, recent requests, and pool scores retain their semantic time or
 priority order.
+
+`kproxy logs show` and `follow` read structured request records retained by the
+daemon. `kproxy logs files` discovers the physical date/severity shards and prints
+their sizes and complete paths; `kproxy logs path` prints the active directory,
+base path, format, and filter. The legacy `kproxy logs --tail ...` and `-f` forms
+remain supported.
 
 `kproxy stats` reports aggregate operational traffic, success, token, credit, and
 latency metrics; it does not replace per-request logs. Its default output is a

@@ -196,7 +196,7 @@ struct ReconfigurableFileWriter {
 
 impl ReconfigurableFileWriter {
     fn new(config: &LogConfig, default_path: PathBuf) -> Result<Self> {
-        let path = configured_path(config, &default_path);
+        let path = configured_log_path(config, &default_path);
         Ok(Self {
             state: Arc::new(Mutex::new(DatedLogFiles::new(
                 path,
@@ -210,7 +210,7 @@ impl ReconfigurableFileWriter {
 
     fn reconfigure(&self, config: &LogConfig) -> Result<()> {
         let next = DatedLogFiles::new(
-            configured_path(config, &self.default_path),
+            configured_log_path(config, &self.default_path),
             maximum_bytes(config),
             config.retention_days,
             config.max_files_per_day,
@@ -243,12 +243,77 @@ impl ReconfigurableFileWriter {
     }
 }
 
-fn configured_path(config: &LogConfig, default_path: &Path) -> PathBuf {
+pub(crate) fn configured_log_path(config: &LogConfig, default_path: &Path) -> PathBuf {
     if config.file_path.trim().is_empty() {
         default_path.to_path_buf()
     } else {
         PathBuf::from(&config.file_path)
     }
+}
+
+#[derive(Debug)]
+pub(crate) struct DiscoveredLogFile {
+    pub path: PathBuf,
+    pub level: String,
+    pub date: String,
+    pub size_bytes: u64,
+    pub modified_at: Option<i64>,
+}
+
+pub(crate) fn discover_log_files(base_path: &Path) -> io::Result<Vec<DiscoveredLogFile>> {
+    let directory = base_path.parent().unwrap_or_else(|| Path::new("."));
+    let entries = match std::fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let mut files = Vec::new();
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let Some(date) = matching_log_date(base_path, &path) else {
+            continue;
+        };
+        let Some(level) = matching_log_level(base_path, &path, &date) else {
+            continue;
+        };
+        let metadata = match entry.metadata() {
+            Ok(metadata) if metadata.is_file() => metadata,
+            Ok(_) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        let modified_at = metadata
+            .modified()
+            .ok()
+            .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+            .and_then(|duration| i64::try_from(duration.as_secs()).ok());
+        files.push(DiscoveredLogFile {
+            path,
+            level: level.into(),
+            date,
+            size_bytes: metadata.len(),
+            modified_at,
+        });
+    }
+    files.sort_by(|left, right| {
+        right
+            .modified_at
+            .cmp(&left.modified_at)
+            .then_with(|| right.date.cmp(&left.date))
+            .then_with(|| left.level.cmp(&right.level))
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    Ok(files)
+}
+
+fn matching_log_level(base: &Path, candidate: &Path, date: &str) -> Option<&'static str> {
+    let stem = base.file_stem()?.to_str()?;
+    let name = candidate.file_name()?.to_str()?;
+    let suffix = name.strip_prefix(&format!("{stem}-{date}-"))?;
+    ["trace", "debug", "info", "warn", "error"]
+        .into_iter()
+        .find(|level| suffix.starts_with(level))
 }
 
 fn maximum_bytes(config: &LogConfig) -> u64 {
@@ -628,6 +693,27 @@ mod tests {
         std::fs::write(&similar, b"keep").expect("similar unrelated log");
         files.cleanup(current).expect("second cleanup");
         assert!(similar.exists());
+    }
+
+    #[test]
+    fn discovers_only_partitioned_log_files_with_metadata() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let base = directory.path().join("kproxyd.log");
+        let info = dated_path(&base, "2026-08-23", "info", 0);
+        let error = dated_path(&base, "2026-08-23", "error", 1);
+        std::fs::write(&info, b"info\n").expect("info log");
+        std::fs::write(&error, b"failure\n").expect("error log");
+        std::fs::write(directory.path().join("unrelated.log"), b"ignore").expect("unrelated file");
+
+        let files = discover_log_files(&base).expect("discover logs");
+        assert_eq!(files.len(), 2);
+        assert!(files
+            .iter()
+            .any(|file| file.path == info && file.level == "info" && file.size_bytes == 5));
+        assert!(files
+            .iter()
+            .any(|file| file.path == error && file.level == "error" && file.size_bytes == 8));
+        assert!(files.iter().all(|file| file.date == "2026-08-23"));
     }
 
     #[test]

@@ -295,13 +295,27 @@ kproxyd-2026-08-10-error.1.log
 rg 'trace_f028' .kproxy-dev/logs/
 ```
 
-也可以通过管理 API 跟踪记录：
+通过管理 API 查看当前日志目标并发现实际分片文件：
 
 ```bash
-cargo run -p kproxy -- logs -f --level warn
+kproxy logs path
+kproxy logs files
+kproxy logs files --level error
+```
+
+`logs files` 输出 daemon 文件系统中的完整路径。容器部署时这些是持久化数据卷内的容器路径，
+在宿主机直接使用 wrapper 执行相同命令即可，无需进入容器。
+
+查看或持续跟踪结构化请求记录：
+
+```bash
+cargo run -p kproxy -- logs show --tail 100
+cargo run -p kproxy -- logs follow --level warn
 cargo run -p kproxy -- stats --since 1h
 cargo run -p kproxy -- stats --detail --since 1h --by endpoint
 ```
+
+旧的 `kproxy logs --tail ...` 与 `kproxy logs -f` 用法继续兼容。
 
 `kproxy stats` 用于查看请求量、成功率、Tokens、Credits 和延迟等聚合运维指标。默认只显示
 紧凑汇总，`--detail` 才显示最近请求和按 model/account/apikey/endpoint 的分组统计；逐条

@@ -324,7 +324,11 @@ kproxy alert edit alerts --event token-expired --event quota-exhausted
 kproxy alert delete alerts
 kproxy stats --since 1h
 kproxy stats --detail --since 1h --by endpoint
-kproxy logs -f --level warn
+kproxy logs show --tail 100
+kproxy logs follow --level warn
+kproxy logs files
+kproxy logs files --level error
+kproxy logs path
 kproxy tasks
 kproxy tasks run status_check
 kproxy help
@@ -337,6 +341,10 @@ kproxy help
 `kproxy account list` 默认按邮箱排序，便于批量核对遗漏；需要查看额度或内部 ID 顺序时可使用
 `--sort credit` 或 `--sort id`。服务、API key、告警目标和模型等列表也会按各自的名称或标识
 稳定排序；日志、最近请求、账号池评分等具有时间或优先级语义的输出保留业务顺序。
+
+`kproxy logs show` 和 `follow` 读取 daemon 保留的结构化请求记录；`kproxy logs files` 会发现
+按日期、级别和分片生成的实际日志文件，并显示大小和完整路径；`kproxy logs path` 显示当前
+日志目录、基础路径、格式和过滤规则。旧的 `kproxy logs --tail ...` 与 `-f` 用法继续兼容。
 
 `kproxy stats` 用于查看代理流量、成功率、Token、Credits 和延迟等聚合运维指标，不替代逐条
 请求日志。默认只输出紧凑汇总；增加 `--detail` 后才输出分组统计和最近请求。
