@@ -1220,7 +1220,7 @@ fn apikey_list_json(
 }
 
 fn format_credits(value: f64) -> String {
-    format!("{value:.4}")
+    format!("{value:.2}")
 }
 
 pub async fn run_service(
@@ -1366,7 +1366,7 @@ pub async fn run_service(
                             key.format,
                             if key.enabled { "enabled" } else { "disabled" }.into(),
                             key.credits_limit
-                                .map(|limit| limit.to_string())
+                                .map(format_credits)
                                 .unwrap_or_else(|| "-".into()),
                             key.key.unwrap_or_else(|| "<hidden>".into()),
                         ]
@@ -2208,6 +2208,12 @@ pub fn print_topic(topic: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credits_are_displayed_with_two_decimal_places() {
+        assert_eq!(format_credits(12.345), "12.35");
+        assert_eq!(format_credits(4.0), "4.00");
+    }
 
     #[tokio::test]
     async fn config_backup_never_overwrites_an_existing_backup() {
