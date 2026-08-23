@@ -148,7 +148,7 @@ impl AccountStore {
             .find(|account| account.id == id_or_email || account.email == id_or_email)
     }
 
-    /// 插入账号；ID 或邮箱重复时报错。
+    /// 插入账号；ID、邮箱或 Kiro 用户 ID 重复时报错。
     pub fn insert(&mut self, account: Account) -> Result<()> {
         if self
             .accounts
@@ -163,6 +163,21 @@ impl AccountStore {
             .any(|existing| existing.email == account.email)
         {
             return Err(anyhow!("account email {} already exists", account.email));
+        }
+        if let Some(user_id) = account
+            .upstream_user_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|user_id| !user_id.is_empty())
+        {
+            if let Some(existing) = self.accounts.iter().find(|existing| {
+                existing.upstream_user_id.as_deref().map(str::trim) == Some(user_id)
+            }) {
+                return Err(anyhow!(
+                    "Kiro identity is already registered as {}",
+                    existing.email
+                ));
+            }
         }
         self.dirty.insert(account.id.clone(), Some(account.clone()));
         self.accounts.push(account);
@@ -334,6 +349,7 @@ mod tests {
             enabled: true,
             machine_id: "a".repeat(64),
             profile_arn: None,
+            upstream_user_id: None,
             credentials: Credentials {
                 access_token: "secret".into(),
                 refresh_token: None,
@@ -391,6 +407,23 @@ mod tests {
             "acc_00000001"
         );
         assert!(store.is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_kiro_user_id_is_rejected_even_for_a_different_email() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("accounts.json");
+        let mut store = AccountStore::load(&path).await.expect("load");
+        let mut first = account("acc_00000001", "a@example.com");
+        first.upstream_user_id = Some("kiro-user-1".into());
+        store.insert(first).expect("insert first identity");
+
+        let mut duplicate = account("acc_00000002", "b@example.com");
+        duplicate.upstream_user_id = Some("kiro-user-1".into());
+        let error = store
+            .insert(duplicate)
+            .expect_err("duplicate Kiro identity must be rejected");
+        assert!(error.to_string().contains("a@example.com"));
     }
 
     #[tokio::test]

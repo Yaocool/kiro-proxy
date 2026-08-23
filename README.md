@@ -447,8 +447,9 @@ CSV file. Add
 `--headful` when MFA or an upstream page change requires manual interaction.
 Every login uses a dedicated incognito Chromium context and temporary profile,
 which are destroyed before the next account is processed. Before saving an
-account, kproxy also verifies that Kiro's authenticated identity matches the
-requested CSV email; mismatches fail without modifying the account store.
+account, kproxy records Kiro's stable user ID and refuses to register that same
+identity under another email. Kiro display names are diagnostic only because
+IAM Identity Center names do not always match login email addresses.
 This flow does not add support for non-enterprise or non-SSO accounts.
 
 ## Docker and systemd

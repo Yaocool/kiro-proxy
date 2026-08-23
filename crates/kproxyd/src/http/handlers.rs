@@ -5713,6 +5713,7 @@ mod model_tests {
                 enabled: true,
                 machine_id: "a".repeat(64),
                 profile_arn: None,
+                upstream_user_id: None,
                 credentials: kproxy_core::account::Credentials {
                     access_token: "access-token".into(),
                     refresh_token: None,
