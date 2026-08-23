@@ -1301,177 +1301,409 @@ fn invalid_config<T>(
 }
 
 /// 首次运行写入的默认配置，每个字段附说明。
-pub const DEFAULT_CONFIG_TOML: &str = r#"# kiro-proxy 配置文件
-# 修改后自动生效（daemon 监听本文件），无需重启。
-# admin.socket / TLS enabled 模式切换例外，改动需重启。
+pub const DEFAULT_CONFIG_TOML: &str = r#"# ============================================================================
+# kiro-proxy 配置文件
+# ============================================================================
+#
+# 本文件列出当前版本支持的全部配置。常用配置使用默认值生效；以 `#` 开头的
+# 配置是可选示例，删除行首 `#` 后再按需修改。请勿把真实 API key、Webhook
+# 密钥或 TLS 私钥提交到 Git。
+#
+# 除特别说明外：
+# - `*_ms` 的单位是毫秒，`*_tokens` 的单位是 token，credits 支持小数。
+# - daemon 会监听文件并热重载；仅 `admin.socket` 和 TLS enabled 模式切换需重启。
+# - 修改已有服务/API key/模型映射时，优先使用 `kproxy service`、
+#   `kproxy apikey`、`kproxy model-map` 等命令，以免写错关联 ID。
 
+# ----------------------------------------------------------------------------
+# API 服务共享配置
+# ----------------------------------------------------------------------------
+# 这里的 host/port 是 `kproxy service create` 的默认值；实际监听实例记录在
+# `[[proxy_service]]` 中。首次启动时服务列表为空，因此 daemon 只启动管理面。
 [server]
-host = "0.0.0.0"                   # kproxy service create 的默认监听地址
-port = 5580                        # kproxy service create 的默认端口，1024-65535
-enforce_user_agent_check = true    # 仅作用于 Claude 路由
-max_concurrent_requests = 500      # 超出返回 503 + Retry-After
+# 新建 API 代理服务的默认监听地址。0.0.0.0 表示监听所有 IPv4 网卡。
+host = "0.0.0.0"
+# 新建 API 代理服务的默认端口；允许范围 1024-65535。
+port = 5580
+# 是否校验 Claude 路由的客户端 User-Agent；不影响 OpenAI Chat Completions。
+enforce_user_agent_check = true
+# 所有代理服务共享的请求准入上限；超出时返回 503 和 Retry-After。
+max_concurrent_requests = 500
+# 下游 HTTP keep-alive 空闲超时。
 keep_alive_timeout_ms = 30000
+# 所有代理服务允许同时保持的最大下游连接数。
 max_connections = 2000
 
+# TLS 默认关闭。启用时必须配置一组证书来源：文件路径 cert_path/key_path，
+# 或内联 PEM cert/key。不要同时混用两组。切换 enabled 后需重启 daemon。
 [server.tls]
+# 是否让代理服务直接提供 HTTPS。
 enabled = false
+# PEM 证书链文件路径。
 # cert_path = "/etc/kproxy/fullchain.pem"
+# PEM 私钥文件路径。
 # key_path = "/etc/kproxy/privkey.pem"
+# 内联 PEM 证书；适合由密钥管理系统生成配置的场景。
+# cert = "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----"
+# 内联 PEM 私钥；配置文件权限应保持为 0600。
+# key = "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----"
 
+# 自适应并发根据上游连接等待延迟和 429/503 比例动态收紧/恢复全局准入。
+# 默认关闭；固定并发更容易预测，确认有持续高并发流量后再开启。
 [server.adaptive]
+# 是否启用自适应并发控制。
 enabled = false
+# 聚合样本并做一次升降并发决策的周期。
 check_interval_ms = 10000
-p99_degrade_ms = 200              # 上游流式连接槽位等待 P99
+# 上游流式连接槽位等待 P99 达到该值时降低并发。
+p99_degrade_ms = 200
+# P99 低于该值时逐步恢复并发；不得高于 p99_degrade_ms。
 p99_recover_ms = 100
-minimum_samples = 5               # 低流量时跨检查周期累计
-overload_error_rate = 0.05         # 上游 429/503 比例
+# 每次决策至少需要的上游调用样本数；低流量时样本跨周期累计。
+minimum_samples = 5
+# 上游 429/503 占比达到该值时降低并发；范围 0.0-1.0。
+overload_error_rate = 0.05
 
+# ----------------------------------------------------------------------------
+# Kiro 上游请求与连接池
+# ----------------------------------------------------------------------------
 [upstream]
+# 强制首选 Kiro 上游端点；可选值："codewhisperer"、"amazonq"。
+# 不配置时按账号类型和已探测结果自动选择。
 # preferred_endpoint = "amazonq"
+# Kiro agent mode；可选值："auto"、"vibe"、"spec"。
 agent_mode = "vibe"
+# 一次请求失败后允许的重试次数；实际总尝试次数还受可用账号数限制。
 max_retries = 3
-# 默认提前 15 分钟；运行时不低于扫描间隔的 2 倍和 10 分钟
+# 期望在 token 到期前多少秒刷新。运行时至少取扫描间隔的 2 倍和 10 分钟。
 token_refresh_before_expiry = 900
+# Kiro MCP Web Search 地址，支持 `{region}` 占位符；不配置时使用下面的默认形式。
 # web_search_endpoint = "https://runtime.{region}.kiro.dev/mcp"
+# 单次 MCP Web Search 请求超时。
 web_search_timeout_ms = 60000
-stream_slot_wait_timeout_ms = 30000    # 等待流式连接槽位的上限
-stream_read_timeout_ms = 600000        # 连续 10 分钟无上游数据则中止，不限制流总时长
+# 等待上游流式连接槽位的最长时间；超时后本次尝试失败。
+stream_slot_wait_timeout_ms = 30000
+# 流式上游连续无数据的最长时间；不是整个流的总时长限制。
+stream_read_timeout_ms = 600000
 
+# 上游使用独立的非流式和流式连接池，避免长连接阻塞普通 HTTP 请求。
 [upstream.pool]
+# 非流式请求连接池的最大连接数。
 http_max_connections = 128
+# 每条非流式 HTTP/1.1 连接允许的流水线深度。
 http_pipelining = 5
+# 流式请求连接池的最大连接数。
 stream_max_connections = 256
-stream_pipelining = 1              # 每流独占 socket，避免队首阻塞
+# 必须为 1，让每个流独占连接，避免队首阻塞。
+stream_pipelining = 1
+# 上游连接空闲超过该时间后允许回收。
 keep_alive_idle_ms = 30000
+# 单条上游连接的最大寿命，降低长期连接失效风险。
 keep_alive_max_ms = 60000
 
+# ----------------------------------------------------------------------------
+# 账号池、排队、额度保护与选号
+# ----------------------------------------------------------------------------
 [pool]
+# 每个 Kiro 账号允许同时处理的最大请求数。
 max_concurrent_per_account = 50
+# 所有账号都繁忙时，等待队列最多容纳的请求数。
 max_queue_size = 10
+# 已进入队列的请求最长等待时间。
 max_queue_wait_ms = 30000
+# 队列已满后，为短暂释放槽位额外等待的时间。
 queue_full_wait_ms = 5000
+# 按剩余额度百分比停用账号；范围 0.0-1.0，0 表示关闭百分比保护。
 low_credit_ratio = 0.0
-low_credit_min_remaining = 7.0
+# 按剩余 credits 绝对值停用账号；剩余值小于等于该值时不再分配请求，0 表示关闭。
+low_credit_min_remaining = 4.0
+# 整个代理服务每天最多消耗的 credits；0 表示不限，按 UTC 自然日重置。
 daily_credit_limit = 0.0
-credit_estimate_per_1k_tokens = 1.0  # 启发式预留系数；真实 usage 返回后按实结算
+# 上游返回真实 usage 前，每 1,000 个估算 token 预留的 credits。
+credit_estimate_per_1k_tokens = 1.0
+# 估算预留额度时最多计入多少输出 token，避免超大 max_tokens 过度预留。
 credit_estimate_output_token_cap = 8192
+# 遇到额度耗尽错误时是否自动尝试其他可用账号。
 auto_switch_on_quota_exhausted = true
 
+# 选号分数由并发压力、额度消耗和最近使用三个权重组成。
+# 权重无需相加为 1，但至少一个必须大于 0。
 [pool.balance]
+# 当前活跃请求数的权重。
 weight_active = 0.5
+# 已用额度比例的权重。
 weight_credit = 0.4
+# 最近使用时间的权重，鼓励轮换账号。
 weight_idle = 0.1
+# 将账号空闲时长归一化的窗口。
 idle_window_ms = 300000
 
+# 账号错误冷却和额度恢复探测。
 [pool.cooldown]
+# 连续错误达到该次数后进入一般冷却。
 max_error_count = 3
+# 一般冷却持续时间。
 cooldown_ms = 30000
+# 单次可恢复错误触发的短冷却时间。
 error_cooldown_ms = 5000
+# 账号被标记额度耗尽后，重新探测额度的间隔。
 quota_reset_ms = 300000
+# 统计额度类错误的滑动窗口长度。
 quota_error_window_ms = 300000
+# 滑动窗口内达到该错误数后，将账号标记为额度耗尽。
 quota_error_threshold = 50
 
+# ----------------------------------------------------------------------------
+# 协议转换与工具功能
+# ----------------------------------------------------------------------------
 [features]
+# 普通工具调用结束后由代理自动续轮的最大次数；0 表示不自动续轮，硬上限 30。
 auto_continue_rounds = 0
+# Anthropic Tool Search 一次搜索工作流允许的最大内部续轮数；运行时限制为 1-8。
 tool_search_max_rounds = 4
+# 单个客户端请求内实际执行 Tool Search 操作的总上限；允许范围 1-256。
 tool_search_max_operations = 32
+# 是否模拟 Anthropic 原生 Tool Search，让大量工具按需加载。
 enable_tool_search = true
+# 单个客户端请求内代理最多执行多少次 MCP Web Search。
 web_search_max_rounds = 20
+# 是否移除请求中的全部工具定义；用于临时排查工具兼容问题。
 disable_tools = false
+# 遇到 429 时是否自动选择同族可用模型降级。
 enable_model_fallback = true
+# 是否模拟 prompt cache 计费字段；不代表 Kiro 提供真实 Anthropic cache。
 enable_prompt_cache = false
+# 是否向上游 system prompt 注入协议兼容和工具使用说明。
 enhance_system_prompt = true
+# 是否缓冲流式工具调用片段，降低参数 JSON 被拆碎或乱序的概率。
 buffer_tool_calls = true
+# 工具调用缓冲等待时间；仅在 buffer_tool_calls=true 时使用。
 tool_call_buffer_delay_ms = 500
+# 思考内容输出格式；"claude" 输出 thinking block，"openai" 输出 reasoning_content。
 thinking_output_format = "claude"
+# 是否根据请求和模型能力自动启用或调整 thinking。
 adaptive_thinking = true
+# 上游未给出有效预算时使用的 thinking token 上限。
 max_thinking_budget_tokens = 8192
+# 是否转换 Claude/OpenAI 的 Web Search 工具并交给 Kiro MCP 执行。
 enable_web_tools = true
+# 是否过滤模型误输出的内部工具协议文本。
 enable_tool_leak_filter = true
+# 客户端未指定模型或模型解析需要兜底时使用的模型 ID；空字符串表示自动选择。
 default_model_id = ""
 
+# ----------------------------------------------------------------------------
+# 模型发现和后台任务
+# ----------------------------------------------------------------------------
 [models]
+# 是否从 Kiro 上游动态发现可用模型。
 dynamic_discovery = true
+# 模型发现结果的缓存时间；启用动态发现时必须大于 0。
 cache_ttl_ms = 3600000
 
 [tasks]
+# 扫描即将过期 token 的周期。
 token_refresh_interval_ms = 300000
+# 刷新账号额度、订阅与健康状态的周期。
 status_check_interval_ms = 60000
+# 将请求统计和 credits 用量写入磁盘的周期。
 stats_persist_interval_ms = 60000
 
+# ----------------------------------------------------------------------------
+# 上下文窗口与自动 compact
+# ----------------------------------------------------------------------------
 [context]
+# 未发现模型元数据时使用的默认最大输入 token 数。
 max_input_tokens = 200000
+# 普通请求允许使用模型上下文窗口的比例；范围 0.0-1.0。
 safe_input_ratio = 0.95
+# compact 请求允许使用模型上下文窗口的比例；范围 0.0-1.0。
 compact_safe_input_ratio = 0.99
+# 模型映射后上下文超限时，是否在首次生成调用前自动摘要压缩。
 auto_compact_on_overflow = false
+# deferred Tool Search 工作集中，工具定义允许占用的最大估算 token 数。
 max_tool_input_tokens = 32000
+# 单次请求可直接发送给 Kiro 的已加载工具数量；不得超过程序硬上限 512。
 max_loaded_tools = 512
+# 单次序列化 Kiro 请求体的最大字节数。
 max_upstream_payload_bytes = 8388608
+# compact 摘要使用的模型；空字符串表示复用当轮映射后的模型。
 compaction_summary_model = ""
+# 主请求等待 compact 摘要结果的最长时间。
 compaction_summary_timeout_ms = 30000
+# compact 摘要之外额外保留的最近完整 user/assistant 轮数；最大 64。
 compaction_preserve_recent_turns = 3
 
+# ----------------------------------------------------------------------------
+# 本地存储
+# ----------------------------------------------------------------------------
 [storage]
+# 账号数超过该值时，将账号库基线编码为压缩格式以减少磁盘占用。
 compression_threshold = 100
+# 是否只追加账号变更并在达到阈值后压实；关闭时每次保存完整重写账号库。
 incremental_write = true
 
+# ----------------------------------------------------------------------------
+# 告警节流
+# ----------------------------------------------------------------------------
 [notify]
+# 账号剩余额度百分比低于该值时开始告警；范围 0-100，0 表示关闭低额度告警。
 low_credit_threshold_percent = 10.0
+# 从初始阈值递进到 0 期间最多发送的低额度告警档位数。
 max_notifications = 5
+# 非额度类相同事件的重复通知抑制窗口。
 suppress_window_ms = 1800000
 
+# ----------------------------------------------------------------------------
+# 日志
+# ----------------------------------------------------------------------------
 [log]
+# tracing 过滤级别，例如 "error"、"warn"、"info"、"debug" 或模块级过滤表达式。
 level = "info"
+# 文件日志格式；可选值："json"、"pretty"。
 format = "json"
+# 日志基础文件路径；空字符串使用数据目录下的 logs/kproxyd.log。
 file_path = ""
+# 每个日志级别、每个分片的最大文件大小（MiB）。
 max_file_size_mb = 100
+# 按 UTC 日期保留最近多少天的日志文件。
 retention_days = 3
-max_files_per_day = 3               # 每个级别每天最多 3 个分片
+# 每个日志级别每天最多保留的分片数；达到上限后丢弃该级别的新增文件日志。
+max_files_per_day = 3
 
+# ----------------------------------------------------------------------------
+# 本机管理面
+# ----------------------------------------------------------------------------
 [admin]
+# CLI 与 daemon 通信的 Unix socket。首次生成时会按 KPROXY_HOME/XDG_RUNTIME_DIR 改写。
+# 修改后必须重启 daemon；容器 wrapper 会使用同一数据目录解析该路径。
 socket = "/run/kproxy/admin.sock"
 
+# ----------------------------------------------------------------------------
+# IAM Identity Center SSO
+# ----------------------------------------------------------------------------
 [sso]
-# 手动添加企业账号时的默认 IAM Identity Center start URL
+# `account add-sso` 未传 --start-url 时使用的默认入口；必须是 https:// URL。
+# 留空表示每次命令都必须显式传入 --start-url。
 start_url = ""
 
-# 首次启动不创建或监听 API 代理服务。使用以下命令创建：
-# kproxy service create --name main --port 5580
-# 命令会同时生成首个 API key；之后可用以下命令按服务查询明文：
-# kproxy service apikeys main --show-secret
+# ----------------------------------------------------------------------------
+# 模型级 thinking 开关
+# ----------------------------------------------------------------------------
+# key 为模型 ID 或模型族前缀，value 为是否允许 thinking。未配置的模型默认为 true。
+# 更精确的完整模型 ID 应避免与宽泛前缀产生歧义。
+[model_thinking_mode]
+# "claude-sonnet-4.6" = true
+# "claude-haiku" = false
 
-# [[proxy_service]]
-# id = "svc_..."
-# name = "main"
-# host = "0.0.0.0"
-# port = 5580
+# ----------------------------------------------------------------------------
+# API key 与代理服务（可重复数组，默认均为空）
+# ----------------------------------------------------------------------------
+# 推荐使用 `kproxy service create` 和 `kproxy apikey` 命令维护。首次启动不创建
+# 代理监听；`kproxy service create --name main --port 5580` 会生成服务及首个 key。
+
+# 单个 API key 示例。每增加一个 key，就增加一个 `[[api_key]]` 块。
+# [[api_key]]
+# 稳定 ID，供 proxy_service.api_key_ids 和模型映射引用；必须非空且唯一。
+# id = "ak_example"
+# 可读名称；必须唯一。
+# name = "alice"
+# 客户端请求时提交的密钥；必须唯一，配置文件权限应保持为 0600。
+# key = "sk-replace-me"
+# 密钥格式；可选值："sk"、"simple"、"token"。
+# format = "sk"
+# 是否允许该 key 认证请求。
 # enabled = true
-# api_key_ids = ["ak_..."]
+# 该 key 的累计 credits 上限；不配置表示不限，0 会禁止产生任何新消耗。
+# credits_limit = 5000.0
+
+# 单个代理监听实例示例。每增加一个服务，就增加一个 `[[proxy_service]]` 块。
+# [[proxy_service]]
+# 稳定服务 ID；必须非空且唯一。
+# id = "svc_example"
+# 可读名称；必须唯一。
+# name = "main"
+# 实际监听地址；非本机地址必须绑定至少一个已启用 API key。
+# host = "0.0.0.0"
+# 实际监听端口；允许范围 1024-65535，启用的服务不得重复 host+port。
+# port = 5580
+# 是否随 daemon 启动该监听实例。
+# enabled = true
+# 允许访问该服务的 API key ID；至少一个，且都必须存在于 [[api_key]]。
+# api_key_ids = ["ak_example"]
+# 创建时间（Unix 秒）；由 CLI 创建时自动填写。
 # created_at = 0
 
-# [[api_key]]
-# name = "alice"
-# key = "sk-..."
-# format = "sk"
-# enabled = true
-# credits_limit = 5000
+# ----------------------------------------------------------------------------
+# 模型映射（可重复数组，默认为空）
+# ----------------------------------------------------------------------------
+# 推荐使用 `kproxy model-map` 命令维护。规则按 priority 从小到大匹配，首个
+# 满足模型、API key、剩余额度和时间窗条件的规则生效。
 
 # [[model_mapping]]
+# 规则名称；用于 CLI 管理和日志定位。
 # name = "opus 降级到 sonnet"
+# 是否启用该规则。
 # enabled = true
+# 规则类型："replace"、"alias" 或 "loadbalance"。
 # type = "replace"
+# 要匹配的客户端模型 glob 列表。
 # source_models = ["claude-opus-4*"]
-# target_models = ["claude-sonnet-4"]
+# 映射后的目标模型列表；replace/alias 通常配置一个，loadbalance 可配置多个。
+# target_models = ["claude-sonnet-4.6"]
+# 数字越小优先级越高。
 # priority = 10
+# loadbalance 各目标的权重；数量必须与 target_models 相同，且至少一个大于 0。
+# weights = [100]
+# 仅当所选账号的剩余额度百分比低于该值时生效；范围 0-100。
+# max_remaining_credit_percent = 10.0
+# 仅对这些 API key ID 生效；不配置表示不限制 key。
+# api_key_ids = ["ak_example"]
+
+# 可选生效时间窗，隶属于上方最近一个 [[model_mapping]]。
+# [model_mapping.schedule]
+# 模式："always"、"daily" 或 "range"。
+# mode = "daily"
+# daily 的星期条件，0=周日、1=周一、...、6=周六；与 days 二选一。
+# days_of_week = [1, 2, 3, 4, 5]
+# daily 的可读星期条件；支持 sun/mon/tue/wed/thu/fri/sat。
+# days = ["mon", "tue", "wed", "thu", "fri"]
+# daily 的开始分钟数（从 00:00 起算）；与 start 二选一。
+# start_minutes = 540
+# daily 的可读开始时间，HH:MM。
+# start = "09:00"
+# daily 的结束分钟数；与 end 二选一。
+# end_minutes = 1080
+# daily 的可读结束时间，HH:MM。
+# end = "18:00"
+# range 的开始时间（Unix 毫秒）。
+# start_at = 1787587200000
+# range 的结束时间（Unix 毫秒）。
+# end_at = 1787673600000
+
+# ----------------------------------------------------------------------------
+# Webhook 告警目标（可重复数组，默认为空）
+# ----------------------------------------------------------------------------
+# 推荐使用 `kproxy alert` 命令维护。每增加一个目标，就增加一个 `[[webhook]]` 块。
 
 # [[webhook]]
+# 可读名称；必须唯一。
 # name = "运维群"
+# 类型："dingtalk"、"wechat-work"、"telegram"、"discord"、"feishu"、"custom"。
 # kind = "dingtalk"
-# url = "https://oapi.dingtalk.com/robot/send?access_token=..."
-# dingtalk_sign = "SEC..."
+# Webhook 接收地址；启用时必须使用 http:// 或 https://。
+# url = "https://oapi.dingtalk.com/robot/send?access_token=replace-me"
+# 是否启用该目标。
 # enabled = true
-# events = ["low-credit", "account-banned", "token-expired",
-#           "quota-exhausted", "service-degraded"]
+# 订阅事件；可选 low-credit、account-banned、token-expired、quota-exhausted、
+# service-degraded。空数组表示不订阅任何事件。
+# events = ["low-credit", "account-banned", "token-expired", "quota-exhausted", "service-degraded"]
+# 钉钉加签密钥；仅 kind="dingtalk" 且机器人开启加签时需要。
+# dingtalk_sign = "SEC-replace-me"
+# Telegram chat ID；kind="telegram" 且目标启用时必填。
+# telegram_chat_id = "123456789"
+# custom JSON/文本模板；支持 {{event}}、{{title}}、{{message}} 占位符。
+# custom_template = '{"event":"{{event}}","title":"{{title}}","message":"{{message}}"}'
 "#;
 
 #[cfg(test)]
@@ -1576,6 +1808,132 @@ mod tests {
             parsed.upstream.pool.stream_pipelining,
             expected.upstream.pool.stream_pipelining
         );
+    }
+
+    #[test]
+    fn documented_default_covers_every_config_field() {
+        let documented: toml::Value = toml::from_str(&uncomment_documented_settings())
+            .expect("all documented settings must form valid TOML");
+        let expected = fully_populated_config();
+        let serialized = toml::to_string(&expected).expect("serialize populated config");
+        let expected: toml::Value = toml::from_str(&serialized).expect("parse populated config");
+
+        assert_same_config_shape(&expected, &documented, "config");
+    }
+
+    fn uncomment_documented_settings() -> String {
+        DEFAULT_CONFIG_TOML
+            .lines()
+            .filter_map(|line| {
+                let trimmed = line.trim();
+                let setting = trimmed.strip_prefix("# ").unwrap_or(trimmed);
+                let is_table = setting.starts_with('[') && setting.ends_with(']');
+                let is_value = setting.contains(" = ");
+                (is_table || is_value).then_some(setting)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn fully_populated_config() -> Config {
+        let mut config = Config::default();
+        config.server.tls.cert_path = Some("/cert.pem".into());
+        config.server.tls.key_path = Some("/key.pem".into());
+        config.server.tls.cert = Some("certificate".into());
+        config.server.tls.key = Some("private-key".into());
+        config.upstream.preferred_endpoint = Some(Endpoint::Amazonq);
+        config.upstream.web_search_endpoint = Some("https://example.com/mcp".into());
+        config.model_mapping.push(ModelMappingRule {
+            name: "mapping".into(),
+            enabled: true,
+            kind: "replace".into(),
+            source_models: vec!["source".into()],
+            target_models: vec!["target".into()],
+            priority: 1,
+            weights: Some(vec![1]),
+            max_remaining_credit_percent: Some(10.0),
+            api_key_ids: Some(vec!["ak_example".into()]),
+            schedule: Some(ModelMappingSchedule {
+                mode: "daily".into(),
+                days_of_week: Some(vec![1]),
+                days: Some(vec!["mon".into()]),
+                start_minutes: Some(540),
+                start: Some("09:00".into()),
+                end_minutes: Some(1080),
+                end: Some("18:00".into()),
+                start_at: Some(1),
+                end_at: Some(2),
+            }),
+        });
+        config.webhook.push(WebhookConfig {
+            name: "webhook".into(),
+            kind: "custom".into(),
+            url: "https://example.com/webhook".into(),
+            enabled: true,
+            events: vec!["low-credit".into()],
+            dingtalk_sign: Some("secret".into()),
+            telegram_chat_id: Some("123".into()),
+            custom_template: Some("template".into()),
+        });
+        config.api_key.push(ApiKeyConfig {
+            id: Some("ak_example".into()),
+            name: "example".into(),
+            key: "sk-example".into(),
+            format: ApiKeyFormat::Sk,
+            enabled: true,
+            credits_limit: Some(100.0),
+        });
+        config.proxy_service.push(ProxyServiceConfig {
+            id: "svc_example".into(),
+            name: "example".into(),
+            host: "127.0.0.1".into(),
+            port: 5580,
+            enabled: true,
+            api_key_ids: vec!["ak_example".into()],
+            created_at: 1,
+        });
+        config
+            .model_thinking_mode
+            .insert("claude-sonnet-4.6".into(), true);
+        config
+            .model_thinking_mode
+            .insert("claude-haiku".into(), false);
+        config
+    }
+
+    fn assert_same_config_shape(expected: &toml::Value, actual: &toml::Value, path: &str) {
+        match (expected, actual) {
+            (toml::Value::Table(expected), toml::Value::Table(actual)) => {
+                let expected_keys = expected.keys().collect::<BTreeSet<_>>();
+                let actual_keys = actual.keys().collect::<BTreeSet<_>>();
+                assert_eq!(
+                    actual_keys, expected_keys,
+                    "documented fields differ at {path}"
+                );
+                for (key, expected) in expected {
+                    assert_same_config_shape(
+                        expected,
+                        actual.get(key).expect("matching key checked above"),
+                        &format!("{path}.{key}"),
+                    );
+                }
+            }
+            (toml::Value::Array(expected), toml::Value::Array(actual)) => {
+                assert!(!actual.is_empty(), "documented array is empty at {path}");
+                if let Some(expected) = expected.first() {
+                    assert_same_config_shape(
+                        expected,
+                        actual.first().expect("non-empty documented array"),
+                        &format!("{path}[0]"),
+                    );
+                }
+            }
+            (expected, actual) => assert_eq!(
+                std::mem::discriminant(expected),
+                std::mem::discriminant(actual),
+                "value type differs at {path}"
+            ),
+        }
     }
 
     #[test]
