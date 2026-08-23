@@ -4,4 +4,5 @@ pub mod accounts;
 pub mod atomic;
 pub mod bootstrap;
 pub mod config_loader;
+pub mod config_update;
 pub mod environment;

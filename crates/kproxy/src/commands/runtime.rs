@@ -1843,12 +1843,15 @@ async fn mutate_config(
     let raw = tokio::fs::read_to_string(&path)
         .await
         .with_context(|| format!("读取 {} 失败", path.display()))?;
-    let mut root = raw.parse::<toml::Value>().context("配置文件 TOML 无效")?;
+    let before = raw.parse::<toml::Value>().context("配置文件 TOML 无效")?;
+    let mut root = before.clone();
     let table = root
         .as_table_mut()
         .ok_or_else(|| anyhow!("config root must be a TOML table"))?;
     mutate(table)?;
-    let output = toml::to_string_pretty(&root).context("序列化配置失败")?;
+    let output =
+        kproxy_store::config_update::render_update_preserving_comments(&raw, &before, &root)
+            .context("更新配置失败")?;
     let config: kproxy_core::config::Config =
         toml::from_str(&output).context("修改后的配置无法解析")?;
     config.validate().context("修改后的配置校验失败")?;

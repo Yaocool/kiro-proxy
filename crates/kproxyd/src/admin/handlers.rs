@@ -1444,11 +1444,10 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
     next.validate()
         .map_err(|error| RpcError::bad_params(error.to_string()))?;
 
-    let raw = tokio::fs::read(&state.paths.config_file)
+    let raw = tokio::fs::read_to_string(&state.paths.config_file)
         .await
         .map_err(|error| RpcError::internal(error.to_string()))?;
-    let output = toml::to_string_pretty(&next)
-        .map_err(|error| RpcError::internal(format!("serialize config: {error}")))?;
+    let output = render_service_config_update(&raw, &next)?;
     kproxy_store::atomic::write_bytes_atomically(
         &state.paths.config_file,
         output.as_bytes(),
@@ -1467,7 +1466,7 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
     {
         let rollback_write = kproxy_store::atomic::write_bytes_atomically(
             &state.paths.config_file,
-            &raw,
+            raw.as_bytes(),
             Some(0o600),
         )
         .await;
@@ -1522,8 +1521,10 @@ async fn handle_service_delete(state: &Arc<AppState>, params: serde_json::Value)
         remove_unshared_service_api_keys(&mut next, &removed);
     next.validate()
         .map_err(|error| RpcError::bad_params(error.to_string()))?;
-    let output = toml::to_string_pretty(&next)
-        .map_err(|error| RpcError::internal(format!("serialize config: {error}")))?;
+    let raw = tokio::fs::read_to_string(&state.paths.config_file)
+        .await
+        .map_err(|error| RpcError::internal(error.to_string()))?;
+    let output = render_service_config_update(&raw, &next)?;
     kproxy_store::atomic::write_bytes_atomically(
         &state.paths.config_file,
         output.as_bytes(),
@@ -1546,6 +1547,28 @@ async fn handle_service_delete(state: &Arc<AppState>, params: serde_json::Value)
         deleted_api_key_ids,
         retained_api_key_ids,
     })
+}
+
+fn render_service_config_update(raw: &str, next: &Config) -> Result<String, RpcError> {
+    let before = raw
+        .parse::<toml::Value>()
+        .map_err(|error| RpcError::internal(format!("parse config: {error}")))?;
+    let mut after = before.clone();
+    let table = after
+        .as_table_mut()
+        .ok_or_else(|| RpcError::internal("config root must be a TOML table"))?;
+    table.insert(
+        "api_key".into(),
+        toml::Value::try_from(&next.api_key)
+            .map_err(|error| RpcError::internal(format!("serialize API keys: {error}")))?,
+    );
+    table.insert(
+        "proxy_service".into(),
+        toml::Value::try_from(&next.proxy_service)
+            .map_err(|error| RpcError::internal(format!("serialize proxy services: {error}")))?,
+    );
+    kproxy_store::config_update::render_update_preserving_comments(raw, &before, &after)
+        .map_err(|error| RpcError::internal(format!("update config: {error}")))
 }
 
 fn remove_unshared_service_api_keys(
@@ -2026,6 +2049,8 @@ mod tests {
             .expect("persisted config");
         assert!(!persisted.contains(&created.api_key.id));
         assert!(!persisted.contains(&created.api_key.key));
+        assert!(persisted.contains("# 日志"));
+        assert!(persisted.contains("# [[proxy_service]]"));
         state.shutdown.cancel();
     }
 
