@@ -328,17 +328,7 @@ async fn handle_status(state: &Arc<AppState>) -> Handled {
         None
     };
     let pool = state.pool();
-    let mut health = [0usize; 5];
-    for account in pool
-        .snapshot()
-        .await
-        .into_iter()
-        .filter(|account| account.enabled)
-    {
-        if let Some(runtime) = pool.get(&account.id).await {
-            health[runtime.health() as usize] += 1;
-        }
-    }
+    let account_counts = pool.scheduling_counts().await;
     let stats = state.stats.snapshot(None);
     let request_count = stats.total.requests;
     let success_rate = if request_count == 0 {
@@ -363,7 +353,7 @@ async fn handle_status(state: &Arc<AppState>) -> Handled {
             running_services.len()
         ));
     }
-    if health[0] == 0 {
+    if account_counts.available == 0 {
         readiness_reasons.push("no account is currently available".to_string());
     }
     if let Some(error) = state.meter.recovery_error() {
@@ -380,10 +370,12 @@ async fn handle_status(state: &Arc<AppState>) -> Handled {
         admin_socket: state.admin_socket().display().to_string(),
         account_total: total,
         account_enabled: enabled,
-        account_available: health[0],
-        account_cooling: health[1],
-        account_exhausted: health[2],
-        account_banned: health[3],
+        account_available: account_counts.available,
+        account_protected: account_counts.protected,
+        account_cooling: account_counts.cooling,
+        account_exhausted: account_counts.exhausted,
+        account_banned: account_counts.banned,
+        account_refreshing: account_counts.refreshing,
         active_requests: pool.active().await,
         max_concurrent_requests: state.admission.maximum(),
         queued_requests: pool.queued(),
@@ -1790,9 +1782,27 @@ mod tests {
 
     #[tokio::test]
     async fn status_reports_counts_and_empty_hint() {
+        let mut protected = sample_account("acc_00000003", "protected@example.com", true);
+        protected.usage = Some(Usage {
+            current: 97.0,
+            limit: 100.0,
+            percent_used: 97.0,
+            next_reset_date: None,
+            updated_at: 0,
+        });
+        let mut exhausted = sample_account("acc_00000004", "exhausted@example.com", true);
+        exhausted.usage = Some(Usage {
+            current: 100.0,
+            limit: 100.0,
+            percent_used: 100.0,
+            next_reset_date: None,
+            updated_at: 0,
+        });
         let (_directory, state) = state_with(vec![
             sample_account("acc_00000001", "a@example.com", true),
             sample_account("acc_00000002", "b@example.com", false),
+            protected,
+            exhausted,
         ])
         .await;
         state.admission.set_maximum(123);
@@ -1804,8 +1814,12 @@ mod tests {
             .await,
         ))
         .expect("status");
-        assert_eq!(status.account_total, 2);
-        assert_eq!(status.account_enabled, 1);
+        assert_eq!(status.account_total, 4);
+        assert_eq!(status.account_enabled, 3);
+        assert_eq!(status.account_available, 1);
+        assert_eq!(status.account_protected, 1);
+        assert_eq!(status.account_exhausted, 1);
+        assert_eq!(status.account_refreshing, 0);
         assert_eq!(status.listen, "-");
         assert_eq!(status.proxy_service_total, 0);
         assert_eq!(status.proxy_service_running, 0);

@@ -756,12 +756,14 @@ fn print_status(status: &StatusResult) {
         status.proxy_service_total, status.proxy_service_running
     );
     println!(
-        "账号    {} 个（{} 可用 / {} 冷却 / {} 额度耗尽 / {} 封禁 / {} 停用）",
+        "账号    {} 个（{} 可调度 / {} 额度保护 / {} 冷却 / {} 额度耗尽 / {} 封禁 / {} 刷新中 / {} 停用）",
         status.account_total,
         status.account_available,
+        status.account_protected,
         status.account_cooling,
         status.account_exhausted,
         status.account_banned,
+        status.account_refreshing,
         status.account_total.saturating_sub(status.account_enabled)
     );
     if status.ready {

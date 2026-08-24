@@ -37,6 +37,20 @@ pub enum AccountCreditState {
     Exhausted,
 }
 
+/// 账号池按实际调度条件汇总的互斥状态计数。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct AccountPoolCounts {
+    pub total: usize,
+    pub enabled: usize,
+    pub available: usize,
+    pub protected: usize,
+    pub cooling: usize,
+    pub exhausted: usize,
+    pub banned: usize,
+    pub refreshing: usize,
+    pub disabled: usize,
+}
+
 /// 使用与调度器相同的规则判断账号额度状态。
 pub fn account_credit_state(account: &Account, config: &PoolConfig) -> AccountCreditState {
     if account.credit_exhausted {
@@ -536,11 +550,44 @@ impl AccountPool {
         self.notify.notify_waiters();
     }
 
-    pub async fn health_counts(&self) -> [usize; 5] {
-        let accounts = self.accounts.read().await;
-        let mut counts = [0; 5];
-        for state in accounts.values() {
-            counts[state.health() as usize] += 1;
+    /// Count accounts using the same health and credit gates as scheduling.
+    ///
+    /// Credit protection is kept separate from true exhaustion even when an
+    /// earlier eligibility check marked the runtime health as exhausted.
+    pub async fn scheduling_counts(&self) -> AccountPoolCounts {
+        let states = self
+            .accounts
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let config = self.config();
+        let mut counts = AccountPoolCounts {
+            total: states.len(),
+            ..AccountPoolCounts::default()
+        };
+        for state in states {
+            if state.cooling_expired().await {
+                state.set_health(AccountHealth::Available);
+            }
+            let account = state.account.read().await;
+            if !account.enabled {
+                counts.disabled += 1;
+                continue;
+            }
+            counts.enabled += 1;
+            match account_credit_state(&account, &config) {
+                AccountCreditState::Protected => counts.protected += 1,
+                AccountCreditState::Exhausted => counts.exhausted += 1,
+                AccountCreditState::Available => match state.health() {
+                    AccountHealth::Available => counts.available += 1,
+                    AccountHealth::Cooling => counts.cooling += 1,
+                    AccountHealth::Exhausted => counts.exhausted += 1,
+                    AccountHealth::Banned => counts.banned += 1,
+                    AccountHealth::Refreshing => counts.refreshing += 1,
+                },
+            }
         }
         counts
     }
@@ -665,6 +712,51 @@ mod tests {
             account_credit_state(&account("exhausted", 100.0, SubscriptionKind::Pro), &config),
             AccountCreditState::Exhausted
         );
+    }
+
+    #[tokio::test]
+    async fn scheduling_counts_apply_credit_protection_and_runtime_health() {
+        let ready = account("ready", 10.0, SubscriptionKind::Pro);
+        let protected = account("protected", 97.0, SubscriptionKind::Pro);
+        let exhausted = account("exhausted", 100.0, SubscriptionKind::Pro);
+        let cooling = account("cooling", 10.0, SubscriptionKind::Pro);
+        let banned = account("banned", 10.0, SubscriptionKind::Pro);
+        let refreshing = account("refreshing", 10.0, SubscriptionKind::Pro);
+        let mut disabled = account("disabled", 10.0, SubscriptionKind::Pro);
+        disabled.enabled = false;
+        let pool = AccountPool::new(
+            vec![
+                ready, protected, exhausted, cooling, banned, refreshing, disabled,
+            ],
+            immediate_config(),
+        );
+        pool.get("protected")
+            .await
+            .expect("protected")
+            .set_health(AccountHealth::Exhausted);
+        pool.get("cooling")
+            .await
+            .expect("cooling")
+            .set_health(AccountHealth::Cooling);
+        pool.get("banned")
+            .await
+            .expect("banned")
+            .set_health(AccountHealth::Banned);
+        pool.get("refreshing")
+            .await
+            .expect("refreshing")
+            .set_health(AccountHealth::Refreshing);
+
+        let counts = pool.scheduling_counts().await;
+        assert_eq!(counts.total, 7);
+        assert_eq!(counts.enabled, 6);
+        assert_eq!(counts.available, 1);
+        assert_eq!(counts.protected, 1);
+        assert_eq!(counts.cooling, 1);
+        assert_eq!(counts.exhausted, 1);
+        assert_eq!(counts.banned, 1);
+        assert_eq!(counts.refreshing, 1);
+        assert_eq!(counts.disabled, 1);
     }
 
     #[tokio::test]

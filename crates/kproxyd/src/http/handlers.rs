@@ -129,7 +129,7 @@ pub async fn root() -> Json<Value> {
 
 pub async fn health(State(service): State<ServiceHttpState>) -> Json<Value> {
     let pool = service.app.pool();
-    let counts = pool.health_counts().await;
+    let counts = pool.scheduling_counts().await;
     let accounts = pool.snapshot().await;
     let (used_credits, total_credits) = accounts
         .iter()
@@ -142,8 +142,13 @@ pub async fn health(State(service): State<ServiceHttpState>) -> Json<Value> {
         "service_id":service.service.id,
         "service_name":service.service.name,
         "total_accounts":accounts.len(),
-        "available_accounts":counts[0],"cooling_accounts":counts[1],
-        "exhausted_accounts":counts[2],"banned_accounts":counts[3],
+        "available_accounts":counts.available,
+        "protected_accounts":counts.protected,
+        "cooling_accounts":counts.cooling,
+        "exhausted_accounts":counts.exhausted,
+        "banned_accounts":counts.banned,
+        "refreshing_accounts":counts.refreshing,
+        "disabled_accounts":counts.disabled,
         "used_credits":used_credits,
         "total_credits":total_credits,
         "uptime_secs":service.app.uptime_secs()
@@ -151,9 +156,9 @@ pub async fn health(State(service): State<ServiceHttpState>) -> Json<Value> {
 }
 
 pub async fn readiness(State(service): State<ServiceHttpState>) -> Response {
-    let counts = service.app.pool().health_counts().await;
+    let counts = service.app.pool().scheduling_counts().await;
     let mut reasons = service.app.task_registry.readiness_issues(&service.app);
-    if counts[0] == 0 {
+    if counts.available == 0 {
         reasons.push("no account is currently available".to_string());
     }
     if let Some(error) = service.app.meter.recovery_error() {
@@ -173,7 +178,7 @@ pub async fn readiness(State(service): State<ServiceHttpState>) -> Response {
             "reasons":reasons,
             "service_id":service.service.id,
             "service_name":service.service.name,
-            "available_accounts":counts[0],
+            "available_accounts":counts.available,
             "uptime_secs":service.app.uptime_secs()
         })),
     )

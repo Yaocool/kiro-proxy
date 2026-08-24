@@ -253,9 +253,12 @@ pub struct StatusResult {
     pub account_total: usize,
     /// 启用账号数。
     pub account_enabled: usize,
-    /// 当前可用账号数。
+    /// 当前可参与账号池调度的账号数（不含模型兼容性筛选）。
     #[serde(default)]
     pub account_available: usize,
+    /// 因低额度保护而不参与调度的账号数。
+    #[serde(default)]
+    pub account_protected: usize,
     /// 冷却账号数。
     #[serde(default)]
     pub account_cooling: usize,
@@ -265,6 +268,9 @@ pub struct StatusResult {
     /// 封禁账号数。
     #[serde(default)]
     pub account_banned: usize,
+    /// 正在刷新凭证的账号数。
+    #[serde(default)]
+    pub account_refreshing: usize,
     /// 当前在途请求数。
     #[serde(default)]
     pub active_requests: usize,
@@ -699,9 +705,11 @@ mod tests {
             account_total: 0,
             account_enabled: 0,
             account_available: 0,
+            account_protected: 0,
             account_cooling: 0,
             account_exhausted: 0,
             account_banned: 0,
+            account_refreshing: 0,
             active_requests: 0,
             max_concurrent_requests: 500,
             queued_requests: 0,
@@ -732,6 +740,8 @@ mod tests {
         }))
         .expect("legacy status");
         assert!(!legacy.ready);
+        assert_eq!(legacy.account_protected, 0);
+        assert_eq!(legacy.account_refreshing, 0);
 
         let summary = AccountSummary {
             id: "acc_00000001".into(),
