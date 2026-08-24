@@ -352,7 +352,8 @@ kproxy help
 
 `kproxy logs show` 和 `follow` 读取 daemon 保留的结构化请求记录；`kproxy logs files` 会发现
 按日期、级别和分片生成的实际日志文件，并显示大小和完整路径；`kproxy logs path` 显示当前
-日志目录、基础路径、格式和过滤规则。旧的 `kproxy logs --tail ...` 与 `-f` 用法继续兼容。
+日志目录、基础路径、格式和过滤规则。通过 Docker 宿主机 wrapper 执行时，这两个路径命令
+还会显示 named volume 在宿主机上的真实路径。旧的 `kproxy logs --tail ...` 与 `-f` 用法继续兼容。
 
 `kproxy stats` 用于查看代理流量、成功率、Token、Credits 和延迟等聚合运维指标，不替代逐条
 请求日志。默认只输出紧凑汇总；增加 `--detail` 后才输出分组统计和最近请求。

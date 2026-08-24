@@ -799,22 +799,36 @@ pub async fn show_log_files(
     let mut result: LogFilesResult = client
         .call(method::LOG_FILES, serde_json::json!({}))
         .await?;
+    let host_data_dir = std::env::var_os(WRAPPER_HOST_DATA_DIR_ENV)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    populate_host_log_paths(
+        &mut result,
+        host_data_dir.as_deref(),
+        &Paths::from_env().data_dir,
+    );
     if let Some(level) = level {
         result.files.retain(|file| file.level == level);
     }
     if json {
         if paths_only {
-            return print_json(&serde_json::json!({
-                "base_path":result.base_path,
-                "directory":result.directory,
-                "format":result.format,
-                "level_filter":result.level_filter,
-            }));
+            let mut output = serde_json::to_value(&result)?;
+            output
+                .as_object_mut()
+                .expect("LogFilesResult serializes as an object")
+                .remove("files");
+            return print_json(&output);
         }
         return print_json(&result);
     }
     println!("日志目录    {}", result.directory);
+    if let Some(host_directory) = &result.host_directory {
+        println!("宿主机目录  {host_directory}");
+    }
     println!("基础路径    {}", result.base_path);
+    if let Some(host_base_path) = &result.host_base_path {
+        println!("宿主机基础路径 {host_base_path}");
+    }
     println!("格式/过滤   {} / {}", result.format, result.level_filter);
     if paths_only {
         return Ok(());
@@ -823,10 +837,12 @@ pub async fn show_log_files(
         println!("暂无匹配的日志文件；对应级别产生日志后会自动创建。");
         return Ok(());
     }
+    let has_host_paths = result.files.iter().any(|file| file.host_path.is_some());
     let rows = result
         .files
         .into_iter()
         .map(|file| {
+            let display_path = file.host_path.unwrap_or(file.path);
             vec![
                 file.date,
                 file.level,
@@ -834,15 +850,42 @@ pub async fn show_log_files(
                 file.modified_at
                     .map(format_timestamp)
                     .unwrap_or_else(|| "-".into()),
-                file.path,
+                display_path,
             ]
         })
         .collect::<Vec<_>>();
+    let path_heading = if has_host_paths {
+        "宿主机文件路径"
+    } else {
+        "文件路径"
+    };
     println!(
         "{}",
-        render_table(&["日期", "级别", "大小", "修改时间", "文件路径"], &rows)
+        render_table(&["日期", "级别", "大小", "修改时间", path_heading], &rows)
     );
     Ok(())
+}
+
+const WRAPPER_HOST_DATA_DIR_ENV: &str = "KPROXY_WRAPPER_HOST_DATA_DIR";
+
+fn populate_host_log_paths(
+    result: &mut LogFilesResult,
+    host_data_dir: Option<&Path>,
+    container_data_dir: &Path,
+) {
+    let Some(host_data_dir) = host_data_dir else {
+        return;
+    };
+    result.host_base_path = host_log_path(&result.base_path, host_data_dir, container_data_dir);
+    result.host_directory = host_log_path(&result.directory, host_data_dir, container_data_dir);
+    for file in &mut result.files {
+        file.host_path = host_log_path(&file.path, host_data_dir, container_data_dir);
+    }
+}
+
+fn host_log_path(path: &str, host_data_dir: &Path, container_data_dir: &Path) -> Option<String> {
+    let relative = Path::new(path).strip_prefix(container_data_dir).ok()?;
+    Some(host_data_dir.join(relative).display().to_string())
 }
 
 fn format_bytes(bytes: u64) -> String {
@@ -2703,6 +2746,62 @@ mod tests {
             None,
             Some(OsStr::new("en_US.UTF-8")),
         ));
+    }
+
+    #[test]
+    fn docker_wrapper_maps_log_files_to_the_host_data_volume() {
+        let mut result = LogFilesResult {
+            base_path: "/var/lib/kproxy/logs/kproxyd.log".into(),
+            host_base_path: None,
+            directory: "/var/lib/kproxy/logs".into(),
+            host_directory: None,
+            format: "json".into(),
+            level_filter: "info".into(),
+            files: vec![kproxy_ipc::protocol::LogFileView {
+                path: "/var/lib/kproxy/logs/kproxyd-2026-08-24-info.log".into(),
+                host_path: None,
+                level: "info".into(),
+                date: "2026-08-24".into(),
+                size_bytes: 42,
+                modified_at: None,
+            }],
+        };
+
+        populate_host_log_paths(
+            &mut result,
+            Some(Path::new(
+                "/var/lib/docker/volumes/kiro-proxy_kproxy-data/_data",
+            )),
+            Path::new("/var/lib/kproxy"),
+        );
+
+        assert_eq!(
+            result.host_directory.as_deref(),
+            Some("/var/lib/docker/volumes/kiro-proxy_kproxy-data/_data/logs")
+        );
+        assert_eq!(
+            result.host_base_path.as_deref(),
+            Some("/var/lib/docker/volumes/kiro-proxy_kproxy-data/_data/logs/kproxyd.log")
+        );
+        assert_eq!(
+            result.files[0].host_path.as_deref(),
+            Some(
+                "/var/lib/docker/volumes/kiro-proxy_kproxy-data/_data/logs/\
+                 kproxyd-2026-08-24-info.log"
+            )
+        );
+    }
+
+    #[test]
+    fn logs_outside_the_data_volume_do_not_claim_a_host_path() {
+        assert_eq!(
+            host_log_path(
+                "/tmp/kproxyd.log",
+                Path::new("/var/lib/docker/volumes/kproxy/_data"),
+                Path::new("/var/lib/kproxy"),
+            ),
+            None
+        );
     }
 
     #[cfg(unix)]

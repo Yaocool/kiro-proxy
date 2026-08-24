@@ -362,9 +362,12 @@ kproxy logs files
 kproxy logs files --level error
 ```
 
-`logs files` reports complete paths from the daemon's filesystem. For a Docker
-deployment these are container paths in the persistent data volume, and the host
-wrapper can invoke the same commands without entering the container.
+`logs files` preserves complete paths from the daemon's filesystem. When invoked
+through the host wrapper, the wrapper resolves the `/var/lib/kproxy` data volume's
+actual mount on the Docker host, additionally reports the host directory and base
+path, and uses host paths in the file table. JSON keeps the container `path` and
+adds `host_path`, `host_directory`, and `host_base_path`. A custom log destination
+outside the data volume cannot be mapped and therefore remains container-only.
 
 View or follow structured request records:
 

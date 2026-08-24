@@ -321,8 +321,11 @@ kproxy logs files
 kproxy logs files --level error
 ```
 
-`logs files` 输出 daemon 文件系统中的完整路径。容器部署时这些是持久化数据卷内的容器路径，
-在宿主机直接使用 wrapper 执行相同命令即可，无需进入容器。
+`logs files` 保留 daemon 文件系统中的完整路径。通过宿主机 wrapper 执行时，wrapper 会解析
+`/var/lib/kproxy` 数据卷在 Docker 宿主机上的实际挂载位置，额外输出宿主机目录和基础路径，
+并在文件表中直接显示宿主机文件路径。JSON 输出保留容器内的 `path`，同时增加
+`host_path`、`host_directory` 和 `host_base_path`。自定义日志路径不在数据卷内时无法映射，
+因此只显示容器路径。
 
 查看或持续跟踪结构化请求记录：
 
