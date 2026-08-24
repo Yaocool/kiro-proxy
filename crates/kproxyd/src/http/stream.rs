@@ -27,7 +27,7 @@ use crate::stats::{RequestDiagnostics, RequestLog, UpstreamAttemptLog};
 use super::prompt_cache::{PromptCachePlan, PromptCacheProfile};
 use super::response::{
     repair_json, web_search_citations, CompactionIterationUsage, DecodedResponse,
-    OpenAiToolIdentity, StopSequenceFilter, ToolLeakFilter,
+    OpenAiToolIdentity, StopSequenceFilter, ThinkingContentFilter, ToolLeakFilter,
 };
 use super::usage::{fallback_credits, fill_missing_usage, produced_output};
 
@@ -101,6 +101,9 @@ pub struct StreamContext {
     pub buffer_tool_calls: bool,
     pub tool_call_buffer_delay_ms: u64,
     pub enable_tool_leak_filter: bool,
+    /// Actual per-request decision. Beta headers only advertise capability and
+    /// remain present when Claude Code sends `thinking.type = "disabled"`.
+    pub thinking_enabled: bool,
     pub thinking_output_format: ThinkingOutputFormat,
     pub include_usage_chunk: bool,
     /// Kiro canonical web tool name -> original Claude server tool type.
@@ -246,6 +249,7 @@ pub fn response(
             .count() as u32;
         'rounds: loop {
             let mut leak_filter = ToolLeakFilter::new(context.enable_tool_leak_filter);
+            let mut thinking_filter = ThinkingContentFilter::new(context.thinking_enabled);
             loop {
                 tokio::select! {
                     chunk = source.next() => match chunk {
@@ -264,7 +268,12 @@ pub fn response(
                                             failed = Some(format!("{kind}: {message}"));
                                             break;
                                         }
-                                        for mut event in leak_filter.push(event) {
+                                        let events = leak_filter
+                                            .push(event)
+                                            .into_iter()
+                                            .flat_map(|event| thinking_filter.push(event))
+                                            .collect::<Vec<_>>();
+                                        for mut event in events {
                                             let internal_search = event_is_tool_search(
                                                 &event,
                                                 context.tool_search.as_deref(),
@@ -378,7 +387,12 @@ pub fn response(
                 }
             }
             if stop_filter.matched().is_none() {
-                for mut event in leak_filter.finish() {
+                let mut events = Vec::new();
+                for event in leak_filter.finish() {
+                    events.extend(thinking_filter.push(event));
+                }
+                events.extend(thinking_filter.finish());
+                for mut event in events {
                     let internal_search =
                         event_is_tool_search(&event, context.tool_search.as_deref());
                     let internal_web_search =
@@ -2440,6 +2454,61 @@ mod tests {
         let stop = joined.find("content_block_stop").expect("stop");
         assert!(signature < stop);
         assert!(joined.contains("\"index\":0"));
+    }
+
+    #[test]
+    fn tagged_thinking_streams_as_native_claude_blocks() {
+        let mut filter = ThinkingContentFilter::new(true);
+        let mut state = ClaudeState::new("msg_test".into(), "model".into(), 10, replay_codec());
+        let mut output = Vec::new();
+        for chunk in ["<thin", "king>hidden", "</thinking>Hello"] {
+            for event in filter.push(KiroEvent::AssistantResponse {
+                content: chunk.into(),
+            }) {
+                output.extend(state.event(&event));
+            }
+        }
+        for event in filter.finish() {
+            output.extend(state.event(&event));
+        }
+        let joined = output.join("");
+        let values = streamed_values(&output);
+
+        assert!(!joined.contains("<thinking>"));
+        assert!(!joined.contains("</thinking>"));
+        assert!(values.iter().any(|value| {
+            value["delta"]["type"] == "thinking_delta" && value["delta"]["thinking"] == "hidden"
+        }));
+        assert!(values.iter().any(|value| {
+            value["delta"]["type"] == "text_delta" && value["delta"]["text"] == "Hello"
+        }));
+        assert_eq!(joined.matches("signature_delta").count(), 1);
+    }
+
+    #[test]
+    fn disabled_thinking_streams_only_visible_text() {
+        let mut filter = ThinkingContentFilter::new(false);
+        let mut state = ClaudeState::new("msg_test".into(), "model".into(), 10, replay_codec());
+        let mut events = filter.push(KiroEvent::AssistantResponse {
+            content: "<thinking>tagged secret</thinking>Hello".into(),
+        });
+        events.extend(filter.push(KiroEvent::Reasoning {
+            content: "native secret".into(),
+        }));
+        events.extend(filter.finish());
+        let output = events
+            .iter()
+            .flat_map(|event| state.event(event))
+            .collect::<Vec<_>>();
+        let joined = output.join("");
+        let values = streamed_values(&output);
+
+        assert!(!joined.contains("thinking_delta"));
+        assert!(!joined.contains("signature_delta"));
+        assert!(!joined.contains("secret"));
+        assert!(values.iter().any(|value| {
+            value["delta"]["type"] == "text_delta" && value["delta"]["text"] == "Hello"
+        }));
     }
 
     #[test]

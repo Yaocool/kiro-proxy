@@ -547,6 +547,60 @@ mod tests {
     }
 
     #[test]
+    fn request_body_thinking_type_controls_prompt_injection() {
+        let request = |kind: &str| {
+            serde_json::from_value::<crate::ClaudeRequest>(serde_json::json!({
+                "model":"claude-sonnet-4.6",
+                "messages":[{"role":"user","content":"hello"}],
+                "max_tokens":4096,
+                "thinking":{"type":kind}
+            }))
+            .expect("Claude request")
+        };
+
+        let disabled = request("disabled");
+        let mut disabled_payload = crate::claude_to_kiro(
+            &disabled,
+            &crate::TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR"),
+        );
+        let disabled_decision = apply_adaptive_thinking(
+            &mut disabled_payload,
+            disabled.thinking.as_ref(),
+            true,
+            true,
+            8_192,
+        );
+        assert_eq!(disabled_decision.reason, ThinkingReason::ClientDisabled);
+        assert!(!disabled_decision.enabled);
+        assert!(!disabled_payload
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content
+            .contains("<thinking_mode>"));
+
+        let adaptive = request("adaptive");
+        let mut adaptive_payload = crate::claude_to_kiro(
+            &adaptive,
+            &crate::TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR"),
+        );
+        let adaptive_decision = apply_adaptive_thinking(
+            &mut adaptive_payload,
+            adaptive.thinking.as_ref(),
+            true,
+            true,
+            8_192,
+        );
+        assert!(adaptive_decision.enabled);
+        assert!(adaptive_payload
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content
+            .starts_with("<thinking_mode>enabled</thinking_mode>"));
+    }
+
+    #[test]
     fn daily_schedule_supports_cross_midnight_and_weekdays() {
         let schedule = ModelMappingSchedule {
             mode: "daily".into(),

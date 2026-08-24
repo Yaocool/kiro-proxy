@@ -672,6 +672,124 @@ async fn claude_stream_stops_before_later_frames_in_the_same_upstream_chunk() {
 }
 
 #[tokio::test]
+async fn claude_thinking_follows_body_state_and_normalizes_tagged_content() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let mut upstream_body = event_stream_frame(
+        "assistantResponseEvent",
+        serde_json::json!({"content":"<thinking>tagged secret</thinking>Hello"}),
+    );
+    upstream_body.extend(event_stream_frame(
+        "reasoningContentEvent",
+        serde_json::json!({"reasoningContentEvent":{"text":"native secret"}}),
+    ));
+    upstream_body.extend(event_stream_frame(
+        "messageMetadataEvent",
+        serde_json::json!({
+            "messageMetadataEvent": {
+                "usage": {
+                    "inputTokens": 100,
+                    "outputTokens": 20,
+                    "creditsConsumed": 0.25
+                }
+            }
+        }),
+    ));
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(upstream_body),
+        )
+        .mount(&mock)
+        .await;
+
+    let port = unused_tcp_port();
+    let upstream_url = format!("{}/generateAssistantResponse", mock.uri());
+    let daemon = Daemon::start_http(port, &upstream_url).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    let client = reqwest::Client::new();
+    let endpoint = format!("http://127.0.0.1:{port}/v1/messages");
+    let beta = "interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13";
+
+    let disabled = client
+        .post(&endpoint)
+        .header(
+            "x-api-key",
+            daemon.api_key.as_deref().expect("service API key"),
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", beta)
+        .header("user-agent", "claude-cli/2.1.235 (external, e2e)")
+        .json(&serde_json::json!({
+            "model":"source-large",
+            "max_tokens":4096,
+            "stream":true,
+            "thinking":{"type":"disabled"},
+            "messages":[{"role":"user","content":"thinking disabled"}]
+        }))
+        .send()
+        .await
+        .expect("call Claude with thinking disabled");
+    assert_eq!(disabled.status(), reqwest::StatusCode::OK);
+    let disabled_body = disabled.text().await.expect("disabled stream body");
+    assert!(disabled_body.contains("Hello"), "{disabled_body}");
+    assert!(!disabled_body.contains("tagged secret"), "{disabled_body}");
+    assert!(!disabled_body.contains("native secret"), "{disabled_body}");
+    assert!(!disabled_body.contains("thinking_delta"), "{disabled_body}");
+    assert!(!disabled_body.contains("<thinking>"), "{disabled_body}");
+
+    let enabled = client
+        .post(&endpoint)
+        .header(
+            "x-api-key",
+            daemon.api_key.as_deref().expect("service API key"),
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("anthropic-beta", beta)
+        .header("user-agent", "claude-cli/2.1.235 (external, e2e)")
+        .json(&serde_json::json!({
+            "model":"source-large",
+            "max_tokens":4096,
+            "stream":true,
+            "thinking":{"type":"adaptive"},
+            "context_management":{"edits":[{
+                "type":"clear_thinking_20251015","keep":"all"
+            }]},
+            "messages":[{"role":"user","content":"thinking enabled"}]
+        }))
+        .send()
+        .await
+        .expect("call Claude with thinking enabled");
+    assert_eq!(enabled.status(), reqwest::StatusCode::OK);
+    let enabled_body = enabled.text().await.expect("enabled stream body");
+    assert!(enabled_body.contains("Hello"), "{enabled_body}");
+    assert!(enabled_body.contains("tagged secret"), "{enabled_body}");
+    assert!(enabled_body.contains("native secret"), "{enabled_body}");
+    assert!(enabled_body.contains("thinking_delta"), "{enabled_body}");
+    assert!(enabled_body.contains("signature_delta"), "{enabled_body}");
+    assert!(!enabled_body.contains("<thinking>"), "{enabled_body}");
+
+    let received = mock.received_requests().await.expect("received requests");
+    let prompts = received
+        .iter()
+        .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+        .filter_map(|payload| {
+            payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(prompts.len(), 2);
+    assert!(!prompts[0].contains("<thinking_mode>"));
+    assert!(prompts[1].starts_with("<thinking_mode>enabled</thinking_mode>"));
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn claude_compaction_uses_a_separate_semantic_kiro_request() {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;
