@@ -1,4 +1,5 @@
 {
   "rust-analyzer.server.path": "rust-analyzer",
-  "rust-analyzer.cargo.features": "all"
+  "rust-analyzer.cargo.features": "all",
+  "todo-tree.ripgrep.ripgrep": "/opt/homebrew/bin/rg"
 }
