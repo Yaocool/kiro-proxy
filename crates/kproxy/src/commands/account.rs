@@ -16,7 +16,7 @@ use crate::output::{format_timestamp, print_json, render_table};
 pub enum AccountCommand {
     /// 列出账号。
     #[command(
-        long_about = "列出账号，默认按邮箱排序。\n\n示例：\n  kproxy account list\n  kproxy account list --tag prod --enabled-only\n  kproxy account list --sort credit"
+        long_about = "列出账号，默认按邮箱排序。\n\n示例：\n  kproxy account list\n  kproxy account list --tag prod --enabled-only\n  kproxy account list --status low_credit\n  kproxy account list --sort credit"
     )]
     List {
         /// 只显示带该标签的账号。
@@ -25,8 +25,20 @@ pub enum AccountCommand {
         /// 只显示已启用账号。
         #[arg(long)]
         enabled_only: bool,
-        /// 状态过滤：available/disabled/exhausted。
-        #[arg(long)]
+        /// 状态过滤：available/low_credit/disabled/exhausted/cooling/banned/refreshing/unavailable。
+        #[arg(
+            long,
+            value_parser = [
+                "available",
+                "low_credit",
+                "disabled",
+                "exhausted",
+                "cooling",
+                "banned",
+                "refreshing",
+                "unavailable"
+            ]
+        )]
         status: Option<String>,
         /// 排序字段：email（默认）/credit/id。
         #[arg(long, value_parser = ["email", "credit", "id"])]
@@ -212,6 +224,7 @@ fn display_health(account: &AccountSummary) -> String {
     }
     match account.health.as_deref() {
         Some("available") => "启用",
+        Some("low_credit") => "低额度保护",
         Some("cooling") => "冷却",
         Some("exhausted") => "额度耗尽",
         Some("banned") => "已封禁",
@@ -849,6 +862,10 @@ mod tests {
         let mut exhausted = summary(true);
         exhausted.credit_exhausted = true;
         assert_eq!(build_list_rows(&[exhausted])[0][2], "额度耗尽");
+
+        let mut protected = summary(true);
+        protected.health = Some("low_credit".into());
+        assert_eq!(build_list_rows(&[protected])[0][2], "低额度保护");
     }
 
     #[test]

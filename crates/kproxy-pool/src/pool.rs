@@ -26,6 +26,42 @@ pub enum PoolError {
     CreditsExhausted,
 }
 
+/// 账号额度相对于当前池保护配置的状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccountCreditState {
+    /// 额度充足，可以参与调度。
+    Available,
+    /// 尚有额度，但已触发低额度保护。
+    Protected,
+    /// 已被上游判定耗尽，或已使用额度达到总额度。
+    Exhausted,
+}
+
+/// 使用与调度器相同的规则判断账号额度状态。
+pub fn account_credit_state(account: &Account, config: &PoolConfig) -> AccountCreditState {
+    if account.credit_exhausted {
+        return AccountCreditState::Exhausted;
+    }
+    let Some(usage) = &account.usage else {
+        return AccountCreditState::Available;
+    };
+    if usage.limit <= 0.0 {
+        return AccountCreditState::Available;
+    }
+    let remaining = (usage.limit - usage.current).max(0.0);
+    if remaining <= 0.0 {
+        return AccountCreditState::Exhausted;
+    }
+    let ratio = remaining / usage.limit;
+    if (config.low_credit_ratio > 0.0 && ratio <= config.low_credit_ratio)
+        || (config.low_credit_min_remaining > 0.0 && remaining <= config.low_credit_min_remaining)
+    {
+        AccountCreditState::Protected
+    } else {
+        AccountCreditState::Available
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScoreExplanation {
     pub account_id: String,
@@ -264,7 +300,7 @@ impl AccountPool {
         if !account.enabled || account.credit_exhausted {
             return false;
         }
-        if low_credit(&account, &self.config()) {
+        if account_credit_state(&account, &self.config()) != AccountCreditState::Available {
             state.set_health(AccountHealth::Exhausted);
             return false;
         }
@@ -448,11 +484,37 @@ impl AccountPool {
                 continue;
             }
             matched = true;
-            if !account.credit_exhausted && !low_credit(&account, &config) {
+            if account_credit_state(&account, &config) == AccountCreditState::Available {
                 return false;
             }
         }
         matched
+    }
+
+    /// Returns true when there is at least one enabled account and every
+    /// enabled account is fully exhausted. Low-credit protection does not
+    /// count as exhaustion for operator alerts.
+    pub async fn all_enabled_credit_exhausted(&self) -> bool {
+        let states = self
+            .accounts
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let config = self.config();
+        let mut enabled = false;
+        for state in states {
+            let account = state.account.read().await;
+            if !account.enabled {
+                continue;
+            }
+            enabled = true;
+            if account_credit_state(&account, &config) != AccountCreditState::Exhausted {
+                return false;
+            }
+        }
+        enabled
     }
 
     pub async fn replace_accounts(&self, accounts: Vec<Account>) {
@@ -514,22 +576,6 @@ impl AccountPool {
             .map(|config| config.clone())
             .unwrap_or_else(|poisoned| poisoned.into_inner().clone())
     }
-}
-
-fn low_credit(account: &Account, config: &PoolConfig) -> bool {
-    let Some(usage) = &account.usage else {
-        return false;
-    };
-    let remaining = (usage.limit - usage.current).max(0.0);
-    let ratio = if usage.limit > 0.0 {
-        remaining / usage.limit
-    } else {
-        0.0
-    };
-    (config.low_credit_ratio > 0.0 && ratio <= config.low_credit_ratio)
-        || (config.low_credit_min_remaining > 0.0
-            && usage.limit > 0.0
-            && remaining <= config.low_credit_min_remaining)
 }
 
 fn can_serve_subscription(account: &Account, model: &str) -> bool {
@@ -602,6 +648,39 @@ mod tests {
             max_queue_wait_ms: 0,
             ..PoolConfig::default()
         }
+    }
+
+    #[test]
+    fn credit_state_distinguishes_protection_from_exhaustion() {
+        let config = PoolConfig::default();
+        assert_eq!(
+            account_credit_state(&account("ready", 95.0, SubscriptionKind::Pro), &config),
+            AccountCreditState::Available
+        );
+        assert_eq!(
+            account_credit_state(&account("protected", 97.0, SubscriptionKind::Pro), &config),
+            AccountCreditState::Protected
+        );
+        assert_eq!(
+            account_credit_state(&account("exhausted", 100.0, SubscriptionKind::Pro), &config),
+            AccountCreditState::Exhausted
+        );
+    }
+
+    #[tokio::test]
+    async fn service_exhaustion_does_not_treat_low_credit_protection_as_exhausted() {
+        let protected = account("protected", 97.0, SubscriptionKind::Pro);
+        let pool = AccountPool::new(vec![protected], immediate_config());
+        assert!(!pool.all_enabled_credit_exhausted().await);
+
+        pool.get("protected")
+            .await
+            .expect("account")
+            .account
+            .write()
+            .await
+            .credit_exhausted = true;
+        assert!(pool.all_enabled_credit_exhausted().await);
     }
 
     #[tokio::test]

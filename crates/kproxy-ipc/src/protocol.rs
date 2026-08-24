@@ -624,7 +624,7 @@ pub struct AccountListParams {
     /// 是否只返回启用账号。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled_only: Option<bool>,
-    /// 状态过滤：available/disabled/exhausted。
+    /// 状态过滤：available/low_credit/disabled/exhausted/cooling/banned/refreshing/unavailable。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     /// 排序字段：email（默认）/credit/id。

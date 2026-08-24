@@ -4,6 +4,9 @@ mod pool;
 mod refresh;
 mod state;
 
-pub use pool::{AccountLease, AccountPool, PoolError, ScoreExplanation};
+pub use pool::{
+    account_credit_state, AccountCreditState, AccountLease, AccountPool, PoolError,
+    ScoreExplanation,
+};
 pub use refresh::{RefreshError, TokenRefresher};
 pub use state::{AccountHealth, AccountState};

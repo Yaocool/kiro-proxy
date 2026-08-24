@@ -7,6 +7,7 @@ use kproxy_core::account::Account;
 use kproxy_core::config::{ApiKeyConfig, ApiKeyFormat, Config, ProxyServiceConfig};
 use kproxy_core::ids::{new_account_id, new_machine_id};
 use kproxy_ipc::protocol::*;
+use kproxy_pool::{account_credit_state, AccountCreditState, AccountPool};
 use kproxy_store::accounts::AccountStore;
 use kproxy_store::config_loader::{load_config, merge_hot_reload};
 use rand::RngCore;
@@ -504,6 +505,25 @@ fn summarize(account: &Account) -> AccountSummary {
     }
 }
 
+async fn effective_account_health(
+    pool: &AccountPool,
+    account: &Account,
+    config: &kproxy_core::config::PoolConfig,
+) -> String {
+    if !account.enabled {
+        return "disabled".into();
+    }
+    match account_credit_state(account, config) {
+        AccountCreditState::Exhausted => return "exhausted".into(),
+        AccountCreditState::Protected => return "low_credit".into(),
+        AccountCreditState::Available => {}
+    }
+    pool.get(&account.id)
+        .await
+        .map(|runtime| format!("{:?}", runtime.health()).to_ascii_lowercase())
+        .unwrap_or_else(|| "unavailable".into())
+}
+
 fn compare_account_identity(
     left_email: &str,
     left_id: &str,
@@ -521,6 +541,7 @@ async fn handle_account_list(state: &Arc<AppState>, params: serde_json::Value) -
     };
     let source = state.with_accounts(|store| store.all().to_vec());
     let pool = state.pool();
+    let pool_config = state.runtime_config_snapshot().pool;
     let mut accounts = Vec::new();
     for account in source
         .iter()
@@ -533,15 +554,7 @@ async fn handle_account_list(state: &Arc<AppState>, params: serde_json::Value) -
         .filter(|account| !params.enabled_only.unwrap_or(false) || account.enabled)
     {
         let mut summary = summarize(account);
-        summary.health = if !account.enabled {
-            Some("disabled".into())
-        } else if account.credit_exhausted {
-            Some("exhausted".into())
-        } else if let Some(runtime) = pool.get(&account.id).await {
-            Some(format!("{:?}", runtime.health()).to_ascii_lowercase())
-        } else {
-            Some("unavailable".into())
-        };
+        summary.health = Some(effective_account_health(&pool, account, &pool_config).await);
         if params
             .status
             .as_deref()
@@ -581,17 +594,12 @@ async fn handle_account_show(state: &Arc<AppState>, params: serde_json::Value) -
     let pool = state.pool();
     let runtime = pool.get(&account.id).await;
     let mut summary = summarize(&account);
+    summary.health = Some(
+        effective_account_health(&pool, &account, &state.runtime_config_snapshot().pool).await,
+    );
     let (supported_models, active_requests) = if let Some(runtime) = runtime {
-        summary.health = Some(if !account.enabled {
-            "disabled".into()
-        } else if account.credit_exhausted {
-            "exhausted".into()
-        } else {
-            format!("{:?}", runtime.health()).to_ascii_lowercase()
-        });
         (runtime.supported_models().await, runtime.active())
     } else {
-        summary.health = Some("unavailable".into());
         (Vec::new(), 0)
     };
     let preferred_endpoint = state
@@ -1655,7 +1663,7 @@ async fn persist_pool_snapshot(state: &Arc<AppState>) -> Result<(), RpcError> {
 
 #[cfg(test)]
 mod tests {
-    use kproxy_core::account::{Account, AuthMethod, Credentials};
+    use kproxy_core::account::{Account, AuthMethod, Credentials, Usage};
     use kproxy_core::config::Config;
     use kproxy_core::paths::Paths;
     use kproxy_store::accounts::AccountStore;
@@ -2343,6 +2351,74 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["A-model", "b-model", "z-model"]
         );
+    }
+
+    #[tokio::test]
+    async fn account_list_distinguishes_low_credit_from_exhaustion() {
+        let ready = sample_account("acc_00000001", "ready@example.com", true);
+        let mut protected = sample_account("acc_00000002", "protected@example.com", true);
+        protected.usage = Some(Usage {
+            current: 97.0,
+            limit: 100.0,
+            percent_used: 97.0,
+            next_reset_date: None,
+            updated_at: 0,
+        });
+        let mut exhausted = sample_account("acc_00000003", "exhausted@example.com", true);
+        exhausted.usage = Some(Usage {
+            current: 100.0,
+            limit: 100.0,
+            percent_used: 100.0,
+            next_reset_date: None,
+            updated_at: 0,
+        });
+        let (_directory, state) = state_with(vec![ready, protected, exhausted]).await;
+
+        let list: AccountListResult = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(1, method::ACCOUNT_LIST, serde_json::json!({})),
+            )
+            .await,
+        ))
+        .expect("account list");
+        let health_by_email = list
+            .accounts
+            .iter()
+            .map(|account| (account.email.as_str(), account.health.as_deref()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(health_by_email["ready@example.com"], Some("available"));
+        assert_eq!(health_by_email["protected@example.com"], Some("low_credit"));
+        assert_eq!(health_by_email["exhausted@example.com"], Some("exhausted"));
+
+        let protected_only: AccountListResult = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(
+                    2,
+                    method::ACCOUNT_LIST,
+                    serde_json::json!({"status":"low_credit"}),
+                ),
+            )
+            .await,
+        ))
+        .expect("protected accounts");
+        assert_eq!(protected_only.accounts.len(), 1);
+        assert_eq!(protected_only.accounts[0].email, "protected@example.com");
+
+        let detail: AccountDetail = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(
+                    3,
+                    method::ACCOUNT_SHOW,
+                    serde_json::json!({"id":"protected@example.com"}),
+                ),
+            )
+            .await,
+        ))
+        .expect("account detail");
+        assert_eq!(detail.summary.health.as_deref(), Some("low_credit"));
     }
 
     #[tokio::test]
