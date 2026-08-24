@@ -383,12 +383,18 @@ async fn main() -> Result<()> {
         crate::commands::runtime::print_topic(topic.as_deref())?;
         return Ok(());
     }
-    if matches!(
-        &command,
-        Command::Alert(crate::commands::runtime::AlertCommand::Events)
-    ) {
-        crate::commands::runtime::show_alert_events(cli.json)?;
-        return Ok(());
+    if let Command::Alert(alert_command) = &command {
+        match alert_command {
+            crate::commands::runtime::AlertCommand::Events => {
+                crate::commands::runtime::show_alert_events(cli.json)?;
+                return Ok(());
+            }
+            crate::commands::runtime::AlertCommand::Platforms => {
+                crate::commands::runtime::show_alert_platforms(cli.json)?;
+                return Ok(());
+            }
+            _ => {}
+        }
     }
     if matches!(
         &command,
@@ -885,29 +891,11 @@ mod tests {
 
     #[test]
     fn alert_command_replaces_the_webhook_entrypoint() {
-        let cli = Cli::try_parse_from([
-            "kproxy",
-            "alert",
-            "config",
-            "--low-credit-threshold-percent",
-            "15",
-            "--max-notifications",
-            "3",
-            "--suppress-window",
-            "20m",
-        ])
-        .expect("alert command");
-        let Some(Command::Alert(crate::commands::runtime::AlertCommand::Config {
-            low_credit_threshold_percent,
-            max_notifications,
-            suppress_window,
-        })) = cli.command
+        let cli = Cli::try_parse_from(["kproxy", "alert", "config"]).expect("alert command");
+        let Some(Command::Alert(crate::commands::runtime::AlertCommand::Config)) = cli.command
         else {
             panic!("expected alert config command");
         };
-        assert_eq!(low_credit_threshold_percent, Some(15.0));
-        assert_eq!(max_notifications, Some(3));
-        assert_eq!(suppress_window.as_deref(), Some("20m"));
         assert!(Cli::try_parse_from(["kproxy", "webhook", "list"]).is_err());
     }
 
@@ -919,14 +907,14 @@ mod tests {
             "add",
             "--name",
             "ops",
-            "--kind",
+            "--platform",
             "dingtalk",
             "--url",
             "https://example.com/hook",
             "--event",
-            "low-credit,account-banned",
+            "account-quota-exhausted,service-quota-exhausted",
             "--event",
-            "quota-exhausted",
+            "token-refresh-failed",
         ])
         .expect("multi-event alert target");
         let Some(Command::Alert(crate::commands::runtime::AlertCommand::Add { events, .. })) =
@@ -937,10 +925,106 @@ mod tests {
         assert_eq!(
             events,
             vec![
-                crate::commands::runtime::AlertEvent::LowCredit,
-                crate::commands::runtime::AlertEvent::AccountBanned,
-                crate::commands::runtime::AlertEvent::QuotaExhausted,
+                crate::commands::runtime::AlertEvent::AccountQuotaExhausted,
+                crate::commands::runtime::AlertEvent::ServiceQuotaExhausted,
+                crate::commands::runtime::AlertEvent::TokenRefreshFailed,
             ]
         );
+    }
+
+    #[test]
+    fn alert_add_accepts_legacy_kind_alias() {
+        let cli = Cli::try_parse_from([
+            "kproxy",
+            "alert",
+            "add",
+            "--name",
+            "ops",
+            "--kind",
+            "wechat",
+            "--url",
+            "https://example.com/hook",
+            "--event",
+            "token-refresh-failed",
+        ])
+        .expect("legacy --kind alias");
+        let Some(Command::Alert(crate::commands::runtime::AlertCommand::Add { platform, .. })) =
+            cli.command
+        else {
+            panic!("expected alert add command");
+        };
+        assert_eq!(
+            platform,
+            crate::commands::runtime::AlertPlatform::WechatWork
+        );
+    }
+
+    #[test]
+    fn alert_edit_accepts_positional_or_named_target() {
+        let positional = Cli::try_parse_from([
+            "kproxy",
+            "alert",
+            "edit",
+            "ops",
+            "--event",
+            "token-refresh-failed",
+        ])
+        .expect("positional alert target");
+        let Some(Command::Alert(crate::commands::runtime::AlertCommand::Edit {
+            target, name, ..
+        })) = positional.command
+        else {
+            panic!("expected alert edit command");
+        };
+        assert_eq!(target.as_deref(), Some("ops"));
+        assert_eq!(name, None);
+
+        let named = Cli::try_parse_from([
+            "kproxy",
+            "alert",
+            "edit",
+            "--name",
+            "ops",
+            "--platform",
+            "feishu",
+        ])
+        .expect("named alert target");
+        let Some(Command::Alert(crate::commands::runtime::AlertCommand::Edit {
+            target,
+            name,
+            platform,
+            ..
+        })) = named.command
+        else {
+            panic!("expected alert edit command");
+        };
+        assert_eq!(target, None);
+        assert_eq!(name.as_deref(), Some("ops"));
+        assert_eq!(
+            platform,
+            Some(crate::commands::runtime::AlertPlatform::Feishu)
+        );
+    }
+
+    #[test]
+    fn alert_platform_rejects_unknown_values() {
+        let error = Cli::try_parse_from([
+            "kproxy",
+            "alert",
+            "add",
+            "--name",
+            "ops",
+            "--platform",
+            "unknown",
+            "--url",
+            "https://example.com/hook",
+            "--event",
+            "token-refresh-failed",
+        ])
+        .expect_err("unknown platform must fail");
+        let message = error.to_string();
+        assert!(message.contains("possible values"));
+        assert!(message.contains("dingtalk"));
+        assert!(message.contains("wechat-work"));
     }
 }

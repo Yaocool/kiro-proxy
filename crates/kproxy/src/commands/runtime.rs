@@ -186,64 +186,84 @@ pub enum ApiKeyCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum AlertEvent {
-    /// 账号剩余额度首次跌破配置的递进告警档位。
-    LowCredit,
-    /// 认证错误后的 Token 刷新失败，账号被封禁。
-    AccountBanned,
-    /// 后台任务刷新即将过期的 Token 失败。
-    TokenExpired,
-    /// 账号或代理服务的可用额度耗尽。
-    QuotaExhausted,
-    /// 额度耗尽导致额度相关请求进入降级状态。
-    ServiceDegraded,
+    /// 单个账号额度完全耗尽。
+    AccountQuotaExhausted,
+    /// API 代理服务的全部启用账号额度完全耗尽。
+    ServiceQuotaExhausted,
+    /// 账号 Token 自动或请求触发刷新失败。
+    TokenRefreshFailed,
 }
 
 impl AlertEvent {
     fn as_str(self) -> &'static str {
         match self {
-            Self::LowCredit => "low-credit",
-            Self::AccountBanned => "account-banned",
-            Self::TokenExpired => "token-expired",
-            Self::QuotaExhausted => "quota-exhausted",
-            Self::ServiceDegraded => "service-degraded",
+            Self::AccountQuotaExhausted => "account-quota-exhausted",
+            Self::ServiceQuotaExhausted => "service-quota-exhausted",
+            Self::TokenRefreshFailed => "token-refresh-failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+pub enum AlertPlatform {
+    /// 钉钉群机器人 Webhook。
+    Dingtalk,
+    /// 企业微信群机器人 Webhook。
+    #[value(name = "wechat-work", alias = "wechat")]
+    WechatWork,
+    /// 飞书群机器人 Webhook。
+    Feishu,
+    /// Telegram Bot API。
+    Telegram,
+    /// Discord Webhook。
+    Discord,
+    /// 自定义 Webhook，可配置消息模板。
+    Custom,
+}
+
+impl AlertPlatform {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Dingtalk => "dingtalk",
+            Self::WechatWork => "wechat-work",
+            Self::Feishu => "feishu",
+            Self::Telegram => "telegram",
+            Self::Discord => "discord",
+            Self::Custom => "custom",
         }
     }
 }
 
 #[derive(Debug, Subcommand)]
 pub enum AlertCommand {
-    /// 查看或修改告警策略。
-    #[command(
-        after_help = "示例：\n  kproxy alert config\n  kproxy alert config --low-credit-threshold-percent 15 --max-notifications 3 --suppress-window 20m"
-    )]
-    Config {
-        /// 低额度告警的起始百分比，0 表示关闭低额度告警。
-        #[arg(long, value_name = "PERCENT")]
-        low_credit_threshold_percent: Option<f64>,
-        /// 低额度递进告警的最大档位数，0 表示关闭低额度告警。
-        #[arg(long, value_name = "COUNT")]
-        max_notifications: Option<u32>,
-        /// 非额度事件的重复告警抑制窗口，例如 30s、20m、1h。
-        #[arg(long, value_name = "DURATION")]
-        suppress_window: Option<String>,
-    },
+    /// 查看一次性异常告警策略。
+    #[command(after_help = "示例：\n  kproxy alert config")]
+    Config,
     /// 列出可订阅事件及其触发条件。
     #[command(after_help = "示例：\n  kproxy alert events\n  kproxy --json alert events")]
     Events,
+    /// 列出支持的通知平台及平台专用参数。
+    #[command(after_help = "示例：\n  kproxy alert platforms\n  kproxy --json alert platforms")]
+    Platforms,
     /// 列出全部告警通知目标。
     #[command(after_help = "示例：\n  kproxy alert list\n  kproxy --json alert list")]
     List,
     /// 添加告警目标。
     #[command(
-        after_help = "先用 `kproxy alert events` 查看事件说明。\n多选可重复传入 --event，也可使用逗号分隔。\n\n示例：\n  kproxy alert add --name alerts --kind dingtalk --url https://example/hook --event token-expired --event quota-exhausted\n  kproxy alert add --name alerts --kind feishu --url https://example/hook --event low-credit,account-banned"
+        after_help = "`--platform` 表示接收 Webhook 的通知平台；先用 `kproxy alert platforms` 查看平台说明。\n用 `kproxy alert events` 查看事件说明。多选可重复传入 --event，也可使用逗号分隔。\n\n示例：\n  kproxy alert add --name alerts --platform dingtalk --url https://example/hook --event token-refresh-failed --event account-quota-exhausted\n  kproxy alert add --name alerts --platform feishu --url https://example/hook --event account-quota-exhausted,service-quota-exhausted"
     )]
     Add {
+        /// 告警目标的唯一名称。
         #[arg(long)]
         name: String,
-        #[arg(long)]
-        kind: String,
+        /// Webhook 接收平台。旧参数名 --kind 继续兼容。
+        #[arg(long = "platform", visible_alias = "kind", value_name = "PLATFORM")]
+        platform: AlertPlatform,
+        /// Webhook 接收地址。
         #[arg(long)]
         url: String,
+        /// 要订阅的异常事件；可重复传入或使用逗号分隔。
         #[arg(
             long = "event",
             value_delimiter = ',',
@@ -251,28 +271,40 @@ pub enum AlertCommand {
             value_name = "EVENT"
         )]
         events: Vec<AlertEvent>,
+        /// 创建目标但暂不启用。
         #[arg(long)]
         disabled: bool,
+        /// 钉钉机器人加签密钥；仅启用加签时需要。
         #[arg(long)]
         dingtalk_sign: Option<String>,
+        /// Telegram 目标的 chat ID；platform=telegram 时必填。
         #[arg(long)]
         telegram_chat_id: Option<String>,
+        /// 自定义 Webhook 消息模板；支持 {{event}}、{{title}}、{{message}}。
         #[arg(long)]
         custom_template: Option<String>,
     },
     /// 编辑告警目标。
     #[command(
-        after_help = "先用 `kproxy alert events` 查看事件说明。\n多选可重复传入 --event，也可使用逗号分隔；新的事件列表会整体替换原订阅。\n\n示例：\n  kproxy alert edit alerts --url https://example/new-hook\n  kproxy alert edit alerts --event token-expired --event service-degraded\n  kproxy alert edit alerts --event low-credit,quota-exhausted"
+        after_help = "目标名称既可写成位置参数，也可通过 --name 指定。\n`--event` 会整体替换原订阅；可重复传入或使用逗号分隔。\n\n示例：\n  kproxy alert edit alerts --url https://example/new-hook\n  kproxy alert edit --name alerts --event token-refresh-failed --event service-quota-exhausted\n  kproxy alert edit --name alerts --platform feishu"
     )]
     Edit {
-        /// 当前名称。
-        name: String,
+        /// 当前名称；也可使用 --name。
+        #[arg(value_name = "NAME", required_unless_present = "name")]
+        target: Option<String>,
+        /// 当前名称；与位置参数 NAME 二选一。
+        #[arg(long, value_name = "NAME", conflicts_with = "target")]
+        name: Option<String>,
+        /// 修改目标名称。
         #[arg(long)]
         rename: Option<String>,
-        #[arg(long)]
-        kind: Option<String>,
+        /// 修改 Webhook 接收平台。旧参数名 --kind 继续兼容。
+        #[arg(long = "platform", visible_alias = "kind", value_name = "PLATFORM")]
+        platform: Option<AlertPlatform>,
+        /// 修改 Webhook 接收地址。
         #[arg(long)]
         url: Option<String>,
+        /// 整体替换要订阅的异常事件；可重复传入或使用逗号分隔。
         #[arg(
             long = "event",
             value_delimiter = ',',
@@ -280,22 +312,31 @@ pub enum AlertCommand {
             value_name = "EVENT"
         )]
         events: Vec<AlertEvent>,
+        /// 清空事件订阅；目标将不再接收告警。
         #[arg(long)]
         clear_events: bool,
+        /// 启用目标。
         #[arg(long, conflicts_with = "disable")]
         enable: bool,
+        /// 停用目标，但保留配置。
         #[arg(long, conflicts_with = "enable")]
         disable: bool,
+        /// 设置钉钉机器人加签密钥。
         #[arg(long, conflicts_with = "clear_dingtalk_sign")]
         dingtalk_sign: Option<String>,
+        /// 删除钉钉机器人加签密钥。
         #[arg(long)]
         clear_dingtalk_sign: bool,
+        /// 设置 Telegram chat ID。
         #[arg(long, conflicts_with = "clear_telegram_chat_id")]
         telegram_chat_id: Option<String>,
+        /// 删除 Telegram chat ID。
         #[arg(long)]
         clear_telegram_chat_id: bool,
+        /// 设置自定义 Webhook 消息模板。
         #[arg(long, conflicts_with = "clear_custom_template")]
         custom_template: Option<String>,
+        /// 删除自定义 Webhook 消息模板。
         #[arg(long)]
         clear_custom_template: bool,
     },
@@ -867,56 +908,15 @@ fn log_model_route(request: &serde_json::Value) -> LogModelRoute<'_> {
 
 pub async fn run_alert(client: &mut AdminClient, command: AlertCommand, json: bool) -> Result<()> {
     match command {
-        AlertCommand::Config {
-            low_credit_threshold_percent,
-            max_notifications,
-            suppress_window,
-        } => {
-            let suppress_window_ms = suppress_window
-                .as_deref()
-                .map(parse_duration)
-                .transpose()?
-                .map(|seconds| {
-                    seconds
-                        .checked_mul(1_000)
-                        .ok_or_else(|| anyhow!("告警抑制窗口过大"))
-                })
-                .transpose()?;
-            if low_credit_threshold_percent.is_some()
-                || max_notifications.is_some()
-                || suppress_window_ms.is_some()
-            {
-                mutate_config_table(client, "notify", |table| {
-                    if let Some(value) = low_credit_threshold_percent {
-                        table.insert(
-                            "low_credit_threshold_percent".into(),
-                            toml::Value::Float(value),
-                        );
-                    }
-                    if let Some(value) = max_notifications {
-                        table.insert(
-                            "max_notifications".into(),
-                            toml::Value::Integer(i64::from(value)),
-                        );
-                    }
-                    if let Some(value) = suppress_window_ms {
-                        let value = i64::try_from(value)
-                            .map_err(|_| anyhow!("告警抑制窗口超过 TOML 整数范围"))?;
-                        table.insert("suppress_window_ms".into(), toml::Value::Integer(value));
-                    }
-                    Ok(())
-                })
-                .await?;
-            }
-            show_alert_config(client, json).await
-        }
+        AlertCommand::Config => show_alert_config(json),
         AlertCommand::Events => show_alert_events(json),
+        AlertCommand::Platforms => show_alert_platforms(json),
         AlertCommand::List => {
             simple_rpc(client, method::WEBHOOK_LIST, serde_json::json!({}), json).await
         }
         AlertCommand::Add {
             name,
-            kind,
+            platform,
             url,
             events,
             disabled,
@@ -930,7 +930,7 @@ pub async fn run_alert(client: &mut AdminClient, command: AlertCommand, json: bo
                 }
                 let mut table = toml::map::Map::new();
                 table.insert("name".into(), toml::Value::String(name.clone()));
-                table.insert("kind".into(), toml::Value::String(kind.clone()));
+                table.insert("kind".into(), toml::Value::String(platform.as_str().into()));
                 table.insert("url".into(), toml::Value::String(url.clone()));
                 table.insert("enabled".into(), toml::Value::Boolean(!disabled));
                 table.insert("events".into(), alert_event_array_value(&events));
@@ -945,9 +945,10 @@ pub async fn run_alert(client: &mut AdminClient, command: AlertCommand, json: bo
             Ok(())
         }
         AlertCommand::Edit {
+            target,
             name,
             rename,
-            kind,
+            platform,
             url,
             events,
             clear_events,
@@ -960,10 +961,13 @@ pub async fn run_alert(client: &mut AdminClient, command: AlertCommand, json: bo
             custom_template,
             clear_custom_template,
         } => {
+            let name = target
+                .or(name)
+                .ok_or_else(|| anyhow!("需指定告警目标名称"))?;
             mutate_config_array(client, "webhook", |array| {
                 let table = find_named_table_mut(array, &name, "告警目标")?;
                 replace_optional_string(table, "name", rename.as_deref());
-                replace_optional_string(table, "kind", kind.as_deref());
+                replace_optional_string(table, "kind", platform.map(AlertPlatform::as_str));
                 replace_optional_string(table, "url", url.as_deref());
                 replace_or_clear_optional_string(
                     table,
@@ -1039,27 +1043,20 @@ struct AlertEventInfo {
     condition: &'static str,
 }
 
-fn alert_event_catalog() -> [AlertEventInfo; 5] {
+fn alert_event_catalog() -> [AlertEventInfo; 3] {
     [
         AlertEventInfo {
-            event: AlertEvent::LowCredit.as_str(),
-            condition: "定时额度检查发现启用账号的剩余额度首次跌破 [notify] 配置的某个递进档位。",
+            event: AlertEvent::AccountQuotaExhausted.as_str(),
+            condition:
+                "单个启用账号的额度完全耗尽；同一次异常只告警一次，额度恢复后才允许再次告警。",
         },
         AlertEventInfo {
-            event: AlertEvent::AccountBanned.as_str(),
-            condition: "生成请求发生认证错误，强制刷新 Token 失败，或刷新后重试仍为认证错误，账号被封禁。",
+            event: AlertEvent::ServiceQuotaExhausted.as_str(),
+            condition: "API 代理服务共享的全部启用账号额度完全耗尽；服务恢复前只告警一次。",
         },
         AlertEventInfo {
-            event: AlertEvent::TokenExpired.as_str(),
-            condition: "后台 Token 扫描发现账号进入提前刷新窗口，并且自动刷新失败；不要求 Token 已完全过期。",
-        },
-        AlertEventInfo {
-            event: AlertEvent::QuotaExhausted.as_str(),
-            condition: "账号连续额度错误达到阈值，或代理日额度达到上限，或全部兼容账号都被判定额度耗尽。",
-        },
-        AlertEventInfo {
-            event: AlertEvent::ServiceDegraded.as_str(),
-            condition: "额度耗尽导致相关请求进入降级拒绝状态时发送；daemon、管理面和后台恢复任务保持运行。",
+            event: AlertEvent::TokenRefreshFailed.as_str(),
+            condition: "后台或请求触发的 Token 刷新失败；同一账号刷新成功前只告警一次。",
         },
     ]
 }
@@ -1078,23 +1075,82 @@ pub fn show_alert_events(json: bool) -> Result<()> {
     Ok(())
 }
 
-async fn show_alert_config(client: &mut AdminClient, json: bool) -> Result<()> {
-    let notify = effective_config(client).await?.notify;
+#[derive(serde::Serialize)]
+struct AlertPlatformInfo {
+    platform: &'static str,
+    description: &'static str,
+    platform_options: &'static str,
+}
+
+fn alert_platform_catalog() -> [AlertPlatformInfo; 6] {
+    [
+        AlertPlatformInfo {
+            platform: AlertPlatform::Dingtalk.as_str(),
+            description: "钉钉群机器人",
+            platform_options: "--dingtalk-sign（机器人启用加签时使用）",
+        },
+        AlertPlatformInfo {
+            platform: AlertPlatform::WechatWork.as_str(),
+            description: "企业微信群机器人",
+            platform_options: "无",
+        },
+        AlertPlatformInfo {
+            platform: AlertPlatform::Feishu.as_str(),
+            description: "飞书群机器人",
+            platform_options: "无",
+        },
+        AlertPlatformInfo {
+            platform: AlertPlatform::Telegram.as_str(),
+            description: "Telegram Bot API",
+            platform_options: "--telegram-chat-id（必填）",
+        },
+        AlertPlatformInfo {
+            platform: AlertPlatform::Discord.as_str(),
+            description: "Discord Webhook",
+            platform_options: "无",
+        },
+        AlertPlatformInfo {
+            platform: AlertPlatform::Custom.as_str(),
+            description: "自定义 Webhook",
+            platform_options: "--custom-template（可选）",
+        },
+    ]
+}
+
+pub fn show_alert_platforms(json: bool) -> Result<()> {
+    let platforms = alert_platform_catalog();
     if json {
-        return print_json(&notify);
+        return print_json(&platforms);
     }
-    let suppress_seconds = notify.suppress_window_ms / 1_000;
-    let suppress_seconds = i64::try_from(suppress_seconds).unwrap_or(i64::MAX);
+    let rows = platforms
+        .iter()
+        .map(|platform| {
+            vec![
+                platform.platform.into(),
+                platform.description.into(),
+                platform.platform_options.into(),
+            ]
+        })
+        .collect::<Vec<_>>();
     println!(
-        "低额度起始阈值  {:.1}%",
-        notify.low_credit_threshold_percent
+        "{}",
+        render_table(&["PLATFORM", "通知平台", "平台专用参数"], &rows)
     );
-    println!("递进告警档位    {}", notify.max_notifications);
-    println!(
-        "重复告警抑制    {}（{} ms）",
-        crate::output::format_relative(suppress_seconds),
-        notify.suppress_window_ms
-    );
+    println!("\n所有平台都需要 --url；旧参数名 --kind 继续兼容，建议新命令使用 --platform。");
+    Ok(())
+}
+
+fn show_alert_config(json: bool) -> Result<()> {
+    if json {
+        return print_json(&serde_json::json!({
+            "mode":"once_until_recovery",
+            "format":"markdown",
+            "events":alert_event_catalog().map(|event| event.event),
+        }));
+    }
+    println!("告警模式  异常期间只发送一次，恢复后再次异常才重新告警");
+    println!("消息格式  Markdown");
+    println!("事件类型  单账号额度耗尽、服务全部账号额度耗尽、Token 刷新失败");
     Ok(())
 }
 
@@ -1816,22 +1872,6 @@ async fn mutate_config_array(
     .await
 }
 
-async fn mutate_config_table(
-    client: &mut AdminClient,
-    section: &str,
-    mutate: impl FnOnce(&mut toml::map::Map<String, toml::Value>) -> Result<()>,
-) -> Result<()> {
-    mutate_config(client, |table| {
-        let nested = table
-            .entry(section)
-            .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
-            .as_table_mut()
-            .ok_or_else(|| anyhow!("{section} must be a table"))?;
-        mutate(nested)
-    })
-    .await
-}
-
 async fn mutate_config(
     client: &mut AdminClient,
     mutate: impl FnOnce(&mut toml::map::Map<String, toml::Value>) -> Result<()>,
@@ -2546,7 +2586,7 @@ pub fn print_topic(topic: Option<&str>) -> Result<()> {
             "`kproxy logs show` 查看内存中的结构化请求日志，`follow` 持续跟踪；支持 `--level`、`--account` 和 `--tail`。`kproxy logs files [--level error]` 列出实际日志文件，`logs path` 显示目录、基础路径和当前日志配置。旧的 `kproxy logs --tail ...` 与 `kproxy logs -f` 继续兼容。"
         }
         "alert" => {
-            "`kproxy alert events` 列出全部事件和触发条件；`kproxy alert config` 查看或修改低额度阈值、递进档位和重复告警抑制窗口；`kproxy alert add/edit/delete/list/test/logs` 管理钉钉、飞书等告警目标。`--event` 可重复传入或使用逗号分隔实现多选。"
+            "`kproxy alert events` 列出三类异常事件和触发条件，`kproxy alert platforms` 说明 --platform 支持的通知平台和平台专用参数；`kproxy alert config` 查看一次性告警策略。每个账号或服务异常期间只发送一次 Markdown 告警，恢复后才允许再次告警。`kproxy alert add/edit/delete/list/test/logs` 管理告警目标。"
         }
         "models" => {
             "`kproxy models` 显示账号自动探测到的 Kiro 模型；`--refresh` 先立即刷新缓存，`--mapped` 同时显示显式映射结果。自动别名解析与强制 model-map 是两层机制。"

@@ -289,9 +289,11 @@ and hot reloads the daemon:
 
 ```bash
 kproxy alert events
-kproxy alert config --low-credit-threshold-percent 10 --max-notifications 5 --suppress-window 30m
-kproxy alert add --name alerts --kind dingtalk --url https://example/hook --event token-expired,quota-exhausted
-kproxy alert edit alerts --event token-expired --event quota-exhausted
+kproxy alert platforms
+kproxy alert config
+kproxy alert add --name alerts --platform dingtalk --url https://example/hook \
+  --event token-refresh-failed,account-quota-exhausted,service-quota-exhausted
+kproxy alert edit --name alerts --event token-refresh-failed --event service-quota-exhausted
 kproxy alert delete alerts
 
 kproxy model-map add --name low-credit --source 'claude-opus-*' \
@@ -305,6 +307,11 @@ kproxy model-map delete low-credit
 subscribe to multiple events by repeating `--event` or by passing a
 comma-separated list; `alert edit --event ...` replaces the target's complete
 subscription list.
+`kproxy alert platforms` explains the notification platform selected by
+`--platform` and lists platform-specific options. The former `--kind` spelling
+remains available as a compatibility alias.
+Each account or service incident emits one Markdown alert and stays suppressed
+until that incident recovers.
 
 A mapping with `--below-credits-percent` is evaluated against each selected
 account's remaining credits. With no schedule it is active all day: it matches

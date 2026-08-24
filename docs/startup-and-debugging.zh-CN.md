@@ -260,9 +260,11 @@ cargo run -p kproxy -- config reload
 
 ```bash
 kproxy alert events
-kproxy alert config --low-credit-threshold-percent 10 --max-notifications 5 --suppress-window 30m
-kproxy alert add --name alerts --kind dingtalk --url https://example/hook --event token-expired,quota-exhausted
-kproxy alert edit alerts --event token-expired --event quota-exhausted
+kproxy alert platforms
+kproxy alert config
+kproxy alert add --name alerts --platform dingtalk --url https://example/hook \
+  --event token-refresh-failed,account-quota-exhausted,service-quota-exhausted
+kproxy alert edit --name alerts --event token-refresh-failed --event service-quota-exhausted
 kproxy alert delete alerts
 
 kproxy model-map add --name low-credit --source 'claude-opus-*' \
@@ -274,6 +276,9 @@ kproxy model-map delete low-credit
 
 `kproxy alert events` 会说明每个事件的实际触发条件。一个告警目标可重复传入 `--event`，
 也可使用逗号分隔订阅多个事件；`alert edit --event ...` 会整体替换该目标原有的事件列表。
+`kproxy alert platforms` 会说明 `--platform` 选择的通知平台及平台专用参数；旧参数名
+`--kind` 作为兼容别名继续可用。
+同一账号或服务在异常持续期间只发送一次 Markdown 告警，恢复后再次发生异常才会重新告警。
 
 带 `--below-credits-percent` 的映射按每个选中账号的剩余 Credits 判断。未配置 schedule 时
 默认全天生效；剩余额度低于阈值时命中，次月额度恢复到阈值以上后自动停止命中。
