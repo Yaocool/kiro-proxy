@@ -383,6 +383,7 @@ impl AppState {
         self.apply_runtime_config(next);
         let failures = self.reconcile_proxy_services(next).await;
         if failures.is_empty() {
+            crate::alerts::sync_quota_incidents(self).await;
             return Ok(());
         }
 
@@ -390,6 +391,7 @@ impl AppState {
         self.config.replace(previous.clone());
         self.apply_runtime_config(&previous);
         let rollback_failures = self.reconcile_proxy_services(&previous).await;
+        crate::alerts::sync_quota_incidents(self).await;
         if rollback_failures.is_empty() {
             Err(format!(
                 "proxy service apply failed; previous config restored: {apply_error}"
@@ -460,14 +462,38 @@ impl AppState {
         account_id: &str,
         force: bool,
     ) -> Result<bool, RefreshError> {
-        let changed = self
+        let (account_name, account_enabled) = if let Some(runtime) = pool.get(account_id).await {
+            let account = runtime.account.read().await;
+            (account.display_name().to_owned(), account.enabled)
+        } else {
+            (account_id.to_owned(), false)
+        };
+        match self
             .refresher()
             .refresh_account(pool, account_id, force)
-            .await?;
-        if changed {
-            self.kiro().endpoint_cache().clear_failures(account_id);
+            .await
+        {
+            Ok(changed) => {
+                if changed {
+                    self.kiro().endpoint_cache().clear_failures(account_id);
+                    crate::alerts::resolve_token_refresh_failure(self, account_id);
+                }
+                Ok(changed)
+            }
+            Err(error) => {
+                if account_enabled {
+                    crate::alerts::emit_token_refresh_failure(
+                        self,
+                        account_id,
+                        &account_name,
+                        &kproxy_translate::sanitize_error_message(&error.to_string()),
+                    );
+                } else {
+                    crate::alerts::resolve_token_refresh_failure(self, account_id);
+                }
+                Err(error)
+            }
         }
-        Ok(changed)
     }
 
     /// Refreshes every expiring account through the same cache-invalidation
@@ -477,7 +503,12 @@ impl AppState {
             .config
             .current()
             .effective_token_refresh_before_expiry();
-        let accounts = pool.snapshot().await;
+        let accounts = pool
+            .snapshot()
+            .await
+            .into_iter()
+            .filter(|account| account.enabled)
+            .collect::<Vec<_>>();
         let mut report = TokenRefreshReport {
             checked: accounts.len(),
             eligible: 0,

@@ -653,6 +653,7 @@ where
     state.replace_accounts(next);
     state.pool().replace_accounts(pool_accounts).await;
     state.request_model_refresh();
+    crate::alerts::sync_quota_incidents(state).await;
     Ok(result)
 }
 
@@ -853,6 +854,11 @@ async fn handle_account_remove(state: &Arc<AppState>, params: serde_json::Value)
     })
     .await?;
     state.kiro().endpoint_cache().clear_account(&removed);
+    state.notifier().resolve_incident(
+        kproxy_notify::WebhookEventKind::AccountQuotaExhausted,
+        Some(&removed),
+    );
+    crate::alerts::resolve_token_refresh_failure(state, &removed);
     to_value(serde_json::json!({"removed": removed}))
 }
 
@@ -868,6 +874,9 @@ async fn handle_account_set_enabled(state: &Arc<AppState>, params: serde_json::V
         }
     })
     .await?;
+    if !enabled {
+        crate::alerts::resolve_token_refresh_failure(state, &id);
+    }
     to_value(serde_json::json!({"id": id, "enabled": enabled}))
 }
 
@@ -1298,15 +1307,12 @@ fn handle_webhook_test(state: &Arc<AppState>, params: serde_json::Value) -> Hand
     use kproxy_notify::{WebhookEvent, WebhookEventKind};
     let params: WebhookTestParams = parse_params(params)?;
     let event = WebhookEvent::new(
-        WebhookEventKind::ServiceDegraded,
-        "kiro-proxy webhook test",
-        "This is a test notification from kiro-proxy.",
+        WebhookEventKind::Test,
+        "KProxy 告警测试",
+        "- **状态：** 测试消息\n- **说明：** Webhook 配置和消息投递链路可用",
     );
     let notifier = state.notifier();
-    let queued = match params.name.as_deref() {
-        Some(name) => notifier.emit_to(name, event),
-        None => notifier.emit(event),
-    };
+    let queued = notifier.emit_test(params.name.as_deref(), event);
     if queued == 0 {
         return Err(RpcError::bad_params(format!(
             "webhook not found, disabled, or not subscribed: {}",

@@ -506,15 +506,15 @@ impl Default for StorageConfig {
     }
 }
 
-/// 分级递进告警。
+/// 旧版告警节流参数，仅为兼容已有配置保留。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct NotifyConfig {
-    /// 初始低额度档位。
+    /// 旧版初始低额度档位；当前一次性异常告警不使用。
     pub low_credit_threshold_percent: f64,
-    /// 最大告警档位数。
+    /// 旧版最大告警档位数；当前一次性异常告警不使用。
     pub max_notifications: u32,
-    /// 非额度事件抑制窗口。
+    /// 旧版事件抑制窗口；当前改为异常恢复前永久去重。
     pub suppress_window_ms: u64,
 }
 
@@ -1261,7 +1261,12 @@ impl Config {
             if target.events.iter().any(|event| {
                 !matches!(
                     event.as_str(),
-                    "low-credit"
+                    "account-quota-exhausted"
+                        | "service-quota-exhausted"
+                        | "token-refresh-failed"
+                        // Legacy aliases remain valid so upgrades do not
+                        // invalidate an existing webhook configuration.
+                        | "low-credit"
                         | "account-banned"
                         | "token-expired"
                         | "quota-exhausted"
@@ -1544,14 +1549,14 @@ compression_threshold = 100
 incremental_write = true
 
 # ----------------------------------------------------------------------------
-# 告警节流
+# 告警策略兼容项
 # ----------------------------------------------------------------------------
 [notify]
-# 账号剩余额度百分比低于该值时开始告警；范围 0-100，0 表示关闭低额度告警。
+# 旧版低额度阈值，兼容已有配置；当前一次性异常告警不使用。
 low_credit_threshold_percent = 10.0
-# 从初始阈值递进到 0 期间最多发送的低额度告警档位数。
+# 旧版低额度递进档位数，兼容已有配置；当前一次性异常告警不使用。
 max_notifications = 5
-# 非额度类相同事件的重复通知抑制窗口。
+# 旧版重复抑制窗口；当前策略会在异常恢复前永久去重。
 suppress_window_ms = 1800000
 
 # ----------------------------------------------------------------------------
@@ -1689,15 +1694,17 @@ start_url = ""
 # [[webhook]]
 # 可读名称；必须唯一。
 # name = "运维群"
-# 类型："dingtalk"、"wechat-work"、"telegram"、"discord"、"feishu"、"custom"。
+# 通知平台；对应 CLI 的 --platform（旧名 --kind）。
+# 可选 "dingtalk"、"wechat-work"、"telegram"、"discord"、"feishu"、"custom"。
 # kind = "dingtalk"
 # Webhook 接收地址；启用时必须使用 http:// 或 https://。
 # url = "https://oapi.dingtalk.com/robot/send?access_token=replace-me"
 # 是否启用该目标。
 # enabled = true
-# 订阅事件；可选 low-credit、account-banned、token-expired、quota-exhausted、
-# service-degraded。空数组表示不订阅任何事件。
-# events = ["low-credit", "account-banned", "token-expired", "quota-exhausted", "service-degraded"]
+# 订阅事件；可选 account-quota-exhausted、service-quota-exhausted、
+# token-refresh-failed。空数组表示不订阅任何事件。
+# 旧名称 quota-exhausted、service-degraded、token-expired、account-banned 仍兼容。
+# events = ["account-quota-exhausted", "service-quota-exhausted", "token-refresh-failed"]
 # 钉钉加签密钥；仅 kind="dingtalk" 且机器人开启加签时需要。
 # dingtalk_sign = "SEC-replace-me"
 # Telegram chat ID；kind="telegram" 且目标启用时必填。

@@ -1,6 +1,7 @@
 //! kiro-proxy 常驻服务。
 
 mod admin;
+mod alerts;
 mod http;
 mod logging;
 mod meter;
