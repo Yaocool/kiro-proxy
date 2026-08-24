@@ -12,7 +12,6 @@ use base64::Engine;
 use bytes::BytesMut;
 use futures::StreamExt;
 use kproxy_kiro::{EventStreamDecoder, KiroError, KiroEvent, KiroResponse};
-use kproxy_notify::{WebhookEvent, WebhookEventKind};
 use kproxy_pool::{AccountLease, PoolError};
 use kproxy_translate::model::{apply_adaptive_thinking, map_model, thinking_enabled_for_model};
 use kproxy_translate::{
@@ -2457,10 +2456,7 @@ async fn execute_upstream(
             Err(PoolError::NoAvailableAccount(_))
                 if pool.all_matching_credit_exhausted(&actual_model).await =>
             {
-                notify_quota_degradation(
-                    state,
-                    "All compatible Kiro accounts have exhausted their credit allowance",
-                );
+                crate::alerts::sync_service_quota(state).await;
                 return Err(ExecuteError::Pool(PoolError::CreditsExhausted));
             }
             Err(PoolError::NoAvailableAccount(_))
@@ -2477,10 +2473,7 @@ async fn execute_upstream(
                     Err(PoolError::NoAvailableAccount(_))
                         if pool.all_matching_credit_exhausted(&actual_model).await =>
                     {
-                        notify_quota_degradation(
-                            state,
-                            "All compatible Kiro accounts have exhausted their credit allowance",
-                        );
+                        crate::alerts::sync_service_quota(state).await;
                         return Err(ExecuteError::Pool(PoolError::CreditsExhausted));
                     }
                     Err(error) => return Err(ExecuteError::Pool(error)),
@@ -2495,10 +2488,7 @@ async fn execute_upstream(
                 Err(PoolError::NoAvailableAccount(_))
                     if pool.all_matching_credit_exhausted("").await =>
                 {
-                    notify_quota_degradation(
-                        state,
-                        "All enabled Kiro accounts have exhausted their credit allowance",
-                    );
+                    crate::alerts::sync_service_quota(state).await;
                     return Err(ExecuteError::Pool(PoolError::CreditsExhausted));
                 }
                 Err(error) => return Err(ExecuteError::Pool(error)),
@@ -2727,13 +2717,12 @@ async fn execute_upstream(
                 }
                 if ban_account {
                     pool.mark_banned(&account.id).await;
-                    let mut event = WebhookEvent::new(
-                        WebhookEventKind::AccountBanned,
-                        "Kiro account disabled",
-                        "Token refresh failed after an authentication error",
+                    crate::alerts::emit_token_refresh_failure(
+                        state,
+                        &account.id,
+                        &account_name,
+                        "刷新后上游认证仍然失败",
                     );
-                    event.account_id = Some(account.id.clone());
-                    state.notifier().emit(event);
                 } else {
                     pool.record_error(&account.id).await;
                 }
@@ -2766,19 +2755,8 @@ async fn execute_upstream(
                             "failed to persist exhausted account state"
                         );
                     }
-                    let mut event = WebhookEvent::new(
-                        WebhookEventKind::QuotaExhausted,
-                        "Kiro account quota exhausted",
-                        "The account was removed from scheduling after repeated quota errors",
-                    );
-                    event.account_id = Some(account.id.clone());
-                    state.notifier().emit(event);
-                    if pool.all_matching_credit_exhausted(&actual_model).await {
-                        notify_quota_degradation(
-                            state,
-                            "All compatible Kiro accounts have exhausted their credit allowance",
-                        );
-                    }
+                    crate::alerts::sync_account_quota(state, &account.id).await;
+                    crate::alerts::sync_service_quota(state).await;
                 }
                 if !config.pool.auto_switch_on_quota_exhausted {
                     return Err(dispatch_error(
@@ -3678,12 +3656,6 @@ async fn collect_nonstream_rounds(
                 "Tool Search continuation prepared"
             );
             if let Err(error) = reservation.extend(estimated_credits) {
-                if matches!(error, MeterError::DailyLimitExceeded) {
-                    notify_quota_degradation(
-                        state,
-                        "The service daily credit limit was reached during Tool Search",
-                    );
-                }
                 return Err(ExecuteError::Meter(error));
             }
             let account = lease.account().await;
@@ -3835,12 +3807,6 @@ async fn collect_nonstream_rounds(
             .await
             .map_err(ExecuteError::Upstream)?;
             if let Err(error) = reservation.extend(estimated_credits) {
-                if matches!(error, MeterError::DailyLimitExceeded) {
-                    notify_quota_degradation(
-                        state,
-                        "The service daily credit limit was reached during Web Search",
-                    );
-                }
                 return Err(ExecuteError::Meter(error));
             }
             let account = lease.account().await;
@@ -3913,12 +3879,6 @@ async fn collect_nonstream_rounds(
         );
         debug_assert!(budget_available);
         if let Err(error) = reservation.extend(estimated_credits) {
-            if matches!(error, MeterError::DailyLimitExceeded) {
-                notify_quota_degradation(
-                    state,
-                    "The service daily credit limit was reached during auto-continuation",
-                );
-            }
             return Err(ExecuteError::Meter(error));
         }
         let account = lease.account().await;
@@ -5206,27 +5166,10 @@ fn reserve_credits(
     match state.meter.reserve(key_id, estimate) {
         Ok(reservation) => Ok(reservation),
         Err(MeterError::DailyLimitExceeded) => {
-            notify_quota_degradation(
-                state,
-                "The configured service daily credit limit has been reached",
-            );
             Err(meter_error(MeterError::DailyLimitExceeded, format))
         }
         Err(error) => Err(meter_error(error, format)),
     }
-}
-
-pub(super) fn notify_quota_degradation(state: &Arc<AppState>, reason: &str) {
-    state.notifier().emit(WebhookEvent::new(
-        WebhookEventKind::QuotaExhausted,
-        "Proxy credit quota exhausted",
-        reason,
-    ));
-    state.notifier().emit(WebhookEvent::new(
-        WebhookEventKind::ServiceDegraded,
-        "Proxy service quota degraded",
-        "Quota-bound requests are being rejected while the daemon and administration plane remain available",
-    ));
 }
 
 fn upstream_error(error: ExecuteError, format: ErrorFormat) -> ApiError {
@@ -5616,7 +5559,7 @@ mod model_tests {
     }
 
     #[tokio::test]
-    async fn quota_degradation_does_not_cancel_the_daemon() {
+    async fn service_quota_alert_does_not_cancel_the_daemon() {
         let directory = tempfile::tempdir().expect("tempdir");
         let paths = kproxy_core::paths::Paths::from_env_values(
             Some(directory.path().to_str().expect("utf8")),
@@ -5636,10 +5579,7 @@ mod model_tests {
             accounts,
         ));
 
-        notify_quota_degradation(
-            &state,
-            "All compatible Kiro accounts are below the protection threshold",
-        );
+        crate::alerts::sync_service_quota(&state).await;
 
         let shutdown = state.shutdown.clone();
         assert!(

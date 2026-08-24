@@ -533,13 +533,19 @@ pub fn response(
                     }
                     if disable_account {
                         context.state.pool().mark_banned(&failed_account_id).await;
-                        let mut event = kproxy_notify::WebhookEvent::new(
-                            kproxy_notify::WebhookEventKind::AccountBanned,
-                            "Kiro account disabled",
-                            "Token refresh failed after a streaming authentication error",
+                        let account_name = if let Some(runtime) =
+                            context.state.pool().get(&failed_account_id).await
+                        {
+                            runtime.account.read().await.display_name().to_owned()
+                        } else {
+                            failed_account_id.clone()
+                        };
+                        crate::alerts::emit_token_refresh_failure(
+                            &context.state,
+                            &failed_account_id,
+                            &account_name,
+                            "刷新后流式请求的上游认证仍然失败",
                         );
-                        event.account_id = Some(failed_account_id.clone());
-                        context.state.notifier().emit(event);
                     } else {
                         context.state.pool().record_error(&failed_account_id).await;
                     }
@@ -617,6 +623,12 @@ pub fn response(
                                 "failed to persist stream quota exhaustion"
                             );
                         }
+                        crate::alerts::sync_account_quota(
+                            &context.state,
+                            &failed_account_id,
+                        )
+                        .await;
+                        crate::alerts::sync_service_quota(&context.state).await;
                     }
                 } else if !is_auth && !is_request_rejection {
                     context.state.pool().record_error(&failed_account_id).await;
@@ -653,10 +665,7 @@ pub fn response(
                                     .all_matching_credit_exhausted(&context.kiro_model)
                                     .await
                                 {
-                                    super::handlers::notify_quota_degradation(
-                                        &context.state,
-                                        "All compatible Kiro accounts have exhausted their credit allowance",
-                                    );
+                                    crate::alerts::sync_service_quota(&context.state).await;
                                 }
                                 failed = Some(error.to_string());
                                 yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error.to_string())));
@@ -1324,12 +1333,6 @@ pub fn response(
             );
             debug_assert!(budget_available);
             if let Err(error) = context.reservation.extend(context.estimated_credits) {
-                if matches!(error, crate::meter::MeterError::DailyLimitExceeded) {
-                    super::handlers::notify_quota_degradation(
-                        &context.state,
-                        "The service daily credit limit was reached during auto-continuation",
-                    );
-                }
                 failed = Some(error.to_string());
                 yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error.to_string())));
                 break 'rounds;

@@ -1,6 +1,6 @@
 //! Non-blocking multi-target webhook notifications.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -15,27 +15,39 @@ use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 type HmacSha256 = Hmac<Sha256>;
-type LowCreditLevels = HashMap<(String, String), HashSet<usize>>;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WebhookEventKind {
-    LowCredit,
-    AccountBanned,
-    TokenExpired,
-    QuotaExhausted,
-    ServiceDegraded,
+    AccountQuotaExhausted,
+    ServiceQuotaExhausted,
+    TokenRefreshFailed,
+    Test,
 }
 
 impl WebhookEventKind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::LowCredit => "low-credit",
-            Self::AccountBanned => "account-banned",
-            Self::TokenExpired => "token-expired",
-            Self::QuotaExhausted => "quota-exhausted",
-            Self::ServiceDegraded => "service-degraded",
+            Self::AccountQuotaExhausted => "account-quota-exhausted",
+            Self::ServiceQuotaExhausted => "service-quota-exhausted",
+            Self::TokenRefreshFailed => "token-refresh-failed",
+            Self::Test => "test",
         }
+    }
+
+    fn matches_subscription(self, configured: &str) -> bool {
+        configured == self.as_str()
+            || match self {
+                // Keep existing webhook configurations working after the
+                // alert policy is narrowed to the three incident types.
+                Self::AccountQuotaExhausted => configured == "quota-exhausted",
+                Self::ServiceQuotaExhausted => {
+                    matches!(configured, "quota-exhausted" | "service-degraded")
+                }
+                Self::TokenRefreshFailed => {
+                    matches!(configured, "token-expired" | "account-banned")
+                }
+                Self::Test => false,
+            }
     }
 }
 
@@ -46,8 +58,6 @@ pub struct WebhookEvent {
     pub message: String,
     #[serde(default)]
     pub account_id: Option<String>,
-    #[serde(default)]
-    pub remaining_percent: Option<f64>,
     pub timestamp: i64,
 }
 
@@ -62,7 +72,6 @@ impl WebhookEvent {
             title: title.into(),
             message: message.into(),
             account_id: None,
-            remaining_percent: None,
             timestamp: now_secs(),
         }
     }
@@ -72,9 +81,7 @@ impl WebhookEvent {
 pub struct Notifier {
     senders: Arc<HashMap<String, mpsc::Sender<Delivery>>>,
     targets: Arc<Vec<WebhookConfig>>,
-    config: NotifyConfig,
-    suppression: Arc<Mutex<HashMap<String, i64>>>,
-    low_credit_levels: Arc<Mutex<LowCreditLevels>>,
+    active_incidents: Arc<Mutex<HashMap<String, i64>>>,
     history: Arc<Mutex<VecDeque<DeliveryLog>>>,
 }
 
@@ -96,15 +103,7 @@ struct Delivery {
 
 enum SuppressionMark {
     None,
-    LowCredit {
-        target: String,
-        account: String,
-        level: usize,
-    },
-    Window {
-        key: String,
-        timestamp: i64,
-    },
+    Incident { key: String, timestamp: i64 },
 }
 
 impl Notifier {
@@ -114,17 +113,15 @@ impl Notifier {
             config,
             queue_size,
             Arc::new(Mutex::new(HashMap::new())),
-            Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(VecDeque::new())),
         )
     }
 
     fn with_state(
         targets: Vec<WebhookConfig>,
-        config: NotifyConfig,
+        _config: NotifyConfig,
         queue_size: usize,
-        suppression: Arc<Mutex<HashMap<String, i64>>>,
-        low_credit_levels: Arc<Mutex<LowCreditLevels>>,
+        active_incidents: Arc<Mutex<HashMap<String, i64>>>,
         history: Arc<Mutex<VecDeque<DeliveryLog>>>,
     ) -> Self {
         let senders = targets
@@ -138,15 +135,13 @@ impl Notifier {
         Self {
             senders: Arc::new(senders),
             targets: Arc::new(targets),
-            config,
-            suppression,
-            low_credit_levels,
+            active_incidents,
             history,
         }
     }
 
-    /// Replace delivery targets while preserving suppression/progressive state
-    /// and delivery history across config hot reloads.
+    /// Replace delivery targets while preserving active incident state and
+    /// delivery history across config hot reloads.
     pub fn reconfigured(
         &self,
         targets: Vec<WebhookConfig>,
@@ -157,8 +152,7 @@ impl Notifier {
             targets,
             config,
             queue_size,
-            Arc::clone(&self.suppression),
-            Arc::clone(&self.low_credit_levels),
+            Arc::clone(&self.active_incidents),
             Arc::clone(&self.history),
         )
     }
@@ -171,17 +165,36 @@ impl Notifier {
         self.emit_matching(Some(name), event)
     }
 
+    /// Send an operator-requested test without requiring an event subscription
+    /// or changing incident suppression state.
+    pub fn emit_test(&self, name: Option<&str>, event: WebhookEvent) -> usize {
+        self.emit_matching_inner(name, event, true)
+    }
+
     fn emit_matching(&self, name: Option<&str>, event: WebhookEvent) -> usize {
+        self.emit_matching_inner(name, event, false)
+    }
+
+    fn emit_matching_inner(&self, name: Option<&str>, event: WebhookEvent, is_test: bool) -> usize {
         let mut queued = 0;
         for target in self.targets.iter() {
             if name.is_some_and(|name| target.name != name)
                 || !target.enabled
-                || !target.events.iter().any(|kind| kind == event.kind.as_str())
+                || (!is_test
+                    && !target
+                        .events
+                        .iter()
+                        .any(|kind| event.kind.matches_subscription(kind)))
             {
                 continue;
             }
-            let Some(mark) = self.mark_send(target, &event) else {
-                continue;
+            let mark = if is_test {
+                SuppressionMark::None
+            } else {
+                let Some(mark) = self.mark_send(target, &event) else {
+                    continue;
+                };
+                mark
             };
             let Some(sender) = self.senders.get(&target.name) else {
                 self.rollback_mark(mark);
@@ -206,49 +219,14 @@ impl Notifier {
 
     fn mark_send(&self, target: &WebhookConfig, event: &WebhookEvent) -> Option<SuppressionMark> {
         let account = event.account_id.as_deref().unwrap_or("global");
-        if event.kind == WebhookEventKind::LowCredit {
-            let Some(remaining) = event.remaining_percent else {
-                return Some(SuppressionMark::None);
-            };
-            let levels = progressive_levels(
-                self.config.low_credit_threshold_percent,
-                self.config.max_notifications,
-            );
-            let crossed = levels
-                .iter()
-                .enumerate()
-                .filter(|(_, threshold)| remaining <= **threshold)
-                .map(|(index, _)| index)
-                .collect::<Vec<_>>();
-            if crossed.is_empty() {
-                self.reset_low_credit(account);
-                return None;
-            }
-            let mut state = lock(&self.low_credit_levels);
-            let notified = state
-                .entry((target.name.clone(), account.into()))
-                .or_default();
-            if let Some(level) = crossed.into_iter().find(|level| !notified.contains(level)) {
-                notified.insert(level);
-                return Some(SuppressionMark::LowCredit {
-                    target: target.name.clone(),
-                    account: account.into(),
-                    level,
-                });
-            }
-            return None;
-        }
         let key = format!("{}:{}:{account}", target.name, event.kind.as_str());
         let now = now_millis();
-        let mut suppression = lock(&self.suppression);
-        if suppression
-            .get(&key)
-            .is_some_and(|last| now.saturating_sub(*last) < self.config.suppress_window_ms as i64)
-        {
+        let mut incidents = lock(&self.active_incidents);
+        if incidents.contains_key(&key) {
             return None;
         }
-        suppression.insert(key.clone(), now);
-        Some(SuppressionMark::Window {
+        incidents.insert(key.clone(), now);
+        Some(SuppressionMark::Incident {
             key,
             timestamp: now,
         })
@@ -257,30 +235,20 @@ impl Notifier {
     fn rollback_mark(&self, mark: SuppressionMark) {
         match mark {
             SuppressionMark::None => {}
-            SuppressionMark::LowCredit {
-                target,
-                account,
-                level,
-            } => {
-                let mut levels = lock(&self.low_credit_levels);
-                if let Some(notified) = levels.get_mut(&(target.clone(), account.clone())) {
-                    notified.remove(&level);
-                    if notified.is_empty() {
-                        levels.remove(&(target, account));
-                    }
-                }
-            }
-            SuppressionMark::Window { key, timestamp } => {
-                let mut suppression = lock(&self.suppression);
-                if suppression.get(&key) == Some(&timestamp) {
-                    suppression.remove(&key);
+            SuppressionMark::Incident { key, timestamp } => {
+                let mut incidents = lock(&self.active_incidents);
+                if incidents.get(&key) == Some(&timestamp) {
+                    incidents.remove(&key);
                 }
             }
         }
     }
 
-    pub fn reset_low_credit(&self, account_id: &str) {
-        lock(&self.low_credit_levels).retain(|(_, account), _| account != account_id);
+    /// Mark an incident as recovered so a future recurrence can alert once.
+    pub fn resolve_incident(&self, kind: WebhookEventKind, account_id: Option<&str>) {
+        let account = account_id.unwrap_or("global");
+        let suffix = format!(":{}:{account}", kind.as_str());
+        lock(&self.active_incidents).retain(|key, _| !key.ends_with(&suffix));
     }
 
     pub fn logs(&self, tail: usize) -> Vec<DeliveryLog> {
@@ -291,15 +259,6 @@ impl Notifier {
             .cloned()
             .collect()
     }
-}
-
-pub fn progressive_levels(threshold: f64, maximum: u32) -> Vec<f64> {
-    if threshold <= 0.0 || maximum == 0 {
-        return Vec::new();
-    }
-    (0..maximum)
-        .map(|index| threshold * (maximum - index) as f64 / maximum as f64)
-        .collect()
 }
 
 async fn worker(
@@ -375,7 +334,7 @@ async fn send(client: &Client, target: &WebhookConfig, event: &WebhookEvent) -> 
 }
 
 fn payload(target: &WebhookConfig, event: &WebhookEvent) -> Result<(String, Value), String> {
-    let text = format!("{}\n{}", event.title, event.message);
+    let markdown = format!("### {}\n\n{}", event.title, event.message);
     match target.kind.as_str() {
         "dingtalk" => {
             let url = if let Some(secret) = &target.dingtalk_sign {
@@ -383,34 +342,60 @@ fn payload(target: &WebhookConfig, event: &WebhookEvent) -> Result<(String, Valu
             } else {
                 target.url.clone()
             };
-            Ok((url, json!({"msgtype":"text","text":{"content":text}})))
+            Ok((
+                url,
+                json!({"msgtype":"markdown","markdown":{"title":event.title,"text":markdown}}),
+            ))
         }
         "wechat-work" | "wechat" => Ok((
             target.url.clone(),
-            json!({"msgtype":"text","text":{"content":text}}),
+            json!({"msgtype":"markdown","markdown":{"content":markdown}}),
         )),
         "feishu" => Ok((
             target.url.clone(),
-            json!({"msg_type":"text","content":{"text":text}}),
+            json!({
+                "msg_type":"interactive",
+                "card":{
+                    "header":{"title":{"tag":"plain_text","content":event.title}},
+                    "elements":[{"tag":"markdown","content":event.message}]
+                }
+            }),
         )),
         "telegram" => Ok((
             target.url.clone(),
-            json!({"chat_id":target.telegram_chat_id,"text":text}),
+            json!({"chat_id":target.telegram_chat_id,"text":markdown,"parse_mode":"Markdown"}),
         )),
-        "discord" => Ok((target.url.clone(), json!({"content":text}))),
+        "discord" => Ok((target.url.clone(), json!({"content":markdown}))),
         "custom" => {
-            let body = target
-                .custom_template
-                .as_deref()
-                .unwrap_or(r#"{"event":"{{event}}","title":"{{title}}","message":"{{message}}"}"#)
-                .replace("{{event}}", event.kind.as_str())
-                .replace("{{title}}", &event.title)
-                .replace("{{message}}", &event.message);
-            let value = serde_json::from_str(&body).unwrap_or_else(|_| json!({"text":body}));
+            let value = if let Some(template) = target.custom_template.as_deref() {
+                let json_body = template
+                    .replace("{{event}}", &json_string_fragment(event.kind.as_str()))
+                    .replace("{{title}}", &json_string_fragment(&event.title))
+                    .replace("{{message}}", &json_string_fragment(&event.message));
+                serde_json::from_str(&json_body).unwrap_or_else(|_| {
+                    let text = template
+                        .replace("{{event}}", event.kind.as_str())
+                        .replace("{{title}}", &event.title)
+                        .replace("{{message}}", &event.message);
+                    json!({"text":text})
+                })
+            } else {
+                json!({
+                    "event":event.kind.as_str(),
+                    "title":event.title,
+                    "message":event.message,
+                })
+            };
             Ok((target.url.clone(), value))
         }
         kind => Err(format!("unknown webhook kind {kind}")),
     }
+}
+
+fn json_string_fragment(value: &str) -> String {
+    serde_json::to_string(value)
+        .map(|encoded| encoded[1..encoded.len().saturating_sub(1)].to_owned())
+        .unwrap_or_default()
 }
 
 fn signed_dingtalk_url(url: &str, secret: &str) -> Result<String, String> {
@@ -451,14 +436,46 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 mod tests {
     use super::*;
 
+    fn target(kind: &str, events: &[&str]) -> WebhookConfig {
+        WebhookConfig {
+            name: kind.into(),
+            kind: kind.into(),
+            url: "https://example.com/hook".into(),
+            enabled: true,
+            events: events.iter().map(|event| (*event).into()).collect(),
+            dingtalk_sign: None,
+            telegram_chat_id: Some("1".into()),
+            custom_template: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn incidents_alert_once_until_resolved() {
+        let target = target("dingtalk", &["account-quota-exhausted"]);
+        let notifier = Notifier::new(vec![target.clone()], NotifyConfig::default(), 1);
+        let mut event = WebhookEvent::new(WebhookEventKind::AccountQuotaExhausted, "title", "body");
+        event.account_id = Some("acc_1".into());
+
+        assert!(notifier.mark_send(&target, &event).is_some());
+        assert!(notifier.mark_send(&target, &event).is_none());
+        notifier.resolve_incident(WebhookEventKind::AccountQuotaExhausted, Some("acc_1"));
+        assert!(notifier.mark_send(&target, &event).is_some());
+    }
+
     #[test]
-    fn progressive_alert_levels_match_typescript_behavior() {
-        assert_eq!(progressive_levels(10.0, 5), vec![10.0, 8.0, 6.0, 4.0, 2.0]);
+    fn legacy_subscriptions_map_to_the_narrowed_incidents() {
+        assert!(WebhookEventKind::AccountQuotaExhausted.matches_subscription("quota-exhausted"));
+        assert!(WebhookEventKind::ServiceQuotaExhausted.matches_subscription("service-degraded"));
+        assert!(WebhookEventKind::TokenRefreshFailed.matches_subscription("token-expired"));
     }
 
     #[test]
     fn all_six_payload_kinds_are_supported() {
-        let event = WebhookEvent::new(WebhookEventKind::ServiceDegraded, "title", "body");
+        let event = WebhookEvent::new(
+            WebhookEventKind::ServiceQuotaExhausted,
+            "title",
+            "- **状态：** 异常",
+        );
         for kind in [
             "dingtalk",
             "wechat-work",
@@ -467,18 +484,33 @@ mod tests {
             "discord",
             "custom",
         ] {
-            let target = WebhookConfig {
-                name: kind.into(),
-                kind: kind.into(),
-                url: "https://example.com/hook".into(),
-                enabled: true,
-                events: vec!["service-degraded".into()],
-                dingtalk_sign: None,
-                telegram_chat_id: Some("1".into()),
-                custom_template: None,
-            };
+            let target = target(kind, &["service-quota-exhausted"]);
             assert!(payload(&target, &event).is_ok(), "{kind}");
         }
+    }
+
+    #[test]
+    fn native_webhook_payloads_use_markdown() {
+        let event = WebhookEvent::new(
+            WebhookEventKind::TokenRefreshFailed,
+            "Token 刷新失败",
+            "- **账号：** `user@example.com`",
+        );
+        let (_, dingtalk) = payload(&target("dingtalk", &[]), &event).expect("dingtalk");
+        assert_eq!(dingtalk["msgtype"], "markdown");
+        assert!(dingtalk["markdown"]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("**账号：**")));
+
+        let (_, wechat) = payload(&target("wechat-work", &[]), &event).expect("wechat");
+        assert_eq!(wechat["msgtype"], "markdown");
+        let (_, feishu) = payload(&target("feishu", &[]), &event).expect("feishu");
+        assert_eq!(feishu["msg_type"], "interactive");
+        assert_eq!(feishu["card"]["elements"][0]["tag"], "markdown");
+
+        let (_, custom) = payload(&target("custom", &[]), &event).expect("custom");
+        assert_eq!(custom["event"], "token-refresh-failed");
+        assert_eq!(custom["message"], "- **账号：** `user@example.com`");
     }
 
     #[test]

@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::FutureExt;
-use kproxy_notify::{WebhookEvent, WebhookEventKind};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -431,13 +430,6 @@ fn spawn_token_refresh(state: Arc<AppState>, shutdown: CancellationToken) {
                         }
                         for (account_id, account_name, error) in &report.failures {
                             warn!(%account_id, %account_name, %error, "background token refresh failed");
-                            let mut event = WebhookEvent::new(
-                                WebhookEventKind::TokenExpired,
-                                "Kiro token refresh failed",
-                                error.to_string(),
-                            );
-                            event.account_id = Some(account_id.clone());
-                            state.notifier().emit(event);
                         }
                         if !report.refreshed.is_empty() {
                             if let Err(error) = persist_pool_accounts(&state).await {
@@ -605,15 +597,9 @@ async fn status_check(state: &Arc<AppState>) -> anyhow::Result<String> {
     let accounts = pool.snapshot().await;
     let mut healthy = 0;
     let mut failed = 0;
-    for mut account in accounts.into_iter().filter(|account| account.enabled) {
+    for account in accounts.into_iter().filter(|account| account.enabled) {
         let status_ok = match refresh_account_usage(state, &pool, &account.id).await {
-            Ok(true) => {
-                if let Some(runtime) = pool.get(&account.id).await {
-                    account = runtime.account.read().await.clone();
-                }
-                true
-            }
-            Ok(false) => true,
+            Ok(_) => true,
             Err(error) => {
                 debug!(
                     account_id = %account.id,
@@ -624,25 +610,13 @@ async fn status_check(state: &Arc<AppState>) -> anyhow::Result<String> {
                 false
             }
         };
-        if let Some(usage) = &account.usage {
-            if usage.limit > 0.0 {
-                let remaining = (100.0 - usage.percent_used).clamp(0.0, 100.0);
-                let mut event = WebhookEvent::new(
-                    WebhookEventKind::LowCredit,
-                    "Kiro account credit is low",
-                    format!("{remaining:.1}% credit remains"),
-                );
-                event.account_id = Some(account.id.clone());
-                event.remaining_percent = Some(remaining);
-                state.notifier().emit(event);
-            }
-        }
         if status_ok {
             healthy += 1;
         } else {
             failed += 1;
         }
     }
+    crate::alerts::sync_quota_incidents(state).await;
     persist_pool_accounts(state).await?;
     Ok(format!("ok: {healthy} healthy, {failed} failed"))
 }
