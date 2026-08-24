@@ -2059,17 +2059,15 @@ pub async fn edit_config(client: &mut AdminClient) -> Result<()> {
         .await
         .with_context(|| format!("读取 {} 失败", path.display()))?;
     let editor = resolve_editor()?;
-    let status = tokio::process::Command::new(&editor.program)
-        .args(&editor.args)
-        .arg(&path)
-        .status()
-        .await
-        .with_context(|| {
-            format!(
-                "启动编辑器 {} 失败；请确认命令已安装，或通过 $VISUAL/$EDITOR 指定编辑器",
-                editor.program.display()
-            )
-        })?;
+    let mut command = tokio::process::Command::new(&editor.program);
+    command.args(&editor.args).arg(&path);
+    ensure_utf8_editor_locale(&mut command);
+    let status = command.status().await.with_context(|| {
+        format!(
+            "启动编辑器 {} 失败；请确认命令已安装，或通过 $VISUAL/$EDITOR 指定编辑器",
+            editor.program.display()
+        )
+    })?;
     if !status.success() {
         return Err(anyhow!("编辑器退出状态为 {status}"));
     }
@@ -2211,6 +2209,7 @@ async fn write_config_backup(path: &Path, contents: &[u8]) -> Result<PathBuf> {
 }
 
 const DEFAULT_EDITORS: [&str; 3] = ["vim", "vi", "nano"];
+const UTF8_EDITOR_LOCALE: &str = "C.UTF-8";
 
 #[derive(Debug, PartialEq, Eq)]
 struct EditorCommand {
@@ -2250,6 +2249,39 @@ fn parse_editor(configured: &str) -> Result<EditorCommand> {
     Ok(EditorCommand {
         program: PathBuf::from(program),
         args: parts.collect(),
+    })
+}
+
+fn ensure_utf8_editor_locale(command: &mut tokio::process::Command) {
+    if editor_needs_utf8_locale(
+        std::env::var_os("LC_ALL").as_deref(),
+        std::env::var_os("LC_CTYPE").as_deref(),
+        std::env::var_os("LANG").as_deref(),
+    ) {
+        command
+            .env("LANG", UTF8_EDITOR_LOCALE)
+            .env("LC_ALL", UTF8_EDITOR_LOCALE);
+    }
+}
+
+fn editor_needs_utf8_locale(
+    lc_all: Option<&std::ffi::OsStr>,
+    lc_ctype: Option<&std::ffi::OsStr>,
+    lang: Option<&std::ffi::OsStr>,
+) -> bool {
+    let effective = [lc_all, lc_ctype, lang]
+        .into_iter()
+        .flatten()
+        .find(|value| !value.is_empty());
+    effective.is_none_or(|value| {
+        !value
+            .to_string_lossy()
+            .bytes()
+            .filter(u8::is_ascii_alphanumeric)
+            .map(|byte| byte.to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .windows(4)
+            .any(|window| window == b"utf8")
     })
 }
 
@@ -2644,6 +2676,33 @@ mod tests {
             }
         );
         assert!(parse_editor("code '").is_err());
+    }
+
+    #[test]
+    fn editor_uses_utf8_locale_when_effective_locale_is_not_utf8() {
+        use std::ffi::OsStr;
+
+        assert!(editor_needs_utf8_locale(None, None, None));
+        assert!(editor_needs_utf8_locale(
+            Some(OsStr::new("C")),
+            Some(OsStr::new("zh_CN.UTF-8")),
+            Some(OsStr::new("zh_CN.UTF-8")),
+        ));
+        assert!(editor_needs_utf8_locale(
+            None,
+            None,
+            Some(OsStr::new("zh_CN.GB18030")),
+        ));
+        assert!(!editor_needs_utf8_locale(
+            None,
+            Some(OsStr::new("C.utf8")),
+            Some(OsStr::new("C")),
+        ));
+        assert!(!editor_needs_utf8_locale(
+            None,
+            None,
+            Some(OsStr::new("en_US.UTF-8")),
+        ));
     }
 
     #[cfg(unix)]

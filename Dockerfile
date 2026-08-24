@@ -31,7 +31,9 @@ RUN apt-get update \
     && useradd --system --uid 10001 --gid kproxy --home /var/lib/kproxy kproxy \
     && install -d -o kproxy -g kproxy -m 0700 /var/lib/kproxy
 COPY deploy/entrypoint.sh /usr/local/bin/kproxy-entrypoint
-ENV KPROXY_HOME=/var/lib/kproxy
+ENV LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    KPROXY_HOME=/var/lib/kproxy
 EXPOSE 5580
 USER kproxy:kproxy
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/kproxy-entrypoint"]
