@@ -39,7 +39,7 @@ use super::prompt_cache::PromptCacheProfile;
 use super::request_trace_id;
 use super::response::{
     ClaudeServerEvent, CompactionIterationUsage, DecodedResponse, OpenAiToolIdentity,
-    StopSequenceFilter, ToolLeakFilter,
+    StopSequenceFilter, ThinkingContentFilter, ToolLeakFilter,
 };
 use super::stream::{self, StreamContext, StreamProtocol};
 use super::usage::{fallback_credits, fill_missing_usage};
@@ -1118,6 +1118,7 @@ async fn handle_claude(
                 buffer_tool_calls: config.features.buffer_tool_calls,
                 tool_call_buffer_delay_ms: config.features.tool_call_buffer_delay_ms,
                 enable_tool_leak_filter: config.features.enable_tool_leak_filter,
+                thinking_enabled: decision.enabled,
                 thinking_output_format: config.features.thinking_output_format,
                 include_usage_chunk: false,
                 web_tool_names,
@@ -1146,6 +1147,7 @@ async fn handle_claude(
         request_id,
         path,
         request,
+        decision.enabled,
         mapped_model,
         kiro_model,
         model_path,
@@ -1395,6 +1397,7 @@ async fn handle_openai(
                 buffer_tool_calls: config.features.buffer_tool_calls,
                 tool_call_buffer_delay_ms: config.features.tool_call_buffer_delay_ms,
                 enable_tool_leak_filter: config.features.enable_tool_leak_filter,
+                thinking_enabled: decision.enabled,
                 thinking_output_format: config.features.thinking_output_format,
                 include_usage_chunk,
                 web_tool_names: std::collections::HashMap::new(),
@@ -1423,6 +1426,7 @@ async fn handle_openai(
         request_id,
         path,
         request,
+        decision.enabled,
         mapped_model,
         kiro_model,
         model_path,
@@ -3177,6 +3181,7 @@ async fn collect_nonstream_rounds(
     compact: bool,
     max_output_tokens: u32,
     stop_sequences: &[String],
+    thinking_enabled: bool,
     tool_search: Option<&Arc<ClaudeToolSearchCatalog>>,
     max_tool_search_operations: u32,
     mut tool_search_operations: u32,
@@ -3218,27 +3223,39 @@ async fn collect_nonstream_rounds(
             .map_err(ExecuteError::Upstream)?;
         let event_count = events.len();
         let mut leak_filter = ToolLeakFilter::new(config.features.enable_tool_leak_filter);
+        let mut thinking_filter = ThinkingContentFilter::new(thinking_enabled);
         let mut stop_filter = StopSequenceFilter::new(stop_sequences);
         let mut visible_text = String::new();
         let mut stop_matched = false;
         'events: for event in events {
             for event in leak_filter.push(event) {
-                if push_nonstream_event(&mut decoded, &mut stop_filter, &mut visible_text, event)
+                for event in thinking_filter.push(event) {
+                    if push_nonstream_event(
+                        &mut decoded,
+                        &mut stop_filter,
+                        &mut visible_text,
+                        event,
+                    )
                     .map_err(|message| {
                         ExecuteError::Upstream(KiroError {
                             status: None,
                             endpoint: endpoint.clone(),
                             message,
                         })
-                    })?
-                {
-                    stop_matched = true;
-                    break 'events;
+                    })? {
+                        stop_matched = true;
+                        break 'events;
+                    }
                 }
             }
         }
         if !stop_matched {
+            let mut trailing_events = Vec::new();
             for event in leak_filter.finish() {
+                trailing_events.extend(thinking_filter.push(event));
+            }
+            trailing_events.extend(thinking_filter.finish());
+            for event in trailing_events {
                 if push_nonstream_event(&mut decoded, &mut stop_filter, &mut visible_text, event)
                     .map_err(|message| {
                         ExecuteError::Upstream(KiroError {
@@ -4115,6 +4132,7 @@ async fn nonstream_claude(
     request_id: String,
     path: String,
     request: ClaudeRequest,
+    thinking_enabled: bool,
     mapped_model: String,
     kiro_model: String,
     model_path: Vec<String>,
@@ -4150,6 +4168,7 @@ async fn nonstream_claude(
         compact,
         request.max_tokens,
         &request.stop_sequences,
+        thinking_enabled,
         tool_search.as_ref(),
         max_tool_search_operations,
         tool_search_operations,
@@ -4243,6 +4262,7 @@ async fn nonstream_openai(
     request_id: String,
     path: String,
     request: OpenAiRequest,
+    thinking_enabled: bool,
     mapped_model: String,
     kiro_model: String,
     model_path: Vec<String>,
@@ -4267,6 +4287,7 @@ async fn nonstream_openai(
         false,
         max_tokens,
         &[],
+        thinking_enabled,
         None,
         0,
         0,

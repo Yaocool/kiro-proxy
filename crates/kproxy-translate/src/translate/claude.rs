@@ -269,7 +269,24 @@ fn assistant_parts(
     completed_server_tool_ids: &HashSet<String>,
     web_search_replay: Option<&super::WebSearchReplayCodec>,
 ) -> (String, Vec<KiroToolUse>) {
-    let mut text = content_text(content);
+    // Claude Code returns prior thinking blocks verbatim on later turns. Kiro
+    // has no compatible signed-thinking history type, so flattening those
+    // blocks into assistant text leaks hidden reasoning and can make a later
+    // `thinking.type = "disabled"` turn imitate it. Preserve only visible
+    // assistant text and proxy compaction checkpoints.
+    let mut text = match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block.get("type").and_then(Value::as_str) {
+                Some("text") => block.get("text").and_then(Value::as_str),
+                Some("compaction") => block.get("content").and_then(Value::as_str),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    };
     if let Some(blocks) = content.as_array() {
         for block in blocks {
             if block.get("type").and_then(Value::as_str) != Some("web_search_tool_result") {
@@ -695,6 +712,35 @@ mod tests {
             .iter()
             .filter_map(|message| message.user_input_message.as_ref())
             .all(|message| !message.content.contains("governing system instruction")));
+    }
+
+    #[test]
+    fn assistant_thinking_history_is_not_flattened_into_kiro_text() {
+        let request: ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-sonnet-4.6",
+            "max_tokens":4096,
+            "thinking":{"type":"disabled"},
+            "messages":[
+                {"role":"user","content":"first turn"},
+                {"role":"assistant","content":[
+                    {"type":"thinking","thinking":"private prior reasoning","signature":"placeholder"},
+                    {"type":"text","text":"visible prior answer"}
+                ]},
+                {"role":"user","content":"continue without thinking"}
+            ]
+        }))
+        .expect("request");
+
+        let payload = claude_to_kiro(
+            &request,
+            &TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR"),
+        );
+        let assistant = payload.conversation_state.history[1]
+            .assistant_response_message
+            .as_ref()
+            .expect("assistant history");
+        assert_eq!(assistant.content, "visible prior answer");
+        assert!(!assistant.content.contains("private prior reasoning"));
     }
 
     #[test]

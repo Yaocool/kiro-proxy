@@ -45,6 +45,134 @@ pub struct StopSequenceFilter {
     visible_bytes: usize,
 }
 
+const THINKING_START_TAG: &str = "<thinking>";
+const THINKING_END_TAG: &str = "</thinking>";
+
+/// Normalizes Kiro's two thinking representations before protocol encoding.
+///
+/// Kiro usually emits `reasoningContentEvent`, but it can fall back to literal
+/// `<thinking>...</thinking>` text inside `assistantResponseEvent`. Tags may be
+/// split across arbitrary upstream chunks, so a small suffix must be retained
+/// until the next event resolves it. When thinking was disabled for the actual
+/// request, both representations are consumed without exposing their content.
+#[derive(Debug)]
+pub struct ThinkingContentFilter {
+    enabled: bool,
+    pending: String,
+    in_tagged_thinking: bool,
+}
+
+impl ThinkingContentFilter {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            pending: String::new(),
+            in_tagged_thinking: false,
+        }
+    }
+
+    pub fn push(&mut self, event: KiroEvent) -> Vec<KiroEvent> {
+        match event {
+            KiroEvent::AssistantResponse { content } => {
+                self.pending.push_str(&content);
+                self.drain(false)
+            }
+            KiroEvent::Reasoning { content } => {
+                let mut output = self.drain(true);
+                if self.enabled && !content.is_empty() {
+                    output.push(KiroEvent::Reasoning { content });
+                }
+                output
+            }
+            event => {
+                let mut output = self.drain(true);
+                output.push(event);
+                output
+            }
+        }
+    }
+
+    pub fn finish(&mut self) -> Vec<KiroEvent> {
+        self.drain(true)
+    }
+
+    fn drain(&mut self, finish: bool) -> Vec<KiroEvent> {
+        let mut output = Vec::new();
+        loop {
+            if self.in_tagged_thinking {
+                if let Some(end) = self.pending.find(THINKING_END_TAG) {
+                    let content = take_prefix(&mut self.pending, end);
+                    self.pending.drain(..THINKING_END_TAG.len());
+                    self.push_reasoning(&mut output, content);
+                    self.in_tagged_thinking = false;
+                    continue;
+                }
+                let split = if finish {
+                    self.pending.len()
+                } else {
+                    safe_prefix_len(&self.pending, THINKING_END_TAG)
+                };
+                if split > 0 {
+                    let content = take_prefix(&mut self.pending, split);
+                    self.push_reasoning(&mut output, content);
+                }
+                if finish {
+                    self.in_tagged_thinking = false;
+                }
+                break;
+            }
+
+            if let Some(start) = self.pending.find(THINKING_START_TAG) {
+                let content = take_prefix(&mut self.pending, start);
+                self.pending.drain(..THINKING_START_TAG.len());
+                push_text(&mut output, content);
+                self.in_tagged_thinking = true;
+                continue;
+            }
+            let split = if finish {
+                self.pending.len()
+            } else {
+                safe_prefix_len(&self.pending, THINKING_START_TAG)
+            };
+            if split > 0 {
+                let content = take_prefix(&mut self.pending, split);
+                push_text(&mut output, content);
+            }
+            break;
+        }
+        output
+    }
+
+    fn push_reasoning(&self, output: &mut Vec<KiroEvent>, content: String) {
+        if self.enabled && !content.is_empty() {
+            output.push(KiroEvent::Reasoning { content });
+        }
+    }
+}
+
+fn safe_prefix_len(value: &str, delimiter: &str) -> usize {
+    let max_retained = value.len().min(delimiter.len().saturating_sub(1));
+    for retained in (1..=max_retained).rev() {
+        let split = value.len() - retained;
+        if value.is_char_boundary(split)
+            && delimiter.as_bytes().starts_with(&value.as_bytes()[split..])
+        {
+            return split;
+        }
+    }
+    value.len()
+}
+
+fn take_prefix(value: &mut String, end: usize) -> String {
+    value.drain(..end).collect()
+}
+
+fn push_text(output: &mut Vec<KiroEvent>, content: String) {
+    if !content.is_empty() {
+        output.push(KiroEvent::AssistantResponse { content });
+    }
+}
+
 #[derive(Debug)]
 struct CompiledStopSequence {
     value: String,
@@ -1092,6 +1220,81 @@ mod tests {
 
     fn replay_codec() -> WebSearchReplayCodec {
         WebSearchReplayCodec::from_key([0x5A; 32])
+    }
+
+    #[test]
+    fn tagged_thinking_is_normalized_across_chunk_boundaries() {
+        let mut filter = ThinkingContentFilter::new(true);
+        let mut events = filter.push(KiroEvent::AssistantResponse {
+            content: "before <thin".into(),
+        });
+        events.extend(filter.push(KiroEvent::AssistantResponse {
+            content: "king>hidden</think".into(),
+        }));
+        events.extend(filter.push(KiroEvent::AssistantResponse {
+            content: "ing>after".into(),
+        }));
+        events.extend(filter.finish());
+
+        assert_eq!(
+            events,
+            vec![
+                KiroEvent::AssistantResponse {
+                    content: "before ".into()
+                },
+                KiroEvent::Reasoning {
+                    content: "hidden".into()
+                },
+                KiroEvent::AssistantResponse {
+                    content: "after".into()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn disabled_thinking_suppresses_native_and_tagged_reasoning() {
+        let mut filter = ThinkingContentFilter::new(false);
+        let mut events = filter.push(KiroEvent::AssistantResponse {
+            content: "before <thinking>hidden</thinking>after".into(),
+        });
+        events.extend(filter.push(KiroEvent::Reasoning {
+            content: "also hidden".into(),
+        }));
+        events.extend(filter.finish());
+
+        assert_eq!(
+            events,
+            vec![
+                KiroEvent::AssistantResponse {
+                    content: "before ".into()
+                },
+                KiroEvent::AssistantResponse {
+                    content: "after".into()
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn incomplete_start_tag_is_preserved_as_text_on_finish() {
+        let mut filter = ThinkingContentFilter::new(true);
+        let mut events = filter.push(KiroEvent::AssistantResponse {
+            content: "literal <thin".into(),
+        });
+        events.extend(filter.finish());
+
+        let text = events
+            .iter()
+            .filter_map(|event| match event {
+                KiroEvent::AssistantResponse { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert_eq!(text, "literal <thin");
+        assert!(events
+            .iter()
+            .all(|event| matches!(event, KiroEvent::AssistantResponse { .. })));
     }
 
     #[test]
