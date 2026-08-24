@@ -418,8 +418,9 @@ priority order.
 `kproxy logs show` and `follow` read structured request records retained by the
 daemon. `kproxy logs files` discovers the physical date/severity shards and prints
 their sizes and complete paths; `kproxy logs path` prints the active directory,
-base path, format, and filter. The legacy `kproxy logs --tail ...` and `-f` forms
-remain supported.
+base path, format, and filter. When invoked through the Docker host wrapper, both
+path commands also report the named volume's real path on the Docker host. The
+legacy `kproxy logs --tail ...` and `-f` forms remain supported.
 
 `kproxy stats` reports aggregate operational traffic, success, token, credit, and
 latency metrics; it does not replace per-request logs. Its default output is a

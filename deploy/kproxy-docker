@@ -313,6 +313,17 @@ case "$lifecycle_action" in
     ;;
 esac
 
+# Tell log path commands where the persistent data directory is mounted on the
+# Docker host. Avoid an extra inspect call for unrelated commands.
+KPROXY_WRAPPER_HOST_DATA_DIR=""
+for argument in "$@"; do
+  if [ "$argument" = "logs" ]; then
+    KPROXY_WRAPPER_HOST_DATA_DIR="$(docker inspect --format '{{range .Mounts}}{{if eq .Destination "/var/lib/kproxy"}}{{.Source}}{{end}}{{end}}' "$container_id" 2>/dev/null || true)"
+    break
+  fi
+done
+export KPROXY_WRAPPER_HOST_DATA_DIR
+
 # A host path is not visible inside an already-running container. For SSO CSV
 # imports, stream a readable host file through stdin and tell the container CLI
 # to consume that stream. Container paths continue to work when no host file
@@ -347,6 +358,7 @@ if [ -n "$host_batch_file" ] && [ "$host_batch_file" != "-" ] && [ -e "$host_bat
   [ -r "$host_batch_file" ] || fail "host batch file is not readable: $host_batch_file"
   exec docker exec -i \
     -e KPROXY_WRAPPER_BATCH_STDIN=1 \
+    -e KPROXY_WRAPPER_HOST_DATA_DIR \
     "$container_id" /usr/local/bin/kproxy "$@" < "$host_batch_file"
 fi
 
@@ -370,7 +382,10 @@ if [ -t 0 ] && [ -t 1 ]; then
     -e "TERM=$terminal_type" \
     -e "EDITOR=$editor" \
     -e "VISUAL=$visual" \
+    -e KPROXY_WRAPPER_HOST_DATA_DIR \
     "$container_id" /usr/local/bin/kproxy "$@"
 else
-  exec docker exec -i "$container_id" /usr/local/bin/kproxy "$@"
+  exec docker exec -i \
+    -e KPROXY_WRAPPER_HOST_DATA_DIR \
+    "$container_id" /usr/local/bin/kproxy "$@"
 fi

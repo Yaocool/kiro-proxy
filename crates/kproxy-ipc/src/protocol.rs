@@ -536,6 +536,9 @@ pub struct ConfigPathResult {
 pub struct LogFileView {
     /// Absolute or daemon-working-directory-relative file path.
     pub path: String,
+    /// Corresponding path on the Docker host when supplied by the host wrapper.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_path: Option<String>,
     /// Log level partition represented by this file.
     pub level: String,
     /// UTC date partition in YYYY-MM-DD form.
@@ -552,8 +555,14 @@ pub struct LogFileView {
 pub struct LogFilesResult {
     /// Configured base path before date/level partition suffixes are added.
     pub base_path: String,
+    /// Corresponding base path on the Docker host when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_base_path: Option<String>,
     /// Directory containing physical log files.
     pub directory: String,
+    /// Corresponding directory on the Docker host when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_directory: Option<String>,
     /// Active formatter (`json` or `pretty`).
     pub format: String,
     /// Active tracing filter expression.

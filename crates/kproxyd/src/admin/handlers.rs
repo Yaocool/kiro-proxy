@@ -107,6 +107,7 @@ async fn handle_log_files(state: &Arc<AppState>) -> Handled {
         .into_iter()
         .map(|file| LogFileView {
             path: file.path.display().to_string(),
+            host_path: None,
             level: file.level,
             date: file.date,
             size_bytes: file.size_bytes,
@@ -118,7 +119,9 @@ async fn handle_log_files(state: &Arc<AppState>) -> Handled {
         .unwrap_or_else(|| std::path::Path::new("."));
     to_value(LogFilesResult {
         base_path: base_path.display().to_string(),
+        host_base_path: None,
         directory: directory.display().to_string(),
+        host_directory: None,
         format: config.log.format.clone(),
         level_filter: config.log.level.clone(),
         files,
