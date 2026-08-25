@@ -106,14 +106,48 @@ pub fn can_resolve_dynamic_model(model: &str, available: &[String]) -> bool {
 }
 
 fn normalize_model_name(model: &str) -> String {
-    model
+    let normalized = model
         .trim()
         .to_ascii_lowercase()
         .replace(['_', '.'], "-")
         .split('-')
         .filter(|part| !part.is_empty())
         .collect::<Vec<_>>()
-        .join("-")
+        .join("-");
+    expand_compact_claude_alias(&normalized).unwrap_or(normalized)
+}
+
+/// Expands common client shorthands such as `opus5` and `sonnet4.6` into the
+/// same normalized family/version shape as Kiro's canonical model IDs. Only
+/// recognized Claude families followed exclusively by a numeric version are
+/// expanded, so arbitrary model names remain untouched.
+fn expand_compact_claude_alias(normalized: &str) -> Option<String> {
+    let alias = normalized
+        .strip_prefix("claude-")
+        .or_else(|| normalized.strip_prefix("claude"))
+        .unwrap_or(normalized);
+    for family in ["opus", "sonnet", "haiku"] {
+        let Some(version) = alias.strip_prefix(family) else {
+            continue;
+        };
+        let version = version.strip_prefix('-').unwrap_or(version);
+        if version.is_empty()
+            || !version
+                .chars()
+                .all(|character| character.is_ascii_digit() || matches!(character, '-' | '.'))
+            || !version.chars().any(|character| character.is_ascii_digit())
+        {
+            return None;
+        }
+        let version = version
+            .replace('.', "-")
+            .split('-')
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("-");
+        return Some(format!("claude-{family}-{version}"));
+    }
+    None
 }
 
 fn prefix_version_match(longer: &str, shorter: &str) -> bool {
@@ -672,6 +706,28 @@ mod tests {
             .as_deref(),
             Some("CLAUDE_SONNET_4_6_20260217_V1_0")
         );
+    }
+
+    #[test]
+    fn dynamic_model_resolution_accepts_compact_claude_aliases() {
+        let models = vec![
+            "claude-opus-5".into(),
+            "claude-sonnet-4.6".into(),
+            "claude-haiku-4.5".into(),
+        ];
+        assert_eq!(
+            resolve_dynamic_model("opus5", &models).as_deref(),
+            Some("claude-opus-5")
+        );
+        assert_eq!(
+            resolve_dynamic_model("sonnet4.6", &models).as_deref(),
+            Some("claude-sonnet-4.6")
+        );
+        assert_eq!(
+            resolve_dynamic_model("claudehaiku4.5", &models).as_deref(),
+            Some("claude-haiku-4.5")
+        );
+        assert!(resolve_dynamic_model("opusfive", &models).is_none());
     }
 
     #[test]
