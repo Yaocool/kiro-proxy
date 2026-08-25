@@ -1004,17 +1004,8 @@ impl KiroClient {
                 "authorization",
                 format!("Bearer {}", account.credentials.access_token),
             )
-            .header(
-                "user-agent",
-                format!(
-                    "aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-0.6.18-{}",
-                    account.machine_id
-                ),
-            )
-            .header(
-                "x-amz-user-agent",
-                format!("aws-sdk-js/1.0.18 KiroIDE 0.6.18 {}", account.machine_id),
-            )
+            .header("user-agent", kiro_user_agent(&account.machine_id))
+            .header("x-amz-user-agent", kiro_amz_user_agent(&account.machine_id))
             .send()
             .await
             .map_err(build_error)?;
@@ -1247,15 +1238,12 @@ fn headers(
     let user_agent = if cli {
         "aws-sdk-rust/1.3.9 os/macos lang/rust/1.87.0".to_string()
     } else {
-        format!(
-            "aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-0.6.18-{}",
-            account.machine_id
-        )
+        kiro_user_agent(&account.machine_id)
     };
     let amz_user_agent = if cli {
         "aws-sdk-rust/1.3.9 ua/2.1 api/ssooidc/1.88.0 os/macos lang/rust/1.87.0 m/E app/AmazonQ-For-CLI".to_string()
     } else {
-        format!("aws-sdk-js/1.0.18 KiroIDE 0.6.18 {}", account.machine_id)
+        kiro_amz_user_agent(&account.machine_id)
     };
     let mode = match mode {
         AgentMode::Auto if cli => "vibe",
@@ -1298,10 +1286,11 @@ fn mcp_headers(account: &Account) -> Result<reqwest::header::HeaderMap, KiroErro
 
     let mut headers = HeaderMap::new();
     let authorization = format!("Bearer {}", account.credentials.access_token);
+    let user_agent = kiro_user_agent(&account.machine_id);
     for (name, value) in [
         (CONTENT_TYPE, "application/json"),
         (ACCEPT, "application/json"),
-        (USER_AGENT, "kproxy/0.0.2 KiroIDE/0.6.18"),
+        (USER_AGENT, user_agent.as_str()),
         (AUTHORIZATION, authorization.as_str()),
     ] {
         headers.insert(name, HeaderValue::from_str(value).map_err(build_error)?);
@@ -1326,11 +1315,7 @@ fn mcp_headers(account: &Account) -> Result<reqwest::header::HeaderMap, KiroErro
     );
     headers.insert(
         reqwest::header::HeaderName::from_static("x-amz-user-agent"),
-        HeaderValue::from_str(&format!(
-            "aws-sdk-js/1.0.18 KiroIDE 0.6.18 {}",
-            account.machine_id
-        ))
-        .map_err(build_error)?,
+        HeaderValue::from_str(&kiro_amz_user_agent(&account.machine_id)).map_err(build_error)?,
     );
     headers.insert(
         reqwest::header::HeaderName::from_static("amz-sdk-invocation-id"),
@@ -1350,11 +1335,8 @@ fn profile_headers(account: &Account) -> Result<reqwest::header::HeaderMap, Kiro
 
     let mut headers = HeaderMap::new();
     let authorization = format!("Bearer {}", account.credentials.access_token);
-    let user_agent = format!(
-        "aws-sdk-js/1.0.18 ua/2.1 os/windows lang/js md/nodejs#20.16.0 api/codewhispererstreaming#1.0.18 m/E KiroIDE-0.6.18-{}",
-        account.machine_id
-    );
-    let amz_user_agent = format!("aws-sdk-js/1.0.18 KiroIDE 0.6.18 {}", account.machine_id);
+    let user_agent = kiro_user_agent(&account.machine_id);
+    let amz_user_agent = kiro_amz_user_agent(&account.machine_id);
     for (name, value) in [
         (CONTENT_TYPE, "application/json"),
         (ACCEPT, "application/json"),
@@ -1374,6 +1356,16 @@ fn profile_headers(account: &Account) -> Result<reqwest::header::HeaderMap, Kiro
         );
     }
     Ok(headers)
+}
+
+fn kiro_user_agent(machine_id: &str) -> String {
+    format!(
+        "aws-sdk-js/1.0.27 ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-0.7.45-{machine_id}"
+    )
+}
+
+fn kiro_amz_user_agent(machine_id: &str) -> String {
+    format!("aws-sdk-js/1.0.27 KiroIDE-0.7.45-{machine_id}")
 }
 
 fn metadata_headers(
@@ -1525,6 +1517,21 @@ mod tests {
             created_at: 0,
             credit_exhausted: false,
         }
+    }
+
+    #[test]
+    fn kiro_ide_user_agents_match_the_current_desktop_client() {
+        let machine_id = "a".repeat(64);
+        assert_eq!(
+            kiro_user_agent(&machine_id),
+            format!(
+                "aws-sdk-js/1.0.27 ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-0.7.45-{machine_id}"
+            )
+        );
+        assert_eq!(
+            kiro_amz_user_agent(&machine_id),
+            format!("aws-sdk-js/1.0.27 KiroIDE-0.7.45-{machine_id}")
+        );
     }
 
     fn payload() -> KiroPayload {
