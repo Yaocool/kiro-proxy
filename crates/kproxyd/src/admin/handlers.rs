@@ -638,8 +638,14 @@ async fn commit_account_change<F, T>(state: &Arc<AppState>, mutate: F) -> Result
 where
     F: FnOnce(&mut AccountStore) -> Result<T, RpcError>,
 {
-    let _transaction = state.lock_account_mutation().await;
-    let mut next = state.with_accounts(Clone::clone);
+    let transaction = state
+        .lock_account_storage()
+        .await
+        .map_err(|error| RpcError::internal(error.to_string()))?;
+    let mut next = AccountStore::load(&state.paths.accounts_file)
+        .await
+        .map_err(|error| RpcError::internal(error.to_string()))?;
+    state.configure_account_store(&mut next);
     let result = mutate(&mut next)?;
     next.save()
         .await
@@ -647,6 +653,7 @@ where
     let pool_accounts = next.all().to_vec();
     state.replace_accounts(next);
     state.pool().replace_accounts(pool_accounts).await;
+    drop(transaction);
     state.request_model_refresh();
     crate::alerts::sync_quota_incidents(state).await;
     Ok(result)
@@ -941,12 +948,16 @@ async fn handle_account_refresh(state: &Arc<AppState>, params: serde_json::Value
     let mut refreshed = Vec::new();
     for id in ids {
         match state.refresh_account_token(&pool, &id, true).await {
-            Ok(changed) => {
+            Ok(outcome) => {
                 let usage_refreshed = crate::tasks::refresh_account_usage(state, &pool, &id)
                     .await
                     .unwrap_or(false);
                 refreshed.push(serde_json::json!({
-                    "id":id,"ok":true,"refreshed":changed,
+                    "id":id,"ok":true,"refreshed":outcome.changed,
+                    "persisted":outcome.persisted(),
+                    "persistence_error":outcome.persistence_error
+                        .as_deref()
+                        .map(kproxy_translate::sanitize_error_message),
                     "usage_refreshed":usage_refreshed
                 }))
             }
@@ -1649,17 +1660,10 @@ async fn handle_apikey_reset(state: &Arc<AppState>, params: serde_json::Value) -
 }
 
 async fn persist_pool_snapshot(state: &Arc<AppState>) -> Result<(), RpcError> {
-    let snapshot = state.pool().snapshot().await;
-    let _transaction = state.lock_account_mutation().await;
-    let mut next = state.with_accounts(Clone::clone);
-    for account in snapshot {
-        next.replace_if_changed(account);
-    }
-    next.save()
+    state
+        .persist_runtime_accounts()
         .await
-        .map_err(|error| RpcError::internal(error.to_string()))?;
-    state.replace_accounts(next);
-    Ok(())
+        .map_err(|error| RpcError::internal(error.to_string()))
 }
 
 #[cfg(test)]

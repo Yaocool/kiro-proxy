@@ -13,13 +13,18 @@ use kproxy_core::paths::Paths;
 use kproxy_kiro::endpoint::EndpointOverrides;
 use kproxy_kiro::{KiroClient, KiroError, KiroResponse, ModelInfo};
 use kproxy_notify::Notifier;
-use kproxy_pool::{AccountPool, RefreshError, TokenRefresher};
+use kproxy_pool::{
+    AccountPool, RefreshError, RefreshOutcome, RefreshedCredentials, ReloadedCredentials,
+    TokenRefresher,
+};
 use kproxy_store::accounts::AccountStore;
+use kproxy_store::atomic::{lock_file_exclusive, ExclusiveFileLock};
 use kproxy_store::config_loader::ConfigHandle;
 use kproxy_translate::{
     model::resolve_dynamic_model, KiroPayload, TokenCountCache, WebSearchReplayCodec,
 };
 use rand::RngCore;
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
@@ -148,6 +153,15 @@ pub struct AppState {
     config_reloaded_at: AtomicI64,
     account_mutation: tokio::sync::Mutex<()>,
     config_mutation: tokio::sync::Mutex<()>,
+}
+
+/// Holds both layers of the account storage transaction lock.
+///
+/// The Tokio guard serializes every writer and the file guard coordinates
+/// multiple kproxy processes that share the same account file.
+pub(crate) struct AccountStorageGuard<'a> {
+    _mutation: tokio::sync::MutexGuard<'a, ()>,
+    _file: ExclusiveFileLock,
 }
 
 impl AppState {
@@ -300,6 +314,14 @@ impl AppState {
         let config = self.config.current();
         next.set_compression_threshold(config.storage.compression_threshold);
         next.set_incremental_write(config.storage.incremental_write);
+        self.install_account_store(next).await;
+        self.request_model_refresh();
+    }
+
+    /// Installs one durable account generation into both in-memory views.
+    /// Callers must hold the account storage transaction when this is part of
+    /// a write operation.
+    async fn install_account_store(&self, next: AccountStore) {
         let invalidated_ids = self.with_accounts(|current| {
             current
                 .all()
@@ -325,7 +347,6 @@ impl AppState {
         for account_id in invalidated_ids {
             endpoint_cache.clear_account(&account_id);
         }
-        self.request_model_refresh();
     }
 
     /// 请求模型发现任务尽快刷新，不绕过任务自身的 singleflight 保护。
@@ -355,9 +376,18 @@ impl AppState {
             .find(|candidate| candidate.model_id.eq_ignore_ascii_case(&resolved))
     }
 
-    /// 串行化账号的「复制、修改、落盘、提交」事务。
-    pub async fn lock_account_mutation(&self) -> tokio::sync::MutexGuard<'_, ()> {
-        self.account_mutation.lock().await
+    /// Serializes the complete account read-modify-write transaction both
+    /// inside this daemon and across cooperating kproxy processes.
+    pub(crate) async fn lock_account_storage(&self) -> anyhow::Result<AccountStorageGuard<'_>> {
+        // Always acquire these locks in this order. Holding the in-process
+        // mutex while waiting for the file lock also prevents a later local
+        // writer from overtaking this transaction.
+        let mutation = self.account_mutation.lock().await;
+        let file = lock_file_exclusive(&self.paths.accounts_file).await?;
+        Ok(AccountStorageGuard {
+            _mutation: mutation,
+            _file: file,
+        })
     }
 
     /// Serializes config mutations initiated through the admin API.
@@ -461,31 +491,124 @@ impl AppState {
         pool: &AccountPool,
         account_id: &str,
         force: bool,
-    ) -> Result<bool, RefreshError> {
-        let (account_name, account_enabled) = if let Some(runtime) = pool.get(account_id).await {
+    ) -> Result<RefreshOutcome, RefreshError> {
+        let (account_name, account_enabled) = self.account_refresh_identity(pool, account_id).await;
+        let result = match self.lock_account_refresh(account_id).await {
+            Ok(_coordination) => {
+                self.refresher()
+                    .refresh_account_and_persist_with_reload(
+                        pool,
+                        account_id,
+                        force,
+                        || async move { self.reload_account_credentials(pool, account_id).await },
+                        |refreshed| async move {
+                            self.persist_refreshed_credentials(pool, refreshed).await
+                        },
+                    )
+                    .await
+            }
+            Err(error) => Err(RefreshError::CredentialReload(format!(
+                "failed to coordinate token refresh: {error}"
+            ))),
+        };
+        self.finish_token_refresh_with_identity(account_id, &account_name, account_enabled, result)
+    }
+
+    /// Refreshes credentials for an authentication failure tied to the exact
+    /// access token used by that failed upstream request.
+    pub async fn refresh_account_token_after_auth_failure(
+        &self,
+        pool: &AccountPool,
+        account_id: &str,
+        rejected_access_token: &str,
+    ) -> Result<RefreshOutcome, RefreshError> {
+        let (account_name, account_enabled) = self.account_refresh_identity(pool, account_id).await;
+        let result = match self.lock_account_refresh(account_id).await {
+            Ok(_coordination) => {
+                self.refresher()
+                    .refresh_after_auth_failure_and_persist(
+                        pool,
+                        account_id,
+                        rejected_access_token,
+                        || async move { self.reload_account_credentials(pool, account_id).await },
+                        |refreshed| async move {
+                            self.persist_refreshed_credentials(pool, refreshed).await
+                        },
+                    )
+                    .await
+            }
+            Err(error) => Err(RefreshError::CredentialReload(format!(
+                "failed to coordinate token refresh: {error}"
+            ))),
+        };
+        self.finish_token_refresh_with_identity(account_id, &account_name, account_enabled, result)
+    }
+
+    async fn account_refresh_identity(
+        &self,
+        pool: &AccountPool,
+        account_id: &str,
+    ) -> (String, bool) {
+        if let Some(runtime) = pool.get(account_id).await {
             let account = runtime.account.read().await;
             (account.display_name().to_owned(), account.enabled)
         } else {
             (account_id.to_owned(), false)
-        };
-        match self
-            .refresher()
-            .refresh_account(pool, account_id, force)
-            .await
-        {
-            Ok(changed) => {
-                if changed {
+        }
+    }
+
+    /// Serializes refresh-token consumption for one account across daemon
+    /// instances. The upstream request and durable commit are both inside this
+    /// guard, so another process cannot consume the previous rotating token in
+    /// the gap before its replacement reaches disk.
+    async fn lock_account_refresh(&self, account_id: &str) -> anyhow::Result<ExclusiveFileLock> {
+        let digest = Sha256::digest(account_id.as_bytes());
+        let suffix = digest[..16]
+            .iter()
+            .fold(String::with_capacity(32), |mut output, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(output, "{byte:02x}");
+                output
+            });
+        let mut path = self.paths.accounts_file.as_os_str().to_os_string();
+        path.push(format!(".refresh.{suffix}"));
+        lock_file_exclusive(&PathBuf::from(path)).await
+    }
+
+    fn finish_token_refresh_with_identity(
+        &self,
+        account_id: &str,
+        account_name: &str,
+        account_enabled: bool,
+        result: Result<RefreshOutcome, RefreshError>,
+    ) -> Result<RefreshOutcome, RefreshError> {
+        match result {
+            Ok(outcome) => {
+                if outcome.changed {
                     self.kiro().endpoint_cache().clear_failures(account_id);
+                }
+                if let Some(error) = outcome.persistence_error.as_deref() {
+                    if account_enabled {
+                        crate::alerts::emit_token_refresh_failure(
+                            self,
+                            account_id,
+                            account_name,
+                            &kproxy_translate::sanitize_error_message(&format!(
+                                "refreshed credentials could not be persisted: {error}"
+                            )),
+                        );
+                    }
+                } else if outcome.changed {
                     crate::alerts::resolve_token_refresh_failure(self, account_id);
                 }
-                Ok(changed)
+                Ok(outcome)
             }
             Err(error) => {
                 if account_enabled {
                     crate::alerts::emit_token_refresh_failure(
                         self,
                         account_id,
-                        &account_name,
+                        account_name,
                         &kproxy_translate::sanitize_error_message(&error.to_string()),
                     );
                 } else {
@@ -494,6 +617,116 @@ impl AppState {
                 Err(error)
             }
         }
+    }
+
+    async fn reload_account_credentials(
+        &self,
+        pool: &AccountPool,
+        account_id: &str,
+    ) -> Result<Option<ReloadedCredentials>, String> {
+        let _transaction = self
+            .lock_account_storage()
+            .await
+            .map_err(|error| error.to_string())?;
+        let mut disk = AccountStore::load(&self.paths.accounts_file)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.configure_account_store(&mut disk);
+        let candidate = disk
+            .find(account_id)
+            .cloned()
+            .ok_or_else(|| format!("account not found in credential store: {account_id}"))?;
+        let runtime = pool
+            .get(account_id)
+            .await
+            .ok_or_else(|| format!("account not found: {account_id}"))?;
+        let current = runtime.account.read().await.clone();
+        let credentials_changed = serde_json::to_value(&candidate.credentials).ok()
+            != serde_json::to_value(&current.credentials).ok()
+            || candidate.profile_arn != current.profile_arn;
+        if !credentials_changed {
+            return Ok(None);
+        }
+
+        self.install_account_store(disk).await;
+        Ok(Some(ReloadedCredentials {
+            credentials: candidate.credentials,
+            profile_arn: candidate.profile_arn,
+        }))
+    }
+
+    /// Commits only the rotated credential fields for one account. Updating a
+    /// single account avoids replaying a stale whole-pool snapshot over tokens
+    /// refreshed concurrently by other accounts.
+    async fn persist_refreshed_credentials(
+        &self,
+        pool: &AccountPool,
+        refreshed: RefreshedCredentials,
+    ) -> Result<(), String> {
+        let _transaction = self
+            .lock_account_storage()
+            .await
+            .map_err(|error| error.to_string())?;
+        let runtime = pool
+            .get(&refreshed.account_id)
+            .await
+            .ok_or_else(|| format!("account not found: {}", refreshed.account_id))?;
+
+        // Reassert the freshly rotated fields while holding the same mutation
+        // lock as the file watcher. This closes the window where a delayed
+        // disk reload could replace them between refresh and persistence.
+        {
+            let mut account = runtime.account.write().await;
+            account.credentials = refreshed.credentials.clone();
+            if let Some(profile_arn) = refreshed.profile_arn.as_ref() {
+                account.profile_arn = Some(profile_arn.clone());
+            }
+        }
+
+        // Always merge into the latest durable snapshot. This mirrors the
+        // reference implementation's read-merge-write behavior and prevents
+        // an external credential update from being overwritten by a stale
+        // in-memory whole-store clone.
+        let mut next = AccountStore::load(&self.paths.accounts_file)
+            .await
+            .map_err(|error| error.to_string())?;
+        self.configure_account_store(&mut next);
+        let credentials = refreshed.credentials;
+        let profile_arn = refreshed.profile_arn;
+        if !next.update(&refreshed.account_id, move |account| {
+            account.credentials = credentials;
+            if let Some(profile_arn) = profile_arn {
+                account.profile_arn = Some(profile_arn);
+            }
+        }) {
+            return Err(format!("account not found: {}", refreshed.account_id));
+        }
+        next.save().await.map_err(|error| error.to_string())?;
+        self.install_account_store(next).await;
+        Ok(())
+    }
+
+    pub(crate) fn configure_account_store(&self, store: &mut AccountStore) {
+        let config = self.config.current();
+        store.set_compression_threshold(config.storage.compression_threshold);
+        store.set_incremental_write(config.storage.incremental_write);
+    }
+
+    /// Persists mutable runtime state without granting a whole-pool snapshot
+    /// permission to overwrite durable credentials or operator-managed fields.
+    /// The lock is acquired before taking the snapshot, and the snapshot is
+    /// merged into the latest on-disk store.
+    pub(crate) async fn persist_runtime_accounts(&self) -> anyhow::Result<()> {
+        let _transaction = self.lock_account_storage().await?;
+        let snapshot = self.pool().snapshot().await;
+        let mut next = AccountStore::load(&self.paths.accounts_file).await?;
+        self.configure_account_store(&mut next);
+        for account in snapshot {
+            merge_runtime_account(&mut next, &account);
+        }
+        next.save().await?;
+        self.install_account_store(next).await;
+        Ok(())
     }
 
     /// Refreshes every expiring account through the same cache-invalidation
@@ -521,8 +754,19 @@ impl AppState {
                 let account_id = account.id.clone();
                 let account_name = account.display_name().to_owned();
                 match self.refresh_account_token(pool, &account.id, false).await {
-                    Ok(true) => report.refreshed.push((account_id, account_name)),
-                    Ok(false) => {}
+                    Ok(outcome) if outcome.changed && outcome.persisted() => {
+                        report.refreshed.push((account_id, account_name));
+                    }
+                    Ok(outcome) if outcome.changed => {
+                        report.failures.push((
+                            account_id,
+                            account_name,
+                            RefreshError::Persistence(outcome.persistence_error.unwrap_or_else(
+                                || "refreshed credentials were not persisted".into(),
+                            )),
+                        ))
+                    }
+                    Ok(_) => {}
                     Err(error) => report.failures.push((account_id, account_name, error)),
                 }
             }
@@ -754,6 +998,34 @@ async fn load_or_regenerate_replay_key(path: &std::path::Path) -> WebSearchRepla
     WebSearchReplayCodec::from_key(key)
 }
 
+/// Merges only fields owned by runtime probes and health tracking. In
+/// particular, credentials and operator-managed metadata are never copied from
+/// a pool snapshot. A resolved profile ARN is accepted only when the snapshot
+/// still describes the same credential generation as durable storage.
+fn merge_runtime_account(store: &mut AccountStore, runtime: &Account) -> bool {
+    let Some(mut merged) = store.find(&runtime.id).cloned() else {
+        return false;
+    };
+    let same_credentials = serde_json::to_value(&merged.credentials).ok()
+        == serde_json::to_value(&runtime.credentials).ok();
+    if same_credentials && runtime.profile_arn.is_some() {
+        merged.profile_arn.clone_from(&runtime.profile_arn);
+    }
+    if merged.upstream_user_id.is_none() && runtime.upstream_user_id.is_some() {
+        merged
+            .upstream_user_id
+            .clone_from(&runtime.upstream_user_id);
+    }
+    if runtime.usage.is_some() {
+        merged.usage.clone_from(&runtime.usage);
+    }
+    if runtime.subscription.is_some() {
+        merged.subscription.clone_from(&runtime.subscription);
+    }
+    merged.credit_exhausted = runtime.credit_exhausted;
+    store.replace_if_changed(merged)
+}
+
 fn format_service_failures(failures: &[(String, String)]) -> String {
     failures
         .iter()
@@ -882,7 +1154,40 @@ impl Drop for BodyGuard {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use kproxy_core::account::{AuthMethod, Credentials, Usage};
+    use serde_json::json;
+    use wiremock::matchers::{body_json, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     use super::*;
+
+    fn refreshable_account(id: &str, email: &str, token: &str) -> Account {
+        Account {
+            id: id.into(),
+            email: email.into(),
+            label: None,
+            enabled: true,
+            machine_id: "a".repeat(64),
+            profile_arn: None,
+            upstream_user_id: None,
+            credentials: Credentials {
+                access_token: token.into(),
+                refresh_token: Some(format!("{token}-refresh")),
+                client_id: Some("client-id".into()),
+                client_secret: Some("client-secret".into()),
+                region: "us-east-1".into(),
+                expires_at: 0,
+                auth_method: AuthMethod::Idc,
+            },
+            usage: None,
+            subscription: None,
+            tags: Vec::new(),
+            created_at: 0,
+            credit_exhausted: false,
+        }
+    }
 
     #[test]
     fn summary_distinguishes_checks_from_actual_refreshes() {
@@ -895,6 +1200,380 @@ mod tests {
         assert_eq!(
             report.summary(),
             "ok: 3 checked, 1 eligible, 1 refreshed, 0 failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn refreshed_credentials_for_concurrent_accounts_are_committed_without_lost_updates() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        let mut accounts = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("accounts");
+        accounts
+            .insert(refreshable_account(
+                "acc_00000001",
+                "one@example.com",
+                "old-one",
+            ))
+            .expect("first account");
+        accounts
+            .insert(refreshable_account(
+                "acc_00000002",
+                "two@example.com",
+                "old-two",
+            ))
+            .expect("second account");
+        accounts.save().await.expect("save accounts");
+        let state = AppState::new(
+            paths.clone(),
+            ConfigHandle::new(Config::default()),
+            accounts,
+        );
+        let pool = state.pool();
+
+        let first = RefreshedCredentials {
+            account_id: "acc_00000001".into(),
+            credentials: Credentials {
+                access_token: "new-one".into(),
+                refresh_token: Some("new-one-refresh".into()),
+                client_id: Some("client-id".into()),
+                client_secret: Some("client-secret".into()),
+                region: "us-east-1".into(),
+                expires_at: 3_000_000_000,
+                auth_method: AuthMethod::Idc,
+            },
+            profile_arn: None,
+        };
+        let second = RefreshedCredentials {
+            account_id: "acc_00000002".into(),
+            credentials: Credentials {
+                access_token: "new-two".into(),
+                refresh_token: Some("new-two-refresh".into()),
+                client_id: Some("client-id".into()),
+                client_secret: Some("client-secret".into()),
+                region: "us-east-1".into(),
+                expires_at: 3_000_000_001,
+                auth_method: AuthMethod::Idc,
+            },
+            profile_arn: None,
+        };
+
+        let (first_result, second_result) = tokio::join!(
+            state.persist_refreshed_credentials(&pool, first),
+            state.persist_refreshed_credentials(&pool, second),
+        );
+        first_result.expect("persist first account");
+        second_result.expect("persist second account");
+
+        let persisted = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("reload accounts");
+        assert_eq!(
+            persisted
+                .find("acc_00000001")
+                .expect("first persisted account")
+                .credentials
+                .refresh_token
+                .as_deref(),
+            Some("new-one-refresh")
+        );
+        assert_eq!(
+            persisted
+                .find("acc_00000002")
+                .expect("second persisted account")
+                .credentials
+                .refresh_token
+                .as_deref(),
+            Some("new-two-refresh")
+        );
+    }
+
+    #[tokio::test]
+    async fn independent_daemons_serialize_rotating_refresh_token_consumption() {
+        let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let responder_attempts = Arc::clone(&attempts);
+        Mock::given(method("POST"))
+            .and(path("/refresh"))
+            .respond_with(move |_request: &wiremock::Request| {
+                if responder_attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                    ResponseTemplate::new(200)
+                        .set_delay(std::time::Duration::from_millis(150))
+                        .set_body_raw(
+                            r#"{"accessToken":"rotated-access","refreshToken":"rotated-refresh","expiresIn":3600}"#,
+                            "application/json",
+                        )
+                } else {
+                    ResponseTemplate::new(400).set_body_string("invalid_request")
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        let mut initial = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("accounts");
+        initial
+            .insert(refreshable_account(
+                "acc_00000001",
+                "one@example.com",
+                "old-access",
+            ))
+            .expect("account");
+        initial.save().await.expect("save account");
+        let first_store = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("first store");
+        let second_store = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("second store");
+        let first = AppState::new(
+            paths.clone(),
+            ConfigHandle::new(Config::default()),
+            first_store,
+        );
+        let second = AppState::new(
+            paths.clone(),
+            ConfigHandle::new(Config::default()),
+            second_store,
+        );
+        let endpoint = format!("{}/refresh", server.uri());
+        *write_lock(&first.refresher) = TokenRefresher::new(300)
+            .expect("first refresher")
+            .with_endpoint(endpoint.clone());
+        *write_lock(&second.refresher) = TokenRefresher::new(300)
+            .expect("second refresher")
+            .with_endpoint(endpoint);
+        let first_pool = first.pool();
+        let second_pool = second.pool();
+
+        let (first_result, second_result) = tokio::join!(
+            first.refresh_account_token_after_auth_failure(
+                &first_pool,
+                "acc_00000001",
+                "old-access"
+            ),
+            second.refresh_account_token_after_auth_failure(
+                &second_pool,
+                "acc_00000001",
+                "old-access"
+            ),
+        );
+        assert!(first_result.expect("first refresh").changed);
+        assert!(second_result.expect("second refresh").changed);
+        assert_eq!(attempts.load(Ordering::Acquire), 2);
+
+        let persisted = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("persisted store");
+        let account = persisted.find("acc_00000001").expect("account");
+        assert_eq!(account.credentials.access_token, "rotated-access");
+        assert_eq!(
+            account.credentials.refresh_token.as_deref(),
+            Some("rotated-refresh")
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_runtime_snapshot_cannot_roll_back_rotated_durable_credentials() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        let mut accounts = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("accounts");
+        let mut original = refreshable_account("acc_00000001", "one@example.com", "old-access");
+        original.profile_arn = Some("old-profile".into());
+        accounts.insert(original).expect("account");
+        accounts.save().await.expect("save account");
+        let state = AppState::new(
+            paths.clone(),
+            ConfigHandle::new(Config::default()),
+            accounts,
+        );
+
+        // Simulate a credential rotation that reached durable storage while a
+        // stale pool snapshot still contains the previous token generation.
+        let mut durable = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("durable store");
+        assert!(durable.update("acc_00000001", |account| {
+            account.label = Some("operator-label".into());
+            account.credentials.access_token = "rotated-access".into();
+            account.credentials.refresh_token = Some("rotated-refresh".into());
+            account.credentials.expires_at = 3_000_000_000;
+            account.profile_arn = Some("rotated-profile".into());
+        }));
+        durable.save().await.expect("persist rotation");
+
+        let runtime = state
+            .pool()
+            .get("acc_00000001")
+            .await
+            .expect("runtime account");
+        {
+            let mut stale = runtime.account.write().await;
+            stale.usage = Some(Usage {
+                current: 42.0,
+                limit: 100.0,
+                percent_used: 42.0,
+                next_reset_date: None,
+                updated_at: 123,
+            });
+        }
+        state
+            .persist_runtime_accounts()
+            .await
+            .expect("persist runtime fields");
+
+        let persisted = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("reload persisted store");
+        let account = persisted.find("acc_00000001").expect("account");
+        assert_eq!(account.credentials.access_token, "rotated-access");
+        assert_eq!(
+            account.credentials.refresh_token.as_deref(),
+            Some("rotated-refresh")
+        );
+        assert_eq!(account.profile_arn.as_deref(), Some("rotated-profile"));
+        assert_eq!(account.label.as_deref(), Some("operator-label"));
+        assert_eq!(
+            account.usage.as_ref().map(|usage| usage.current),
+            Some(42.0)
+        );
+        let runtime = state
+            .pool()
+            .get("acc_00000001")
+            .await
+            .expect("runtime account")
+            .account
+            .read()
+            .await
+            .clone();
+        assert_eq!(runtime.credentials.access_token, "rotated-access");
+        assert_eq!(
+            runtime.credentials.refresh_token.as_deref(),
+            Some("rotated-refresh")
+        );
+    }
+
+    #[tokio::test]
+    async fn proactive_idc_400_reloads_new_credentials_from_disk_before_retrying() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/refresh"))
+            .and(body_json(json!({
+                "clientId": "client-id",
+                "clientSecret": "client-secret",
+                "grantType": "refresh_token",
+                "refreshToken": "old-access-refresh"
+            })))
+            .respond_with(ResponseTemplate::new(400).set_body_string("invalid_request"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/refresh"))
+            .and(body_json(json!({
+                "clientId": "new-client-id",
+                "clientSecret": "new-client-secret",
+                "grantType": "refresh_token",
+                "refreshToken": "external-refresh"
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                r#"{"accessToken":"recovered-access","refreshToken":"recovered-refresh","expiresIn":3600}"#,
+                "application/json",
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        let mut accounts = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("accounts");
+        accounts
+            .insert(refreshable_account(
+                "acc_00000001",
+                "one@example.com",
+                "old-access",
+            ))
+            .expect("account");
+        accounts.save().await.expect("save account");
+        let state = AppState::new(
+            paths.clone(),
+            ConfigHandle::new(Config::default()),
+            accounts,
+        );
+        let pool = state.pool();
+        *write_lock(&state.refresher) = TokenRefresher::new(300)
+            .expect("refresher")
+            .with_endpoint(format!("{}/refresh", server.uri()));
+
+        let mut external = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("external store");
+        assert!(external.update("acc_00000001", |account| {
+            account.credentials.refresh_token = Some("external-refresh".into());
+            account.credentials.client_id = Some("new-client-id".into());
+            account.credentials.client_secret = Some("new-client-secret".into());
+        }));
+        external.save().await.expect("external credential update");
+
+        let outcome = state
+            .refresh_account_token(&pool, "acc_00000001", false)
+            .await
+            .expect("refresh recovers");
+
+        assert!(outcome.changed);
+        assert!(outcome.persisted());
+        let persisted = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("persisted store");
+        let credentials = &persisted
+            .find("acc_00000001")
+            .expect("persisted account")
+            .credentials;
+        assert_eq!(credentials.access_token, "recovered-access");
+        assert_eq!(
+            credentials.refresh_token.as_deref(),
+            Some("recovered-refresh")
         );
     }
 
