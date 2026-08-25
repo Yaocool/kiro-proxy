@@ -58,6 +58,8 @@ pub mod method {
     pub const LOG_FILES: &str = "logs.files";
     /// 动态模型列表。
     pub const MODELS: &str = "models";
+    /// 解析客户端模型 ID 到账号实际模型。
+    pub const MODEL_RESOLVE: &str = "models.resolve";
     /// API key 列表与用量。
     pub const APIKEY_LIST: &str = "apikey.list";
     /// 清零 API key 用量。
@@ -105,6 +107,7 @@ pub mod method {
         LOGS,
         LOG_FILES,
         MODELS,
+        MODEL_RESOLVE,
         APIKEY_LIST,
         APIKEY_RESET_USAGE,
         SERVICE_LIST,
@@ -497,6 +500,61 @@ pub struct AccountDetail {
     /// 近期错误摘要。
     #[serde(default)]
     pub recent_errors: Vec<String>,
+}
+
+/// 一个账号对客户端模型 ID 的解析结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelResolutionAccount {
+    /// 账号稳定 ID。
+    pub account_id: String,
+    /// 账号展示名称。
+    pub account_name: String,
+    /// 当前有效健康状态。
+    pub health: String,
+    /// 当前是否可能被调度器选中。
+    pub schedulable: bool,
+    /// 该账号额度条件下，显式 model-map 后的模型。
+    pub mapped_model: String,
+    /// 命中的显式映射规则。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapping_rule: Option<String>,
+    /// 最终发送到 Kiro 的精确模型 ID；无法匹配时为空。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
+    /// 是否因为原模型无法匹配而使用了默认模型。
+    pub used_default: bool,
+    /// 模型集合来源：account_cache 或 static_catalog。
+    pub model_source: String,
+    /// 该账号模型集合的数量。
+    pub available_model_count: usize,
+    /// 无法匹配时的原因。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `models.resolve` 结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModelResolutionResult {
+    /// 客户端传入的模型 ID。
+    pub input_model: String,
+    /// 不考虑账号额度条件时的显式映射结果。
+    pub mapped_model: String,
+    /// 命中的初始显式映射规则。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mapping_rule: Option<String>,
+    /// 所有可匹配账号结果一致时的唯一最终模型。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_model: Option<String>,
+    /// 当前账号池中所有可能的最终模型。
+    #[serde(default)]
+    pub possible_models: Vec<String>,
+    /// 成功匹配的可调度账号数量。
+    pub matched_accounts: usize,
+    /// 当前可调度账号总数。
+    pub total_accounts: usize,
+    /// 各账号的真实缓存解析结果。
+    #[serde(default)]
+    pub accounts: Vec<ModelResolutionAccount>,
 }
 
 /// `config.show` 结果。

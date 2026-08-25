@@ -328,6 +328,12 @@ at daemon startup, is triggered again after account changes, and then follows
 `models.cache_ttl_ms`. The account `status_check` task refreshes usage data only;
 it does not issue a second set of model-list requests.
 
+Use `kproxy models resolve <MODEL_ID>` to query the final model against the
+active configuration and each account's model cache. The output separates
+explicit model-map routing from automatic alias resolution. Add `--api-key
+<ID_OR_NAME>` for API-key-scoped rules or `--refresh` to refresh model caches
+first.
+
 Bootstrap never overwrites an existing `config.toml`. A data directory created
 by an older release may therefore retain `server.host = "127.0.0.1"`. Inspect
 the effective value with `kproxy config show --effective` and use `kproxy config edit`

@@ -5,7 +5,7 @@ use clap::{Subcommand, ValueEnum};
 use kproxy_core::paths::Paths;
 use kproxy_ipc::protocol::method;
 use kproxy_ipc::protocol::{
-    ConfigPathResult, ConfigReloadResult, ConfigShowResult, LogFilesResult,
+    ConfigPathResult, ConfigReloadResult, ConfigShowResult, LogFilesResult, ModelResolutionResult,
     ProxyServiceApiKeysResult, ProxyServiceCreateResult, ProxyServiceDeleteResult,
     ProxyServiceListResult,
 };
@@ -2407,6 +2407,78 @@ pub async fn show_models(client: &mut AdminClient, mapped: bool, json: bool) -> 
     }
 }
 
+pub async fn show_model_resolution(
+    client: &mut AdminClient,
+    model: &str,
+    api_key: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let result: ModelResolutionResult = client
+        .call(
+            method::MODEL_RESOLVE,
+            serde_json::json!({"model":model,"api_key":api_key}),
+        )
+        .await?;
+    if json {
+        return print_json(&result);
+    }
+
+    println!("输入模型  {}", result.input_model);
+    println!("显式映射  {}", result.mapped_model);
+    println!(
+        "映射规则  {}",
+        result.mapping_rule.as_deref().unwrap_or("(无规则)")
+    );
+    if let Some(resolved) = &result.resolved_model {
+        println!("最终模型  {resolved}");
+    } else if result.possible_models.is_empty() {
+        println!("最终模型  (无法解析)");
+    } else {
+        println!("候选模型  {}", result.possible_models.join(", "));
+    }
+    println!(
+        "匹配账号  {}/{}",
+        result.matched_accounts, result.total_accounts
+    );
+    let rows = result
+        .accounts
+        .iter()
+        .map(|account| {
+            vec![
+                format!("{} ({})", account.account_name, account.account_id),
+                account.health.clone(),
+                account.mapped_model.clone(),
+                account
+                    .resolved_model
+                    .clone()
+                    .or_else(|| account.error.clone())
+                    .unwrap_or_else(|| "-".into()),
+                account.mapping_rule.clone().unwrap_or_else(|| "-".into()),
+                if account.used_default {
+                    format!("{}+default", account.model_source)
+                } else {
+                    account.model_source.clone()
+                },
+            ]
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "\n{}",
+        render_table(
+            &[
+                "账号",
+                "状态",
+                "映射模型",
+                "最终模型 / 原因",
+                "规则",
+                "来源",
+            ],
+            &rows
+        )
+    );
+    Ok(())
+}
+
 pub async fn run_model_map(
     client: &mut AdminClient,
     command: ModelMapCommand,
@@ -2674,7 +2746,7 @@ pub fn print_topic(topic: Option<&str>) -> Result<()> {
             "`kproxy alert events` 列出四类异常事件和触发条件，`kproxy alert platforms` 说明 --platform 支持的通知平台和平台专用参数；`kproxy alert config` 查看一次性告警策略。同类型的多账号事件会聚合为一条 Markdown 告警；每个账号或服务恢复后才允许再次告警。`kproxy alert add/edit/delete/list/test/logs` 管理告警目标。"
         }
         "models" => {
-            "`kproxy models` 显示账号自动探测到的 Kiro 模型；`--refresh` 先立即刷新缓存，`--mapped` 同时显示显式映射结果。自动别名解析与强制 model-map 是两层机制。"
+            "`kproxy models` 显示账号自动探测到的 Kiro 模型；`--refresh` 先立即刷新缓存，`--mapped` 同时显示显式映射结果。`kproxy models resolve <MODEL_ID>` 使用当前配置、账号额度和账号模型缓存，显示显式映射与最终 Kiro 模型；可配合 `--api-key` 和 `--refresh`。"
         }
         "docker" => {
             "默认 `docker compose up -d --build` 构建 runtime-full，启用全部 feature 并包含 Chromium SSO 运行时。数据保存在 kproxy-data 命名卷。"

@@ -51,6 +51,7 @@ pub async fn dispatch(state: &Arc<AppState>, request: Request) -> Response {
         method::LOGS => handle_logs(state, request.params).await,
         method::LOG_FILES => handle_log_files(state).await,
         method::MODELS => handle_models(state).await,
+        method::MODEL_RESOLVE => handle_model_resolve(state, request.params).await,
         method::APIKEY_LIST => to_value(state.meter.list()),
         method::APIKEY_RESET_USAGE => handle_apikey_reset(state, request.params).await,
         method::SERVICE_LIST => handle_service_list(state).await,
@@ -1329,6 +1330,171 @@ async fn handle_models(state: &Arc<AppState>) -> Handled {
     to_value(output)
 }
 
+#[derive(serde::Deserialize)]
+struct ModelResolveParams {
+    model: String,
+    api_key: Option<String>,
+}
+
+async fn handle_model_resolve(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
+    let params: ModelResolveParams = parse_params(params)?;
+    let input_model = params.model.trim();
+    if input_model.is_empty() {
+        return Err(RpcError::bad_params("model must not be empty"));
+    }
+    let config = state.config.current();
+    let api_key_id = params
+        .api_key
+        .as_deref()
+        .map(|selector| {
+            config
+                .api_key
+                .iter()
+                .find(|key| key.id.as_deref() == Some(selector) || key.name == selector)
+                .and_then(|key| key.id.clone())
+                .ok_or_else(|| RpcError::bad_params(format!("API key not found: {selector}")))
+        })
+        .transpose()?;
+    let initial_route = kproxy_translate::model::map_model(
+        input_model,
+        &config.model_mapping,
+        api_key_id.as_deref(),
+        None,
+        "",
+    );
+    let pool = state.pool();
+    let mut accounts = pool
+        .snapshot()
+        .await
+        .into_iter()
+        .filter(|account| account.enabled)
+        .collect::<Vec<_>>();
+    accounts.sort_by(|left, right| {
+        compare_account_identity(
+            left.display_name(),
+            &left.id,
+            right.display_name(),
+            &right.id,
+        )
+    });
+    if accounts.is_empty() {
+        return Err(RpcError::bad_params(
+            "no enabled account for model resolution",
+        ));
+    }
+
+    let mut results = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        let account_name = account.display_name().to_owned();
+        let health = effective_account_health(&pool, &account, &config.pool).await;
+        let schedulable = health == "available";
+        let remaining = account
+            .usage
+            .as_ref()
+            .filter(|usage| usage.limit > 0.0)
+            .map(|usage| ((usage.limit - usage.current) / usage.limit * 100.0).clamp(0.0, 100.0));
+        let route = kproxy_translate::model::map_model(
+            input_model,
+            &config.model_mapping,
+            api_key_id.as_deref(),
+            remaining,
+            "",
+        );
+        let runtime = pool.get(&account.id).await;
+        let cache_loaded = if let Some(runtime) = runtime.as_ref() {
+            runtime.has_model_cache().await
+        } else {
+            false
+        };
+        let (available_models, model_source) = if cache_loaded {
+            (
+                runtime
+                    .as_ref()
+                    .expect("cache-loaded runtime exists")
+                    .supported_models()
+                    .await,
+                "account_cache",
+            )
+        } else {
+            (
+                kproxy_kiro::static_models_for_subscription(
+                    account
+                        .subscription
+                        .as_ref()
+                        .map(|subscription| subscription.kind),
+                )
+                .into_iter()
+                .map(|model| model.model_id)
+                .collect(),
+                "static_catalog",
+            )
+        };
+        let mut resolved_model =
+            kproxy_translate::model::resolve_dynamic_model(&route.mapped, &available_models);
+        let mut used_default = false;
+        if resolved_model.is_none()
+            && cache_loaded
+            && !config.features.default_model_id.trim().is_empty()
+        {
+            resolved_model = kproxy_translate::model::resolve_dynamic_model(
+                &config.features.default_model_id,
+                &available_models,
+            );
+            used_default = resolved_model.is_some();
+        }
+        let error = resolved_model.is_none().then(|| {
+            if config.features.default_model_id.trim().is_empty() || !cache_loaded {
+                format!(
+                    "model '{}' is not present in this account's {model_source}",
+                    route.mapped
+                )
+            } else {
+                format!(
+                    "model '{}' and default model '{}' are not present in this account's model cache",
+                    route.mapped, config.features.default_model_id
+                )
+            }
+        });
+        results.push(ModelResolutionAccount {
+            account_id: account.id,
+            account_name,
+            health,
+            schedulable,
+            mapped_model: route.mapped,
+            mapping_rule: route.rule,
+            resolved_model,
+            used_default,
+            model_source: model_source.into(),
+            available_model_count: available_models.len(),
+            error,
+        });
+    }
+
+    let possible_models = results
+        .iter()
+        .filter(|account| account.schedulable)
+        .filter_map(|account| account.resolved_model.clone())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let resolved_model = (possible_models.len() == 1).then(|| possible_models[0].clone());
+    let matched_accounts = results
+        .iter()
+        .filter(|account| account.schedulable && account.resolved_model.is_some())
+        .count();
+    let schedulable_accounts = results.iter().filter(|account| account.schedulable).count();
+    to_value(ModelResolutionResult {
+        input_model: input_model.into(),
+        mapped_model: initial_route.mapped,
+        mapping_rule: initial_route.rule,
+        resolved_model,
+        possible_models,
+        matched_accounts,
+        total_accounts: schedulable_accounts,
+        accounts: results,
+    })
+}
+
 fn sort_models_for_display(models: &mut [kproxy_kiro::ModelInfo]) {
     models.sort_by(|left, right| {
         compare_display_text(&left.model_id, &right.model_id)
@@ -2478,6 +2644,68 @@ mod tests {
         ))
         .expect("account detail");
         assert_eq!(detail.summary.health.as_deref(), Some("low_credit"));
+    }
+
+    #[tokio::test]
+    async fn model_resolution_uses_each_accounts_real_model_cache() {
+        let account = sample_account("acc_00000001", "enterprise@example.com", true);
+        let mut protected = sample_account("acc_00000002", "protected@example.com", true);
+        protected.usage = Some(Usage {
+            current: 99.0,
+            limit: 100.0,
+            percent_used: 99.0,
+            next_reset_date: None,
+            updated_at: 0,
+        });
+        let (_directory, state) = state_with(vec![account, protected]).await;
+        state
+            .pool()
+            .get("acc_00000001")
+            .await
+            .expect("runtime account")
+            .set_supported_models(["claude-opus-5".into(), "claude-sonnet-4.6".into()])
+            .await;
+        state
+            .pool()
+            .get("acc_00000002")
+            .await
+            .expect("protected runtime account")
+            .set_supported_models(["claude-opus-4.8".into()])
+            .await;
+
+        let result: ModelResolutionResult = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(
+                    1,
+                    method::MODEL_RESOLVE,
+                    serde_json::json!({"model":"opus5"}),
+                ),
+            )
+            .await,
+        ))
+        .expect("model resolution result");
+
+        assert_eq!(result.input_model, "opus5");
+        assert_eq!(result.mapped_model, "opus5");
+        assert_eq!(result.resolved_model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(result.possible_models, ["claude-opus-5"]);
+        assert_eq!(result.matched_accounts, 1);
+        assert_eq!(result.total_accounts, 1);
+        assert_eq!(result.accounts.len(), 2);
+        assert_eq!(result.accounts[0].model_source, "account_cache");
+        assert!(result.accounts[0].schedulable);
+        assert_eq!(result.accounts[0].health, "available");
+        assert_eq!(
+            result.accounts[0].resolved_model.as_deref(),
+            Some("claude-opus-5")
+        );
+        assert!(!result.accounts[1].schedulable);
+        assert_eq!(result.accounts[1].health, "low_credit");
+        assert_eq!(
+            result.accounts[1].resolved_model.as_deref(),
+            Some("claude-opus-4.8")
+        );
     }
 
     #[tokio::test]
