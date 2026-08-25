@@ -15,7 +15,7 @@ use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio_util::codec::Decoder;
-use tracing::debug;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::endpoint::{
@@ -1087,7 +1087,28 @@ impl KiroClient {
                 future
             }
         };
-        fetch.await
+        match fetch.await {
+            Ok(models) => Ok(models),
+            Err(error) => {
+                let models = crate::catalog::static_models_for_subscription(
+                    account
+                        .subscription
+                        .as_ref()
+                        .map(|subscription| subscription.kind),
+                );
+                if models.is_empty() {
+                    return Err(error);
+                }
+                warn!(
+                    account = %account.id,
+                    endpoint = %error.endpoint,
+                    status = error.status.unwrap_or_default(),
+                    fallback_models = models.len(),
+                    "dynamic model discovery failed; using the subscription-safe static catalog"
+                );
+                Ok(models)
+            }
+        }
     }
 
     async fn fetch_models_once(&self, account: &Account) -> Result<Vec<ModelInfo>, KiroError> {
@@ -1104,15 +1125,7 @@ impl KiroClient {
                 .await
                 .map_err(build_error)?;
             let endpoint = EndpointDefinition::for_key(key, &self.overrides);
-            let base = endpoint
-                .url
-                .split("/generateAssistantResponse")
-                .next()
-                .unwrap_or(&endpoint.url);
-            let url = format!(
-                "{base}/ListAvailableModels?origin={}&maxResults=50",
-                endpoint.origin
-            );
+            let url = models_url(&endpoint.url, account)?;
             let request = self.short.get(url).headers(metadata_headers(
                 account,
                 &endpoint,
@@ -1300,8 +1313,13 @@ fn headers(
         headers.insert(name, HeaderValue::from_str(value).map_err(build_error)?);
     }
     let invocation_id = Uuid::new_v4().to_string();
+    if !endpoint.amz_target.is_empty() {
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-amz-target"),
+            HeaderValue::from_static(endpoint.amz_target),
+        );
+    }
     for (name, value) in [
-        ("x-amz-target", endpoint.amz_target),
         ("x-amz-user-agent", amz_user_agent.as_str()),
         ("x-amzn-kiro-agent-mode", mode),
         ("x-amzn-codewhisperer-optout", "true"),
@@ -1472,6 +1490,21 @@ fn usage_limits_url(endpoint: &str, account: &Account) -> Result<url::Url, KiroE
     query.append_pair("origin", "AI_EDITOR");
     query.append_pair("resourceType", "AGENTIC_REQUEST");
     query.append_pair("isEmailRequired", "true");
+    if let Some(profile_arn) = usage_profile_arn(account) {
+        query.append_pair("profileArn", profile_arn);
+    }
+    drop(query);
+    Ok(url)
+}
+
+fn models_url(endpoint: &str, account: &Account) -> Result<url::Url, KiroError> {
+    let mut url = operation_url(endpoint, "ListAvailableModels")?;
+    let mut query = url.query_pairs_mut();
+    // ListAvailableModels is a Kiro IDE REST operation even when it is served
+    // from the q.* host. Enterprise Identity Center profiles are authorized by
+    // profile ARN, not by the legacy Amazon Q CLI origin.
+    query.append_pair("origin", "AI_EDITOR");
+    query.append_pair("maxResults", "50");
     if let Some(profile_arn) = usage_profile_arn(account) {
         query.append_pair("profileArn", profile_arn);
     }
@@ -1702,10 +1735,61 @@ mod tests {
         EndpointDefinition {
             key: EndpointKey::Amazonq,
             url: format!("{}/amazon/generateAssistantResponse", server.uri()),
-            origin: "CLI",
-            amz_target: "AmazonQDeveloperStreamingService.SendMessage",
+            origin: "AI_EDITOR",
+            amz_target: "",
             name: "AmazonQ",
         }
+    }
+
+    fn power_account(method: AuthMethod) -> Account {
+        let mut account = account(method);
+        account.profile_arn =
+            Some("arn:aws:codewhisperer:us-east-1:123456789012:profile/enterprise".into());
+        account.subscription = Some(Subscription {
+            kind: SubscriptionKind::Power,
+            title: Some("Kiro Power".into()),
+            raw_type: Some("POWER".into()),
+            expires_at: None,
+            days_remaining: None,
+        });
+        account
+    }
+
+    #[tokio::test]
+    async fn idc_generation_uses_kiro_ide_origin_and_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/amazon/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let client = test_client(&server);
+        let account = power_account(AuthMethod::Idc);
+
+        let response = client
+            .generate(&account, &payload(), None)
+            .await
+            .expect("enterprise IdC generation succeeds");
+        drop(response);
+
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(request.headers.get("x-amz-target").is_none());
+        let user_agent = request
+            .headers
+            .get("user-agent")
+            .expect("user-agent")
+            .to_str()
+            .expect("valid user-agent");
+        assert!(user_agent.contains("api/codewhispererstreaming#1.0.27"));
+        assert!(user_agent.contains("KiroIDE-0.7.45-"));
+        let body: serde_json::Value = serde_json::from_slice(&request.body).expect("JSON body");
+        assert_eq!(
+            body.pointer("/conversationState/currentMessage/userInputMessage/origin")
+                .and_then(serde_json::Value::as_str),
+            Some("AI_EDITOR")
+        );
     }
 
     #[tokio::test]
@@ -1926,6 +2010,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enterprise_model_discovery_sends_profile_and_ide_origin() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/amazon/ListAvailableModels"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "models": [{"modelId": "claude-opus-4.6"}]
+            })))
+            .mount(&server)
+            .await;
+        let client = test_client(&server);
+        let account = power_account(AuthMethod::Idc);
+
+        let models = client
+            .list_models(&account)
+            .await
+            .expect("enterprise model discovery succeeds");
+
+        assert_eq!(models[0].model_id, "claude-opus-4.6");
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        let query = requests[0]
+            .url
+            .query_pairs()
+            .into_owned()
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query.get("origin").map(String::as_str), Some("AI_EDITOR"));
+        assert_eq!(query.get("maxResults").map(String::as_str), Some("50"));
+        assert_eq!(
+            query.get("profileArn").map(String::as_str),
+            account.profile_arn.as_deref()
+        );
+    }
+
+    #[tokio::test]
     async fn model_discovery_does_not_switch_endpoints_for_server_errors() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -1937,7 +2055,7 @@ mod tests {
         let account = account(AuthMethod::Idc);
 
         let error = client
-            .list_models(&account)
+            .fetch_models_once(&account)
             .await
             .expect_err("server error fails the request");
 
@@ -1945,6 +2063,27 @@ mod tests {
         let requests = server.received_requests().await.expect("requests");
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].url.path(), "/amazon/ListAvailableModels");
+    }
+
+    #[tokio::test]
+    async fn enterprise_model_discovery_failure_uses_static_catalog() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/amazon/ListAvailableModels"))
+            .respond_with(ResponseTemplate::new(500))
+            .mount(&server)
+            .await;
+        let client = test_client(&server);
+        let account = power_account(AuthMethod::Idc);
+
+        let models = client
+            .list_models(&account)
+            .await
+            .expect("static catalog keeps model listing available");
+
+        assert!(models
+            .iter()
+            .any(|model| model.model_id == "claude-opus-4.6"));
     }
 
     #[tokio::test]

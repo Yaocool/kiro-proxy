@@ -61,8 +61,12 @@ impl EndpointDefinition {
                     .amazonq_url
                     .clone()
                     .unwrap_or_else(|| AMAZONQ_URL.into()),
-                origin: "CLI",
-                amz_target: "AmazonQDeveloperStreamingService.SendMessage",
+                // The q.* runtime accepts Kiro IDE traffic for both Builder ID and
+                // Identity Center accounts. Advertising this request as Amazon Q
+                // CLI (and sending its RPC target) makes enterprise profiles fail
+                // authorization even when the bearer token itself is valid.
+                origin: "AI_EDITOR",
+                amz_target: "",
                 name: "AmazonQ",
             },
         }
@@ -466,6 +470,15 @@ mod tests {
             cache.order(&account, None, EndpointPurpose::Models),
             vec![EndpointKey::Amazonq, EndpointKey::Codewhisperer]
         );
+    }
+
+    #[test]
+    fn amazon_q_uses_the_kiro_ide_protocol() {
+        let endpoint =
+            EndpointDefinition::for_key(EndpointKey::Amazonq, &EndpointOverrides::default());
+
+        assert_eq!(endpoint.origin, "AI_EDITOR");
+        assert!(endpoint.amz_target.is_empty());
     }
 
     #[test]

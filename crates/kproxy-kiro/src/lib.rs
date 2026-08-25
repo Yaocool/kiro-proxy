@@ -6,7 +6,8 @@ pub mod endpoint;
 pub mod event_stream;
 
 pub use catalog::{
-    static_models, static_subscription_can_serve, StaticModel, STATIC_MODEL_CATALOG,
+    static_models, static_models_for_subscription, static_subscription_can_serve, StaticModel,
+    STATIC_MODEL_CATALOG,
 };
 pub use client::{
     KiroClient, KiroError, KiroResponse, ModelInfo, UsageInfo, UsageLimits, UsageUserInfo,

@@ -13,7 +13,9 @@ use bytes::BytesMut;
 use futures::StreamExt;
 use kproxy_kiro::{EventStreamDecoder, KiroError, KiroEvent, KiroResponse};
 use kproxy_pool::{AccountLease, PoolError};
-use kproxy_translate::model::{apply_adaptive_thinking, map_model, thinking_enabled_for_model};
+use kproxy_translate::model::{
+    apply_adaptive_thinking, map_model, resolve_dynamic_model, thinking_enabled_for_model,
+};
 use kproxy_translate::{
     apply_compaction_boundary, apply_context_management_edits, claude_loaded_tools,
     claude_pending_server_tool_uses, claude_to_kiro, compact_trigger_tokens,
@@ -2565,6 +2567,10 @@ async fn execute_upstream(
                     available_models = runtime.supported_models().await;
                 }
             } else {
+                if let Some(resolved) = resolve_static_model(&account, &actual_model) {
+                    actual_model = resolved;
+                    push_model_path(&mut model_path, &actual_model);
+                }
                 set_payload_model(&mut request_payload, &actual_model);
             }
         }
@@ -3076,6 +3082,24 @@ pub(super) fn set_payload_model(payload: &mut kproxy_translate::KiroPayload, mod
             user.model_id = model.into();
         }
     }
+}
+
+/// Resolve common client aliases during the cold-start window before an
+/// account's dynamic model cache has been populated. The catalog is filtered
+/// by subscription so this cannot route a premium model through a Free account.
+pub(super) fn resolve_static_model(
+    account: &kproxy_core::account::Account,
+    model: &str,
+) -> Option<String> {
+    let subscription = account
+        .subscription
+        .as_ref()
+        .map(|subscription| subscription.kind);
+    let available = kproxy_kiro::static_models_for_subscription(subscription)
+        .into_iter()
+        .map(|model| model.model_id)
+        .collect::<Vec<_>>();
+    resolve_dynamic_model(model, &available)
 }
 
 pub(super) fn find_model_fallback(
@@ -5743,6 +5767,46 @@ mod model_tests {
         assert_eq!(
             find_model_fallback("claude-opus-4-7", &models).as_deref(),
             Some("claude-opus-4-6")
+        );
+    }
+
+    #[test]
+    fn cold_start_resolves_enterprise_model_alias_from_static_catalog() {
+        let account = kproxy_core::account::Account {
+            id: "acc_enterprise".into(),
+            email: "enterprise@example.com".into(),
+            label: None,
+            enabled: true,
+            machine_id: "a".repeat(64),
+            profile_arn: Some(
+                "arn:aws:codewhisperer:us-east-1:123456789012:profile/enterprise".into(),
+            ),
+            upstream_user_id: None,
+            credentials: kproxy_core::account::Credentials {
+                access_token: "access-token".into(),
+                refresh_token: None,
+                client_id: None,
+                client_secret: None,
+                region: "us-east-1".into(),
+                expires_at: i64::MAX,
+                auth_method: kproxy_core::account::AuthMethod::Idc,
+            },
+            usage: None,
+            subscription: Some(kproxy_core::account::Subscription {
+                kind: kproxy_core::account::SubscriptionKind::Power,
+                title: Some("Kiro Power".into()),
+                raw_type: Some("POWER".into()),
+                expires_at: None,
+                days_remaining: None,
+            }),
+            tags: Vec::new(),
+            created_at: 0,
+            credit_exhausted: false,
+        };
+
+        assert_eq!(
+            resolve_static_model(&account, "claude-opus-4-6").as_deref(),
+            Some("claude-opus-4.6")
         );
     }
 
