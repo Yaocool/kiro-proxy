@@ -290,6 +290,10 @@ kproxy model-map delete low-credit
 触发，之后遵循 `models.cache_ttl_ms`；账号 `status_check` 任务只刷新额度，不会再发起一轮
 模型列表请求。
 
+使用 `kproxy models resolve <MODEL_ID>` 可按当前配置和各账号模型缓存查询最终模型；输出会
+区分显式 model-map 与自动别名解析。映射规则依赖 API key 时传入 `--api-key <ID|名称>`，需要
+先更新模型缓存时增加 `--refresh`。
+
 首次初始化永远不会覆盖已有 `config.toml`，因此旧版本创建的数据目录可能仍保留
 `server.host = "127.0.0.1"`。可使用 `kproxy config show --effective` 检查实际值；需要采用
 当前的 `0.0.0.0` 默认值时，使用 `kproxy config edit` 修改。

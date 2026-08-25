@@ -150,9 +150,12 @@ enum Command {
     Alert(crate::commands::runtime::AlertCommand),
     /// 显示上游动态模型。
     #[command(
-        after_help = "示例：\n  kproxy models\n  kproxy models --mapped\n  kproxy models --refresh"
+        args_conflicts_with_subcommands = true,
+        after_help = "示例：\n  kproxy models\n  kproxy models --mapped\n  kproxy models --refresh\n  kproxy models resolve opus5"
     )]
     Models {
+        #[command(subcommand)]
+        command: Option<ModelsCommand>,
         /// 同时显示每个模型经过映射规则后的结果。
         #[arg(long)]
         mapped: bool,
@@ -166,6 +169,24 @@ enum Command {
     /// 查看主题帮助。不指定主题时列出全部主题。
     #[command(after_help = "示例：\n  kproxy help\n  kproxy help stats\n  kproxy help model-map")]
     Help { topic: Option<String> },
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelsCommand {
+    /// 查询一个客户端 model ID 最终会解析成哪个 Kiro 模型。
+    #[command(
+        after_help = "示例：\n  kproxy models resolve opus5\n  kproxy models resolve claude-4.6-sonnet --refresh\n  kproxy --json models resolve opus5 --api-key production"
+    )]
+    Resolve {
+        /// 客户端传入的 model ID。
+        model: String,
+        /// 按指定 API key ID 或名称应用条件映射规则。
+        #[arg(long, value_name = "ID_OR_NAME")]
+        api_key: Option<String>,
+        /// 查询前先刷新账号模型缓存。
+        #[arg(long)]
+        refresh: bool,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -721,17 +742,44 @@ async fn main() -> Result<()> {
         Command::Alert(command) => {
             crate::commands::runtime::run_alert(&mut client, command, cli.json).await?;
         }
-        Command::Models { mapped, refresh } => {
-            if refresh {
-                let _: serde_json::Value = client
-                    .call(
-                        method::TASK_RUN,
-                        serde_json::json!({"name":"model_cache_refresh"}),
-                    )
-                    .await?;
+        Command::Models {
+            command,
+            mapped,
+            refresh,
+        } => match command {
+            Some(ModelsCommand::Resolve {
+                model,
+                api_key,
+                refresh,
+            }) => {
+                if refresh {
+                    let _: serde_json::Value = client
+                        .call(
+                            method::TASK_RUN,
+                            serde_json::json!({"name":"model_cache_refresh"}),
+                        )
+                        .await?;
+                }
+                crate::commands::runtime::show_model_resolution(
+                    &mut client,
+                    &model,
+                    api_key.as_deref(),
+                    cli.json,
+                )
+                .await?;
             }
-            crate::commands::runtime::show_models(&mut client, mapped, cli.json).await?;
-        }
+            None => {
+                if refresh {
+                    let _: serde_json::Value = client
+                        .call(
+                            method::TASK_RUN,
+                            serde_json::json!({"name":"model_cache_refresh"}),
+                        )
+                        .await?;
+                }
+                crate::commands::runtime::show_models(&mut client, mapped, cli.json).await?;
+            }
+        },
         Command::ModelMap(command) => {
             crate::commands::runtime::run_model_map(&mut client, command, cli.json).await?;
         }
@@ -811,6 +859,46 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Config(ConfigCommand::Reset))
+        ));
+    }
+
+    #[test]
+    fn models_supports_resolution_without_breaking_list_flags() {
+        let resolve = Cli::try_parse_from([
+            "kproxy",
+            "models",
+            "resolve",
+            "opus5",
+            "--api-key",
+            "production",
+            "--refresh",
+        ])
+        .expect("model resolve");
+        let Some(Command::Models {
+            command:
+                Some(ModelsCommand::Resolve {
+                    model,
+                    api_key,
+                    refresh: true,
+                }),
+            mapped: false,
+            refresh: false,
+        }) = resolve.command
+        else {
+            panic!("expected models resolve command");
+        };
+        assert_eq!(model, "opus5");
+        assert_eq!(api_key.as_deref(), Some("production"));
+
+        let list = Cli::try_parse_from(["kproxy", "models", "--mapped", "--refresh"])
+            .expect("legacy models flags");
+        assert!(matches!(
+            list.command,
+            Some(Command::Models {
+                command: None,
+                mapped: true,
+                refresh: true,
+            })
         ));
     }
 

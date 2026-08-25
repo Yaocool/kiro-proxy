@@ -375,6 +375,7 @@ kproxy diagnose endpoints
 kproxy diagnose account --all -c 4 --timeout 45s
 kproxy subscriptions
 kproxy models --refresh --mapped
+kproxy models resolve opus5       # show model-map and final per-account Kiro model
 kproxy model-map add --name low-credit --source 'claude-opus-*' --target claude-sonnet-4.6 --below-credits-percent 10
 kproxy model-map edit low-credit --below-credits-percent 15
 kproxy model-map delete low-credit
