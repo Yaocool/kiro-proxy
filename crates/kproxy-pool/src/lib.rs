@@ -8,5 +8,7 @@ pub use pool::{
     account_credit_state, AccountCreditState, AccountLease, AccountPool, AccountPoolCounts,
     PoolError, ScoreExplanation,
 };
-pub use refresh::{RefreshError, TokenRefresher};
+pub use refresh::{
+    RefreshError, RefreshOutcome, RefreshedCredentials, ReloadedCredentials, TokenRefresher,
+};
 pub use state::{AccountHealth, AccountState};

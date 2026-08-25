@@ -11,6 +11,95 @@ use tokio::sync::Mutex;
 
 const RETRY_DELAYS_MS: [u64; 6] = [25, 50, 100, 200, 400, 800];
 
+/// An advisory cross-process lock for a durable state file.
+///
+/// The lock is kept in a stable sibling file instead of the state file itself,
+/// because atomic replacement changes the state file's inode. All cooperating
+/// processes therefore continue to contend on the same lock across renames.
+#[cfg(unix)]
+pub struct ExclusiveFileLock {
+    file: std::fs::File,
+}
+
+#[cfg(not(unix))]
+pub struct ExclusiveFileLock;
+
+#[cfg(unix)]
+impl Drop for ExclusiveFileLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: `file` remains open for this call and `flock` does not retain
+        // the descriptor. Closing the file would also release the lock, but an
+        // explicit unlock makes the lifetime unambiguous.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn exclusive_lock_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".lock");
+    PathBuf::from(value)
+}
+
+/// Exclusively locks a stable sibling lock file until the returned guard is
+/// dropped. This lock must cover the complete read-modify-write transaction,
+/// not just the final atomic rename.
+pub async fn lock_file_exclusive(path: &Path) -> Result<ExclusiveFileLock> {
+    let lock_path = exclusive_lock_path(path);
+    if let Some(parent) = lock_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .with_context(|| format!("create parent dir for {}", lock_path.display()))?;
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        tokio::task::spawn_blocking(move || {
+            use std::os::fd::AsRawFd;
+            use std::os::unix::fs::OpenOptionsExt;
+
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(&lock_path)
+                .with_context(|| format!("open lock file {}", lock_path.display()))?;
+            loop {
+                // SAFETY: `file` owns a valid descriptor for the duration of
+                // the call and `flock` does not retain the descriptor.
+                let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+                if result == 0 {
+                    break;
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != ErrorKind::Interrupted {
+                    return Err(
+                        anyhow::Error::new(error).context(format!("lock {}", lock_path.display()))
+                    );
+                }
+            }
+            Ok(ExclusiveFileLock { file })
+        })
+        .await
+        .context("join file lock task")?
+    }
+
+    #[cfg(not(unix))]
+    {
+        // The daemon's in-process account mutex still serializes writers on
+        // platforms where libc flock is unavailable.
+        let _ = lock_path;
+        Ok(ExclusiveFileLock)
+    }
+}
+
 fn path_locks() -> &'static StdMutex<HashMap<PathBuf, Arc<Mutex<()>>>> {
     static LOCKS: OnceLock<StdMutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
     LOCKS.get_or_init(|| StdMutex::new(HashMap::new()))
@@ -294,6 +383,35 @@ mod tests {
         two.await.expect("join two").expect("write two");
         let actual = read_to_string_with_retry(&path).await.expect("read");
         assert!(actual == first || actual == second);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exclusive_file_lock_serializes_independent_callers() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("accounts.json");
+        let first = lock_file_exclusive(&path).await.expect("first lock");
+        let second_path = path.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let mut waiter = tokio::spawn(async move {
+            started_tx.send(()).expect("signal waiter");
+            lock_file_exclusive(&second_path).await
+        });
+        started_rx.await.expect("waiter started");
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut waiter)
+                .await
+                .is_err(),
+            "second caller acquired an already-held file lock"
+        );
+        drop(first);
+        let second = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("second lock timed out")
+            .expect("join waiter")
+            .expect("second lock");
+        drop(second);
     }
 
     #[tokio::test]

@@ -160,8 +160,19 @@ fn spawn_account_file_watcher(state: Arc<AppState>, shutdown: CancellationToken)
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     _ = interval.tick() => {
-                        let current = account_storage_signature(&path).await;
+                        let mut current = account_storage_signature(&path).await;
                         state.task_registry.record("account_file_watcher", "ok");
+                        if current == previous {
+                            continue;
+                        }
+                        let _transaction = match state.lock_account_storage().await {
+                            Ok(transaction) => transaction,
+                            Err(error) => {
+                                warn!(%error, path = %path.display(), "accounts file lock failed; keeping current accounts");
+                                continue;
+                            }
+                        };
+                        current = account_storage_signature(&path).await;
                         if current == previous {
                             continue;
                         }
@@ -430,11 +441,6 @@ fn spawn_token_refresh(state: Arc<AppState>, shutdown: CancellationToken) {
                         }
                         for (account_id, account_name, error) in &report.failures {
                             warn!(%account_id, %account_name, %error, "background token refresh failed");
-                        }
-                        if !report.refreshed.is_empty() {
-                            if let Err(error) = persist_pool_accounts(&state).await {
-                                warn!(%error, "failed to persist refreshed credentials");
-                            }
                         }
                         info!(
                             checked = report.checked,
@@ -737,9 +743,6 @@ pub async fn run_named(state: &Arc<AppState>, name: &str) -> anyhow::Result<serd
         "token_refresh" => {
             let pool = state.pool();
             let report = state.refresh_expiring_tokens(&pool).await;
-            if !report.refreshed.is_empty() {
-                persist_pool_accounts(state).await?;
-            }
             report.summary()
         }
         "stats_persist" => {
@@ -777,15 +780,7 @@ pub async fn run_named(state: &Arc<AppState>, name: &str) -> anyhow::Result<serd
 }
 
 pub(crate) async fn persist_pool_accounts(state: &Arc<AppState>) -> anyhow::Result<()> {
-    let snapshot = state.pool().snapshot().await;
-    let _transaction = state.lock_account_mutation().await;
-    let mut next = state.with_accounts(Clone::clone);
-    for account in snapshot {
-        next.replace_if_changed(account);
-    }
-    next.save().await?;
-    state.replace_accounts(next);
-    Ok(())
+    state.persist_runtime_accounts().await
 }
 
 #[cfg(test)]

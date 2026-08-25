@@ -73,6 +73,8 @@ impl StreamProtocol {
 pub struct StreamContext {
     pub state: Arc<AppState>,
     pub lease: AccountLease,
+    /// Access token used to create the currently consumed upstream response.
+    pub upstream_access_token: String,
     pub reservation: CreditReservation,
     pub trace_id: String,
     pub request_id: String,
@@ -224,6 +226,7 @@ pub fn response(
         };
         let created = now_secs();
         let mut failed = None;
+        let mut upstream_access_token = context.upstream_access_token.clone();
         let mut pre_data_retries = 0;
         let mut attempted_accounts = HashSet::new();
         let mut fallback_model = None::<String>;
@@ -500,7 +503,11 @@ pub fn response(
                     let mut disable_account = true;
                     if context
                         .state
-                        .refresh_account_token(&context.state.pool(), &failed_account_id, true)
+                        .refresh_account_token_after_auth_failure(
+                            &context.state.pool(),
+                            &failed_account_id,
+                            &upstream_access_token,
+                        )
                         .await
                         .is_ok()
                     {
@@ -510,38 +517,34 @@ pub fn response(
                             account_id = %failed_account_id,
                             "stream account token refreshed"
                         );
-                        if let Err(error) = crate::tasks::persist_pool_accounts(&context.state).await {
-                            failed = Some(error.to_string());
-                            disable_account = false;
-                        } else {
-                            let account = context.lease.account().await;
-                            payload.profile_arn.clone_from(&account.profile_arn);
-                            match context.state.generate(&account, &payload).await {
-                                Ok(retry) => {
-                                    let (next_endpoint, next_response, next_permit) = retry.into_parts();
-                                    endpoint = next_endpoint.name.to_string();
-                                    source = next_response.bytes_stream();
-                                    upstream_permit = next_permit;
-                                    buffer.clear();
-                                    decoder = EventStreamDecoder;
-                                    decoded = DecodedResponse::default();
-                                    stop_filter = StopSequenceFilter::new(&context.stop_sequences);
-                                    failed = None;
-                                    pre_data_retries += 1;
-                                    tracing::info!(
-                                        trace_id = %context.trace_id,
-                                        request_id = %context.request_id,
-                                        account_id = %failed_account_id,
-                                        endpoint,
-                                        retry = pre_data_retries,
-                                        "retrying stream after token refresh"
-                                    );
-                                    continue 'rounds;
-                                }
-                                Err(error) => {
-                                    disable_account = error.is_auth();
-                                    failed = Some(error.to_string());
-                                }
+                        let account = context.lease.account().await;
+                        payload.profile_arn.clone_from(&account.profile_arn);
+                        match context.state.generate(&account, &payload).await {
+                            Ok(retry) => {
+                                upstream_access_token = account.credentials.access_token.clone();
+                                let (next_endpoint, next_response, next_permit) = retry.into_parts();
+                                endpoint = next_endpoint.name.to_string();
+                                source = next_response.bytes_stream();
+                                upstream_permit = next_permit;
+                                buffer.clear();
+                                decoder = EventStreamDecoder;
+                                decoded = DecodedResponse::default();
+                                stop_filter = StopSequenceFilter::new(&context.stop_sequences);
+                                failed = None;
+                                pre_data_retries += 1;
+                                tracing::info!(
+                                    trace_id = %context.trace_id,
+                                    request_id = %context.request_id,
+                                    account_id = %failed_account_id,
+                                    endpoint,
+                                    retry = pre_data_retries,
+                                    "retrying stream after token refresh"
+                                );
+                                continue 'rounds;
+                            }
+                            Err(error) => {
+                                disable_account = error.is_auth();
+                                failed = Some(error.to_string());
                             }
                         }
                     }
@@ -600,6 +603,7 @@ pub fn response(
                             let account = context.lease.account().await;
                             match context.state.generate(&account, &payload).await {
                                 Ok(retry) => {
+                                    upstream_access_token = account.credentials.access_token.clone();
                                     let (next_endpoint, next_response, next_permit) =
                                         retry.into_parts();
                                     endpoint = next_endpoint.name.to_string();
@@ -785,6 +789,7 @@ pub fn response(
                     .await;
                     match context.state.generate(&account, &payload).await {
                         Ok(retry) => {
+                            upstream_access_token = account.credentials.access_token.clone();
                             let (next_endpoint, next_response, next_permit) = retry.into_parts();
                             endpoint = next_endpoint.name.to_string();
                             source = next_response.bytes_stream();
@@ -1147,6 +1152,7 @@ pub fn response(
                 let account = context.lease.account().await;
                 match context.state.generate(&account, &payload).await {
                     Ok(next) => {
+                        upstream_access_token = account.credentials.access_token.clone();
                         let (next_endpoint, next_response, next_permit) = next.into_parts();
                         endpoint = next_endpoint.name.to_string();
                         source = next_response.bytes_stream();
@@ -1295,6 +1301,7 @@ pub fn response(
                 let account = context.lease.account().await;
                 match context.state.generate(&account, &payload).await {
                     Ok(next) => {
+                        upstream_access_token = account.credentials.access_token.clone();
                         let (next_endpoint, next_response, next_permit) = next.into_parts();
                         endpoint = next_endpoint.name.to_string();
                         source = next_response.bytes_stream();
@@ -1354,6 +1361,7 @@ pub fn response(
             let account = context.lease.account().await;
             match context.state.generate(&account, &payload).await {
                 Ok(next) => {
+                    upstream_access_token = account.credentials.access_token.clone();
                     let (next_endpoint, next_response, next_permit) = next.into_parts();
                     endpoint = next_endpoint.name.to_string();
                     source = next_response.bytes_stream();

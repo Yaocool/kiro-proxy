@@ -1082,6 +1082,7 @@ async fn handle_claude(
     let UpstreamExecution {
         lease,
         response: upstream,
+        upstream_access_token,
         mapped_model,
         kiro_model,
         model_path,
@@ -1096,6 +1097,7 @@ async fn handle_claude(
             StreamContext {
                 state,
                 lease,
+                upstream_access_token,
                 reservation,
                 trace_id,
                 request_id,
@@ -1348,6 +1350,7 @@ async fn handle_openai(
     let UpstreamExecution {
         lease,
         response: upstream,
+        upstream_access_token,
         mapped_model,
         kiro_model,
         model_path,
@@ -1375,6 +1378,7 @@ async fn handle_openai(
             StreamContext {
                 state,
                 lease,
+                upstream_access_token,
                 reservation,
                 trace_id,
                 request_id,
@@ -1768,6 +1772,7 @@ async fn generate_compaction_summary_inner(
     let UpstreamExecution {
         mut lease,
         response,
+        upstream_access_token: _,
         mapped_model,
         kiro_model,
         model_path,
@@ -2613,14 +2618,13 @@ async fn execute_upstream(
         ) && state
             .refresh_account_token(&pool, &account.id, false)
             .await
-            .is_ok()
+            .is_ok_and(|outcome| outcome.changed)
         {
             tracing::info!(
                 trace_id,
                 account_id = %account.id,
                 "expiring account token refreshed before upstream call"
             );
-            persist_refreshed_accounts(state).await?;
         }
         let account = lease.account().await;
         match state.generate(&account, &request_payload).await {
@@ -2641,6 +2645,7 @@ async fn execute_upstream(
                 return Ok(UpstreamExecution {
                     lease,
                     response,
+                    upstream_access_token: account.credentials.access_token.clone(),
                     mapped_model,
                     kiro_model: actual_model,
                     model_path,
@@ -2668,11 +2673,14 @@ async fn execute_upstream(
                 );
                 let mut ban_account = true;
                 if state
-                    .refresh_account_token(&pool, &account.id, true)
+                    .refresh_account_token_after_auth_failure(
+                        &pool,
+                        &account.id,
+                        &account.credentials.access_token,
+                    )
                     .await
                     .is_ok()
                 {
-                    persist_refreshed_accounts(state).await?;
                     let refreshed = lease.account().await;
                     request_payload
                         .profile_arn
@@ -2691,6 +2699,7 @@ async fn execute_upstream(
                             pool.record_success(&refreshed.id).await;
                             return Ok(UpstreamExecution {
                                 lease,
+                                upstream_access_token: refreshed.credentials.access_token.clone(),
                                 mapped_model,
                                 kiro_model: actual_model,
                                 model_path,
@@ -2833,6 +2842,10 @@ async fn execute_upstream(
                                     pool.record_success(&account.id).await;
                                     return Ok(UpstreamExecution {
                                         lease,
+                                        upstream_access_token: account
+                                            .credentials
+                                            .access_token
+                                            .clone(),
                                         mapped_model,
                                         kiro_model: actual_model,
                                         model_path,
@@ -3052,18 +3065,6 @@ fn retry_attempt_count(max_retries: u32, account_count: u32) -> u32 {
     max_retries.saturating_add(1).min(account_count).max(1)
 }
 
-async fn persist_refreshed_accounts(state: &Arc<AppState>) -> Result<(), ExecuteError> {
-    crate::tasks::persist_pool_accounts(state)
-        .await
-        .map_err(|error| {
-            ExecuteError::Upstream(KiroError {
-                status: None,
-                endpoint: "credential-store".into(),
-                message: format!("refreshed credentials could not be persisted: {error}"),
-            })
-        })
-}
-
 pub(super) fn set_payload_model(payload: &mut kproxy_translate::KiroPayload, model: &str) {
     payload
         .conversation_state
@@ -3129,6 +3130,7 @@ struct DispatchFailure {
 struct UpstreamExecution {
     lease: AccountLease,
     response: KiroResponse,
+    upstream_access_token: String,
     mapped_model: String,
     kiro_model: String,
     model_path: Vec<String>,
@@ -3944,23 +3946,22 @@ pub(super) async fn execute_kiro_web_search(
     lease: &AccountLease,
     query: &str,
 ) -> Result<kproxy_translate::WebSearchResults, KiroError> {
-    let account_id = lease.account().await.id;
+    let account = lease.account().await;
+    let account_id = account.id;
+    let rejected_access_token = account.credentials.access_token;
     match execute_kiro_web_search_once(state, lease, query).await {
         Err(error) if error.is_auth() => {
             state
-                .refresh_account_token(&state.pool(), &account_id, true)
+                .refresh_account_token_after_auth_failure(
+                    &state.pool(),
+                    &account_id,
+                    &rejected_access_token,
+                )
                 .await
                 .map_err(|refresh| KiroError {
                     status: error.status,
                     endpoint: "MCP web_search".into(),
                     message: format!("web search authentication refresh failed: {refresh}"),
-                })?;
-            persist_refreshed_accounts(state)
-                .await
-                .map_err(|_| KiroError {
-                    status: None,
-                    endpoint: "MCP web_search".into(),
-                    message: "failed to persist refreshed web search token".into(),
                 })?;
             execute_kiro_web_search_once(state, lease, query).await
         }
