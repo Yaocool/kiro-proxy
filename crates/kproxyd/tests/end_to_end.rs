@@ -472,7 +472,7 @@ async fn dotenv_is_loaded_before_daemon_startup_configuration() {
 }
 
 #[tokio::test]
-async fn inbound_openai_request_runs_through_translation_pool_and_mock_upstream() {
+async fn compact_model_alias_runs_through_translation_pool_and_mock_upstream() {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;
     let mut upstream_body = event_stream_frame(
@@ -540,7 +540,7 @@ async fn inbound_openai_request_runs_through_translation_pool_and_mock_upstream(
         .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
         .bearer_auth(daemon.api_key.as_deref().expect("service API key"))
         .json(&serde_json::json!({
-            "model": "minimax-m2.5",
+            "model": "opus5",
             "messages": [{"role":"user", "content":"exercise every layer"}],
             "max_tokens": 64,
             "stream": false
@@ -568,7 +568,7 @@ async fn inbound_openai_request_runs_through_translation_pool_and_mock_upstream(
     for payload in generation_payloads {
         assert_eq!(
             payload["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
-            "minimax-m2.5"
+            "claude-opus-5"
         );
         assert!(
             payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
