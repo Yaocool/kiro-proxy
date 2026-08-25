@@ -8,7 +8,7 @@ use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use futures::future::{BoxFuture, FutureExt, Shared};
 use futures::{Stream, StreamExt};
-use kproxy_core::account::{Account, Subscription, SubscriptionKind, Usage};
+use kproxy_core::account::{Account, AuthMethod, Subscription, SubscriptionKind, Usage};
 use kproxy_core::config::{AgentMode, UpstreamConfig};
 use kproxy_translate::{KiroPayload, WebSearchResults};
 use reqwest::{Client, Response};
@@ -696,12 +696,8 @@ impl KiroClient {
     }
 
     fn profile_discovery_urls(&self, account: &Account) -> Result<Vec<url::Url>, KiroError> {
-        if let Some(endpoint) = self.overrides.codewhisperer_url.as_deref() {
-            let mut url = url::Url::parse(endpoint).map_err(build_error)?;
-            url.set_path("/ListAvailableProfiles");
-            url.set_query(None);
-            url.set_fragment(None);
-            return Ok(vec![url]);
+        if let Some(endpoint) = self.overrides.amazonq_url.as_deref() {
+            return Ok(vec![operation_url(endpoint, "ListAvailableProfiles")?]);
         }
 
         let region = account.credentials.region.trim();
@@ -724,10 +720,10 @@ impl KiroClient {
         regions
             .into_iter()
             .map(|region| {
-                url::Url::parse(&format!(
-                    "https://codewhisperer.{region}.amazonaws.com/ListAvailableProfiles"
-                ))
-                .map_err(build_error)
+                operation_url(
+                    &format!("https://q.{region}.amazonaws.com"),
+                    "ListAvailableProfiles",
+                )
             })
             .collect()
     }
@@ -983,36 +979,78 @@ impl KiroClient {
             .acquire_owned()
             .await
             .map_err(build_error)?;
-        let endpoint = EndpointDefinition::for_key(EndpointKey::Amazonq, &self.overrides);
-        let base = endpoint
-            .url
-            .split("/generateAssistantResponse")
-            .next()
-            .unwrap_or(&endpoint.url);
-        let mut url = url::Url::parse(&format!(
-            "{base}/getUsageLimits?origin=AI_EDITOR&isEmailRequired=true"
-        ))
-        .map_err(build_error)?;
-        if let Some(profile_arn) = account.profile_arn.as_deref() {
-            url.query_pairs_mut().append_pair("profileArn", profile_arn);
+        let urls = self.usage_limits_urls(account)?;
+        self.get_usage_limits_from_urls(account, urls).await
+    }
+
+    async fn get_usage_limits_from_urls(
+        &self,
+        account: &Account,
+        urls: Vec<url::Url>,
+    ) -> Result<UsageLimits, KiroError> {
+        let attempt_count = urls.len();
+        let mut last_error = None;
+        for (attempt, url) in urls.into_iter().enumerate() {
+            let endpoint = usage_endpoint_label(&url);
+            let response = self
+                .short
+                .get(url)
+                .header("accept", "application/json")
+                .header(
+                    "authorization",
+                    format!("Bearer {}", account.credentials.access_token),
+                )
+                .header("user-agent", kiro_user_agent(&account.machine_id))
+                .header("x-amz-user-agent", kiro_amz_user_agent(&account.machine_id))
+                .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+                .header("amz-sdk-request", "attempt=1; max=1")
+                .send()
+                .await
+                .map_err(|error| KiroError {
+                    status: None,
+                    endpoint: endpoint.clone(),
+                    message: error.to_string(),
+                })?;
+            let status = response.status();
+            let body = bounded_response_text(response, 1024 * 1024, &endpoint).await?;
+            if status.is_success() {
+                return serde_json::from_str::<UsageLimits>(&body).map_err(|error| KiroError {
+                    status: Some(502),
+                    endpoint,
+                    message: format!("invalid usage limits response: {error}"),
+                });
+            }
+            let error = KiroError {
+                status: Some(status.as_u16()),
+                endpoint: endpoint.clone(),
+                message: nonempty_error_body(status.as_u16(), &body),
+            };
+            if status.as_u16() == 403 && attempt + 1 < attempt_count {
+                debug!(
+                    account = %account.id,
+                    endpoint = %endpoint,
+                    "Kiro usage endpoint rejected the account; trying the regional fallback"
+                );
+                last_error = Some(error);
+                continue;
+            }
+            return Err(error);
         }
-        let response = self
-            .short
-            .get(url)
-            .header("accept", "application/json")
-            .header(
-                "authorization",
-                format!("Bearer {}", account.credentials.access_token),
-            )
-            .header("user-agent", kiro_user_agent(&account.machine_id))
-            .header("x-amz-user-agent", kiro_amz_user_agent(&account.machine_id))
-            .send()
-            .await
-            .map_err(build_error)?;
-        if !response.status().is_success() {
-            return Err(response_error(response, &endpoint).await);
+        Err(last_error.unwrap_or_else(|| KiroError {
+            status: None,
+            endpoint: "getUsageLimits".into(),
+            message: "no usable Kiro usage endpoint".into(),
+        }))
+    }
+
+    fn usage_limits_urls(&self, account: &Account) -> Result<Vec<url::Url>, KiroError> {
+        if let Some(endpoint) = self.overrides.amazonq_url.as_deref() {
+            return Ok(vec![usage_limits_url(endpoint, account)?]);
         }
-        response.json::<UsageLimits>().await.map_err(build_error)
+        usage_api_regions(account)
+            .into_iter()
+            .map(|region| usage_limits_url(&format!("https://q.{region}.amazonaws.com"), account))
+            .collect()
     }
 
     pub async fn list_models(&self, account: &Account) -> Result<Vec<ModelInfo>, KiroError> {
@@ -1408,6 +1446,96 @@ fn nonempty_error_body(status: u16, body: &str) -> String {
         format!("upstream returned HTTP {status} without an error message")
     } else {
         truncate_chars(body, 2_000)
+    }
+}
+
+fn operation_url(endpoint: &str, operation: &str) -> Result<url::Url, KiroError> {
+    let mut url = url::Url::parse(endpoint).map_err(build_error)?;
+    let current_path = url.path().trim_end_matches('/');
+    let base_path = current_path
+        .strip_suffix("/generateAssistantResponse")
+        .unwrap_or(current_path);
+    let path = if base_path.is_empty() {
+        format!("/{operation}")
+    } else {
+        format!("{base_path}/{operation}")
+    };
+    url.set_path(&path);
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
+fn usage_limits_url(endpoint: &str, account: &Account) -> Result<url::Url, KiroError> {
+    let mut url = operation_url(endpoint, "getUsageLimits")?;
+    let mut query = url.query_pairs_mut();
+    query.append_pair("origin", "AI_EDITOR");
+    query.append_pair("resourceType", "AGENTIC_REQUEST");
+    query.append_pair("isEmailRequired", "true");
+    if let Some(profile_arn) = usage_profile_arn(account) {
+        query.append_pair("profileArn", profile_arn);
+    }
+    drop(query);
+    Ok(url)
+}
+
+fn usage_profile_arn(account: &Account) -> Option<&str> {
+    account
+        .profile_arn
+        .as_deref()
+        .map(str::trim)
+        .filter(|profile_arn| !profile_arn.is_empty())
+        .filter(|profile_arn| {
+            account.credentials.auth_method != AuthMethod::Idc
+                || *profile_arn != KIRO_BUILDER_ID_PROFILE_ARN
+        })
+}
+
+fn usage_api_regions(account: &Account) -> Vec<String> {
+    let profile_region = account.profile_arn.as_deref().and_then(profile_arn_region);
+    let primary = profile_region
+        .map(str::to_owned)
+        .unwrap_or_else(|| canonical_api_region(&account.credentials.region).to_owned());
+    let fallback = if primary == "us-east-1" {
+        "eu-central-1"
+    } else {
+        "us-east-1"
+    };
+    let mut regions = vec![primary];
+    if regions[0] != fallback {
+        regions.push(fallback.to_owned());
+    }
+    regions
+}
+
+fn canonical_api_region(region: &str) -> &'static str {
+    if region.trim().starts_with("eu-") {
+        "eu-central-1"
+    } else {
+        "us-east-1"
+    }
+}
+
+fn profile_arn_region(profile_arn: &str) -> Option<&str> {
+    let mut parts = profile_arn.split(':');
+    let valid_prefix = parts.next() == Some("arn")
+        && parts
+            .next()
+            .is_some_and(|partition| partition.starts_with("aws"))
+        && parts.next() == Some("codewhisperer");
+    let region = parts.next()?.trim();
+    (valid_prefix
+        && !region.is_empty()
+        && region
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '-'))
+    .then_some(region)
+}
+
+fn usage_endpoint_label(url: &url::Url) -> String {
+    match url.host_str() {
+        Some(host) => format!("getUsageLimits ({host})"),
+        None => "getUsageLimits".into(),
     }
 }
 
@@ -1938,7 +2066,7 @@ mod tests {
         let server = MockServer::start().await;
         let discovered = "arn:aws:codewhisperer:us-east-1:123456789012:profile/discovered-profile";
         Mock::given(method("POST"))
-            .and(path("/ListAvailableProfiles"))
+            .and(path("/amazon/ListAvailableProfiles"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_delay(Duration::from_millis(50))
@@ -1960,7 +2088,7 @@ mod tests {
         assert_eq!(right.expect("right profile"), discovered);
         let requests = server.received_requests().await.expect("requests");
         assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].url.path(), "/ListAvailableProfiles");
+        assert_eq!(requests[0].url.path(), "/amazon/ListAvailableProfiles");
         assert_eq!(
             requests[0]
                 .headers
@@ -1978,7 +2106,7 @@ mod tests {
     async fn builder_id_profile_is_used_when_profile_listing_is_forbidden() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/ListAvailableProfiles"))
+            .and(path("/amazon/ListAvailableProfiles"))
             .respond_with(
                 ResponseTemplate::new(403)
                     .set_body_string("User is not authorized to make this call"),
@@ -1994,6 +2122,155 @@ mod tests {
 
         assert_eq!(profile, KIRO_BUILDER_ID_PROFILE_ARN);
         assert_eq!(server.received_requests().await.expect("requests").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn usage_limits_send_complete_enterprise_query_and_runtime_headers() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/amazon/getUsageLimits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "userInfo":{"userId":"stable-user","email":"test@example.com"},
+                "usageBreakdownList":[]
+            })))
+            .mount(&server)
+            .await;
+        let client = test_client(&server);
+        let mut account = account(AuthMethod::Idc);
+        let profile_arn = "arn:aws:codewhisperer:us-east-1:123456789012:profile/enterprise-profile";
+        account.profile_arn = Some(profile_arn.into());
+
+        let limits = client
+            .get_usage_limits(&account)
+            .await
+            .expect("usage limits");
+
+        assert_eq!(
+            limits.user_info.as_ref().map(|user| user.user_id.as_str()),
+            Some("stable-user")
+        );
+        let requests = server.received_requests().await.expect("requests");
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        let query = request
+            .url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(query.get("origin").map(String::as_str), Some("AI_EDITOR"));
+        assert_eq!(
+            query.get("resourceType").map(String::as_str),
+            Some("AGENTIC_REQUEST")
+        );
+        assert_eq!(
+            query.get("isEmailRequired").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            query.get("profileArn").map(String::as_str),
+            Some(profile_arn)
+        );
+        assert!(request.headers.contains_key("amz-sdk-invocation-id"));
+        assert_eq!(
+            request
+                .headers
+                .get("amz-sdk-request")
+                .and_then(|value| value.to_str().ok()),
+            Some("attempt=1; max=1")
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_id_usage_omits_the_synthetic_profile_arn() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/amazon/getUsageLimits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({})))
+            .mount(&server)
+            .await;
+        let client = test_client(&server);
+        let mut account = account(AuthMethod::Idc);
+        account.profile_arn = Some(KIRO_BUILDER_ID_PROFILE_ARN.into());
+
+        client
+            .get_usage_limits(&account)
+            .await
+            .expect("Builder ID usage limits");
+
+        let requests = server.received_requests().await.expect("requests");
+        let query = requests[0]
+            .url
+            .query_pairs()
+            .map(|(key, value)| (key.into_owned(), value.into_owned()))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert!(!query.contains_key("profileArn"));
+        assert_eq!(
+            query.get("isEmailRequired").map(String::as_str),
+            Some("true")
+        );
+    }
+
+    #[tokio::test]
+    async fn usage_limits_retry_the_regional_endpoint_after_a_403() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/primary/getUsageLimits"))
+            .respond_with(ResponseTemplate::new(403).set_body_string("AccessDeniedException"))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/fallback/getUsageLimits"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "userInfo":{"userId":"stable-user"}
+            })))
+            .mount(&server)
+            .await;
+        let client = test_client(&server);
+        let account = account(AuthMethod::Idc);
+        let urls = ["primary", "fallback"]
+            .into_iter()
+            .map(|path| {
+                usage_limits_url(&format!("{}/{path}", server.uri()), &account).expect("usage URL")
+            })
+            .collect();
+
+        let limits = client
+            .get_usage_limits_from_urls(&account, urls)
+            .await
+            .expect("regional fallback");
+
+        assert_eq!(
+            limits.user_info.as_ref().map(|user| user.user_id.as_str()),
+            Some("stable-user")
+        );
+        let paths = server
+            .received_requests()
+            .await
+            .expect("requests")
+            .into_iter()
+            .map(|request| request.url.path().to_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            paths,
+            vec!["/primary/getUsageLimits", "/fallback/getUsageLimits"]
+        );
+    }
+
+    #[test]
+    fn usage_endpoint_regions_follow_profile_then_sso_region() {
+        let mut account = account(AuthMethod::Idc);
+        account.credentials.region = "eu-west-1".into();
+        assert_eq!(
+            usage_api_regions(&account),
+            vec!["eu-central-1", "us-east-1"]
+        );
+
+        account.profile_arn =
+            Some("arn:aws:codewhisperer:ap-southeast-1:123456789012:profile/enterprise".into());
+        assert_eq!(
+            usage_api_regions(&account),
+            vec!["ap-southeast-1", "us-east-1"]
+        );
     }
 
     #[tokio::test]

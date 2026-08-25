@@ -766,16 +766,25 @@ async fn handle_account_add_sso(state: &Arc<AppState>, params: serde_json::Value
         created_at: now_secs(),
         credit_exhausted: false,
     };
+    match state.kiro().resolve_profile_arn(&account).await {
+        Ok(profile_arn) => account.profile_arn = Some(profile_arn),
+        Err(error) => {
+            let safe_error = kproxy_translate::sanitize_error_message(&error.to_string());
+            warn!(
+                requested_email = %email,
+                validation_step = "profile discovery",
+                upstream_endpoint = %error.endpoint,
+                upstream_status = ?error.status,
+                error = %safe_error,
+                "Kiro profile discovery failed; continuing with token validation without a profile ARN"
+            );
+        }
+    }
     let limits = state
         .kiro()
         .get_usage_limits(&account)
         .await
-        .map_err(|error| {
-            RpcError::internal(format!(
-                "SSO login succeeded, but Kiro account validation failed; account was not saved: {}",
-                kproxy_translate::sanitize_error_message(&error.to_string())
-            ))
-        })?;
+        .map_err(|error| sso_account_validation_error(&email, "usage limits", &error))?;
     let upstream_user_id = authenticated_sso_user_id(&limits)?;
     if let Some(actual_identity) = limits
         .user_info
@@ -804,6 +813,25 @@ async fn handle_account_add_sso(state: &Arc<AppState>, params: serde_json::Value
     })
     .await?;
     to_value(summary)
+}
+
+fn sso_account_validation_error(
+    email: &str,
+    step: &'static str,
+    error: &kproxy_kiro::KiroError,
+) -> RpcError {
+    let safe_error = kproxy_translate::sanitize_error_message(&error.to_string());
+    warn!(
+        requested_email = %email,
+        validation_step = step,
+        upstream_endpoint = %error.endpoint,
+        upstream_status = ?error.status,
+        error = %safe_error,
+        "SSO login succeeded but Kiro account validation failed"
+    );
+    RpcError::internal(format!(
+        "SSO login succeeded, but Kiro account validation failed during {step}; account was not saved: {safe_error}"
+    ))
 }
 
 fn authenticated_sso_user_id(limits: &kproxy_kiro::UsageLimits) -> Result<String, RpcError> {
