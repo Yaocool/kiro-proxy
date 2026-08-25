@@ -388,7 +388,7 @@ kproxy apikey limit ci --clear
 kproxy alert events
 kproxy alert platforms
 kproxy alert config
-kproxy alert add --name alerts --platform dingtalk --url https://example/hook --event token-refresh-failed,account-quota-exhausted,service-quota-exhausted
+kproxy alert add --name alerts --platform dingtalk --url https://example/hook --event token-refresh-failed,account-credit-protected,account-quota-exhausted,service-quota-exhausted
 kproxy alert edit --name alerts --event token-refresh-failed --event service-quota-exhausted
 kproxy alert delete alerts
 kproxy stats --since 1h
@@ -405,6 +405,10 @@ kproxy help
 
 All commands support the global `--json` option. Run `kproxy --help` or a
 subcommand's `--help` for the authoritative option list.
+Subscribe to `account-credit-protected` when accounts should alert after reaching
+the scheduler's remaining-credit protection threshold. Same-kind account events
+for one target are batched into one message while retaining per-account
+once-until-recovery suppression.
 Destructive commands have no `--yes` bypass and require an interactive `y` or
 `yes` confirmation. Running bare `kproxy` prints the main help; `kproxy help` lists
 the available topic guides.

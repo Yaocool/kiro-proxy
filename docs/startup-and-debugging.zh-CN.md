@@ -263,7 +263,7 @@ kproxy alert events
 kproxy alert platforms
 kproxy alert config
 kproxy alert add --name alerts --platform dingtalk --url https://example/hook \
-  --event token-refresh-failed,account-quota-exhausted,service-quota-exhausted
+  --event token-refresh-failed,account-credit-protected,account-quota-exhausted,service-quota-exhausted
 kproxy alert edit --name alerts --event token-refresh-failed --event service-quota-exhausted
 kproxy alert delete alerts
 
@@ -279,6 +279,9 @@ kproxy model-map delete low-credit
 `kproxy alert platforms` 会说明 `--platform` 选择的通知平台及平台专用参数；旧参数名
 `--kind` 作为兼容别名继续可用。
 同一账号或服务在异常持续期间只发送一次 Markdown 告警，恢复后再次发生异常才会重新告警。
+同一告警目标在短时间内收到多个同类型账号事件时，会按账号聚合为一条消息，避免群机器人刷屏。
+`account-credit-protected` 使用与调度器相同的 `pool.low_credit_ratio` 和
+`pool.low_credit_min_remaining` 规则；账号仍有额度，但会暂停参与调度以保留最后可用额度。
 
 带 `--below-credits-percent` 的映射按每个选中账号的剩余 Credits 判断。未配置 schedule 时
 默认全天生效；剩余额度低于阈值时命中，次月额度恢复到阈值以上后自动停止命中。

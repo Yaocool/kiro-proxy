@@ -186,6 +186,8 @@ pub enum ApiKeyCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum AlertEvent {
+    /// 单个账号触发剩余额度保护并暂停调度。
+    AccountCreditProtected,
     /// 单个账号额度完全耗尽。
     AccountQuotaExhausted,
     /// API 代理服务的全部启用账号额度完全耗尽。
@@ -197,6 +199,7 @@ pub enum AlertEvent {
 impl AlertEvent {
     fn as_str(self) -> &'static str {
         match self {
+            Self::AccountCreditProtected => "account-credit-protected",
             Self::AccountQuotaExhausted => "account-quota-exhausted",
             Self::ServiceQuotaExhausted => "service-quota-exhausted",
             Self::TokenRefreshFailed => "token-refresh-failed",
@@ -251,7 +254,7 @@ pub enum AlertCommand {
     List,
     /// 添加告警目标。
     #[command(
-        after_help = "`--platform` 表示接收 Webhook 的通知平台；先用 `kproxy alert platforms` 查看平台说明。\n用 `kproxy alert events` 查看事件说明。多选可重复传入 --event，也可使用逗号分隔。\n\n示例：\n  kproxy alert add --name alerts --platform dingtalk --url https://example/hook --event token-refresh-failed --event account-quota-exhausted\n  kproxy alert add --name alerts --platform feishu --url https://example/hook --event account-quota-exhausted,service-quota-exhausted"
+        after_help = "`--platform` 表示接收 Webhook 的通知平台；先用 `kproxy alert platforms` 查看平台说明。\n用 `kproxy alert events` 查看事件说明。多选可重复传入 --event，也可使用逗号分隔。\n\n示例：\n  kproxy alert add --name alerts --platform dingtalk --url https://example/hook --event account-credit-protected --event account-quota-exhausted\n  kproxy alert add --name alerts --platform feishu --url https://example/hook --event account-credit-protected,account-quota-exhausted,service-quota-exhausted"
     )]
     Add {
         /// 告警目标的唯一名称。
@@ -1086,8 +1089,13 @@ struct AlertEventInfo {
     condition: &'static str,
 }
 
-fn alert_event_catalog() -> [AlertEventInfo; 3] {
+fn alert_event_catalog() -> [AlertEventInfo; 4] {
     [
+        AlertEventInfo {
+            event: AlertEvent::AccountCreditProtected.as_str(),
+            condition:
+                "单个启用账号仍有额度，但达到 pool.low_credit_ratio 或 low_credit_min_remaining 保护阈值并暂停调度；额度恢复后才允许再次告警。",
+        },
         AlertEventInfo {
             event: AlertEvent::AccountQuotaExhausted.as_str(),
             condition:
@@ -1188,12 +1196,14 @@ fn show_alert_config(json: bool) -> Result<()> {
         return print_json(&serde_json::json!({
             "mode":"once_until_recovery",
             "format":"markdown",
+            "account_event_aggregation":"same_target_and_event_type",
             "events":alert_event_catalog().map(|event| event.event),
         }));
     }
     println!("告警模式  异常期间只发送一次，恢复后再次异常才重新告警");
+    println!("账号聚合  同一目标的同类型多账号事件合并发送");
     println!("消息格式  Markdown");
-    println!("事件类型  单账号额度耗尽、服务全部账号额度耗尽、Token 刷新失败");
+    println!("事件类型  账号剩余额度保护、单账号额度耗尽、服务全部账号额度耗尽、Token 刷新失败");
     Ok(())
 }
 
@@ -2661,7 +2671,7 @@ pub fn print_topic(topic: Option<&str>) -> Result<()> {
             "`kproxy logs show` 查看内存中的结构化请求日志，`follow` 持续跟踪；支持 `--level`、`--account` 和 `--tail`。`kproxy logs files [--level error]` 列出实际日志文件，`logs path` 显示目录、基础路径和当前日志配置。旧的 `kproxy logs --tail ...` 与 `kproxy logs -f` 继续兼容。"
         }
         "alert" => {
-            "`kproxy alert events` 列出三类异常事件和触发条件，`kproxy alert platforms` 说明 --platform 支持的通知平台和平台专用参数；`kproxy alert config` 查看一次性告警策略。每个账号或服务异常期间只发送一次 Markdown 告警，恢复后才允许再次告警。`kproxy alert add/edit/delete/list/test/logs` 管理告警目标。"
+            "`kproxy alert events` 列出四类异常事件和触发条件，`kproxy alert platforms` 说明 --platform 支持的通知平台和平台专用参数；`kproxy alert config` 查看一次性告警策略。同类型的多账号事件会聚合为一条 Markdown 告警；每个账号或服务恢复后才允许再次告警。`kproxy alert add/edit/delete/list/test/logs` 管理告警目标。"
         }
         "models" => {
             "`kproxy models` 显示账号自动探测到的 Kiro 模型；`--refresh` 先立即刷新缓存，`--mapped` 同时显示显式映射结果。自动别名解析与强制 model-map 是两层机制。"
