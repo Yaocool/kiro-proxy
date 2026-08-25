@@ -860,6 +860,10 @@ async fn handle_account_remove(state: &Arc<AppState>, params: serde_json::Value)
         kproxy_notify::WebhookEventKind::AccountQuotaExhausted,
         Some(&removed),
     );
+    state.notifier().resolve_incident(
+        kproxy_notify::WebhookEventKind::AccountCreditProtected,
+        Some(&removed),
+    );
     crate::alerts::resolve_token_refresh_failure(state, &removed);
     to_value(serde_json::json!({"removed": removed}))
 }

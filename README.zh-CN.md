@@ -327,7 +327,7 @@ kproxy apikey limit ci --clear
 kproxy alert events
 kproxy alert platforms
 kproxy alert config
-kproxy alert add --name alerts --platform dingtalk --url https://example/hook --event token-refresh-failed,account-quota-exhausted,service-quota-exhausted
+kproxy alert add --name alerts --platform dingtalk --url https://example/hook --event token-refresh-failed,account-credit-protected,account-quota-exhausted,service-quota-exhausted
 kproxy alert edit --name alerts --event token-refresh-failed --event service-quota-exhausted
 kproxy alert delete alerts
 kproxy stats --since 1h
@@ -343,6 +343,8 @@ kproxy help
 ```
 
 所有命令都支持全局 `--json`，权威参数列表以 `kproxy --help` 和各子命令的 `--help` 为准。
+账号剩余额度达到调度保护阈值时可订阅 `account-credit-protected`；同一目标短时间内产生的
+同类型多账号告警会合并成一条消息，每个账号仍独立保持“恢复前只告警一次”的去重语义。
 破坏性操作不提供 `--yes` 跳过选项，执行时必须交互输入 `y` 或 `yes` 二次确认。直接执行
 `kproxy` 会显示总帮助，`kproxy help` 会列出可用的主题帮助。
 

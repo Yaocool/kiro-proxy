@@ -914,7 +914,7 @@ mod tests {
             "--url",
             "https://example.com/hook",
             "--event",
-            "account-quota-exhausted,service-quota-exhausted",
+            "account-credit-protected,account-quota-exhausted,service-quota-exhausted",
             "--event",
             "token-refresh-failed",
         ])
@@ -927,6 +927,7 @@ mod tests {
         assert_eq!(
             events,
             vec![
+                crate::commands::runtime::AlertEvent::AccountCreditProtected,
                 crate::commands::runtime::AlertEvent::AccountQuotaExhausted,
                 crate::commands::runtime::AlertEvent::ServiceQuotaExhausted,
                 crate::commands::runtime::AlertEvent::TokenRefreshFailed,

@@ -18,6 +18,7 @@ type HmacSha256 = Hmac<Sha256>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum WebhookEventKind {
+    AccountCreditProtected,
     AccountQuotaExhausted,
     ServiceQuotaExhausted,
     TokenRefreshFailed,
@@ -27,6 +28,7 @@ pub enum WebhookEventKind {
 impl WebhookEventKind {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::AccountCreditProtected => "account-credit-protected",
             Self::AccountQuotaExhausted => "account-quota-exhausted",
             Self::ServiceQuotaExhausted => "service-quota-exhausted",
             Self::TokenRefreshFailed => "token-refresh-failed",
@@ -38,7 +40,8 @@ impl WebhookEventKind {
         configured == self.as_str()
             || match self {
                 // Keep existing webhook configurations working after the
-                // alert policy is narrowed to the three incident types.
+                // alert policy moved to explicit incident names.
+                Self::AccountCreditProtected => configured == "low-credit",
                 Self::AccountQuotaExhausted => configured == "quota-exhausted",
                 Self::ServiceQuotaExhausted => {
                     matches!(configured, "quota-exhausted" | "service-degraded")
@@ -100,6 +103,8 @@ struct Delivery {
     target: WebhookConfig,
     event: WebhookEvent,
 }
+
+const ACCOUNT_EVENT_AGGREGATION_WINDOW: Duration = Duration::from_millis(500);
 
 enum SuppressionMark {
     None,
@@ -272,9 +277,80 @@ async fn worker(
             return;
         }
     };
-    while let Some(delivery) = receiver.recv().await {
+    let mut pending = VecDeque::new();
+    loop {
+        let delivery = if let Some(delivery) = pending.pop_front() {
+            delivery
+        } else if let Some(delivery) = receiver.recv().await {
+            delivery
+        } else {
+            break;
+        };
+        let delivery = collect_account_event_batch(&mut receiver, &mut pending, delivery).await;
         deliver(client.clone(), Arc::clone(&history), delivery).await;
     }
+}
+
+async fn collect_account_event_batch(
+    receiver: &mut mpsc::Receiver<Delivery>,
+    pending: &mut VecDeque<Delivery>,
+    first: Delivery,
+) -> Delivery {
+    if first.event.account_id.is_none() {
+        return first;
+    }
+    let kind = first.event.kind;
+    let mut batch = vec![first];
+    let mut deferred = VecDeque::new();
+    while let Some(candidate) = pending.pop_front() {
+        if is_matching_account_event(kind, &candidate) {
+            batch.push(candidate);
+        } else {
+            deferred.push_back(candidate);
+        }
+    }
+    *pending = deferred;
+
+    tokio::time::sleep(ACCOUNT_EVENT_AGGREGATION_WINDOW).await;
+    while let Ok(candidate) = receiver.try_recv() {
+        if is_matching_account_event(kind, &candidate) {
+            batch.push(candidate);
+        } else {
+            pending.push_back(candidate);
+        }
+    }
+    aggregate_account_events(batch)
+}
+
+fn is_matching_account_event(kind: WebhookEventKind, delivery: &Delivery) -> bool {
+    delivery.event.kind == kind && delivery.event.account_id.is_some()
+}
+
+fn aggregate_account_events(mut deliveries: Vec<Delivery>) -> Delivery {
+    let count = deliveries.len();
+    let mut first = deliveries.remove(0);
+    if count == 1 {
+        return first;
+    }
+    let mut messages = Vec::with_capacity(count);
+    messages.push(first.event.message.clone());
+    messages.extend(
+        deliveries
+            .into_iter()
+            .map(|delivery| delivery.event.message),
+    );
+    first.event.title = format!("{}（{count} 个账号）", first.event.title);
+    first.event.message = format!(
+        "- **涉及账号：** {count} 个\n\n{}",
+        messages
+            .into_iter()
+            .enumerate()
+            .map(|(index, message)| format!("**账号 {}**\n{message}", index + 1))
+            .collect::<Vec<_>>()
+            .join("\n\n---\n\n")
+    );
+    first.event.account_id = None;
+    first
 }
 
 async fn deliver(client: Client, history: Arc<Mutex<VecDeque<DeliveryLog>>>, delivery: Delivery) {
@@ -463,10 +539,86 @@ mod tests {
     }
 
     #[test]
-    fn legacy_subscriptions_map_to_the_narrowed_incidents() {
+    fn legacy_subscriptions_map_to_explicit_incidents() {
+        assert!(WebhookEventKind::AccountCreditProtected.matches_subscription("low-credit"));
         assert!(WebhookEventKind::AccountQuotaExhausted.matches_subscription("quota-exhausted"));
         assert!(WebhookEventKind::ServiceQuotaExhausted.matches_subscription("service-degraded"));
         assert!(WebhookEventKind::TokenRefreshFailed.matches_subscription("token-expired"));
+    }
+
+    #[test]
+    fn same_kind_account_events_are_aggregated_into_one_delivery() {
+        let target = target("dingtalk", &["account-quota-exhausted"]);
+        let event = |account_id: &str, account: &str| {
+            let mut event = WebhookEvent::new(
+                WebhookEventKind::AccountQuotaExhausted,
+                "KProxy 账号额度耗尽",
+                format!("- **账号：** `{account}`\n- **账号 ID：** `{account_id}`"),
+            );
+            event.account_id = Some(account_id.into());
+            Delivery {
+                target: target.clone(),
+                event,
+            }
+        };
+
+        let delivery = aggregate_account_events(vec![
+            event("acc_1", "one@example.com"),
+            event("acc_2", "two@example.com"),
+        ]);
+
+        assert_eq!(delivery.event.title, "KProxy 账号额度耗尽（2 个账号）");
+        assert!(delivery.event.message.contains("涉及账号：** 2 个"));
+        assert!(delivery.event.message.contains("one@example.com"));
+        assert!(delivery.event.message.contains("two@example.com"));
+        assert!(delivery.event.account_id.is_none());
+    }
+
+    #[tokio::test]
+    async fn worker_batch_collects_queued_same_kind_account_events() {
+        let target = target("dingtalk", &["account-credit-protected"]);
+        let event = |account_id: &str| {
+            let mut event = WebhookEvent::new(
+                WebhookEventKind::AccountCreditProtected,
+                "KProxy 账号剩余额度保护",
+                format!("- **账号 ID：** `{account_id}`"),
+            );
+            event.account_id = Some(account_id.into());
+            Delivery {
+                target: target.clone(),
+                event,
+            }
+        };
+        let (sender, mut receiver) = mpsc::channel(4);
+        sender.send(event("acc_1")).await.expect("first event");
+        sender.send(event("acc_2")).await.expect("second event");
+        let mut exhausted = WebhookEvent::new(
+            WebhookEventKind::AccountQuotaExhausted,
+            "KProxy 账号额度耗尽",
+            "- **账号 ID：** `acc_3`",
+        );
+        exhausted.account_id = Some("acc_3".into());
+        sender
+            .send(Delivery {
+                target: target.clone(),
+                event: exhausted,
+            })
+            .await
+            .expect("different event kind");
+        drop(sender);
+        let first = receiver.recv().await.expect("queued event");
+        let mut pending = VecDeque::new();
+
+        let delivery = collect_account_event_batch(&mut receiver, &mut pending, first).await;
+
+        assert_eq!(delivery.event.title, "KProxy 账号剩余额度保护（2 个账号）");
+        assert!(delivery.event.message.contains("acc_1"));
+        assert!(delivery.event.message.contains("acc_2"));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].event.kind,
+            WebhookEventKind::AccountQuotaExhausted
+        );
     }
 
     #[test]

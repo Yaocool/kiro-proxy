@@ -1261,7 +1261,8 @@ impl Config {
             if target.events.iter().any(|event| {
                 !matches!(
                     event.as_str(),
-                    "account-quota-exhausted"
+                    "account-credit-protected"
+                        | "account-quota-exhausted"
                         | "service-quota-exhausted"
                         | "token-refresh-failed"
                         // Legacy aliases remain valid so upgrades do not
@@ -1701,10 +1702,10 @@ start_url = ""
 # url = "https://oapi.dingtalk.com/robot/send?access_token=replace-me"
 # 是否启用该目标。
 # enabled = true
-# 订阅事件；可选 account-quota-exhausted、service-quota-exhausted、
-# token-refresh-failed。空数组表示不订阅任何事件。
-# 旧名称 quota-exhausted、service-degraded、token-expired、account-banned 仍兼容。
-# events = ["account-quota-exhausted", "service-quota-exhausted", "token-refresh-failed"]
+# 订阅事件；可选 account-credit-protected、account-quota-exhausted、
+# service-quota-exhausted、token-refresh-failed。空数组表示不订阅任何事件。
+# 旧名称 low-credit、quota-exhausted、service-degraded、token-expired、account-banned 仍兼容。
+# events = ["account-credit-protected", "account-quota-exhausted", "service-quota-exhausted", "token-refresh-failed"]
 # 钉钉加签密钥；仅 kind="dingtalk" 且机器人开启加签时需要。
 # dingtalk_sign = "SEC-replace-me"
 # Telegram chat ID；kind="telegram" 且目标启用时必填。
@@ -1877,7 +1878,7 @@ mod tests {
             kind: "custom".into(),
             url: "https://example.com/webhook".into(),
             enabled: true,
-            events: vec!["low-credit".into()],
+            events: vec!["account-credit-protected".into(), "low-credit".into()],
             dingtalk_sign: Some("secret".into()),
             telegram_chat_id: Some("123".into()),
             custom_template: Some("template".into()),
