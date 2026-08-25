@@ -69,6 +69,16 @@ pub fn static_models() -> Vec<ModelInfo> {
         .collect()
 }
 
+/// Returns the conservative fallback catalog that the subscription may use.
+/// This is used when Kiro's model-discovery API is unavailable or rejects an
+/// otherwise valid enterprise account.
+pub fn static_models_for_subscription(subscription: Option<SubscriptionKind>) -> Vec<ModelInfo> {
+    static_models()
+        .into_iter()
+        .filter(|model| static_subscription_can_serve(subscription, &model.model_id))
+        .collect()
+}
+
 /// Applies the public tier matrix only when dynamic discovery has no answer.
 /// Unknown models are permitted for paid/managed subscriptions for forward
 /// compatibility, but not for Free/unknown subscriptions where doing so would
@@ -164,5 +174,17 @@ mod tests {
             Some(SubscriptionKind::Unknown),
             "future-premium-model"
         ));
+    }
+
+    #[test]
+    fn fallback_catalog_is_filtered_by_subscription() {
+        let free = static_models_for_subscription(Some(SubscriptionKind::Free));
+        assert!(free.iter().any(|model| model.model_id == "auto"));
+        assert!(!free.iter().any(|model| model.model_id == "claude-opus-4.6"));
+
+        let power = static_models_for_subscription(Some(SubscriptionKind::Power));
+        assert!(power
+            .iter()
+            .any(|model| model.model_id == "claude-opus-4.6"));
     }
 }

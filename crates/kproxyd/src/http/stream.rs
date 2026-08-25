@@ -728,6 +728,15 @@ pub fn response(
                             } else {
                                 incompatible = true;
                             }
+                        } else if let Some(resolved) = super::handlers::resolve_static_model(
+                            &account,
+                            &context.kiro_model,
+                        ) {
+                            context.kiro_model = resolved;
+                            super::handlers::set_payload_model(
+                                &mut payload,
+                                &context.kiro_model,
+                            );
                         }
                         if !incompatible
                             && super::handlers::check_context_limit(
