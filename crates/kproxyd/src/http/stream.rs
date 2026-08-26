@@ -474,9 +474,12 @@ pub fn response(
                 let is_auth = kproxy_kiro::client::text_is_auth_error(&failure_text);
                 let is_quota = kproxy_kiro::client::text_is_quota_error(&failure_text);
                 let is_throttle = kproxy_kiro::client::text_is_throttle_error(&failure_text);
+                let is_model_unavailable =
+                    kproxy_kiro::client::text_is_model_temporarily_unavailable(&failure_text);
+                let is_model_capacity_error = is_throttle || is_model_unavailable;
                 let is_request_rejection =
                     kproxy_kiro::client::text_is_request_rejection(&failure_text);
-                if is_throttle {
+                if is_model_capacity_error {
                     context.state.record_stream_overload();
                 }
                 tracing::warn!(
@@ -488,6 +491,7 @@ pub fn response(
                     auth_error = is_auth,
                     quota_error = is_quota,
                     throttle_error = is_throttle,
+                    model_unavailable = is_model_unavailable,
                     request_rejection = is_request_rejection,
                     error = %kproxy_translate::sanitize_error_message(&failure_text),
                     "upstream stream failed"
@@ -571,7 +575,7 @@ pub fn response(
                 if !data_started
                     && pre_data_retries < retry_limit
                     && may_switch
-                    && is_throttle
+                    && is_model_capacity_error
                     && config.features.enable_model_fallback
                     && fallback_model.is_none()
                 {
@@ -648,7 +652,7 @@ pub fn response(
                         .await;
                         crate::alerts::sync_service_quota(&context.state).await;
                     }
-                } else if !is_auth && !is_request_rejection {
+                } else if !is_auth && !is_request_rejection && !is_model_unavailable {
                     context.state.pool().record_error(&failed_account_id).await;
                 }
                 attempted_accounts.insert(failed_account_id.clone());
@@ -2435,6 +2439,14 @@ fn classify_stream_failure(message: &str) -> StreamFailureDetails {
             account_error: false,
         };
     }
+    if kproxy_kiro::client::text_is_model_temporarily_unavailable(message) {
+        return StreamFailureDetails {
+            upstream_status,
+            error_code: "upstream_model_unavailable",
+            error_stage: "upstream_stream",
+            account_error: false,
+        };
+    }
     if kproxy_kiro::client::text_is_throttle_error(message) {
         return StreamFailureDetails {
             upstream_status: upstream_status.or(Some(429)),
@@ -2508,6 +2520,13 @@ mod tests {
         assert_eq!(unavailable.upstream_status, Some(503));
         assert_eq!(unavailable.error_code, "upstream_unavailable");
         assert!(unavailable.account_error);
+
+        let model_unavailable = classify_stream_failure(
+            r#"Kiro Amazon Q returned Some(500): {"message":"Encountered unexpectedly high load when processing the request, please try again.","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#,
+        );
+        assert_eq!(model_unavailable.upstream_status, Some(500));
+        assert_eq!(model_unavailable.error_code, "upstream_model_unavailable");
+        assert!(!model_unavailable.account_error);
     }
 
     #[test]

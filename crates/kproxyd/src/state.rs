@@ -464,9 +464,9 @@ impl AppState {
             Ok(response) => self
                 .adaptive_feedback
                 .record_success(response.stream_slot_wait_ms()),
-            Err(error) => self
-                .adaptive_feedback
-                .record_failure(error.is_throttle() || matches!(error.status, Some(429 | 503))),
+            Err(error) => self.adaptive_feedback.record_failure(
+                error.is_model_capacity_error() || matches!(error.status, Some(429 | 503)),
+            ),
         }
         result
     }
