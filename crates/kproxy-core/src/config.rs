@@ -355,7 +355,7 @@ pub struct FeaturesConfig {
     pub web_search_max_rounds: u32,
     /// 是否移除工具。
     pub disable_tools: bool,
-    /// 429 时是否启用同族模型降级。
+    /// 上游限流或模型暂时不可用时是否启用同族模型降级。
     pub enable_model_fallback: bool,
     /// 是否模拟 prompt cache。
     pub enable_prompt_cache: bool,
@@ -1475,7 +1475,7 @@ enable_tool_search = true
 web_search_max_rounds = 20
 # 是否移除请求中的全部工具定义；用于临时排查工具兼容问题。
 disable_tools = false
-# 遇到 429 时是否自动选择同族可用模型降级。
+# 遇到上游限流或模型暂时不可用时是否自动选择同族可用模型降级。
 enable_model_fallback = true
 # 是否模拟 prompt cache 计费字段；不代表 Kiro 提供真实 Anthropic cache。
 enable_prompt_cache = false

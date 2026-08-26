@@ -337,6 +337,29 @@ impl wiremock::Respond for RetryingCompactionStreamResponder {
     }
 }
 
+#[derive(Clone, Default)]
+struct ModelUnavailableFallbackResponder;
+
+impl wiremock::Respond for ModelUnavailableFallbackResponder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let payload =
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap_or_default();
+        let model = payload["conversationState"]["currentMessage"]["userInputMessage"]["modelId"]
+            .as_str()
+            .unwrap_or_default();
+        if model == "claude-opus-5" {
+            ResponseTemplate::new(500).set_body_json(serde_json::json!({
+                "message": "Encountered unexpectedly high load when processing the request, please try again.",
+                "reason": "MODEL_TEMPORARILY_UNAVAILABLE"
+            }))
+        } else {
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(generation_body("completed with the fallback model"))
+        }
+    }
+}
+
 async fn mount_context_alignment_models(mock: &MockServer) {
     Mock::given(method("GET"))
         .and(path("/ListAvailableModels"))
@@ -576,6 +599,111 @@ async fn compact_model_alias_runs_through_translation_pool_and_mock_upstream() {
                 .is_some_and(|content| content.ends_with("exercise every layer"))
         );
     }
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn temporarily_unavailable_model_falls_back_to_lower_same_family_model() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/ListAvailableModels"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "models": [
+                {
+                    "modelId": "claude-opus-5",
+                    "tokenLimits": {"maxInputTokens": 1000000, "maxOutputTokens": 64000}
+                },
+                {
+                    "modelId": "claude-opus-4.8",
+                    "tokenLimits": {"maxInputTokens": 1000000, "maxOutputTokens": 64000}
+                }
+            ]
+        })))
+        .mount(&mock)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(ModelUnavailableFallbackResponder)
+        .mount(&mock)
+        .await;
+
+    let port = unused_tcp_port();
+    let upstream_url = format!("{}/generateAssistantResponse", mock.uri());
+    let daemon = Daemon::start_http(port, &upstream_url).await;
+    assert_eq!(
+        expect_ok(
+            daemon
+                .call(
+                    "account.import",
+                    serde_json::json!({
+                        "accounts": [{
+                            "id": "acc_66666666",
+                            "email": "fallback@example.com",
+                            "machine_id": "6".repeat(64),
+                            "credentials": {
+                                "access_token": "fallback-token",
+                                "region": "us-east-1",
+                                "expires_at": 4_000_000_000i64,
+                                "auth_method": "idc"
+                            },
+                            "usage": {
+                                "current": 0.0,
+                                "limit": 100.0,
+                                "percent_used": 0.0,
+                                "updated_at": 1
+                            },
+                            "subscription": {"kind": "pro"},
+                            "created_at": 1
+                        }]
+                    }),
+                )
+                .await,
+        )["imported"],
+        1
+    );
+    let models = expect_ok(daemon.call("models", serde_json::json!({})).await);
+    assert_eq!(models.as_array().map(Vec::len), Some(2));
+
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header(
+            "x-api-key",
+            daemon.api_key.as_deref().expect("service API key"),
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("user-agent", "claude-cli/2.1.0 (external, e2e)")
+        .json(&serde_json::json!({
+            "model": "claude-opus-5",
+            "max_tokens": 64,
+            "stream": false,
+            "messages": [{"role": "user", "content": "exercise model fallback"}]
+        }))
+        .send()
+        .await
+        .expect("call Claude fallback path");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("Claude response JSON");
+    assert_eq!(
+        body["content"][0]["text"],
+        "completed with the fallback model"
+    );
+
+    let generated_models = mock
+        .received_requests()
+        .await
+        .expect("received requests")
+        .iter()
+        .filter(|request| request.url.path() == "/generateAssistantResponse")
+        .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+        .filter_map(|payload| {
+            payload["conversationState"]["currentMessage"]["userInputMessage"]["modelId"]
+                .as_str()
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(generated_models, vec!["claude-opus-5", "claude-opus-4.8"]);
+
     daemon.stop().await;
 }
 

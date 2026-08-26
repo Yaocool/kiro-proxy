@@ -2962,7 +2962,9 @@ async fn execute_upstream(
                 }
                 last_error = Some(error);
             }
-            Err(error) if error.is_throttle() => {
+            Err(error) if error.is_model_capacity_error() => {
+                let is_throttle = error.is_throttle();
+                let is_model_unavailable = error.is_model_temporarily_unavailable();
                 attempt_logs.push(upstream_attempt_log(
                     attempt + 1,
                     &account,
@@ -2976,10 +2978,14 @@ async fn execute_upstream(
                     account_name,
                     endpoint = %error.endpoint,
                     upstream_status = error.status.unwrap_or_default(),
+                    throttle_error = is_throttle,
+                    model_unavailable = is_model_unavailable,
                     error = %sanitize_error_message(&error.message),
-                    "upstream throttled request"
+                    "upstream model capacity unavailable"
                 );
-                pool.record_error(&account.id).await;
+                if !is_model_unavailable {
+                    pool.record_error(&account.id).await;
+                }
                 last_error = Some(error);
                 if config.features.enable_model_fallback && fallback_model.is_none() {
                     let (models, _) = state.models.get(config.models.cache_ttl_ms);
@@ -2995,48 +3001,73 @@ async fn execute_upstream(
                             Some(fallback.clone())
                         };
                         if let Some(resolved) = resolved {
-                            fallback_model = Some(fallback.clone());
-                            mapped_model = fallback;
-                            actual_model = resolved;
-                            push_model_path(&mut model_path, &mapped_model);
-                            push_model_path(&mut model_path, &actual_model);
-                            set_payload_model(&mut request_payload, &actual_model);
-                            match state.generate(&account, &request_payload).await {
-                                Ok(response) => {
-                                    tracing::info!(
-                                        trace_id,
-                                        attempt = attempt + 1,
-                                        account_id = %account.id,
-                                        account_name,
-                                        fallback_model = %actual_model,
-                                        model_path = %model_path.join(" -> "),
-                                        endpoint = %response.endpoint.name,
-                                        "upstream model fallback succeeded"
-                                    );
-                                    pool.record_success(&account.id).await;
-                                    return Ok(UpstreamExecution {
-                                        lease,
-                                        upstream_access_token: account
-                                            .credentials
-                                            .access_token
-                                            .clone(),
-                                        mapped_model,
-                                        kiro_model: actual_model,
-                                        model_path,
-                                        model_mapping_rule,
-                                        attempts: attempt_logs,
-                                        payload: request_payload,
-                                        response,
-                                    });
-                                }
-                                Err(fallback_error) => {
-                                    attempt_logs.push(upstream_attempt_log(
-                                        attempt + 1,
-                                        &account,
-                                        &actual_model,
-                                        &fallback_error,
-                                    ));
-                                    last_error = Some(fallback_error);
+                            let fits_context =
+                                check_context_limit(state, input_tokens, compact, &resolved)
+                                    .is_ok();
+                            if !fits_context {
+                                tracing::warn!(
+                                    trace_id,
+                                    attempt = attempt + 1,
+                                    account_id = %account.id,
+                                    account_name,
+                                    fallback_model = %resolved,
+                                    input_tokens,
+                                    "skipping model fallback because its context window is too small"
+                                );
+                            } else {
+                                fallback_model = Some(fallback.clone());
+                                mapped_model = fallback;
+                                actual_model = resolved;
+                                push_model_path(&mut model_path, &mapped_model);
+                                push_model_path(&mut model_path, &actual_model);
+                                set_payload_model(&mut request_payload, &actual_model);
+                                match state.generate(&account, &request_payload).await {
+                                    Ok(response) => {
+                                        tracing::info!(
+                                            trace_id,
+                                            attempt = attempt + 1,
+                                            account_id = %account.id,
+                                            account_name,
+                                            fallback_model = %actual_model,
+                                            model_path = %model_path.join(" -> "),
+                                            endpoint = %response.endpoint.name,
+                                            "upstream model fallback succeeded"
+                                        );
+                                        pool.record_success(&account.id).await;
+                                        return Ok(UpstreamExecution {
+                                            lease,
+                                            upstream_access_token: account
+                                                .credentials
+                                                .access_token
+                                                .clone(),
+                                            mapped_model,
+                                            kiro_model: actual_model,
+                                            model_path,
+                                            model_mapping_rule,
+                                            attempts: attempt_logs,
+                                            payload: request_payload,
+                                            response,
+                                        });
+                                    }
+                                    Err(fallback_error) => {
+                                        attempt_logs.push(upstream_attempt_log(
+                                            attempt + 1,
+                                            &account,
+                                            &actual_model,
+                                            &fallback_error,
+                                        ));
+                                        if fallback_error.is_request_rejection() {
+                                            return Err(dispatch_error(
+                                                fallback_error,
+                                                &mapped_model,
+                                                &actual_model,
+                                                &model_path,
+                                                model_mapping_rule,
+                                                attempt_logs,
+                                            ));
+                                        }
+                                        last_error = Some(fallback_error);
+                                    }
                                 }
                             }
                         }
@@ -5542,8 +5573,10 @@ fn upstream_api_error(
     let model_resolution_error = error.endpoint == "model-resolution";
     let upstream_status = error.status;
     let upstream_throttle = error.is_throttle();
+    let model_unavailable = error.is_model_temporarily_unavailable();
     let request_rejection = error.is_request_rejection();
     let account_error = !request_rejection
+        && !model_unavailable
         && (error.is_auth()
             || error.is_quota()
             || error.is_throttle()
@@ -5591,6 +5624,8 @@ fn upstream_api_error(
         output.error_code = "model_not_available";
         output.error_stage = "model_resolution";
         output.account_error = false;
+    } else if model_unavailable {
+        output.error_code = "upstream_model_unavailable";
     } else if upstream_status == Some(429) || upstream_throttle {
         output.error_code = "upstream_rate_limited";
     } else if upstream_status == Some(413) {
@@ -6238,6 +6273,23 @@ mod model_tests {
         );
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
         assert_eq!(error.error_code, "tool_budget_exceeded");
+        assert!(!error.account_error);
+    }
+
+    #[test]
+    fn temporarily_unavailable_models_are_retryable_without_poisoning_accounts() {
+        let error = upstream_api_error(
+            KiroError {
+                status: Some(500),
+                endpoint: "AmazonQ".into(),
+                message: r#"{"message":"Encountered unexpectedly high load when processing the request, please try again.","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#.into(),
+            },
+            RequestLogContext::default(),
+            ErrorFormat::Claude,
+        );
+        assert_eq!(error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(error.error_code, "upstream_model_unavailable");
+        assert!(error.retry_after);
         assert!(!error.account_error);
     }
 
