@@ -12,6 +12,7 @@ use kproxy_ipc::protocol::{
 use rand::RngCore;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::client::AdminClient;
@@ -374,6 +375,259 @@ pub async fn simple_rpc(
         print_human_value(&value);
     }
     Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct PoolOutput {
+    model: String,
+    #[serde(default)]
+    queued: usize,
+    #[serde(default)]
+    accounts: Vec<PoolAccountOutput>,
+    #[serde(default)]
+    scoring: Option<PoolScoringOutput>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PoolScoringOutput {
+    weight_active: f64,
+    weight_credit: f64,
+    weight_idle: f64,
+    max_concurrent_per_account: usize,
+    idle_window_ms: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct PoolAccountOutput {
+    account_id: String,
+    #[serde(default)]
+    account_name: String,
+    score: Option<f64>,
+    #[serde(default)]
+    active_factor: f64,
+    #[serde(default)]
+    credit_factor: f64,
+    #[serde(default)]
+    idle_factor: f64,
+    #[serde(default)]
+    eligible: bool,
+    #[serde(default)]
+    reason: String,
+}
+
+pub async fn show_pool(
+    client: &mut AdminClient,
+    model: &str,
+    explain: bool,
+    json: bool,
+) -> Result<()> {
+    let value: serde_json::Value = client
+        .call(method::POOL, serde_json::json!({"model":model}))
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let output =
+        serde_json::from_value::<PoolOutput>(value).context("daemon 返回的账号池评分无效")?;
+    print!("{}", render_pool_output(&output, explain));
+    Ok(())
+}
+
+fn render_pool_output(pool: &PoolOutput, explain: bool) -> String {
+    let eligible = pool
+        .accounts
+        .iter()
+        .filter(|account| account.eligible)
+        .count();
+    let unavailable = pool.accounts.len().saturating_sub(eligible);
+    let mut output = format!(
+        "模型 {}  排队 {}  可调度 {}/{}\n",
+        pool.model,
+        pool.queued,
+        eligible,
+        pool.accounts.len()
+    );
+
+    let mut unavailable_by_reason = BTreeMap::<&str, usize>::new();
+    for account in pool.accounts.iter().filter(|account| !account.eligible) {
+        *unavailable_by_reason
+            .entry(account.reason.as_str())
+            .or_default() += 1;
+    }
+    if !unavailable_by_reason.is_empty() {
+        output.push_str("不可调度：");
+        output.push_str(
+            &unavailable_by_reason
+                .into_iter()
+                .map(|(reason, count)| format!("{} {count}", pool_reason_label(reason)))
+                .collect::<Vec<_>>()
+                .join("，"),
+        );
+        output.push('\n');
+    }
+    output.push('\n');
+
+    let has_names = pool
+        .accounts
+        .iter()
+        .any(|account| !account.account_name.trim().is_empty());
+    if explain {
+        let rows = pool
+            .accounts
+            .iter()
+            .enumerate()
+            .map(|(index, account)| {
+                let mut row = vec![
+                    if account.eligible {
+                        (index + 1).to_string()
+                    } else {
+                        "-".into()
+                    },
+                    account.account_id.clone(),
+                ];
+                if has_names {
+                    row.push(short_pool_name(&account.account_name));
+                }
+                row.extend([
+                    if account.eligible {
+                        "可调度".into()
+                    } else {
+                        pool_reason_label(&account.reason).into()
+                    },
+                    format_pool_score(account.score),
+                    format_pool_factor(account.active_factor, account.eligible),
+                    format_pool_factor(account.credit_factor, account.eligible),
+                    format_pool_factor(account.idle_factor, account.eligible),
+                ]);
+                row
+            })
+            .collect::<Vec<_>>();
+        let mut headers = vec!["排名", "账号"];
+        if has_names {
+            headers.push("名称");
+        }
+        headers.extend(["状态", "评分", "并发", "额度", "近期使用"]);
+        output.push_str(&render_table(&headers, &rows));
+    } else {
+        let rows = pool
+            .accounts
+            .iter()
+            .filter(|account| account.eligible)
+            .enumerate()
+            .map(|(index, account)| {
+                let mut row = vec![(index + 1).to_string(), account.account_id.clone()];
+                if has_names {
+                    row.push(short_pool_name(&account.account_name));
+                }
+                row.push(format_pool_score(account.score));
+                row
+            })
+            .collect::<Vec<_>>();
+        if rows.is_empty() {
+            output.push_str("暂无可调度账号。\n");
+        } else {
+            let mut headers = vec!["排名", "账号"];
+            if has_names {
+                headers.push("名称");
+            }
+            headers.push("评分");
+            output.push_str(&render_table(&headers, &rows));
+        }
+        if unavailable > 0 {
+            output.push_str(&format!(
+                "提示：已折叠 {unavailable} 个不可调度账号；使用 --explain 查看详情。\n"
+            ));
+        }
+    }
+    output.push_str(&render_pool_score_help(pool.scoring.as_ref(), explain));
+    output
+}
+
+fn render_pool_score_help(scoring: Option<&PoolScoringOutput>, explain: bool) -> String {
+    if !explain {
+        return "评分说明：越低越优；综合并发压力、额度使用率和近期使用情况计算。使用 --explain 查看公式。\n".into();
+    }
+
+    let Some(scoring) = scoring else {
+        return "\n评分说明：越低越优；综合并发压力、额度使用率和近期使用情况计算。\n".into();
+    };
+    let concurrent_baseline = if scoring.max_concurrent_per_account == 0 {
+        "10（未设置单账号上限时的归一化基准）".into()
+    } else {
+        scoring.max_concurrent_per_account.to_string()
+    };
+    format!(
+        "\n评分说明：越低越优；评分 = 并发 × {} + 额度 × {} + 近期使用 × {}。\n\
+         因子说明：并发 = 活跃请求数 ÷ {concurrent_baseline}；额度 = 已用额度 ÷ 总额度；近期使用 = 刚使用时 100%，空闲 {}后降为 0%。\n\
+         调度说明：完全同分时会加入极小随机量打破平局。\n",
+        format_pool_weight(scoring.weight_active),
+        format_pool_weight(scoring.weight_credit),
+        format_pool_weight(scoring.weight_idle),
+        format_pool_duration(scoring.idle_window_ms),
+    )
+}
+
+fn format_pool_weight(weight: f64) -> String {
+    if weight.is_finite() {
+        format!("{weight:.3}")
+            .trim_end_matches('0')
+            .trim_end_matches('.')
+            .to_owned()
+    } else {
+        "-".into()
+    }
+}
+
+fn format_pool_duration(duration_ms: u64) -> String {
+    if duration_ms > 0 && duration_ms.is_multiple_of(60_000) {
+        format!("{} 分钟", duration_ms / 60_000)
+    } else if duration_ms > 0 && duration_ms.is_multiple_of(1_000) {
+        format!("{} 秒", duration_ms / 1_000)
+    } else {
+        format!("{duration_ms} 毫秒")
+    }
+}
+
+fn format_pool_score(score: Option<f64>) -> String {
+    score
+        .filter(|score| score.is_finite())
+        .map(|score| format!("{score:.4}"))
+        .unwrap_or_else(|| "-".into())
+}
+
+fn format_pool_factor(factor: f64, eligible: bool) -> String {
+    if eligible && factor.is_finite() {
+        format!("{:.1}%", factor * 100.0)
+    } else {
+        "-".into()
+    }
+}
+
+fn pool_reason_label(reason: &str) -> &'static str {
+    match reason {
+        "disabled" => "已停用",
+        "exhausted" => "额度耗尽",
+        "low_credit" => "低额度保护",
+        "cooling" => "冷却中",
+        "banned" => "已封禁",
+        "refreshing" => "刷新中",
+        "model_unavailable" => "模型不支持",
+        "available" | "" => "不可调度",
+        _ => "其他",
+    }
+}
+
+fn short_pool_name(name: &str) -> String {
+    const MAX_CHARS: usize = 28;
+    let mut characters = name.chars();
+    let prefix = characters.by_ref().take(MAX_CHARS).collect::<String>();
+    if characters.next().is_some() {
+        format!("{prefix}…")
+    } else if prefix.is_empty() {
+        "-".into()
+    } else {
+        prefix
+    }
 }
 
 pub async fn show_stats(
@@ -2790,6 +3044,85 @@ pub fn print_topic(topic: Option<&str>) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pool_output_fixture() -> PoolOutput {
+        PoolOutput {
+            model: "claude-opus-5".into(),
+            queued: 2,
+            scoring: Some(PoolScoringOutput {
+                weight_active: 0.5,
+                weight_credit: 0.4,
+                weight_idle: 0.1,
+                max_concurrent_per_account: 50,
+                idle_window_ms: 300_000,
+            }),
+            accounts: vec![
+                PoolAccountOutput {
+                    account_id: "acc_ready".into(),
+                    account_name: "Primary account".into(),
+                    score: Some(0.123_456),
+                    active_factor: 0.02,
+                    credit_factor: 0.25,
+                    idle_factor: 0.5,
+                    eligible: true,
+                    reason: "available".into(),
+                },
+                PoolAccountOutput {
+                    account_id: "acc_exhausted".into(),
+                    account_name: "Exhausted account".into(),
+                    score: None,
+                    active_factor: 0.0,
+                    credit_factor: 0.0,
+                    idle_factor: 0.0,
+                    eligible: false,
+                    reason: "exhausted".into(),
+                },
+                PoolAccountOutput {
+                    account_id: "acc_wrong_model".into(),
+                    account_name: "Different subscription".into(),
+                    score: None,
+                    active_factor: 0.0,
+                    credit_factor: 0.0,
+                    idle_factor: 0.0,
+                    eligible: false,
+                    reason: "model_unavailable".into(),
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn pool_default_view_is_compact_and_folds_unavailable_accounts() {
+        let output = render_pool_output(&pool_output_fixture(), false);
+        assert!(output.contains("模型 claude-opus-5  排队 2  可调度 1/3"));
+        assert!(output.contains("额度耗尽 1"));
+        assert!(output.contains("模型不支持 1"));
+        assert!(output.contains("acc_ready"));
+        assert!(output.contains("0.1235"));
+        assert!(output.contains("评分说明：越低越优"));
+        assert!(output.contains("使用 --explain 查看公式"));
+        assert!(!output.contains("acc_exhausted"));
+        assert!(!output.contains("acc_wrong_model"));
+        assert!(!output.contains('{'));
+    }
+
+    #[test]
+    fn pool_explain_view_shows_all_accounts_and_factors() {
+        let output = render_pool_output(&pool_output_fixture(), true);
+        assert!(output.contains("acc_ready"));
+        assert!(output.contains("acc_exhausted"));
+        assert!(output.contains("acc_wrong_model"));
+        assert!(output.contains("并发"));
+        assert!(output.contains("2.0%"));
+        assert!(output.contains("25.0%"));
+        assert!(output.contains("50.0%"));
+        assert!(output.contains("额度耗尽"));
+        assert!(output.contains("模型不支持"));
+        assert!(output.contains("评分 = 并发 × 0.5 + 额度 × 0.4 + 近期使用 × 0.1"));
+        assert!(output.contains("并发 = 活跃请求数 ÷ 50"));
+        assert!(output.contains("空闲 5 分钟后降为 0%"));
+        assert!(output.contains("完全同分时会加入极小随机量打破平局"));
+    }
 
     #[test]
     fn credits_are_displayed_with_two_decimal_places() {
