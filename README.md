@@ -531,12 +531,12 @@ build with the initial Chromium installation. Local Cargo parallelism defaults
 to one job; override it only when the build host has enough memory, for example
 `CARGO_BUILD_JOBS=4 docker compose -f docker-compose.yml -f docker-compose.build.yml build`.
 
-The `Build and publish Docker image` GitHub Actions workflow publishes `edge`
-and `sha-*` images from `main`. A version tag such as `v0.1.3` additionally
-publishes `v0.1.3`, `v0.1`, and `latest`; the tag must match the Cargo workspace
-version. After bumping that version and merging the release commit, publish it
-with `git tag v0.1.3 && git push origin v0.1.3`. Production upgrades pull the new
-image before replacing the container and keep the named volume:
+The `Build and publish Docker image` GitHub Actions workflow runs only when a
+`v*` tag is pushed. A version tag such as `v0.1.3` publishes `v0.1.3`, `v0.1`,
+and `latest`; the tag must match the Cargo workspace version. After bumping that
+version and merging the release commit, publish it with
+`git tag v0.1.3 && git push origin v0.1.3`. Production upgrades pull the new image
+before replacing the container and keep the named volume:
 
 ```bash
 ./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
@@ -544,8 +544,8 @@ docker compose exec kproxyd kproxy config show --effective
 ```
 
 Alternatively, follow the newest stable release automatically with
-`./deploy/docker-upgrade.sh`. Set `KPROXY_UPGRADE_IMAGE` to follow another
-channel such as `ghcr.io/yaocool/kiro-proxy:edge`.
+`./deploy/docker-upgrade.sh`. Set `KPROXY_UPGRADE_IMAGE` to use a different
+registry image.
 
 The script retains the previous local image under a rollback tag. If container
 creation or the health check fails, it recreates the service from that image.

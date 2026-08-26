@@ -2,11 +2,8 @@ name: Build and publish Docker image
 
 on:
   push:
-    branches:
-      - main
     tags:
       - "v*"
-  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
@@ -56,11 +53,9 @@ jobs:
           images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
           flavor: latest=false
           tags: |
-            type=raw,value=edge,enable={{is_default_branch}}
             type=semver,pattern={{raw}}
             type=semver,pattern=v{{major}}.{{minor}}
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' && !contains(github.ref_name, '-') }}
-            type=sha,prefix=sha-
 
       - name: Build and push image
         id: push

@@ -21,7 +21,7 @@ Environment:
 Examples:
   ./deploy/$script_name
   ./deploy/$script_name --timeout 120
-  KPROXY_UPGRADE_IMAGE=ghcr.io/yaocool/kiro-proxy:edge ./deploy/$script_name
+  KPROXY_UPGRADE_IMAGE=registry.example.com/kiro-proxy:stable ./deploy/$script_name
 
 Safe docker-setup options such as --target, --project-name, --timeout, --force,
 and --repair-volume are forwarded. Build, no-pull, and a second --image option
