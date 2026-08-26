@@ -354,20 +354,22 @@ cargo run -p kproxy -- stats --detail --since 1h --by endpoint
 
 ## 8. Docker Compose
 
-构建并启动默认 full 镜像（启用全部 feature 并包含 Chromium SSO）：
+拉取并启动预构建的 full 镜像（启用全部 feature 并包含 Chromium SSO）：
 
 ```bash
-./deploy/docker-setup.sh
+./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
 kproxy health
 ```
 
-该脚本会完成 Compose 配置校验、镜像构建、服务启动、健康等待和宿主机 `kproxy` 命令安装。
+该脚本会完成 Compose 配置校验，在旧容器继续运行时拉取镜像，然后替换服务、等待健康，失败
+时恢复原镜像，并在宿主机安装 `kproxy` 命令。
 默认目标是 `/usr/local/bin/kproxy`；无 sudo 权限时可使用
 `--target "$HOME/.local/bin/kproxy"`。以下是对应的手工命令，适合调试：
 
 ```bash
 docker compose config --quiet
-docker compose up -d --build
+KPROXY_IMAGE=ghcr.io/yaocool/kiro-proxy:v0.1.3 docker compose pull kproxyd
+KPROXY_IMAGE=ghcr.io/yaocool/kiro-proxy:v0.1.3 docker compose up -d --no-build
 docker compose ps
 docker compose exec kproxyd kproxy health
 docker compose logs -f kproxyd
@@ -375,11 +377,11 @@ docker compose logs -f kproxyd
 
 Linux Docker Engine 上如果出现 `failed to populate volume`，且错误指出
 `.../volumes/kiro-proxy_kproxy-data/_data` 不存在，说明 Docker 保留了 named volume 元数据，
-但实际目录已经丢失。新版一键脚本会在构建前检测这一状态：交互终端会请求确认后重建，CI
+但实际目录已经丢失。新版一键脚本会在替换容器前检测这一状态：交互终端会请求确认后重建，CI
 或其他非交互环境可运行：
 
 ```bash
-./deploy/docker-setup.sh --no-build --repair-volume
+./deploy/docker-setup.sh --no-pull --repair-volume
 ```
 
 修复只针对带有当前 Compose 项目标记且数据路径已经不存在的 volume。如果 Docker volume
@@ -401,12 +403,24 @@ Docker Engine 可直接使用；Docker Desktop 4.34 及以上版本需要先在 
 docker compose up -d --force-recreate
 ```
 
-日常源码升级只需原地重新构建，并保留 named volume：
+日常生产升级应部署 CI 构建的发布镜像，并保留 named volume：
 
 ```bash
-docker compose up -d --build
+./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
 docker compose exec kproxyd kproxy version
 docker compose exec kproxyd kproxy config show --effective
+```
+
+自动拉取并部署当前 `latest` 指向的最新稳定版本：
+
+```bash
+./deploy/docker-upgrade.sh
+```
+
+只有明确要在本机从源码构建时才加载 build override：
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
 ### 在 Docker 宿主机直接使用 `kproxy`
@@ -430,8 +444,7 @@ socket，也不存在宿主机与容器二进制兼容问题。
 升级已有部署时，wrapper 和容器镜像都需要更新：
 
 ```bash
-sudo ./deploy/install-kproxy-wrapper.sh
-docker compose up -d --build
+./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
 kproxy config edit
 ```
 

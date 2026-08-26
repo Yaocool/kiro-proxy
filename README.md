@@ -54,11 +54,12 @@ is located in [`crates/kproxyd`](crates/kproxyd).
 ### Docker Compose (recommended for a Linux server)
 
 Docker Engine with the Compose v2 plugin is the shortest production setup. The
-Compose stack builds the full image with all features and Chromium enabled by
-default, runs `kproxyd` with host networking, and keeps all state in the `kproxy-data`
+Compose stack pulls the prebuilt full image with all features and Chromium,
+runs `kproxyd` with host networking, and keeps all state in the `kproxy-data`
 named volume. Run the one-step setup from the repository root. It validates the
-environment, builds and starts the stack, waits for health, and installs the
-`kproxy` command on the host:
+environment, pulls the image before replacing the container, waits for health,
+rolls back automatically on failure, and installs the `kproxy` command on the
+host:
 
 ```bash
 ./deploy/docker-setup.sh
@@ -75,8 +76,27 @@ needed. Without sudo access, install it in a user-owned directory:
 
 The host command is a small wrapper that runs the matching CLI inside the
 container. This avoids Linux-container binary incompatibility on hosts such as
-macOS and keeps the administration Unix socket private. Rerun the same script
-after a source update, or pass `--no-build` to start an existing image.
+macOS and keeps the administration Unix socket private. Deploy an immutable
+release tag explicitly; the successful image reference is saved locally for
+subsequent restarts:
+
+```bash
+./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
+```
+
+To automatically follow the newest stable image published as `latest`, run:
+
+```bash
+./deploy/docker-upgrade.sh
+```
+
+It checks the registry even when an older image reference was saved by a
+previous deployment, and retains the same health-check and rollback behavior.
+
+Use `--no-pull` for an offline restart of the saved image. Use `--build` only
+when a deliberate local source build is required. GHCR packages are private by
+default unless their visibility is changed; private deployments must run
+`docker login ghcr.io` with an account/token that can read the package.
 
 The wrapper also manages the Docker service lifecycle from the host:
 
@@ -96,7 +116,7 @@ or `KPROXY_BACKUP_DIR`. Interactive use asks whether to retain the backup.
 `--yes` retains it by default, and only an explicit `--delete-backup` removes it
 after a successful uninstall. The source checkout is always retained.
 
-On Linux, the script also checks the named volume before the long image build.
+On Linux, the script also checks the named volume before changing the container.
 If Docker retains the volume metadata but its host data directory is gone, an
 interactive run offers to recreate it; automation can opt in with
 `--repair-volume`. Repair is allowed only when the volume belongs to this
@@ -479,7 +499,12 @@ This flow does not add support for non-enterprise or non-SSO accounts.
 ## Docker and systemd
 
 ```bash
-docker compose up -d --build
+# Production: pull while the old container is still serving, then replace it.
+KPROXY_IMAGE=ghcr.io/yaocool/kiro-proxy:v0.1.3 docker compose pull kproxyd
+KPROXY_IMAGE=ghcr.io/yaocool/kiro-proxy:v0.1.3 docker compose up -d --no-build
+
+# Local source build through the explicit build override:
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 
 # The standalone default is also the full image:
 docker build -t kiro-proxy:latest .
@@ -500,25 +525,39 @@ official `r1566079` snapshot used by the CDP definitions in `chromiumoxide
 0.9.1`, so a routine image rebuild cannot silently upgrade the protocol. Update
 and test both pins together when adopting browser security updates.
 
-Docker reuses persistent Cargo registry and target caches across source updates.
-Full-image builds compile the all-features binaries only once and serialize that
-release build with the initial Chromium installation to avoid exhausting smaller
-hosts. Cargo parallelism defaults to one job; override it only when the builder
-has enough memory, for example `CARGO_BUILD_JOBS=4 docker compose build`.
+Local and CI builds reuse persistent Cargo registry and target caches. Full-image
+builds compile the all-features binaries only once and serialize that release
+build with the initial Chromium installation. Local Cargo parallelism defaults
+to one job; override it only when the build host has enough memory, for example
+`CARGO_BUILD_JOBS=4 docker compose -f docker-compose.yml -f docker-compose.build.yml build`.
 
-After updating the source, rebuild and recreate the container without deleting
-the named volume:
+The `Build and publish Docker image` GitHub Actions workflow publishes `edge`
+and `sha-*` images from `main`. A version tag such as `v0.1.3` additionally
+publishes `v0.1.3`, `v0.1`, and `latest`; the tag must match the Cargo workspace
+version. After bumping that version and merging the release commit, publish it
+with `git tag v0.1.3 && git push origin v0.1.3`. Production upgrades pull the new
+image before replacing the container and keep the named volume:
 
 ```bash
-docker compose up -d --build
+./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
 docker compose exec kproxyd kproxy config show --effective
 ```
+
+Alternatively, follow the newest stable release automatically with
+`./deploy/docker-upgrade.sh`. Set `KPROXY_UPGRADE_IMAGE` to follow another
+channel such as `ghcr.io/yaocool/kiro-proxy:edge`.
+
+The script retains the previous local image under a rollback tag. If container
+creation or the health check fails, it recreates the service from that image.
+With host networking, the old and new containers cannot bind the same proxy
+ports concurrently, so the final container switch still has a short restart
+window; image download and compilation no longer consume production downtime.
 
 Existing `config.toml` files are never overwritten. A volume created by an
 older version may still contain `server.host = "127.0.0.1"`; change it with
 `kproxy config edit` if the new `0.0.0.0` default is desired.
 
-Build, start, and install the Docker-backed wrapper in one step:
+Pull, start, and install the Docker-backed wrapper in one step:
 
 ```bash
 ./deploy/docker-setup.sh

@@ -5,11 +5,15 @@ script_name="$(basename "$0")"
 script_dir="$(CDPATH= cd "$(dirname "$0")" && pwd)"
 repo_root="$(CDPATH= cd "$script_dir/.." && pwd)"
 compose_file="$repo_root/docker-compose.yml"
+build_compose_file="$repo_root/docker-compose.build.yml"
+image_state_file="${KPROXY_IMAGE_STATE_FILE:-$script_dir/.kproxy-image}"
+default_image="ghcr.io/yaocool/kiro-proxy:latest"
 
 target="/usr/local/bin/kproxy"
 project_name=""
 health_timeout=60
-build=1
+deployment_mode="pull"
+requested_image="${KPROXY_IMAGE:-}"
 force=0
 repair_volume=0
 
@@ -24,16 +28,21 @@ Options:
   --target PATH         Host command path (default: /usr/local/bin/kproxy)
   --project-name NAME   Override the Docker Compose project name
   --timeout SECONDS     Health-check timeout (default: 60)
-  --no-build            Start the existing image without rebuilding it
+  --image IMAGE         Pull and deploy an image reference (default: saved image
+                        or $default_image)
+  --build               Build from source locally with the Compose build override
+  --no-pull             Start the saved/existing image without pulling it
+  --no-build            Deprecated alias for --no-pull
   --force               Replace an unrelated command already at --target
   --repair-volume       Recreate a Compose-owned volume whose data path is missing
   -h, --help            Show this help
 
 Examples:
   ./deploy/$script_name
+  ./deploy/$script_name --image ghcr.io/yaocool/kiro-proxy:v0.1.3
   ./deploy/$script_name --target "\$HOME/.local/bin/kproxy"
-  ./deploy/$script_name --no-build
-  ./deploy/$script_name --no-build --repair-volume
+  ./deploy/$script_name --build
+  ./deploy/$script_name --no-pull --repair-volume
 EOF
 }
 
@@ -59,8 +68,19 @@ while [ "$#" -gt 0 ]; do
       health_timeout="$2"
       shift 2
       ;;
-    --no-build)
-      build=0
+    --image)
+      [ "$#" -ge 2 ] || fail "--image requires an image reference"
+      [ -n "$2" ] || fail "--image must not be empty"
+      requested_image="$2"
+      deployment_mode="pull"
+      shift 2
+      ;;
+    --build)
+      deployment_mode="build"
+      shift
+      ;;
+    --no-pull|--no-build)
+      deployment_mode="existing"
       shift
       ;;
     --force)
@@ -87,12 +107,29 @@ case "$health_timeout" in
 esac
 [ "$health_timeout" -gt 0 ] || fail "--timeout must be greater than zero"
 [ -f "$compose_file" ] || fail "Compose file not found: $compose_file"
+[ "$deployment_mode" != "build" ] || \
+  [ -f "$build_compose_file" ] || fail "Compose build override not found: $build_compose_file"
+
+if [ -z "$requested_image" ] && [ -f "$image_state_file" ]; then
+  requested_image="$(sed -n '1p' "$image_state_file")"
+fi
+[ -n "$requested_image" ] || requested_image="$default_image"
+case "$requested_image" in
+  *[!A-Za-z0-9_./:@+-]*) fail "invalid image reference: $requested_image" ;;
+esac
+export KPROXY_IMAGE="$requested_image"
+
+build_image="${KPROXY_BUILD_IMAGE:-kiro-proxy:latest}"
+case "$build_image" in
+  ''|*[!A-Za-z0-9_./:@+-]*) fail "invalid KPROXY_BUILD_IMAGE: $build_image" ;;
+esac
+export KPROXY_BUILD_IMAGE="$build_image"
 
 command -v docker >/dev/null 2>&1 || fail "docker command not found"
 docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required (docker compose)"
 docker info >/dev/null 2>&1 || fail "cannot connect to Docker; start Docker and check your permissions"
 
-compose() {
+compose_base() {
   if [ -n "$project_name" ]; then
     docker compose \
       --project-name "$project_name" \
@@ -103,6 +140,25 @@ compose() {
     docker compose \
       --project-directory "$repo_root" \
       --file "$compose_file" \
+      "$@"
+  fi
+}
+
+compose() {
+  if [ "$deployment_mode" != "build" ]; then
+    compose_base "$@"
+  elif [ -n "$project_name" ]; then
+    docker compose \
+      --project-name "$project_name" \
+      --project-directory "$repo_root" \
+      --file "$compose_file" \
+      --file "$build_compose_file" \
+      "$@"
+  else
+    docker compose \
+      --project-directory "$repo_root" \
+      --file "$compose_file" \
+      --file "$build_compose_file" \
       "$@"
   fi
 }
@@ -221,7 +277,7 @@ prepare_data_volume() {
   fi
 
   echo "==> Recreating broken Docker data volume $data_volume_name"
-  compose down --remove-orphans
+  compose_base down --remove-orphans
   volume_users="$(docker ps --all --quiet --filter "volume=$data_volume_name")"
   [ -z "$volume_users" ] || \
     fail "volume $data_volume_name is still referenced by container(s): $volume_users"
@@ -288,27 +344,90 @@ else
   sudo "$@"
 fi
 
-if [ "$build" -eq 1 ]; then
-  echo "==> Building and starting kiro-proxy"
-  compose up --detach --build
-else
-  echo "==> Starting kiro-proxy from the existing image"
-  compose up --detach --no-build
+wait_for_health() {
+  elapsed=0
+  while ! compose_base exec --no-tty kproxyd /usr/local/bin/kproxy health >/dev/null 2>&1; do
+    [ "$elapsed" -lt "$health_timeout" ] || return 1
+    sleep 1
+    elapsed=$((elapsed + 1))
+  done
+}
+
+previous_container="$(compose_base ps --all --quiet kproxyd 2>/dev/null | awk 'NF { print; exit }')"
+previous_image_id=""
+rollback_image=""
+if [ -n "$previous_container" ]; then
+  previous_image_id="$(docker inspect --format '{{.Image}}' "$previous_container" 2>/dev/null || true)"
+fi
+if [ -n "$previous_image_id" ]; then
+  rollback_suffix="$(printf '%s' "$selected_project" | tr -c 'A-Za-z0-9_.-' '-')"
+  rollback_image="kiro-proxy-rollback:${rollback_suffix}"
+  echo "==> Saving the current image as $rollback_image"
+  docker image tag "$previous_image_id" "$rollback_image"
 fi
 
-echo "==> Waiting for kproxyd to become healthy"
-elapsed=0
-while ! compose exec --no-tty kproxyd /usr/local/bin/kproxy health >/dev/null 2>&1; do
-  if [ "$elapsed" -ge "$health_timeout" ]; then
-    compose logs --tail 80 kproxyd >&2 || true
-    fail "kproxyd did not become healthy within ${health_timeout}s"
+deployment_failed=0
+case "$deployment_mode" in
+  build)
+    echo "==> Building kiro-proxy locally and starting $build_image"
+    if ! compose up --detach --build; then
+      deployment_failed=1
+    fi
+    ;;
+  existing)
+    echo "==> Starting the existing image without pulling: $requested_image"
+    if ! compose_base up --detach --no-build; then
+      deployment_failed=1
+    fi
+    ;;
+  pull)
+    echo "==> Pulling image while the current container keeps running: $requested_image"
+    if ! compose_base pull kproxyd; then
+      fail "could not pull $requested_image; the current container was left untouched"
+    fi
+    echo "==> Replacing the container without building on this host"
+    if ! compose_base up --detach --no-build; then
+      deployment_failed=1
+    fi
+    ;;
+esac
+
+if [ "$deployment_failed" -eq 0 ]; then
+  echo "==> Waiting for kproxyd to become healthy"
+  wait_for_health || deployment_failed=1
+fi
+
+if [ "$deployment_failed" -ne 0 ]; then
+  echo "==> Deployment failed; recent daemon logs follow" >&2
+  compose_base logs --tail 80 kproxyd >&2 || true
+  if [ -n "$rollback_image" ]; then
+    echo "==> Rolling back to $rollback_image" >&2
+    export KPROXY_IMAGE="$rollback_image"
+    if compose_base up --detach --no-build && wait_for_health; then
+      fail "new deployment failed; the previous image was restored successfully"
+    fi
+    compose_base logs --tail 80 kproxyd >&2 || true
+    fail "new deployment failed and automatic rollback did not become healthy"
   fi
-  sleep 1
-  elapsed=$((elapsed + 1))
-done
+  fail "deployment failed and no previous image was available for rollback"
+fi
 
 echo "==> Verifying the host command"
 KPROXY_COMPOSE_PROJECT="$selected_project" "$target" health
+
+if [ "$deployment_mode" != "build" ]; then
+  image_state_tmp="$image_state_file.tmp.$$"
+  (umask 077 && printf '%s\n' "$requested_image" > "$image_state_tmp") || \
+    fail "could not save the deployed image to $image_state_tmp"
+  mv "$image_state_tmp" "$image_state_file" || \
+    fail "could not save the deployed image to $image_state_file"
+fi
+
+if [ "$deployment_mode" = "build" ]; then
+  deployed_image="$build_image"
+else
+  deployed_image="$requested_image"
+fi
 
 host_command="kproxy"
 case ":${PATH}:" in
@@ -322,6 +441,7 @@ kiro-proxy is ready.
 
   Host command:  $target
   Compose stack: $selected_project
+  Image:         $deployed_image
   Persistent data is stored in the kproxy-data Docker volume.
 
 Next steps:

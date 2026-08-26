@@ -401,22 +401,24 @@ record prompts, generated response bodies, or API-key values.
 
 ## 8. Docker Compose
 
-Build and start the default full image with all features and Chromium SSO:
+Pull and start the prebuilt full image with all features and Chromium SSO:
 
 ```bash
-./deploy/docker-setup.sh
+./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
 kproxy health
 ```
 
-This command validates Compose, builds the image, starts the service, waits for
-health, and installs the host `kproxy` command. It targets
+This command validates Compose, pulls the new image while the old container is
+still running, replaces the service, waits for health, rolls back to the old
+image on failure, and installs the host `kproxy` command. It targets
 `/usr/local/bin/kproxy` by default; without sudo access, use
 `--target "$HOME/.local/bin/kproxy"`. The equivalent manual commands are useful
 for debugging:
 
 ```bash
 docker compose config --quiet
-docker compose up -d --build
+KPROXY_IMAGE=ghcr.io/yaocool/kiro-proxy:v0.1.3 docker compose pull kproxyd
+KPROXY_IMAGE=ghcr.io/yaocool/kiro-proxy:v0.1.3 docker compose up -d --no-build
 docker compose ps
 docker compose exec kproxyd kproxy health
 docker compose logs -f kproxyd
@@ -425,11 +427,12 @@ docker compose logs -f kproxyd
 On Linux Docker Engine, `failed to populate volume` together with a missing
 `.../volumes/kiro-proxy_kproxy-data/_data` path means Docker retained the named
 volume metadata while its data directory disappeared. The setup script checks
-for this before building. It asks before repairing in an interactive terminal;
-CI and other non-interactive environments can opt in explicitly:
+for this before changing the container. It asks before repairing in an
+interactive terminal; CI and other non-interactive environments can opt in
+explicitly:
 
 ```bash
-./deploy/docker-setup.sh --no-build --repair-volume
+./deploy/docker-setup.sh --no-pull --repair-volume
 ```
 
 Repair applies only to a volume labeled for the current Compose project whose
@@ -458,12 +461,25 @@ preserved:
 docker compose up -d --force-recreate
 ```
 
-For normal source upgrades, rebuild in place and keep the named volume:
+For normal production upgrades, deploy the CI-built release image and keep the
+named volume:
 
 ```bash
-docker compose up -d --build
+./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
 docker compose exec kproxyd kproxy version
 docker compose exec kproxyd kproxy config show --effective
+```
+
+To pull and deploy whichever stable release currently owns the `latest` tag:
+
+```bash
+./deploy/docker-upgrade.sh
+```
+
+Use the build override only for an intentional local source build:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
 ### Use `kproxy` directly on the Docker host
@@ -491,8 +507,7 @@ compatibility problems.
 Update both the wrapper and the container image for an existing deployment:
 
 ```bash
-sudo ./deploy/install-kproxy-wrapper.sh
-docker compose up -d --build
+./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
 kproxy config edit
 ```
 

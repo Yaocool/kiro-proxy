@@ -1,0 +1,9 @@
+services:
+  kproxyd:
+    image: "${KPROXY_BUILD_IMAGE:-kiro-proxy:latest}"
+    build:
+      context: .
+      target: runtime-full # Includes all features and the SSO browser.
+      args:
+        RUST_VERSION: "1.97.1"
+        CARGO_BUILD_JOBS: "${CARGO_BUILD_JOBS:-1}"
