@@ -60,6 +60,7 @@ enum CompactionReason {
     ClientTrigger,
     MappedWindowOverflow,
     ResolvedWindowOverflow,
+    UpstreamWindowOverflow,
 }
 
 impl CompactionReason {
@@ -68,6 +69,7 @@ impl CompactionReason {
             Self::ClientTrigger => "client_trigger",
             Self::MappedWindowOverflow => "mapped_overflow",
             Self::ResolvedWindowOverflow => "resolved_overflow",
+            Self::UpstreamWindowOverflow => "upstream_overflow",
         }
     }
 }
@@ -1078,9 +1080,30 @@ async fn handle_claude(
     .await;
     let (execution, reservation) = match first_execution {
         Ok(execution) => (execution, reservation),
-        Err(ExecuteError::ContextLimit(limit)) if config.context.auto_compact_on_overflow => {
+        Err(error) if config.context.auto_compact_on_overflow => {
+            let retry_plan = match &error {
+                ExecuteError::ContextLimit(limit) => {
+                    Some((resolved_compaction_decision(limit), Vec::new(), false))
+                }
+                ExecuteError::Dispatch(failure) if failure.error.is_context_too_long() => {
+                    let model = if failure.context.kiro_model.is_empty() {
+                        route.mapped.as_str()
+                    } else {
+                        failure.context.kiro_model.as_str()
+                    };
+                    upstream_overflow_compaction_decision(&state, model, input_tokens)
+                        .map(|decision| (decision, failure.context.attempts.clone(), true))
+                }
+                ExecuteError::Upstream(upstream) if upstream.is_context_too_long() => {
+                    upstream_overflow_compaction_decision(&state, &route.mapped, input_tokens)
+                        .map(|decision| (decision, Vec::new(), true))
+                }
+                _ => None,
+            };
+            let Some((decision, previous_attempts, upstream_rejected)) = retry_plan else {
+                return Err(upstream_error(error, ErrorFormat::Claude));
+            };
             drop(reservation);
-            let decision = resolved_compaction_decision(&limit);
             let summary_model = if config.context.compaction_summary_model.trim().is_empty() {
                 route.mapped.as_str()
             } else {
@@ -1160,10 +1183,11 @@ async fn handle_claude(
                 summary_input_tokens = run.summary_input_tokens.unwrap_or(0),
                 summary_output_tokens = run.iteration_usage.map_or(0, |usage| usage.output_tokens),
                 fallback_reason = run.fallback_reason.unwrap_or("none"),
-                resolved_replanned = true,
-                "request context replanned for resolved account model"
+                resolved_replanned = !upstream_rejected,
+                upstream_overflow_retry = upstream_rejected,
+                "request context replanned for automatic overflow retry"
             );
-            let execution = execute_upstream(
+            let retry_execution = execute_upstream(
                 &state,
                 &trace_id,
                 &route.mapped,
@@ -1175,8 +1199,17 @@ async fn handle_claude(
                 true,
                 &payload,
             )
-            .await
-            .map_err(|error| upstream_error(error, ErrorFormat::Claude))?;
+            .await;
+            let execution = match retry_execution {
+                Ok(mut execution) => {
+                    prepend_attempt_logs(&mut execution.attempts, previous_attempts);
+                    execution
+                }
+                Err(mut retry_error) => {
+                    prepend_execute_error_attempts(&mut retry_error, previous_attempts);
+                    return Err(upstream_error(retry_error, ErrorFormat::Claude));
+                }
+            };
             (execution, reservation)
         }
         Err(error) => return Err(upstream_error(error, ErrorFormat::Claude)),
@@ -2156,6 +2189,40 @@ fn resolved_compaction_decision(limit: &ContextLimitError) -> CompactionDecision
     }
 }
 
+fn upstream_overflow_compaction_decision(
+    state: &Arc<AppState>,
+    model: &str,
+    input_tokens: u64,
+) -> Option<CompactionDecision> {
+    if input_tokens <= 1 {
+        return None;
+    }
+    let context = &state.config.current().context;
+    // An upstream overflow means the dynamic model metadata is not a safe
+    // authority for this request. Fall back to the operator-controlled default
+    // window and force meaningful progress even when the request is already
+    // below that default.
+    let configured_maximum =
+        (f64::from(context.max_input_tokens) * context.safe_input_ratio) as u64;
+    let maximum_tokens = configured_maximum
+        .max(1)
+        .min(input_tokens.saturating_sub(1));
+    Some(CompactionDecision {
+        reasons: vec![CompactionReason::UpstreamWindowOverflow],
+        model: model.to_owned(),
+        trigger_tokens: maximum_tokens,
+        target_tokens: compact_target_from_maximum(maximum_tokens),
+        maximum_tokens,
+    })
+}
+
+fn conservative_summary_context_maximum(state: &Arc<AppState>, model: &str) -> u64 {
+    let context = &state.config.current().context;
+    let configured =
+        (f64::from(context.max_input_tokens) * context.compact_safe_input_ratio) as u64;
+    configured.max(1).min(context_maximum(state, true, model))
+}
+
 async fn extractive_compaction(
     state: &Arc<AppState>,
     source_payload: &KiroPayload,
@@ -2306,7 +2373,47 @@ async fn run_compaction(
         });
     };
 
-    let summary_payload = compaction_summary_payload(source_payload, &plan, summary_model);
+    // Never send the original oversized conversation directly to the summary
+    // model. Dynamic model metadata can overstate the real upstream window, so
+    // first create a bounded local checkpoint using the configured fallback
+    // window. The semantic summary then improves that checkpoint instead of
+    // recursively failing on the same oversized prompt.
+    let summary_context_maximum = conservative_summary_context_maximum(state, summary_model);
+    let summary_preprocess_target = compact_target_from_maximum(summary_context_maximum);
+    let source_input_tokens = state
+        .tokenizer
+        .estimate_kiro_payload(source_payload)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error,
+                ErrorFormat::Claude,
+            )
+        })? as u64;
+    let (summary_source, summary_preprocessed) = if source_input_tokens > summary_preprocess_target
+    {
+        let (payload, stats) = extractive_compaction(
+            state,
+            source_payload,
+            summary_preprocess_target,
+            preserve_recent_turns,
+        )
+        .await?;
+        tracing::info!(
+            trace_id,
+            summary_model,
+            original_input_tokens = source_input_tokens,
+            preprocessed_input_tokens = stats.compacted_tokens,
+            preprocess_target_tokens = summary_preprocess_target,
+            removed_messages = stats.removed_messages,
+            "compaction summary input preprocessed locally"
+        );
+        (payload, true)
+    } else {
+        (source_payload.clone(), false)
+    };
+    let summary_payload = compaction_summary_payload(&summary_source, &plan, summary_model);
     let summary_input_tokens = state
         .tokenizer
         .estimate_kiro_payload(&summary_payload)
@@ -2318,8 +2425,7 @@ async fn run_compaction(
                 ErrorFormat::Claude,
             )
         })? as u64;
-    let capacity_insufficient =
-        check_context_limit(state, summary_input_tokens, true, summary_model).is_err();
+    let capacity_insufficient = summary_input_tokens > summary_context_maximum;
     let mut fallback_reason = None;
     let mut semantic_summary = None;
     let mut iteration_usage = None;
@@ -2329,7 +2435,8 @@ async fn run_compaction(
             trace_id,
             summary_model,
             summary_input_tokens,
-            summary_context_maximum = context_maximum(state, true, summary_model),
+            summary_context_maximum,
+            summary_preprocessed,
             "semantic compaction summary cannot fit its model; using extractive fallback"
         );
     } else {
@@ -3304,6 +3411,26 @@ fn dispatch_error(
         },
         error,
     })
+}
+
+fn prepend_attempt_logs(
+    attempts: &mut Vec<UpstreamAttemptLog>,
+    mut previous: Vec<UpstreamAttemptLog>,
+) {
+    if previous.is_empty() {
+        return;
+    }
+    previous.append(attempts);
+    for (index, attempt) in previous.iter_mut().enumerate() {
+        attempt.attempt = index as u32 + 1;
+    }
+    *attempts = previous;
+}
+
+fn prepend_execute_error_attempts(error: &mut ExecuteError, previous: Vec<UpstreamAttemptLog>) {
+    if let ExecuteError::Dispatch(failure) = error {
+        prepend_attempt_logs(&mut failure.context.attempts, previous);
+    }
 }
 
 fn retry_attempt_count(max_retries: u32, account_count: u32) -> u32 {
@@ -6553,10 +6680,23 @@ mod model_tests {
             decision.reasons,
             vec![CompactionReason::MappedWindowOverflow]
         );
+
+        let retry = upstream_overflow_compaction_decision(
+            &state,
+            "incorrectly-advertised-1m-model",
+            767_743,
+        )
+        .expect("upstream overflow retry decision");
+        assert_eq!(retry.maximum_tokens, 190_000);
+        assert_eq!(retry.target_tokens, 142_500);
+        assert_eq!(
+            retry.reasons,
+            vec![CompactionReason::UpstreamWindowOverflow]
+        );
     }
 
     #[tokio::test]
-    async fn summary_capacity_preflight_skips_a_doomed_semantic_request() {
+    async fn summary_input_is_preprocessed_before_semantic_compaction() {
         let directory = tempfile::tempdir().expect("tempdir");
         let paths = kproxy_core::paths::Paths::from_env_values(
             Some(directory.path().to_str().expect("utf8")),
@@ -6624,8 +6764,15 @@ mod model_tests {
             Err(error) => panic!("extractive fallback failed: {}", error.message),
         };
         assert_eq!(run.mode, "extractive_fallback");
-        assert_eq!(run.fallback_reason, Some("summary_capacity_insufficient"));
-        assert!(run.summary_input_tokens.expect("summary tokens") > 9_900);
+        assert_eq!(run.fallback_reason, Some("summary_upstream_error"));
+        let source_tokens = state
+            .tokenizer
+            .estimate_kiro_payload(&source_payload)
+            .await
+            .expect("source tokens") as u64;
+        let summary_tokens = run.summary_input_tokens.expect("summary tokens");
+        assert!(summary_tokens <= 9_900);
+        assert!(summary_tokens < source_tokens);
         assert!(run.stats.compacted_tokens <= decision.target_tokens as usize);
         assert!(matches!(
             run.artifact,

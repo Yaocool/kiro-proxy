@@ -4,16 +4,16 @@
 
 本文只谈**压缩本身的质量**：摘要怎么生成、保留什么、丢弃什么。压缩何时被触发（模型映射导致的窗口不一致）见 `model-mapping-context-window.md`，两份文档互为前提：那份决定"什么时候压"，本文决定"压得好不好"。
 
-## 实现状态（2026-08-20）
+## 实现状态（2026-08-26）
 
 本文的语义摘要主方案已经落地；下文“现状”章节保留的是改造前问题记录。当前实现具有以下行为：
 
-- compact 触发后，kproxy 会把完整有效历史转换为一个**无 tools 的普通 Kiro 对话请求**。工具调用与工具结果会转成完整可读文本，当前用户轮以 JSON 字符串作为不可信源数据放入摘要 prompt；模型被要求只返回 `<summary>` checkpoint，不回答原任务。
+- compact 触发后，kproxy 会先用本地 tokenizer 把有效历史预处理成有界 checkpoint，再转换为一个**无 tools 的普通 Kiro 对话请求**。工具调用与工具结果会转成可读文本，当前用户轮以 JSON 字符串作为不可信源数据放入摘要 prompt；模型被要求只返回 `<summary>` checkpoint，不回答原任务。原始超长会话不会直接发送给摘要模型。
 - 摘要 checkpoint 覆盖完整历史和当前用户轮。主请求同时尽量保留最近 `compaction_preserve_recent_turns` 轮结构化原文；payload 中注入的 checkpoint 与返回客户端的 compaction block 是同一份内容，下一轮应用 compaction boundary 后不会换成另一份字符碎片。
 - 摘要调用独立走 `AccountPool`、额度预留、usage 与 stats，内部统计路径为 `/internal/compact`，不会混入主响应的顶层 token usage。
 - 摘要调用超时、额度不足、上游失败、返回空/非法摘要或无法压到目标窗口时，会恢复原 payload 并使用 extractive fallback；日志中的 `compaction_mode` 可区分 `semantic` 与 `extractive_fallback`。超时立即结束主链路等待，已启动任务只在有界后台宽限期内继续结算；到期后取消摘要流，并保留已经解码的 usage、credits 与失败 stats。
 - 已加入 `compaction_summary_model`、`compaction_summary_timeout_ms`、`compaction_preserve_recent_turns` 三个配置项及校验，均随现有配置热更新机制生效。
-- 模型映射窗口溢出现在可通过默认关闭的 `auto_compact_on_overflow` 自动触发；摘要容量会在调用前预检，账号实际窗口更小时只复用同一压缩产物重规划一次。
+- `auto_compact_on_overflow` 默认开启；模型映射窗口溢出会在首次调用前触发，上游返回 `prompt is too long`/`context length exceeded` 时会按保守窗口重新压缩并只重试一次。摘要容量会在本地预处理后预检，账号实际窗口更小时只复用同一压缩产物重规划一次。
 - 流式和非流式响应都先返回同一份 compaction checkpoint；流式 prelude 在首个成功语义事件前暂存，以保留 pre-data retry。摘要与主调用分别记账，Claude usage 可通过 `iterations` 观察摘要与累计主采样，内部续轮的 input tokens 不会只上报第一轮。
 
 尚未实现的质量优化项是摘要内容哈希缓存和分块滚动摘要；自动触发的范围、限制及后续 prepared-dispatch 工作见 `model-mapping-context-window.md`。
@@ -49,7 +49,7 @@ if compacted_tokens <= target_tokens || summary_char_budget <= 256 {
 
 上下文质量在第二轮不是持平而是断崖下降。且 `original_history` 远大于 `removed`，却复用同一个（可能已被收缩过的）`summary_char_budget`，压缩比更狠。无注释可证明这是设计意图，倾向判定为 bug。
 
-**该客户端触发路径在改造前是休眠的。** 实测确认 Claude Code 普通请求发送的是 `clear_thinking_20251015`，不是 `compact_20260112`，所以不能依赖客户端 edit 触发。当前默认关闭的 `auto_compact_on_overflow` 已按映射窗口主动点亮新链路，缺陷 1 也已在启用前修复；本段保留为历史风险记录。
+**该客户端触发路径在改造前是休眠的。** 实测确认 Claude Code 普通请求发送的是 `clear_thinking_20251015`，不是 `compact_20260112`，所以不能依赖客户端 edit 触发。当前默认开启的 `auto_compact_on_overflow` 已按映射窗口和上游真实拒绝主动点亮新链路，缺陷 1 也已修复；本段保留为历史风险记录。
 
 **2. char/token 换算对中文是错的。** `summary_char_budget = summary_token_budget * 3` 隐含 1 token ≈ 3 chars，这是英文比例。中文在 cl100k 下 1 汉字约 1~2 tokens，`* 3` 严重高估可容纳字符数，于是中文对话的摘要几乎必然超预算，直接落入收缩重试循环。
 

@@ -222,6 +222,45 @@ impl wiremock::Respond for CompactionResponder {
     }
 }
 
+#[derive(Clone, Default)]
+struct UpstreamOverflowCompactionResponder {
+    main_calls: Arc<AtomicUsize>,
+    first_main_body_bytes: Arc<AtomicUsize>,
+    summary_body_bytes: Arc<AtomicUsize>,
+}
+
+impl wiremock::Respond for UpstreamOverflowCompactionResponder {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let payload =
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap_or_default();
+        let current = payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+            .as_str()
+            .unwrap_or_default();
+        if current.contains("durable conversation checkpoint") {
+            self.summary_body_bytes
+                .store(request.body.len(), Ordering::SeqCst);
+            return ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(generation_body(
+                    "<summary>Task Overview: recover from the upstream context rejection. Current State: local preprocessing bounded the summary input. Next Steps: retry once.</summary>",
+                ));
+        }
+        if self.main_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            self.first_main_body_bytes
+                .store(request.body.len(), Ordering::SeqCst);
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "message":"prompt is too long: context length exceeded"
+            }))
+        } else {
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(generation_body(
+                    "main request completed after overflow retry",
+                ))
+        }
+    }
+}
+
 #[derive(Clone)]
 struct LongCompactionResponder;
 
@@ -432,16 +471,10 @@ async fn configure_context_alignment(daemon: &Daemon, summary_model: &str, mappi
     let raw = tokio::fs::read_to_string(&config_path)
         .await
         .expect("read config");
-    let edited = raw
-        .replace("model_mapping = []", "")
-        .replace(
-            "auto_compact_on_overflow = false",
-            "auto_compact_on_overflow = true",
-        )
-        .replace(
-            "compaction_summary_model = \"\"",
-            &format!("compaction_summary_model = \"{summary_model}\""),
-        );
+    let edited = raw.replace("model_mapping = []", "").replace(
+        "compaction_summary_model = \"\"",
+        &format!("compaction_summary_model = \"{summary_model}\""),
+    );
     let edited = format!("{edited}\n{mapping}\n");
     toml::from_str::<kproxy_core::config::Config>(&edited).expect("parse edited config");
     tokio::fs::write(&config_path, edited)
@@ -1032,6 +1065,74 @@ async fn claude_compaction_uses_a_separate_semantic_kiro_request() {
         main_request["conversationState"]["history"][0]["userInputMessage"]["content"]
             .as_str()
             .is_some_and(|content| content.contains("System-generated conversation checkpoint"))
+    );
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn upstream_context_rejection_preprocesses_compacts_and_retries_once() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let responder = UpstreamOverflowCompactionResponder::default();
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(responder.clone())
+        .mount(&mock)
+        .await;
+
+    let port = unused_tcp_port();
+    let upstream_url = format!("{}/generateAssistantResponse", mock.uri());
+    let daemon = Daemon::start_http(port, &upstream_url).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header(
+            "x-api-key",
+            daemon.api_key.as_deref().expect("service API key"),
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("user-agent", "claude-cli/2.1.235 (external, e2e)")
+        .json(&serde_json::json!({
+            "model":"source-large",
+            "max_tokens":64,
+            "stream":false,
+            "messages":[
+                {"role":"user","content":"overflow history ".repeat(100000)},
+                {"role":"assistant","content":"keep the earlier decision"},
+                {"role":"user","content":"retry after upstream overflow"}
+            ]
+        }))
+        .send()
+        .await
+        .expect("call upstream overflow retry path");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await.expect("Claude response JSON");
+    assert_eq!(body["content"][0]["type"], "compaction");
+    assert_eq!(
+        body["content"][1]["text"],
+        "main request completed after overflow retry"
+    );
+    assert_eq!(responder.main_calls.load(Ordering::SeqCst), 2);
+    let first_main_bytes = responder.first_main_body_bytes.load(Ordering::SeqCst);
+    let summary_bytes = responder.summary_body_bytes.load(Ordering::SeqCst);
+    assert!(first_main_bytes > 0);
+    assert!(summary_bytes > 0);
+    assert!(
+        summary_bytes < first_main_bytes,
+        "summary request was not preprocessed: {summary_bytes} >= {first_main_bytes}"
+    );
+
+    let requests = mock.received_requests().await.expect("received requests");
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.url.path() == "/generateAssistantResponse")
+            .count(),
+        3,
+        "expected first main request, bounded summary request, and one main retry"
     );
 
     daemon.stop().await;
