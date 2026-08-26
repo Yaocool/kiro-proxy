@@ -1754,6 +1754,7 @@ mod tests {
             },
             profile_arn: None,
             inference_config: None,
+            protected_history_messages: 0,
         }
     }
 

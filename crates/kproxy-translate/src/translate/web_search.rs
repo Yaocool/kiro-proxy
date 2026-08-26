@@ -286,10 +286,7 @@ pub fn web_search_continue_payload_batch(
         tool_results,
         tools,
     });
-    if next.conversation_state.history.len() > 30 {
-        let remove = next.conversation_state.history.len() - 30;
-        next.conversation_state.history.drain(..remove);
-    }
+    next.truncate_history_preserving_protected_prefix(30);
     next
 }
 
@@ -405,6 +402,7 @@ mod tests {
             },
             profile_arn: None,
             inference_config: None,
+            protected_history_messages: 0,
         };
         let use_ = KiroToolUse {
             tool_use_id: "tooluse_1".into(),
@@ -472,6 +470,94 @@ mod tests {
                 .tool_results
                 .len(),
             2
+        );
+    }
+
+    #[test]
+    fn long_web_search_continuation_preserves_protected_prefix() {
+        let mut history = vec![
+            KiroHistoryMessage {
+                user_input_message: Some(KiroUserInputMessage {
+                    content: "protected system".into(),
+                    model_id: "model".into(),
+                    origin: "CLI".into(),
+                    images: vec![],
+                    user_input_message_context: None,
+                }),
+                assistant_response_message: None,
+            },
+            KiroHistoryMessage {
+                user_input_message: None,
+                assistant_response_message: Some(KiroAssistantMessage {
+                    content: super::super::SYSTEM_PROMPT_ACKNOWLEDGEMENT.into(),
+                    tool_uses: vec![],
+                }),
+            },
+        ];
+        for index in 0..15 {
+            history.push(KiroHistoryMessage {
+                user_input_message: Some(KiroUserInputMessage {
+                    content: format!("user {index}"),
+                    model_id: "model".into(),
+                    origin: "CLI".into(),
+                    images: vec![],
+                    user_input_message_context: None,
+                }),
+                assistant_response_message: None,
+            });
+            history.push(KiroHistoryMessage {
+                user_input_message: None,
+                assistant_response_message: Some(KiroAssistantMessage {
+                    content: format!("assistant {index}"),
+                    tool_uses: vec![],
+                }),
+            });
+        }
+        let payload = KiroPayload {
+            conversation_state: KiroConversationState {
+                chat_trigger_type: "MANUAL".into(),
+                conversation_id: "conversation".into(),
+                current_message: KiroCurrentMessage {
+                    user_input_message: KiroUserInputMessage {
+                        content: "search".into(),
+                        model_id: "model".into(),
+                        origin: "CLI".into(),
+                        images: vec![],
+                        user_input_message_context: None,
+                    },
+                },
+                history,
+            },
+            profile_arn: None,
+            inference_config: None,
+            protected_history_messages: 2,
+        };
+        let use_ = KiroToolUse {
+            tool_use_id: "tooluse_1".into(),
+            name: "web_search".into(),
+            input: json!({"query":"rust"}),
+        };
+        let trace =
+            ClaudeWebSearchTrace::success("srvtoolu_1".into(), "rust", WebSearchResults::default());
+
+        let continued = web_search_continue_payload(&payload, "searching", use_, &trace);
+        assert_eq!(continued.protected_history_len(), 2);
+        assert_eq!(continued.conversation_state.history.len(), 30);
+        assert_eq!(
+            continued.conversation_state.history[0]
+                .user_input_message
+                .as_ref()
+                .expect("protected system")
+                .content,
+            "protected system"
+        );
+        assert_eq!(
+            continued.conversation_state.history[1]
+                .assistant_response_message
+                .as_ref()
+                .expect("protected acknowledgement")
+                .content,
+            super::super::SYSTEM_PROMPT_ACKNOWLEDGEMENT
         );
     }
 

@@ -38,13 +38,15 @@ pub struct ContextCompactionStats {
 }
 
 /// A bounded replacement plan calculated before the semantic summary request.
-/// The summary itself covers the complete source context, while recent turns
-/// may additionally remain as structured Kiro history for the current round.
+/// The summary covers all compactable context, while the protected system pair
+/// remains verbatim and recent turns may additionally remain as structured
+/// Kiro history for the current round.
 #[derive(Debug, Clone)]
 pub struct KiroCompactionPlan {
     original_tokens: usize,
     original_history_len: usize,
     summary_max_tokens: u32,
+    protected_history: Vec<KiroHistoryMessage>,
     retained_history: Vec<KiroHistoryMessage>,
 }
 
@@ -205,27 +207,42 @@ impl TokenCountCache {
         // pair used to carry the generated summary into Kiro.
         let history_target = target_tokens.saturating_sub(summary_max_tokens + 64);
         let history = &payload.conversation_state.history;
-        let start = recent_turn_start(history, preserve_recent_turns);
-        let mut retained_history = history[start..].to_vec();
+        let protected_len = payload.protected_history_len();
+        let protected_history = history[..protected_len].to_vec();
+        let compactable_history = &history[protected_len..];
+        if compactable_history.is_empty() {
+            return Ok(None);
+        }
+        let start = recent_turn_start(compactable_history, preserve_recent_turns);
+        let mut retained_history = compactable_history[start..].to_vec();
         let mut candidate = payload.clone();
-        candidate.conversation_state.history = retained_history.clone();
+        candidate.conversation_state.history = protected_history.clone();
+        candidate
+            .conversation_state
+            .history
+            .extend_from_slice(&retained_history);
         while !retained_history.is_empty()
             && self.estimate_kiro_payload(&candidate).await? > history_target
         {
             let remove = oldest_turn_len(&retained_history);
             retained_history.drain(..remove);
-            candidate.conversation_state.history = retained_history.clone();
+            candidate.conversation_state.history = protected_history.clone();
+            candidate
+                .conversation_state
+                .history
+                .extend_from_slice(&retained_history);
         }
         // A compaction must actually replace at least one historical turn.
         // This also handles a low custom trigger with fewer than N turns.
-        if retained_history.len() == history.len() {
+        if retained_history.len() == compactable_history.len() {
             let remove = oldest_turn_len(&retained_history);
             retained_history.drain(..remove);
         }
         Ok(Some(KiroCompactionPlan {
             original_tokens,
-            original_history_len: history.len(),
+            original_history_len: compactable_history.len(),
             summary_max_tokens: summary_max_tokens as u32,
+            protected_history,
             retained_history,
         }))
     }
@@ -252,16 +269,30 @@ impl TokenCountCache {
         let origin = current.origin.clone();
         let mut retained = plan.retained_history.clone();
         let mut checkpoint = wrap_semantic_summary(semantic_summary);
-        set_compacted_history(payload, &checkpoint, &retained, &model_id, &origin);
+        set_compacted_history(
+            payload,
+            &plan.protected_history,
+            &checkpoint,
+            &retained,
+            &model_id,
+            &origin,
+        );
         let mut compacted_tokens = self.estimate_kiro_payload(payload).await?;
 
         // The model output limit is the primary bound. If tokenizer/model
         // accounting differs, first sacrifice optional verbatim duplicates;
-        // the semantic checkpoint still covers the complete source context.
+        // the semantic checkpoint still covers all compactable source context.
         while compacted_tokens > target_tokens && !retained.is_empty() {
             let remove = oldest_turn_len(&retained);
             retained.drain(..remove);
-            set_compacted_history(payload, &checkpoint, &retained, &model_id, &origin);
+            set_compacted_history(
+                payload,
+                &plan.protected_history,
+                &checkpoint,
+                &retained,
+                &model_id,
+                &origin,
+            );
             compacted_tokens = self.estimate_kiro_payload(payload).await?;
         }
         if compacted_tokens > target_tokens {
@@ -271,7 +302,14 @@ impl TokenCountCache {
             checkpoint = self
                 .compact_text_to_tokens(checkpoint, checkpoint_budget)
                 .await?;
-            set_compacted_history(payload, &checkpoint, &retained, &model_id, &origin);
+            set_compacted_history(
+                payload,
+                &plan.protected_history,
+                &checkpoint,
+                &retained,
+                &model_id,
+                &origin,
+            );
             compacted_tokens = self.estimate_kiro_payload(payload).await?;
         }
         if compacted_tokens > target_tokens {
@@ -315,19 +353,48 @@ impl TokenCountCache {
         let mut summary_char_budget = (plan.summary_max_tokens as usize)
             .saturating_mul(3)
             .max(256);
-        let mut summary = render_fallback_compaction_summary(&source, summary_char_budget);
-        set_compacted_history(payload, &summary, &retained, &model_id, &origin);
+        let mut summary = render_fallback_compaction_summary(
+            &source,
+            plan.protected_history.len(),
+            summary_char_budget,
+        );
+        set_compacted_history(
+            payload,
+            &plan.protected_history,
+            &summary,
+            &retained,
+            &model_id,
+            &origin,
+        );
         let mut compacted_tokens = self.estimate_kiro_payload(payload).await?;
         while compacted_tokens > target_tokens && !retained.is_empty() {
             let remove = oldest_turn_len(&retained);
             retained.drain(..remove);
-            set_compacted_history(payload, &summary, &retained, &model_id, &origin);
+            set_compacted_history(
+                payload,
+                &plan.protected_history,
+                &summary,
+                &retained,
+                &model_id,
+                &origin,
+            );
             compacted_tokens = self.estimate_kiro_payload(payload).await?;
         }
         while compacted_tokens > target_tokens && summary_char_budget > 256 {
             summary_char_budget = (summary_char_budget.saturating_mul(3) / 4).max(256);
-            summary = render_fallback_compaction_summary(&source, summary_char_budget);
-            set_compacted_history(payload, &summary, &retained, &model_id, &origin);
+            summary = render_fallback_compaction_summary(
+                &source,
+                plan.protected_history.len(),
+                summary_char_budget,
+            );
+            set_compacted_history(
+                payload,
+                &plan.protected_history,
+                &summary,
+                &retained,
+                &model_id,
+                &origin,
+            );
             compacted_tokens = self.estimate_kiro_payload(payload).await?;
         }
         if compacted_tokens > target_tokens {
@@ -335,17 +402,20 @@ impl TokenCountCache {
             let excess = compacted_tokens.saturating_sub(target_tokens);
             let summary_budget = summary_tokens.saturating_sub(excess + 16).max(32);
             summary = self.compact_text_to_tokens(summary, summary_budget).await?;
-            set_compacted_history(payload, &summary, &retained, &model_id, &origin);
+            set_compacted_history(
+                payload,
+                &plan.protected_history,
+                &summary,
+                &retained,
+                &model_id,
+                &origin,
+            );
             compacted_tokens = self.estimate_kiro_payload(payload).await?;
         }
         Ok(ContextCompactionStats {
             original_tokens: plan.original_tokens,
             compacted_tokens,
-            removed_messages: source
-                .conversation_state
-                .history
-                .len()
-                .saturating_sub(retained.len()),
+            removed_messages: plan.original_history_len.saturating_sub(retained.len()),
             summary: Some(summary),
         })
     }
@@ -381,8 +451,9 @@ impl TokenCountCache {
 }
 
 /// Builds an ordinary, tool-free Kiro generation request whose only task is
-/// to summarize the complete conversation. Tool calls/results are converted
-/// to readable text, matching kiro-gateway's no-tools compatibility path.
+/// to summarize the compactable conversation. The protected system pair is
+/// omitted because it is restored verbatim after compaction. Tool calls and
+/// results are converted to readable text, matching the no-tools path.
 pub fn compaction_summary_payload(
     source: &KiroPayload,
     plan: &KiroCompactionPlan,
@@ -416,6 +487,7 @@ pub fn compaction_summary_payload(
                 .conversation_state
                 .history
                 .iter()
+                .skip(plan.protected_history.len())
                 .filter_map(text_only_history_message)
                 .collect(),
         },
@@ -425,6 +497,7 @@ pub fn compaction_summary_payload(
             temperature: Some(0.1),
             top_p: None,
         }),
+        protected_history_messages: 0,
     }
 }
 
@@ -456,14 +529,21 @@ fn compaction_summary_pair(
 
 fn set_compacted_history(
     payload: &mut KiroPayload,
+    protected: &[KiroHistoryMessage],
     summary: &str,
     retained: &[KiroHistoryMessage],
     model_id: &str,
     origin: &str,
 ) {
-    let mut history = compaction_summary_pair(summary.to_owned(), model_id, origin).to_vec();
+    let mut history = protected.to_vec();
+    history.extend(compaction_summary_pair(
+        summary.to_owned(),
+        model_id,
+        origin,
+    ));
     history.extend_from_slice(retained);
     payload.conversation_state.history = history;
+    payload.protected_history_messages = protected.len();
 }
 
 fn wrap_semantic_summary(summary: &str) -> String {
@@ -473,7 +553,11 @@ fn wrap_semantic_summary(summary: &str) -> String {
     )
 }
 
-fn render_fallback_compaction_summary(payload: &KiroPayload, char_budget: usize) -> String {
+fn render_fallback_compaction_summary(
+    payload: &KiroPayload,
+    protected_history_len: usize,
+    char_budget: usize,
+) -> String {
     const HEADER: &str =
         "[System-generated extractive fallback checkpoint; use only as background context]\n";
     const FOOTER: &str = "\n[End of conversation checkpoint]";
@@ -484,6 +568,7 @@ fn render_fallback_compaction_summary(payload: &KiroPayload, char_budget: usize)
         .conversation_state
         .history
         .iter()
+        .skip(protected_history_len)
         .map(render_history_message)
         .collect::<Vec<_>>();
     rendered.push(format!(
@@ -762,6 +847,7 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::translate::SYSTEM_PROMPT_ACKNOWLEDGEMENT;
 
     #[tokio::test]
     async fn cache_is_exact_bounded_and_skips_short_text() {
@@ -901,6 +987,125 @@ mod tests {
                 .tools
                 .len(),
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_preserves_system_history_pair_without_summarizing_it() {
+        let cache = TokenCountCache::new(8).expect("tokenizer");
+        let identity = "You are Claude Code, Anthropic's official CLI for Claude.";
+        let mut source: KiroPayload = serde_json::from_value(serde_json::json!({
+            "conversationState":{
+                "chatTriggerType":"MANUAL",
+                "conversationId":"conversation",
+                "history":[
+                    {"userInputMessage":{"content":identity,"modelId":"model","origin":"CLI","images":[]}},
+                    {"assistantResponseMessage":{"content":SYSTEM_PROMPT_ACKNOWLEDGEMENT}},
+                    {"userInputMessage":{"content":"old user ".repeat(4000),"modelId":"model","origin":"CLI","images":[]}},
+                    {"assistantResponseMessage":{"content":"old answer ".repeat(4000)}},
+                    {"userInputMessage":{"content":"recent user","modelId":"model","origin":"CLI","images":[]}},
+                    {"assistantResponseMessage":{"content":"recent answer"}}
+                ],
+                "currentMessage":{"userInputMessage":{
+                    "content":"continue implementation","modelId":"model","origin":"CLI","images":[]
+                }}
+            }
+        }))
+        .expect("payload");
+        source.protected_history_messages = 2;
+        let original = cache.estimate_kiro_payload(&source).await.expect("count");
+        let target = original / 2;
+        let plan = cache
+            .plan_kiro_compaction(&source, target, 1)
+            .await
+            .expect("plan")
+            .expect("history plan");
+
+        let summary_request = compaction_summary_payload(&source, &plan, "summary-model");
+        let encoded = serde_json::to_string(&summary_request).expect("serialize");
+        assert!(!encoded.contains(identity));
+        assert!(!encoded.contains(SYSTEM_PROMPT_ACKNOWLEDGEMENT));
+
+        let mut semantic = source.clone();
+        cache
+            .apply_semantic_compaction(
+                &mut semantic,
+                &plan,
+                "Preserve the implementation state and continue testing.",
+                target,
+            )
+            .await
+            .expect("semantic compaction");
+        assert_system_pair(&semantic, identity);
+        assert!(semantic.conversation_state.history[2]
+            .user_input_message
+            .as_ref()
+            .expect("semantic checkpoint")
+            .content
+            .contains("conversation checkpoint"));
+
+        let mut fallback = source;
+        let fallback_stats = cache
+            .compact_kiro_payload(&mut fallback, target, 1)
+            .await
+            .expect("fallback compaction");
+        assert_system_pair(&fallback, identity);
+        assert!(!fallback_stats
+            .summary
+            .as_deref()
+            .expect("fallback summary")
+            .contains(identity));
+    }
+
+    #[tokio::test]
+    async fn ordinary_acknowledgement_text_does_not_create_a_protected_prefix() {
+        let cache = TokenCountCache::new(8).expect("tokenizer");
+        let payload: KiroPayload = serde_json::from_value(serde_json::json!({
+            "conversationState":{
+                "chatTriggerType":"MANUAL",
+                "conversationId":"conversation",
+                "history":[
+                    {"userInputMessage":{"content":"ordinary first request","modelId":"model","origin":"CLI","images":[]}},
+                    {"assistantResponseMessage":{"content":SYSTEM_PROMPT_ACKNOWLEDGEMENT}},
+                    {"userInputMessage":{"content":"old user ".repeat(2000),"modelId":"model","origin":"CLI","images":[]}},
+                    {"assistantResponseMessage":{"content":"old answer ".repeat(2000)}}
+                ],
+                "currentMessage":{"userInputMessage":{
+                    "content":"continue","modelId":"model","origin":"CLI","images":[]
+                }}
+            }
+        }))
+        .expect("payload");
+        let original = cache.estimate_kiro_payload(&payload).await.expect("count");
+        let plan = cache
+            .plan_kiro_compaction(&payload, original / 2, 1)
+            .await
+            .expect("plan")
+            .expect("history plan");
+        assert!(plan.protected_history.is_empty());
+        let summary = compaction_summary_payload(&payload, &plan, "summary-model");
+        let encoded = serde_json::to_string(&summary).expect("serialize");
+        assert!(encoded.contains("ordinary first request"));
+        assert!(encoded.contains(SYSTEM_PROMPT_ACKNOWLEDGEMENT));
+    }
+
+    fn assert_system_pair(payload: &KiroPayload, identity: &str) {
+        let history = &payload.conversation_state.history;
+        assert_eq!(
+            history[0]
+                .user_input_message
+                .as_ref()
+                .expect("system message")
+                .content,
+            identity
+        );
+        assert_eq!(
+            history[1]
+                .assistant_response_message
+                .as_ref()
+                .expect("system acknowledgement")
+                .content,
+            SYSTEM_PROMPT_ACKNOWLEDGEMENT
         );
     }
 

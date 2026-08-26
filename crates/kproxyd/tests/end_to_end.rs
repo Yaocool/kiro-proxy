@@ -1061,11 +1061,12 @@ async fn claude_compaction_uses_a_separate_semantic_kiro_request() {
                 })
         })
         .expect("main request");
-    assert!(
-        main_request["conversationState"]["history"][0]["userInputMessage"]["content"]
-            .as_str()
-            .is_some_and(|content| content.contains("System-generated conversation checkpoint"))
-    );
+    assert!(main_request["conversationState"]["history"]
+        .as_array()
+        .expect("main history")
+        .iter()
+        .filter_map(|message| message["userInputMessage"]["content"].as_str())
+        .any(|content| content.contains("System-generated conversation checkpoint")));
 
     daemon.stop().await;
 }
@@ -1223,6 +1224,9 @@ priority = 10
         summary["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
         "summary-large"
     );
+    assert!(!summary
+        .to_string()
+        .contains("Never lose this governing instruction."));
     let main = payloads
         .iter()
         .find(|payload| {
@@ -1238,10 +1242,18 @@ priority = 10
         main["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
         "mapped-small"
     );
+    assert_eq!(
+        main["conversationState"]["currentMessage"]["userInputMessage"]["content"],
+        "continue the implementation"
+    );
     assert!(
-        main["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+        main["conversationState"]["history"][0]["userInputMessage"]["content"]
             .as_str()
             .is_some_and(|content| content.contains("Never lose this governing instruction."))
+    );
+    assert_eq!(
+        main["conversationState"]["history"][1]["assistantResponseMessage"]["content"],
+        "I will follow these instructions."
     );
 
     daemon.stop().await;

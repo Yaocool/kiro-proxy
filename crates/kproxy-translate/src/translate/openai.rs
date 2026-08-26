@@ -172,6 +172,7 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
             request.temperature,
             request.top_p,
         )),
+        protected_history_messages: 0,
     }
 }
 
