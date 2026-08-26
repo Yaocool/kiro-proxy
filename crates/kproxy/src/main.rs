@@ -9,6 +9,7 @@ use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use kproxy_ipc::protocol::{
     method, ConfigPathResult, ConfigReloadResult, ConfigShowResult, StatusResult,
 };
+use std::io::{IsTerminal, Write};
 
 use crate::client::{resolve_socket, AdminClient};
 use crate::output::{format_relative, format_timestamp, print_json};
@@ -85,11 +86,13 @@ enum Command {
         after_help = "示例：\n  kproxy pool --explain\n  kproxy pool --model claude-sonnet-4 --watch"
     )]
     Pool {
+        /// 按该模型检查账号是否可调度。
         #[arg(long, default_value = "minimax-m2.5")]
         model: String,
+        /// 每 2 秒刷新；交互终端中原地更新。
         #[arg(long)]
         watch: bool,
-        /// 显示三因子评分明细；默认输出仍保留机器可读的完整数据。
+        /// 显示全部账号、不可调度原因和三因子评分明细。
         #[arg(long)]
         explain: bool,
     },
@@ -574,22 +577,23 @@ async fn main() -> Result<()> {
             model,
             watch,
             explain,
-        } => loop {
-            crate::commands::runtime::simple_rpc(
-                &mut client,
-                method::POOL,
-                serde_json::json!({"model":model,"explain":explain}),
-                cli.json,
-            )
-            .await?;
-            if !watch {
-                break;
+        } => {
+            let refresh_in_place = watch && !cli.json && std::io::stdout().is_terminal();
+            loop {
+                if refresh_in_place {
+                    print!("\x1b[2J\x1b[H");
+                    std::io::stdout().flush()?;
+                }
+                crate::commands::runtime::show_pool(&mut client, &model, explain, cli.json).await?;
+                if !watch {
+                    break;
+                }
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                }
             }
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => break,
-                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
-            }
-        },
+        }
         Command::Diagnose { command } => match command {
             Some(DiagnoseCommand::Endpoints { region }) => {
                 crate::commands::runtime::simple_rpc(

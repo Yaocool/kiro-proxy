@@ -1,6 +1,6 @@
 //! 管理面各方法实现。
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use futures::{stream, StreamExt};
 use kproxy_core::account::Account;
@@ -1200,6 +1200,13 @@ struct PoolParams {
     model: String,
 }
 
+#[derive(serde::Serialize)]
+struct PoolAccountView {
+    #[serde(flatten)]
+    score: kproxy_pool::ScoreExplanation,
+    account_name: String,
+}
+
 fn default_pool_model() -> String {
     "minimax-m2.5".into()
 }
@@ -1213,8 +1220,37 @@ async fn handle_pool(state: &Arc<AppState>, params: serde_json::Value) -> Handle
         parse_params(params)?
     };
     let pool = state.pool();
-    let scores = pool.explain(&params.model).await;
-    to_value(serde_json::json!({"model":params.model,"queued":pool.queued(),"accounts":scores}))
+    let account_names = pool
+        .snapshot()
+        .await
+        .into_iter()
+        .map(|account| (account.id.clone(), account.display_name().to_owned()))
+        .collect::<HashMap<_, _>>();
+    let scores = pool
+        .explain(&params.model)
+        .await
+        .into_iter()
+        .map(|score| PoolAccountView {
+            account_name: account_names
+                .get(&score.account_id)
+                .cloned()
+                .unwrap_or_default(),
+            score,
+        })
+        .collect::<Vec<_>>();
+    let pool_config = state.runtime_config_snapshot().pool;
+    to_value(serde_json::json!({
+        "model": params.model,
+        "queued": pool.queued(),
+        "accounts": scores,
+        "scoring": {
+            "weight_active": pool_config.balance.weight_active,
+            "weight_credit": pool_config.balance.weight_credit,
+            "weight_idle": pool_config.balance.weight_idle,
+            "max_concurrent_per_account": pool_config.max_concurrent_per_account,
+            "idle_window_ms": pool_config.balance.idle_window_ms,
+        }
+    }))
 }
 
 #[derive(serde::Deserialize, Default)]

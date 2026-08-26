@@ -368,6 +368,24 @@ impl AccountPool {
                 explanations.push(self.score(state).await);
             } else {
                 let account = state.account.read().await;
+                let health = state.health();
+                let reason = if !account.enabled {
+                    "disabled".into()
+                } else if matches!(
+                    health,
+                    AccountHealth::Cooling | AccountHealth::Banned | AccountHealth::Refreshing
+                ) {
+                    format!("{health:?}").to_ascii_lowercase()
+                } else {
+                    match account_credit_state(&account, &self.config()) {
+                        AccountCreditState::Exhausted => "exhausted".into(),
+                        AccountCreditState::Protected => "low_credit".into(),
+                        AccountCreditState::Available if health != AccountHealth::Available => {
+                            format!("{health:?}").to_ascii_lowercase()
+                        }
+                        AccountCreditState::Available => "model_unavailable".into(),
+                    }
+                };
                 explanations.push(ScoreExplanation {
                     account_id: account.id.clone(),
                     score: f64::INFINITY,
@@ -375,7 +393,7 @@ impl AccountPool {
                     credit_factor: 0.0,
                     idle_factor: 0.0,
                     eligible: false,
-                    reason: format!("{:?}", state.health()).to_ascii_lowercase(),
+                    reason,
                 });
             }
         }
@@ -800,6 +818,13 @@ mod tests {
             ],
             immediate_config(),
         );
+        let explanations = pool.explain("claude-opus-4").await;
+        let free = explanations
+            .iter()
+            .find(|explanation| explanation.account_id == "free")
+            .expect("free account explanation");
+        assert!(!free.eligible);
+        assert_eq!(free.reason, "model_unavailable");
         let lease = pool
             .acquire("claude-opus-4", 0.0, &[])
             .await
