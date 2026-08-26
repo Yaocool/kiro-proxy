@@ -50,6 +50,19 @@ impl KiroError {
         self.status == Some(429) || text_is_throttle_error(&self.message)
     }
 
+    pub fn is_model_temporarily_unavailable(&self) -> bool {
+        matches!(self.status, None | Some(500..=599))
+            && text_is_model_temporarily_unavailable(&self.message)
+    }
+
+    pub fn is_model_capacity_error(&self) -> bool {
+        self.is_throttle() || self.is_model_temporarily_unavailable()
+    }
+
+    pub fn is_context_too_long(&self) -> bool {
+        text_is_context_too_long(&self.message)
+    }
+
     pub fn is_retriable(&self) -> bool {
         self.status.is_none() || self.is_throttle() || matches!(self.status, Some(500..=599))
     }
@@ -103,22 +116,43 @@ pub fn text_is_throttle_error(message: &str) -> bool {
         || contains_status(&text, 429)
 }
 
-pub fn text_is_request_rejection(message: &str) -> bool {
+pub fn text_is_model_temporarily_unavailable(message: &str) -> bool {
     let text = message.to_ascii_lowercase();
     [
-        "too many tools",
-        "tool definitions are too large",
-        "tool schema",
-        "payload too large",
-        "request too large",
-        "request entity too large",
-        "context length",
-        "prompt is too long",
-        "input is too long",
-        "validationexception",
+        "model_temporarily_unavailable",
+        "model temporarily unavailable",
+        "unexpectedly high load",
     ]
     .iter()
     .any(|marker| text.contains(marker))
+}
+
+pub fn text_is_context_too_long(message: &str) -> bool {
+    let text = message.to_ascii_lowercase();
+    [
+        "prompt is too long",
+        "context length exceeded",
+        "input is too long",
+        "maximum context",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
+pub fn text_is_request_rejection(message: &str) -> bool {
+    let text = message.to_ascii_lowercase();
+    text_is_context_too_long(&text)
+        || [
+            "too many tools",
+            "tool definitions are too large",
+            "tool schema",
+            "payload too large",
+            "request too large",
+            "request entity too large",
+            "validationexception",
+        ]
+        .iter()
+        .any(|marker| text.contains(marker))
         || contains_status(&text, 413)
         || contains_status(&text, 422)
 }
@@ -2582,6 +2616,35 @@ mod tests {
             message: "ValidationException: tool schema request too large".into(),
         };
         assert!(payload.is_request_rejection());
+        assert!(!payload.is_context_too_long());
         assert!(payload.is_retriable());
+
+        let context = KiroError {
+            status: Some(400),
+            endpoint: "AmazonQ".into(),
+            message: "prompt is too long: context length exceeded".into(),
+        };
+        assert!(context.is_request_rejection());
+        assert!(context.is_context_too_long());
+
+        let model_unavailable = KiroError {
+            status: Some(500),
+            endpoint: "AmazonQ".into(),
+            message: r#"{"message":"Encountered unexpectedly high load when processing the request, please try again.","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#.into(),
+        };
+        assert!(model_unavailable.is_model_temporarily_unavailable());
+        assert!(model_unavailable.is_model_capacity_error());
+        assert!(model_unavailable.is_retriable());
+        assert!(!model_unavailable.is_throttle());
+        assert!(!model_unavailable.is_request_rejection());
+
+        let ordinary_server_error = KiroError {
+            status: Some(500),
+            endpoint: "AmazonQ".into(),
+            message: "Internal Server Error".into(),
+        };
+        assert!(ordinary_server_error.is_retriable());
+        assert!(!ordinary_server_error.is_model_capacity_error());
+        assert!(!ordinary_server_error.is_context_too_long());
     }
 }
