@@ -228,13 +228,15 @@ locally instead of producing an opaque upstream error. HTTP
 tool, context, and translated-payload budget errors use 400 so Claude Code does
 not misreport them as a 32 MB attachment failure.
 
-Mapping-aware context compaction for Claude Messages can be enabled with
-`context.auto_compact_on_overflow = true`; it is disabled by default. Before
-the first upstream generation, the proxy compacts against the mapped model's
-safe window, preflights the semantic-summary request against its own model, and
-may reapply the same compaction artifact once if the selected account resolves
-to a smaller window. Configure `context.compaction_summary_model` to a model
-large enough for the original conversations you expect to compact. OpenAI Chat
+Mapping-aware context compaction for Claude Messages is enabled by default with
+`context.auto_compact_on_overflow`. Before the first upstream generation, the
+proxy compacts against the mapped model's safe window. If upstream still
+returns `prompt is too long` or `context length exceeded`, the proxy compacts
+against a conservative window and retries only once. A semantic-summary request
+never receives the original oversized conversation directly: the local
+tokenizer first creates a bounded checkpoint for the summary model. The same
+compaction artifact may also be reapplied once if the selected account resolves
+to a smaller window. OpenAI Chat
 Completions and context growth after a Tool Search response has started retain
 hard context-limit errors because they cannot safely return a leading Claude
 `compaction` boundary. A summary timeout releases the main request immediately;

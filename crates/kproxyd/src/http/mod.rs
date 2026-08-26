@@ -740,6 +740,7 @@ mod tests {
         let mut config = Config::default();
         config.context.max_input_tokens = 128;
         config.context.safe_input_ratio = 1.0;
+        config.context.auto_compact_on_overflow = false;
         let (_directory, state) = test_state(config).await;
         let response = router(state)
             .oneshot(

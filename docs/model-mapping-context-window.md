@@ -11,9 +11,9 @@
 
 第一阶段只对 Claude Messages 的首次上游调用启用自动 compact。OpenAI 协议没有可回传的 `compaction` 块，已经开始输出后的 Tool Search 轮次也不能安全地补发位于响应首部的 compact 边界，这两类场景继续返回明确的上下文错误，不能静默删历史。
 
-## 实现状态（2026-08-20）
+## 实现状态（2026-08-26）
 
-第一阶段已经按本文方案落地，配置开关 `context.auto_compact_on_overflow` 默认仍为 `false`。已实现映射窗口主动触发、摘要 payload 容量预检、可复用的 `CompactionArtifact`、账号实际窗口下的单次重规划、独立摘要用量迭代、流式首块顺序和压缩后的保守 prompt-cache 断点。流式 compaction prelude 会暂存到首个成功且通过工具参数校验的语义轮次，避免在上游尚可切号重试时过早提交客户端数据；摘要超时后后台任务只在有界宽限期内继续独立结算，到期会主动取消流并结算已解码 usage。分块滚动摘要、prepared-dispatch 重构以及 Tool Search 已开始输出后的 pause/resume compact 仍是后续工作。
+第一阶段已经按本文方案落地，配置开关 `context.auto_compact_on_overflow` 默认开启。已实现映射窗口主动触发、上游上下文拒绝后的保守窗口压缩与单次重试、摘要输入的本地有界预处理、可复用的 `CompactionArtifact`、账号实际窗口下的单次重规划、独立摘要用量迭代、流式首块顺序和压缩后的保守 prompt-cache 断点。流式 compaction prelude 会暂存到首个成功且通过工具参数校验的语义轮次，避免在上游尚可切号重试时过早提交客户端数据；摘要超时后后台任务只在有界宽限期内继续独立结算，到期会主动取消流并结算已解码 usage。分块滚动摘要、prepared-dispatch 重构以及 Tool Search 已开始输出后的 pause/resume compact 仍是后续工作。
 
 ## 目标与约束
 
@@ -114,16 +114,16 @@ Claude 请求
 
 ```toml
 [context]
-# 映射后窗口装不下时，在第一次上游生成前自动 compact。
-auto_compact_on_overflow = false
+# 映射后窗口装不下或上游拒绝超长请求时，自动 compact 并单次重试。
+auto_compact_on_overflow = true
 
-# 已有配置；生产启用自动 compact 时应显式选择能容纳长上下文的模型。
+# 已有配置；超长摘要输入会先在本地预处理到保守窗口内。
 compaction_summary_model = ""
 compaction_summary_timeout_ms = 30000
 compaction_preserve_recent_turns = 3
 ```
 
-首个版本默认关闭，完成灰度和质量观测后再改默认值。不要新增 `auto_compact_max_retries`：重规划次数是正确性边界，应固定为一次，而不是可调策略。
+该开关默认开启；需要严格禁止代理生成摘要的部署可显式关闭。不要新增 `auto_compact_max_retries`：重规划次数是正确性边界，应固定为一次，而不是可调策略。
 
 OpenAI `/v1/chat/completions` 第一阶段不启用自动 compact。它没有 `compaction` content block，服务端无法把边界可靠带回下一轮；静默压缩会导致每轮重复摘要并使客户端历史与上游历史永久分叉。
 
@@ -320,8 +320,9 @@ Claude Code 会按它认定的源模型窗口执行客户端 compact，而服务
 3. [x] 增加摘要 payload 容量预检、fallback reason 和相关日志；生产配置大窗口 `compaction_summary_model`。
 4. [x] 捕获首次 `ExecuteError::ContextLimit`，复用 artifact 完成一次 `W_resolved` 精确重规划和额度重预留。
 5. [x] 修正流式 resumed server events 与 compaction block 的顺序；OpenAI 和内部轮次保持硬错误。
-6. [ ] 根据 fallback 数据决定是否实现分块滚动摘要。
-7. [ ] 最后再评估 prepared-dispatch 重构和内部 Tool Search 的 pause/resume compact。
+6. [x] 捕获首次上游 context-too-long 拒绝，以配置的保守窗口预压缩摘要输入，并只重试一次主请求。
+7. [ ] 根据 fallback 数据决定是否实现分块滚动摘要。
+8. [ ] 最后再评估 prepared-dispatch 重构和内部 Tool Search 的 pause/resume compact。
 
 ## 验证
 

@@ -454,7 +454,7 @@ pub struct ContextConfig {
     pub safe_input_ratio: f64,
     /// compact 请求安全比例。
     pub compact_safe_input_ratio: f64,
-    /// 映射后的 Claude 模型窗口不足时，在首次上游调用前自动 compact。
+    /// 映射后的 Claude 模型窗口不足或上游拒绝超长请求时，自动 compact 并单次重试。
     pub auto_compact_on_overflow: bool,
     /// deferred Tool Search 工作集中工具定义允许占用的最大估算 token。
     pub max_tool_input_tokens: u32,
@@ -476,7 +476,7 @@ impl Default for ContextConfig {
             max_input_tokens: 200_000,
             safe_input_ratio: 0.95,
             compact_safe_input_ratio: 0.99,
-            auto_compact_on_overflow: false,
+            auto_compact_on_overflow: true,
             max_tool_input_tokens: 32_000,
             max_loaded_tools: MAX_LOADED_TOOLS,
             max_upstream_payload_bytes: 8 * 1024 * 1024,
@@ -1525,8 +1525,8 @@ max_input_tokens = 200000
 safe_input_ratio = 0.95
 # compact 请求允许使用模型上下文窗口的比例；范围 0.0-1.0。
 compact_safe_input_ratio = 0.99
-# 模型映射后上下文超限时，是否在首次生成调用前自动摘要压缩。
-auto_compact_on_overflow = false
+# 模型映射后上下文超限或上游拒绝超长请求时，是否自动摘要压缩并单次重试。
+auto_compact_on_overflow = true
 # deferred Tool Search 工作集中，工具定义允许占用的最大估算 token 数。
 max_tool_input_tokens = 32000
 # 单次请求可直接发送给 Kiro 的已加载工具数量；不得超过程序硬上限 512。
@@ -1778,7 +1778,7 @@ mod tests {
         assert_eq!(config.context.max_input_tokens, 200_000);
         assert_eq!(config.context.safe_input_ratio, 0.95);
         assert_eq!(config.context.compact_safe_input_ratio, 0.99);
-        assert!(!config.context.auto_compact_on_overflow);
+        assert!(config.context.auto_compact_on_overflow);
         assert_eq!(config.context.max_tool_input_tokens, 32_000);
         assert_eq!(config.context.max_loaded_tools, MAX_LOADED_TOOLS);
         assert_eq!(config.context.max_upstream_payload_bytes, 8 * 1024 * 1024);
