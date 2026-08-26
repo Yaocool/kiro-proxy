@@ -6,11 +6,18 @@ use crate::{
 };
 
 use super::common::{
-    content_text, context, enhance_system, extract_openai_images, inference, kiro_tool, tool_name,
+    content_text, context, enhance_system, extract_openai_images, inference, kiro_tool_named,
+    ToolNameRegistry,
 };
 use super::TranslationOptions;
 
 pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> KiroPayload {
+    let tool_names = ToolNameRegistry::new(request.tools.iter().filter_map(|tool| {
+        tool.body
+            .get(&tool.r#type)
+            .and_then(|definition| definition.get("name"))
+            .and_then(Value::as_str)
+    }));
     let selected = selected_tools(request);
     let mut documentation = Vec::new();
     let tools = selected
@@ -30,7 +37,12 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
                     .cloned()
                     .unwrap_or_else(|| json!({"type":"object","properties":{}}))
             };
-            let (tool, docs) = kiro_tool(name, description, &schema);
+            let (tool, docs) = kiro_tool_named(
+                name,
+                &tool_names.kiro_name(name),
+                description,
+                &schema,
+            );
             documentation.extend(docs);
             Some(tool)
         })
@@ -94,7 +106,7 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
                     push_user(&mut history, make_user(text, images, Vec::new(), options));
                 }
             }
-            "assistant" => push_assistant(&mut history, assistant_message(message)),
+            "assistant" => push_assistant(&mut history, assistant_message(message, &tool_names)),
             "tool" => {
                 if let Some(id) = &message.tool_call_id {
                     let text = message
@@ -219,7 +231,10 @@ fn selected_tools(request: &OpenAiRequest) -> Vec<&crate::OpenAiTool> {
     }
 }
 
-fn assistant_message(message: &crate::OpenAiMessage) -> KiroAssistantMessage {
+fn assistant_message(
+    message: &crate::OpenAiMessage,
+    tool_names: &ToolNameRegistry,
+) -> KiroAssistantMessage {
     let mut content = message
         .content
         .as_ref()
@@ -245,7 +260,7 @@ fn assistant_message(message: &crate::OpenAiMessage) -> KiroAssistantMessage {
             };
             Some(KiroToolUse {
                 tool_use_id: id,
-                name: tool_name(name),
+                name: tool_names.kiro_name(name),
                 input,
             })
         })
@@ -406,5 +421,49 @@ mod tests {
             .tools;
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].tool_specification.name, "two");
+    }
+
+    #[test]
+    fn colliding_tool_names_use_the_same_registry_for_definitions_and_history() {
+        let request: OpenAiRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet",
+            "messages":[
+                {"role":"user","content":"look it up"},
+                {"role":"assistant","tool_calls":[{
+                    "id":"call_1","type":"function",
+                    "function":{"name":"mcp.a/read","arguments":"{}"}
+                }]},
+                {"role":"tool","tool_call_id":"call_1","content":"done"}
+            ],
+            "tools":[
+                {"type":"function","function":{"name":"mcp.a/read","parameters":{"type":"object"}}},
+                {"type":"function","function":{"name":"mcp_a/read","parameters":{"type":"object"}}}
+            ]
+        }))
+        .expect("request");
+
+        let payload = openai_to_kiro(
+            &request,
+            &TranslationOptions::new("claude-sonnet", "AI_EDITOR"),
+        );
+        let mapped = ToolNameRegistry::new(["mcp.a/read", "mcp_a/read"]).kiro_name("mcp.a/read");
+        let context = payload
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .as_ref()
+            .expect("context");
+        assert!(context
+            .tools
+            .iter()
+            .any(|tool| tool.tool_specification.name == mapped));
+        let history_name = &payload.conversation_state.history[1]
+            .assistant_response_message
+            .as_ref()
+            .expect("assistant")
+            .tool_uses[0]
+            .name;
+        assert_eq!(history_name, &mapped);
     }
 }

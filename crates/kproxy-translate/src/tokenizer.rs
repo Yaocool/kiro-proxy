@@ -518,7 +518,7 @@ fn recent_turn_start(history: &[KiroHistoryMessage], preserve_turns: usize) -> u
     }
     let mut users = 0usize;
     for (index, message) in history.iter().enumerate().rev() {
-        if message.user_input_message.is_some() {
+        if starts_conversation_turn(message) {
             users += 1;
             if users == preserve_turns {
                 return index;
@@ -527,7 +527,7 @@ fn recent_turn_start(history: &[KiroHistoryMessage], preserve_turns: usize) -> u
     }
     history
         .iter()
-        .position(|message| message.user_input_message.is_some())
+        .position(starts_conversation_turn)
         .unwrap_or(history.len())
 }
 
@@ -539,8 +539,17 @@ fn oldest_turn_len(history: &[KiroHistoryMessage]) -> usize {
         .iter()
         .enumerate()
         .skip(1)
-        .find_map(|(index, message)| message.user_input_message.is_some().then_some(index))
+        .find_map(|(index, message)| starts_conversation_turn(message).then_some(index))
         .unwrap_or(history.len())
+}
+
+fn starts_conversation_turn(message: &KiroHistoryMessage) -> bool {
+    message.user_input_message.as_ref().is_some_and(|user| {
+        !user
+            .user_input_message_context
+            .as_ref()
+            .is_some_and(|context| !context.tool_results.is_empty())
+    })
 }
 
 fn text_only_history_message(message: &KiroHistoryMessage) -> Option<KiroHistoryMessage> {
@@ -893,6 +902,28 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[test]
+    fn compaction_boundaries_do_not_split_tool_calls_from_results() {
+        let history: Vec<KiroHistoryMessage> = serde_json::from_value(serde_json::json!([
+            {"userInputMessage":{"content":"first request","modelId":"model","origin":"CLI"}},
+            {"assistantResponseMessage":{"content":"calling","toolUses":[{
+                "toolUseId":"call_1","name":"lookup","input":{}
+            }]}},
+            {"userInputMessage":{"content":"result","modelId":"model","origin":"CLI",
+                "userInputMessageContext":{"toolResults":[{
+                    "toolUseId":"call_1","status":"success","content":[{"text":"done"}]
+                }]}}},
+            {"assistantResponseMessage":{"content":"first answer"}},
+            {"userInputMessage":{"content":"second request","modelId":"model","origin":"CLI"}},
+            {"assistantResponseMessage":{"content":"second answer"}}
+        ]))
+        .expect("history");
+
+        assert_eq!(oldest_turn_len(&history), 4);
+        assert_eq!(recent_turn_start(&history, 1), 4);
+        assert_eq!(recent_turn_start(&history, 2), 0);
     }
 
     #[tokio::test]
