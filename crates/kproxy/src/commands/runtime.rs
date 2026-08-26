@@ -751,6 +751,31 @@ pub async fn show_logs(
                 if let Some(error) = request["error"].as_str().filter(|value| !value.is_empty()) {
                     println!("  error: {error}");
                 }
+                let diagnostics = &request["diagnostics"];
+                let error_code = diagnostics["error_code"]
+                    .as_str()
+                    .filter(|value| !value.is_empty());
+                let error_stage = diagnostics["error_stage"]
+                    .as_str()
+                    .filter(|value| !value.is_empty());
+                if error_code.is_some() || error_stage.is_some() {
+                    let upstream_status = diagnostics["upstream_status"]
+                        .as_u64()
+                        .map_or_else(|| "-".into(), |status| status.to_string());
+                    println!(
+                        "  diagnostics code={} stage={} client_status={} upstream_status={} account_error={}",
+                        error_code.unwrap_or("-"),
+                        error_stage.unwrap_or("-"),
+                        diagnostics["client_status"]
+                            .as_u64()
+                            .unwrap_or_else(|| request["status"].as_u64().unwrap_or_default()),
+                        upstream_status,
+                        diagnostics["account_error"].as_bool().unwrap_or(false),
+                    );
+                    if error_code == Some("model_not_available") {
+                        println!("  hint: kproxy models resolve {}", models.original);
+                    }
+                }
                 for attempt in request["attempts"].as_array().into_iter().flatten() {
                     let status = attempt["status"]
                         .as_u64()

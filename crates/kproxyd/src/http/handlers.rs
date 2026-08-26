@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -49,6 +49,7 @@ use super::usage::{fallback_credits, fill_missing_usage};
 use super::ServiceHttpState;
 
 const MAX_STATS_MODEL_CHARS: usize = 128;
+const MAX_ATTEMPT_LOG_SUMMARY_CHARS: usize = 4_096;
 const UNKNOWN_STATS_MODEL: &str = "unknown";
 const MIN_COMPACTION_BACKGROUND_GRACE: Duration = Duration::from_millis(250);
 const MAX_COMPACTION_BACKGROUND_GRACE: Duration = Duration::from_secs(5);
@@ -364,6 +365,77 @@ fn request_model_hint(body: &[u8]) -> String {
         .unwrap_or_default()
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct AttemptDiagnostics {
+    account_ids: String,
+    account_names: String,
+    available_models: String,
+    available_model_count: usize,
+    errors: String,
+}
+
+fn attempt_diagnostics(attempts: &[UpstreamAttemptLog]) -> AttemptDiagnostics {
+    let account_ids = attempts
+        .iter()
+        .filter_map(|attempt| {
+            (!attempt.account_id.is_empty()).then_some(attempt.account_id.as_str())
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(",");
+    let account_names = attempts
+        .iter()
+        .filter_map(|attempt| {
+            (!attempt.account_name.is_empty()).then_some(attempt.account_name.as_str())
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join(",");
+    let available_models = attempts
+        .iter()
+        .flat_map(|attempt| attempt.available_models.iter().map(String::as_str))
+        .collect::<BTreeSet<_>>();
+    let available_model_count = available_models.len();
+    let available_models = available_models.into_iter().collect::<Vec<_>>().join(",");
+    let errors = attempts
+        .iter()
+        .map(|attempt| {
+            format!(
+                "attempt={} account={} endpoint={} status={} error={}",
+                attempt.attempt,
+                attempt.account_id,
+                attempt.endpoint,
+                attempt
+                    .status
+                    .map_or_else(|| "-".into(), |status| status.to_string()),
+                attempt.error
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(" | ");
+    AttemptDiagnostics {
+        account_ids: bounded_log_summary(account_ids),
+        account_names: bounded_log_summary(account_names),
+        available_models: bounded_log_summary(available_models),
+        available_model_count,
+        errors: bounded_log_summary(errors),
+    }
+}
+
+fn bounded_log_summary(value: String) -> String {
+    if value.chars().count() <= MAX_ATTEMPT_LOG_SUMMARY_CHARS {
+        return value;
+    }
+    let mut output = value
+        .chars()
+        .take(MAX_ATTEMPT_LOG_SUMMARY_CHARS)
+        .collect::<String>();
+    output.push('…');
+    output
+}
+
 fn record_failed_request(
     state: &Arc<AppState>,
     trace_id: &str,
@@ -380,9 +452,20 @@ fn record_failed_request(
     let safe_error = sanitize_error_message(&error.message);
     let duration_ms = started.elapsed().as_millis() as u64;
     let model_path = error.log_context.model_path.join(" -> ");
+    let request_id = format!("req_{}", Uuid::new_v4().simple());
+    let attempts = attempt_diagnostics(&error.log_context.attempts);
+    let upstream_status = error.upstream_status.or_else(|| {
+        error
+            .log_context
+            .attempts
+            .iter()
+            .rev()
+            .find_map(|attempt| attempt.status)
+    });
     if error.status.is_server_error() {
         tracing::error!(
             trace_id,
+            request_id,
             http_path = path,
             model = %model,
             mapped_model = %error.log_context.mapped_model,
@@ -393,7 +476,16 @@ fn record_failed_request(
             account_name = %error.log_context.account_name,
             endpoint = %error.log_context.endpoint,
             upstream_attempts = error.log_context.attempts.len(),
+            attempted_account_ids = %attempts.account_ids,
+            attempted_account_names = %attempts.account_names,
+            available_model_count = attempts.available_model_count,
+            available_models = %attempts.available_models,
+            attempt_errors = %attempts.errors,
             http_status = error.status.as_u16(),
+            upstream_status = upstream_status.unwrap_or_default(),
+            error_code = error.error_code,
+            error_stage = error.error_stage,
+            account_error = error.account_error,
             duration_ms,
             error = %safe_error,
             "client request failed"
@@ -401,13 +493,27 @@ fn record_failed_request(
     } else {
         tracing::warn!(
             trace_id,
+            request_id,
             http_path = path,
             model = %model,
             mapped_model = %error.log_context.mapped_model,
             kiro_model = %error.log_context.kiro_model,
             model_path,
             mapping_rule = error.log_context.model_mapping_rule.as_deref().unwrap_or("none"),
+            account_id = %error.log_context.account_id,
+            account_name = %error.log_context.account_name,
+            endpoint = %error.log_context.endpoint,
+            upstream_attempts = error.log_context.attempts.len(),
+            attempted_account_ids = %attempts.account_ids,
+            attempted_account_names = %attempts.account_names,
+            available_model_count = attempts.available_model_count,
+            available_models = %attempts.available_models,
+            attempt_errors = %attempts.errors,
             http_status = error.status.as_u16(),
+            upstream_status = upstream_status.unwrap_or_default(),
+            error_code = error.error_code,
+            error_stage = error.error_stage,
+            account_error = error.account_error,
             duration_ms,
             error = %safe_error,
             "client request rejected"
@@ -416,7 +522,7 @@ fn record_failed_request(
     state.stats.record(RequestLog {
         timestamp: now_secs(),
         trace_id: trace_id.into(),
-        request_id: format!("req_{}", Uuid::new_v4().simple()),
+        request_id,
         path: path.into(),
         model: if error.log_context.mapped_model.is_empty() {
             model.clone()
@@ -439,14 +545,7 @@ fn record_failed_request(
         error: Some(safe_error),
         diagnostics: RequestDiagnostics {
             client_status: error.status.as_u16(),
-            upstream_status: error.upstream_status.or_else(|| {
-                error
-                    .log_context
-                    .attempts
-                    .iter()
-                    .rev()
-                    .find_map(|attempt| attempt.status)
-            }),
+            upstream_status,
             error_code: error.error_code.to_owned(),
             error_stage: error.error_stage.to_owned(),
             account_error: error.account_error,
@@ -3033,11 +3132,13 @@ async fn execute_upstream(
             tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
         }
     }
+    let model_resolution_failed = last_error.is_none()
+        && !attempt_logs.is_empty()
+        && attempt_logs
+            .iter()
+            .all(|attempt| attempt.endpoint == "model-resolution");
+    let attempt_diagnostics = attempt_diagnostics(&attempt_logs);
     let error = last_error.unwrap_or_else(|| {
-        let model_resolution_failed = !attempt_logs.is_empty()
-            && attempt_logs
-                .iter()
-                .all(|attempt| attempt.endpoint == "model-resolution");
         KiroError {
             status: None,
             endpoint: if model_resolution_failed {
@@ -3047,26 +3148,64 @@ async fn execute_upstream(
             }
             .into(),
             message: if model_resolution_failed {
-                format!("no selected account can serve resolved model '{actual_model}'")
+                format!(
+                    "no selected account can serve resolved model '{actual_model}' ({} distinct models are available); inspect routing with 'kproxy models resolve <model-id>'",
+                    attempt_diagnostics.available_model_count
+                )
             } else {
                 "all upstream attempts failed".into()
             },
         }
     });
-    tracing::error!(
-        trace_id,
-        endpoint = %error.endpoint,
-        upstream_status = error.status.unwrap_or_default(),
-        error = %sanitize_error_message(&error.message),
-        attempted_accounts = attempted_accounts.len(),
-        account_id = attempt_logs.last().map(|attempt| attempt.account_id.as_str()).unwrap_or(""),
-        account_name = attempt_logs.last().map(|attempt| attempt.account_name.as_str()).unwrap_or(""),
-        mapped_model,
-        kiro_model = actual_model,
-        model_path = %model_path.join(" -> "),
-        mapping_rule = model_mapping_rule.as_deref().unwrap_or("none"),
-        "all upstream attempts failed"
-    );
+    if model_resolution_failed {
+        tracing::warn!(
+            trace_id,
+            failure_kind = "model_not_available",
+            error_stage = "model_resolution",
+            endpoint = %error.endpoint,
+            upstream_status = error.status.unwrap_or_default(),
+            error = %sanitize_error_message(&error.message),
+            requested_model,
+            default_model,
+            max_attempts = attempts,
+            attempt_count = attempt_logs.len(),
+            attempted_accounts = attempted_accounts.len(),
+            attempted_account_ids = %attempt_diagnostics.account_ids,
+            attempted_account_names = %attempt_diagnostics.account_names,
+            available_model_count = attempt_diagnostics.available_model_count,
+            available_models = %attempt_diagnostics.available_models,
+            attempt_errors = %attempt_diagnostics.errors,
+            mapped_model,
+            kiro_model = actual_model,
+            model_path = %model_path.join(" -> "),
+            mapping_rule = model_mapping_rule.as_deref().unwrap_or("none"),
+            "model resolution exhausted selected accounts"
+        );
+    } else {
+        tracing::warn!(
+            trace_id,
+            failure_kind = "upstream_attempts_exhausted",
+            error_stage = "upstream_dispatch",
+            endpoint = %error.endpoint,
+            upstream_status = error.status.unwrap_or_default(),
+            error = %sanitize_error_message(&error.message),
+            requested_model,
+            default_model,
+            max_attempts = attempts,
+            attempt_count = attempt_logs.len(),
+            attempted_accounts = attempted_accounts.len(),
+            attempted_account_ids = %attempt_diagnostics.account_ids,
+            attempted_account_names = %attempt_diagnostics.account_names,
+            available_model_count = attempt_diagnostics.available_model_count,
+            available_models = %attempt_diagnostics.available_models,
+            attempt_errors = %attempt_diagnostics.errors,
+            mapped_model,
+            kiro_model = actual_model,
+            model_path = %model_path.join(" -> "),
+            mapping_rule = model_mapping_rule.as_deref().unwrap_or("none"),
+            "all upstream attempts failed"
+        );
+    }
     Err(dispatch_error(
         error,
         &mapped_model,
@@ -5400,6 +5539,7 @@ fn upstream_api_error(
     context: RequestLogContext,
     format: ErrorFormat,
 ) -> ApiError {
+    let model_resolution_error = error.endpoint == "model-resolution";
     let upstream_status = error.status;
     let upstream_throttle = error.is_throttle();
     let request_rejection = error.is_request_rejection();
@@ -5408,21 +5548,27 @@ fn upstream_api_error(
             || error.is_quota()
             || error.is_throttle()
             || matches!(error.status, Some(500..=599)));
-    let status = match error.status {
-        // An upstream 413 describes Kiro's translated payload, not necessarily
-        // a Claude request body over 32 MiB. Preserve the upstream status in
-        // diagnostics, but use 400 so Claude Code displays the real message.
-        Some(413) if format == ErrorFormat::Claude => StatusCode::BAD_REQUEST,
-        Some(413) => StatusCode::PAYLOAD_TOO_LARGE,
-        Some(400) if upstream_bad_request_is_actionable(&error.message) => StatusCode::BAD_REQUEST,
-        // kproxy already validates the public request and enforces its context
-        // window before dispatch. A remaining opaque upstream 400 (including
-        // an empty body or "Internal Server Error") is an integration/upstream
-        // failure, not an actionable Claude Code request error.
-        Some(400) => StatusCode::BAD_GATEWAY,
-        Some(401 | 403) => StatusCode::SERVICE_UNAVAILABLE,
-        Some(402 | 429) => StatusCode::TOO_MANY_REQUESTS,
-        _ => StatusCode::BAD_GATEWAY,
+    let status = if model_resolution_error {
+        StatusCode::BAD_REQUEST
+    } else {
+        match error.status {
+            // An upstream 413 describes Kiro's translated payload, not necessarily
+            // a Claude request body over 32 MiB. Preserve the upstream status in
+            // diagnostics, but use 400 so Claude Code displays the real message.
+            Some(413) if format == ErrorFormat::Claude => StatusCode::BAD_REQUEST,
+            Some(413) => StatusCode::PAYLOAD_TOO_LARGE,
+            Some(400) if upstream_bad_request_is_actionable(&error.message) => {
+                StatusCode::BAD_REQUEST
+            }
+            // kproxy already validates the public request and enforces its context
+            // window before dispatch. A remaining opaque upstream 400 (including
+            // an empty body or "Internal Server Error") is an integration/upstream
+            // failure, not an actionable Claude Code request error.
+            Some(400) => StatusCode::BAD_GATEWAY,
+            Some(401 | 403) => StatusCode::SERVICE_UNAVAILABLE,
+            Some(402 | 429) => StatusCode::TOO_MANY_REQUESTS,
+            _ => StatusCode::BAD_GATEWAY,
+        }
     };
     let message = if error.message.trim().is_empty() {
         "Upstream service error, please retry later".to_owned()
@@ -5430,15 +5576,22 @@ fn upstream_api_error(
         error.message
     };
     let mut output = ApiError::new(status, message, format);
-    output.retry_after = matches!(
-        status,
-        StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS
-    );
+    output.retry_after = !model_resolution_error
+        && matches!(
+            status,
+            StatusCode::BAD_GATEWAY
+                | StatusCode::SERVICE_UNAVAILABLE
+                | StatusCode::TOO_MANY_REQUESTS
+        );
     output.log_context = Box::new(context);
     output.upstream_status = upstream_status;
     output.error_stage = "upstream_dispatch";
     output.account_error = account_error;
-    if upstream_status == Some(429) || upstream_throttle {
+    if model_resolution_error {
+        output.error_code = "model_not_available";
+        output.error_stage = "model_resolution";
+        output.account_error = false;
+    } else if upstream_status == Some(429) || upstream_throttle {
         output.error_code = "upstream_rate_limited";
     } else if upstream_status == Some(413) {
         output.error_code = "request_payload_exceeded";
@@ -6086,6 +6239,84 @@ mod model_tests {
         assert_eq!(error.status, StatusCode::BAD_GATEWAY);
         assert_eq!(error.error_code, "tool_budget_exceeded");
         assert!(!error.account_error);
+    }
+
+    #[test]
+    fn model_resolution_failures_are_actionable_client_errors() {
+        let attempts = vec![UpstreamAttemptLog {
+            attempt: 1,
+            account_id: "acc_1".into(),
+            account_name: "enterprise@example.com".into(),
+            model: "claude-fable-5".into(),
+            available_models: vec!["claude-opus-5".into(), "claude-sonnet-5".into()],
+            endpoint: "model-resolution".into(),
+            status: None,
+            error: "model is not present in this account's model cache".into(),
+        }];
+        let error = upstream_api_error(
+            KiroError {
+                status: None,
+                endpoint: "model-resolution".into(),
+                message: "no selected account can serve resolved model 'claude-fable-5'".into(),
+            },
+            RequestLogContext {
+                attempts,
+                ..RequestLogContext::default()
+            },
+            ErrorFormat::Claude,
+        );
+
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.error_code, "model_not_available");
+        assert_eq!(error.error_stage, "model_resolution");
+        assert!(!error.retry_after);
+        assert!(!error.account_error);
+        assert_eq!(error.upstream_status, None);
+        let response = error.with_request_id("trace_model").into_response();
+        assert_eq!(
+            response.headers()["x-kproxy-error-code"],
+            "model_not_available"
+        );
+        assert_eq!(
+            response.headers()["x-kproxy-error-stage"],
+            "model_resolution"
+        );
+        assert!(response.headers().get(header::RETRY_AFTER).is_none());
+    }
+
+    #[test]
+    fn attempt_diagnostics_aggregate_accounts_models_and_reasons() {
+        let attempts = vec![
+            UpstreamAttemptLog {
+                attempt: 1,
+                account_id: "acc_b".into(),
+                account_name: "b@example.com".into(),
+                model: "missing".into(),
+                available_models: vec!["sonnet".into(), "opus".into()],
+                endpoint: "model-resolution".into(),
+                status: None,
+                error: "not in cache".into(),
+            },
+            UpstreamAttemptLog {
+                attempt: 2,
+                account_id: "acc_a".into(),
+                account_name: "a@example.com".into(),
+                model: "missing".into(),
+                available_models: vec!["opus".into(), "haiku".into()],
+                endpoint: "model-resolution".into(),
+                status: None,
+                error: "not in cache either".into(),
+            },
+        ];
+
+        let diagnostics = attempt_diagnostics(&attempts);
+
+        assert_eq!(diagnostics.account_ids, "acc_a,acc_b");
+        assert_eq!(diagnostics.account_names, "a@example.com,b@example.com");
+        assert_eq!(diagnostics.available_model_count, 3);
+        assert_eq!(diagnostics.available_models, "haiku,opus,sonnet");
+        assert!(diagnostics.errors.contains("attempt=1 account=acc_b"));
+        assert!(diagnostics.errors.contains("attempt=2 account=acc_a"));
     }
 
     #[test]
