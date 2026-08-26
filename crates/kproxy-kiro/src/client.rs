@@ -10,7 +10,7 @@ use futures::future::{BoxFuture, FutureExt, Shared};
 use futures::{Stream, StreamExt};
 use kproxy_core::account::{Account, AuthMethod, Subscription, SubscriptionKind, Usage};
 use kproxy_core::config::{AgentMode, UpstreamConfig};
-use kproxy_translate::{KiroPayload, WebSearchResults};
+use kproxy_translate::{validate_kiro_tool_history, KiroPayload, WebSearchResults};
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -895,6 +895,15 @@ impl KiroClient {
         payload: &KiroPayload,
         endpoint: EndpointDefinition,
     ) -> Result<KiroResponse, KiroError> {
+        let mut payload = payload.clone();
+        set_payload_origin(&mut payload, endpoint.origin);
+        validate_kiro_tool_history(&payload).map_err(|message| KiroError {
+            status: Some(400),
+            endpoint: endpoint.name.into(),
+            message: format!(
+                "Kiro payload reached the transport without prepared tool history: {message}"
+            ),
+        })?;
         let slot_wait_started = Instant::now();
         let permit = tokio::time::timeout(
             Duration::from_millis(self.upstream.stream_slot_wait_timeout_ms),
@@ -911,8 +920,6 @@ impl KiroClient {
         })?
         .map_err(build_error)?;
         let stream_slot_wait_ms = slot_wait_started.elapsed().as_millis() as u64;
-        let mut payload = payload.clone();
-        set_payload_origin(&mut payload, endpoint.origin);
         let response = self
             .stream
             .post(&endpoint.url)
@@ -1790,6 +1797,66 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("AI_EDITOR")
         );
+    }
+
+    #[tokio::test]
+    async fn generation_rejects_unprepared_tool_history_before_network_io() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/amazon/generateAssistantResponse"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let client = test_client(&server);
+        let invalid: KiroPayload = serde_json::from_value(serde_json::json!({
+            "conversationState": {
+                "chatTriggerType": "MANUAL",
+                "conversationId": "conversation",
+                "history": [
+                    {"userInputMessage": {
+                        "content": "start", "modelId": "model", "origin": "AI_EDITOR"
+                    }},
+                    {"assistantResponseMessage": {
+                        "content": "calling", "toolUses": [{
+                            "toolUseId": "call_1", "name": "lookup", "input": {}
+                        }]
+                    }}
+                ],
+                "currentMessage": {"userInputMessage": {
+                    "content": "latest", "modelId": "model", "origin": "AI_EDITOR",
+                    "userInputMessageContext": {
+                        "tools": [{"toolSpecification": {
+                            "name": "lookup", "description": "",
+                            "inputSchema": {"json": {"type": "object"}}
+                        }}],
+                        "toolResults": [{
+                            "toolUseId": "orphan", "status": "success",
+                            "content": [{"text": "valuable orphan output"}]
+                        }]
+                    }
+                }}
+            },
+            "profileArn": null,
+            "inferenceConfig": null
+        }))
+        .expect("payload");
+
+        let error = match client
+            .send_generation(
+                &account(AuthMethod::Idc),
+                &invalid,
+                generation_endpoint(&server),
+            )
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("unprepared payload must not bypass request accounting"),
+        };
+
+        let requests = server.received_requests().await.expect("requests");
+        assert!(requests.is_empty());
+        assert_eq!(error.status, Some(400));
+        assert!(error.message.contains("without prepared tool history"));
     }
 
     #[tokio::test]

@@ -1083,6 +1083,17 @@ pub fn response(
                 );
                 debug_assert!(budget_available);
 
+                if let Err(error) = super::handlers::prepare_kiro_payload(
+                    &mut payload,
+                    &endpoint,
+                    "Tool Search",
+                ) {
+                    let error = error.to_string();
+                    failed = Some(error.clone());
+                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
+                    break 'rounds;
+                }
+
                 let next_input_tokens = match context.state.tokenizer.estimate_kiro_payload(&payload).await {
                     Ok(tokens) => tokens as u64,
                     Err(error) => {
@@ -1153,7 +1164,15 @@ pub fn response(
                     break 'rounds;
                 }
                 context.input_tokens = next_input_tokens;
-                if let Err(error) = context.reservation.extend(context.estimated_credits) {
+                let continuation_estimate = super::handlers::estimated_credits(
+                    next_input_tokens,
+                    payload.inference_config.as_ref().map_or(
+                        context.max_tokens,
+                        |inference| inference.max_tokens,
+                    ),
+                    &config.pool,
+                );
+                if let Err(error) = context.reservation.extend(continuation_estimate) {
                     failed = Some(error.to_string());
                     yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error.to_string())));
                     break 'rounds;
@@ -1286,7 +1305,7 @@ pub fn response(
                 debug_assert!(budget_available);
                 match super::handlers::validate_internal_continuation(
                     &context.state,
-                    &payload,
+                    &mut payload,
                     context.compact,
                     &endpoint,
                     "Web Search",
@@ -1302,7 +1321,16 @@ pub fn response(
                         break 'rounds;
                     }
                 }
-                if let Err(error) = context.reservation.extend(context.estimated_credits) {
+                let config = context.state.config.current();
+                let continuation_estimate = super::handlers::estimated_credits(
+                    context.input_tokens,
+                    payload.inference_config.as_ref().map_or(
+                        context.max_tokens,
+                        |inference| inference.max_tokens,
+                    ),
+                    &config.pool,
+                );
+                if let Err(error) = context.reservation.extend(continuation_estimate) {
                     failed = Some(error.to_string());
                     yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error.to_string())));
                     break 'rounds;
@@ -1362,7 +1390,34 @@ pub fn response(
                 accumulated_usage.output_tokens,
             );
             debug_assert!(budget_available);
-            if let Err(error) = context.reservation.extend(context.estimated_credits) {
+            match super::handlers::validate_internal_continuation(
+                &context.state,
+                &mut payload,
+                context.compact,
+                &endpoint,
+                "automatic continuation",
+                context.tool_search.is_some(),
+            )
+            .await
+            {
+                Ok(tokens) => context.input_tokens = tokens,
+                Err(error) => {
+                    let error = error.to_string();
+                    failed = Some(error.clone());
+                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
+                    break 'rounds;
+                }
+            }
+            let config = context.state.config.current();
+            let continuation_estimate = super::handlers::estimated_credits(
+                context.input_tokens,
+                payload
+                    .inference_config
+                    .as_ref()
+                    .map_or(context.max_tokens, |inference| inference.max_tokens),
+                &config.pool,
+            );
+            if let Err(error) = context.reservation.extend(continuation_estimate) {
                 failed = Some(error.to_string());
                 yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error.to_string())));
                 break 'rounds;
