@@ -45,10 +45,10 @@ CLI 源码位于 [`crates/kproxy`](crates/kproxy)，daemon 源码位于
 
 ### Docker Compose（Linux 服务器推荐）
 
-最简生产部署只需要 Docker Engine 和 Compose v2 插件。Compose 默认构建启用全部 feature
-且包含 Chromium 的 full 镜像，使用 host network 启动 `kproxyd`，并将全部状态保存在
-`kproxy-data` named volume 中。在仓库根目录执行一键脚本，它会校验环境、构建镜像、启动
-服务、等待健康，并在宿主机安装 `kproxy` 命令：
+最简生产部署只需要 Docker Engine 和 Compose v2 插件。Compose 会拉取已在 CI 中构建、启用
+全部 feature 且包含 Chromium 的 full 镜像，使用 host network 启动 `kproxyd`，并将全部状态
+保存在 `kproxy-data` named volume 中。在仓库根目录执行一键脚本，它会校验环境、先拉取镜像
+再替换容器、等待健康、失败时自动回滚，并在宿主机安装 `kproxy` 命令：
 
 ```bash
 ./deploy/docker-setup.sh
@@ -64,8 +64,25 @@ kproxy status
 ```
 
 宿主机上的 `kproxy` 是轻量包装器：它把命令转发给容器内同版本 CLI，避免 Linux 容器二进制
-与 macOS 等宿主机不兼容，也无需暴露管理 Unix socket。源码升级后重新运行同一脚本即可；
-如只需启动已有镜像，可增加 `--no-build`。
+与 macOS 等宿主机不兼容，也无需暴露管理 Unix socket。生产升级应显式指定不可变的发布
+版本；部署成功后脚本会在本地保存该镜像引用，供后续重启使用：
+
+```bash
+./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
+```
+
+需要自动跟随发布为 `latest` 的最新稳定镜像时，执行：
+
+```bash
+./deploy/docker-upgrade.sh
+```
+
+即使上次部署保存的是旧版本，该脚本也会强制检查镜像仓库，并继续使用相同的健康检查和
+失败回滚机制。
+
+离线启动已保存镜像时使用 `--no-pull`；只有明确要在本机从源码构建时才使用 `--build`。
+GHCR package 默认是私有的，除非主动调整可见性；私有部署需要先用具有 package 读取权限的
+账号或 Token 执行 `docker login ghcr.io`。
 
 该 wrapper 同时提供宿主机服务生命周期管理：
 
@@ -400,7 +417,12 @@ Docker 宿主机 wrapper 会自动识别可读的宿主机 CSV，并通过 stdin
 ## Docker 与 systemd
 
 ```bash
-docker compose up -d --build
+# 生产部署：旧容器继续服务时先拉取镜像，然后只替换容器。
+KPROXY_IMAGE=ghcr.io/yaocool/kiro-proxy:v0.1.3 docker compose pull kproxyd
+KPROXY_IMAGE=ghcr.io/yaocool/kiro-proxy:v0.1.3 docker compose up -d --no-build
+
+# 本地源码构建必须显式加载 build override：
+docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 
 # 不使用 Compose 时，默认镜像同样是 full：
 docker build -t kiro-proxy:latest .
@@ -417,23 +439,34 @@ Engine 可直接使用；Docker Desktop 4.34+ 需要在设置中启用 host netw
 `chromiumoxide 0.9.1` 的 CDP 定义所使用的官方 `r1566079` 快照，普通镜像重建不会再静默
 升级协议。后续采用浏览器安全更新时，应同时更新并测试这两个固定版本。
 
-Docker 会在源码更新后复用持久化的 Cargo registry 和 target 构建缓存。full 镜像只编译
-一次 all-features 二进制，并让首次 Chromium 安装在 Rust release 构建完成后再执行，避免
-小规格宿主机被同时进行的两个重任务压垮。Cargo 默认使用一个编译任务；只有在构建机内存
-充足时才应提高，例如 `CARGO_BUILD_JOBS=4 docker compose build`。
+本地与 CI 构建会复用 Cargo registry 和 target 构建缓存。full 镜像只编译一次 all-features
+二进制，并让首次 Chromium 安装在 Rust release 构建完成后再执行。本地 Cargo 默认使用一个
+编译任务；只有构建机内存充足时才应提高，例如
+`CARGO_BUILD_JOBS=4 docker compose -f docker-compose.yml -f docker-compose.build.yml build`。
 
-源码更新后，重新构建并创建容器即可，不要删除 named volume：
+GitHub Actions 的 `Build and publish Docker image` 工作流会从 `main` 发布 `edge` 和
+`sha-*` 镜像。推送 `v0.1.3` 这样的版本 tag 时还会发布 `v0.1.3`、`v0.1` 和 `latest`；tag
+必须与 Cargo workspace 版本一致。更新版本并合入发布 commit 后，执行
+`git tag v0.1.3 && git push origin v0.1.3` 即可发布。生产升级会先拉取镜像再替换容器，并
+保留 named volume：
 
 ```bash
-docker compose up -d --build
+./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
 docker compose exec kproxyd kproxy config show --effective
 ```
+
+也可以执行 `./deploy/docker-upgrade.sh` 自动跟随最新稳定版本。需要跟随其他通道时设置
+`KPROXY_UPGRADE_IMAGE`，例如 `ghcr.io/yaocool/kiro-proxy:edge`。
+
+脚本会把原镜像保留为本地 rollback tag。如果创建容器或健康检查失败，会自动用原镜像恢复
+服务。由于当前使用 host network，新旧容器不能同时绑定相同代理端口，所以最终切换仍有一次
+很短的重启窗口；镜像下载和编译已经不再占用生产服务的升级时间。
 
 已有 `config.toml` 永远不会被覆盖。旧版本创建的 volume 可能仍包含
 `server.host = "127.0.0.1"`；如果需要采用新的 `0.0.0.0` 默认值，请使用
 `kproxy config edit` 修改。
 
-一键构建、启动并安装 Docker 包装器：
+一键拉取、启动并安装 Docker 包装器：
 
 ```bash
 ./deploy/docker-setup.sh
