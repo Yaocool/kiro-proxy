@@ -163,23 +163,71 @@ async fn trace_requests(mut request: axum::extract::Request, next: Next) -> Resp
     let mut response = next.run(request).instrument(span).await;
     let status = response.status();
     let duration_ms = started.elapsed().as_millis() as u64;
-    if status.is_server_error() {
+    let response_request_id = response
+        .headers()
+        .get(REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let error_code = response
+        .headers()
+        .get("x-kproxy-error-code")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let error_stage = response
+        .headers()
+        .get("x-kproxy-error-stage")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let upstream_status = response
+        .headers()
+        .get("x-kproxy-upstream-status")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let account_error = response
+        .headers()
+        .get("x-kproxy-account-error")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("")
+        .to_owned();
+    let handled_error = !error_code.is_empty();
+    if status.is_server_error() && !handled_error {
         tracing::error!(
             trace_id = %trace_id,
+            request_id = %response_request_id,
+            http_method = %method,
+            http_path = %path,
             http_status = status.as_u16(),
+            error_code = %error_code,
+            error_stage = %error_stage,
+            upstream_status = %upstream_status,
+            account_error = %account_error,
             duration_ms,
-            "client response headers ready"
+            "unhandled server response headers ready"
         );
-    } else if status.is_client_error() {
+    } else if status.is_client_error() || status.is_server_error() {
         tracing::warn!(
             trace_id = %trace_id,
+            request_id = %response_request_id,
+            http_method = %method,
+            http_path = %path,
             http_status = status.as_u16(),
+            error_code = %error_code,
+            error_stage = %error_stage,
+            upstream_status = %upstream_status,
+            account_error = %account_error,
             duration_ms,
             "client response headers ready"
         );
     } else {
         tracing::info!(
             trace_id = %trace_id,
+            request_id = %response_request_id,
+            http_method = %method,
+            http_path = %path,
             http_status = status.as_u16(),
             duration_ms,
             "client response headers ready"
