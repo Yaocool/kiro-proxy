@@ -444,9 +444,9 @@ Engine 可直接使用；Docker Desktop 4.34+ 需要在设置中启用 host netw
 编译任务；只有构建机内存充足时才应提高，例如
 `CARGO_BUILD_JOBS=4 docker compose -f docker-compose.yml -f docker-compose.build.yml build`。
 
-GitHub Actions 的 `Build and publish Docker image` 工作流会从 `main` 发布 `edge` 和
-`sha-*` 镜像。推送 `v0.1.3` 这样的版本 tag 时还会发布 `v0.1.3`、`v0.1` 和 `latest`；tag
-必须与 Cargo workspace 版本一致。更新版本并合入发布 commit 后，执行
+GitHub Actions 的 `Build and publish Docker image` 工作流只在推送 `v*` tag 时运行。
+推送 `v0.1.3` 这样的版本 tag 会发布 `v0.1.3`、`v0.1` 和 `latest`；tag 必须与 Cargo
+workspace 版本一致。更新版本并合入发布 commit 后，执行
 `git tag v0.1.3 && git push origin v0.1.3` 即可发布。生产升级会先拉取镜像再替换容器，并
 保留 named volume：
 
@@ -455,8 +455,8 @@ GitHub Actions 的 `Build and publish Docker image` 工作流会从 `main` 发�
 docker compose exec kproxyd kproxy config show --effective
 ```
 
-也可以执行 `./deploy/docker-upgrade.sh` 自动跟随最新稳定版本。需要跟随其他通道时设置
-`KPROXY_UPGRADE_IMAGE`，例如 `ghcr.io/yaocool/kiro-proxy:edge`。
+也可以执行 `./deploy/docker-upgrade.sh` 自动跟随最新稳定版本。需要使用其他镜像地址时设置
+`KPROXY_UPGRADE_IMAGE`。
 
 脚本会把原镜像保留为本地 rollback tag。如果创建容器或健康检查失败，会自动用原镜像恢复
 服务。由于当前使用 host network，新旧容器不能同时绑定相同代理端口，所以最终切换仍有一次
