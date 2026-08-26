@@ -80,6 +80,10 @@ impl ToolNameRegistry {
             .unwrap_or_else(|| tool_name(original))
     }
 
+    pub fn contains_original(&self, original: &str) -> bool {
+        self.original_to_kiro.contains_key(original)
+    }
+
     pub fn restore_map(&self) -> HashMap<String, String> {
         self.kiro_to_original.clone()
     }

@@ -8,7 +8,7 @@ use crate::{
 
 use super::common::{
     content_text, context, enhance_system, extract_images, extract_tool_results, inference,
-    kiro_tool, kiro_tool_named, system_text, tool_name, ToolNameRegistry,
+    kiro_tool, kiro_tool_named, system_text, ToolNameRegistry,
 };
 use super::tool_search::is_tool_search_tool;
 use super::TranslationOptions;
@@ -17,6 +17,7 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
     let selected_tools = claude_loaded_tools(request);
     let completed_server_tool_ids = completed_server_tool_ids(request);
     let tool_names = ToolNameRegistry::new(request.tools.iter().map(|tool| tool.name.as_str()));
+    let official_web_tools = OfficialWebTools::from_request(request);
     let mut documentation = Vec::new();
     let tools = selected_tools
         .iter()
@@ -86,7 +87,10 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
             "Deferred tools are available through the tool search tool. When the required tool is not loaded, call tool search by itself; use the optional limit when more than the default five matches are needed. The proxy will load the matching tool definitions and continue the same assistant turn.",
         );
     }
-    system = join_nonempty(&system, &tool_choice_directive(request, &tools));
+    system = join_nonempty(
+        &system,
+        &tool_choice_directive(request, &tools, &tool_names),
+    );
 
     let mut history = Vec::new();
     let mut pending_system = String::new();
@@ -123,6 +127,8 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
                     &message.content,
                     &completed_server_tool_ids,
                     options.web_search_replay.as_ref(),
+                    &tool_names,
+                    official_web_tools,
                 );
                 push_assistant(
                     &mut history,
@@ -268,6 +274,8 @@ fn assistant_parts(
     content: &Value,
     completed_server_tool_ids: &HashSet<String>,
     web_search_replay: Option<&super::WebSearchReplayCodec>,
+    tool_names: &ToolNameRegistry,
+    official_web_tools: OfficialWebTools,
 ) -> (String, Vec<KiroToolUse>) {
     // Claude Code returns prior thinking blocks verbatim on later turns. Kiro
     // has no compatible signed-thinking history type, so flattening those
@@ -353,9 +361,16 @@ fn assistant_parts(
             _ => false,
         })
         .filter_map(|block| {
+            let server_tool_use =
+                block.get("type").and_then(Value::as_str) == Some("server_tool_use");
             Some(KiroToolUse {
                 tool_use_id: block.get("id")?.as_str()?.into(),
-                name: normalize_history_tool_name(block.get("name")?.as_str()?),
+                name: normalize_history_tool_name(
+                    block.get("name")?.as_str()?,
+                    tool_names,
+                    official_web_tools,
+                    server_tool_use,
+                ),
                 input: block
                     .get("input")
                     .cloned()
@@ -405,6 +420,8 @@ fn completed_server_tool_ids(request: &ClaudeRequest) -> HashSet<String> {
 /// have no matching server-tool result yet. The client sends these blocks back
 /// unchanged when a mixed client/server turn is resumed.
 pub fn claude_pending_server_tool_uses(request: &ClaudeRequest) -> Vec<KiroToolUse> {
+    let tool_names = ToolNameRegistry::new(request.tools.iter().map(|tool| tool.name.as_str()));
+    let official_web_tools = OfficialWebTools::from_request(request);
     let mut pending = Vec::<KiroToolUse>::new();
     let mut positions = HashMap::<String, usize>::new();
     for message in &request.messages {
@@ -423,7 +440,12 @@ pub fn claude_pending_server_tool_uses(request: &ClaudeRequest) -> Vec<KiroToolU
                     positions.insert(id.to_owned(), pending.len());
                     pending.push(KiroToolUse {
                         tool_use_id: id.to_owned(),
-                        name: normalize_history_tool_name(name),
+                        name: normalize_history_tool_name(
+                            name,
+                            &tool_names,
+                            official_web_tools,
+                            true,
+                        ),
                         input: block
                             .get("input")
                             .cloned()
@@ -447,13 +469,51 @@ pub fn claude_pending_server_tool_uses(request: &ClaudeRequest) -> Vec<KiroToolU
         .collect()
 }
 
-fn normalize_history_tool_name(name: &str) -> String {
-    if matches_type_family(name, "web_search") {
+#[derive(Clone, Copy, Default)]
+struct OfficialWebTools {
+    search: bool,
+    fetch: bool,
+}
+
+impl OfficialWebTools {
+    fn from_request(request: &ClaudeRequest) -> Self {
+        Self {
+            search: request.tools.iter().any(|tool| {
+                tool.r#type
+                    .as_deref()
+                    .is_some_and(|kind| matches_type_family(kind, "web_search"))
+            }),
+            fetch: request.tools.iter().any(|tool| {
+                tool.r#type
+                    .as_deref()
+                    .is_some_and(|kind| matches_type_family(kind, "web_fetch"))
+            }),
+        }
+    }
+}
+
+fn normalize_history_tool_name(
+    name: &str,
+    tool_names: &ToolNameRegistry,
+    official_web_tools: OfficialWebTools,
+    server_tool_use: bool,
+) -> String {
+    // Server blocks use the official canonical identity. Ordinary client tool
+    // blocks preserve exact request-scoped names such as `web_search_custom`
+    // before considering compatibility aliases from official definitions.
+    if server_tool_use && official_web_tools.search && matches_type_family(name, "web_search") {
         "web_search".into()
-    } else if matches_type_family(name, "web_fetch") {
+    } else if server_tool_use && official_web_tools.fetch && matches_type_family(name, "web_fetch")
+    {
+        "web_fetch".into()
+    } else if tool_names.contains_original(name) {
+        tool_names.kiro_name(name)
+    } else if official_web_tools.search && matches_type_family(name, "web_search") {
+        "web_search".into()
+    } else if official_web_tools.fetch && matches_type_family(name, "web_fetch") {
         "web_fetch".into()
     } else {
-        tool_name(name)
+        tool_names.kiro_name(name)
     }
 }
 
@@ -542,7 +602,11 @@ fn inject_system(
     }
 }
 
-fn tool_choice_directive(request: &ClaudeRequest, tools: &[crate::KiroTool]) -> String {
+fn tool_choice_directive(
+    request: &ClaudeRequest,
+    tools: &[crate::KiroTool],
+    tool_names: &ToolNameRegistry,
+) -> String {
     let Some(choice) = &request.tool_choice else {
         return String::new();
     };
@@ -551,7 +615,7 @@ fn tool_choice_directive(request: &ClaudeRequest, tools: &[crate::KiroTool]) -> 
         "tool" => choice
             .name
             .as_ref()
-            .map(|name| format!("You must call the tool \"{}\".", tool_name(name)))
+            .map(|name| format!("You must call the tool \"{}\".", tool_names.kiro_name(name)))
             .unwrap_or_default(),
         _ => String::new(),
     };
@@ -712,6 +776,100 @@ mod tests {
             .iter()
             .filter_map(|message| message.user_input_message.as_ref())
             .all(|message| !message.content.contains("governing system instruction")));
+    }
+
+    #[test]
+    fn colliding_tool_names_use_the_same_registry_for_definitions_and_history() {
+        let request: ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-sonnet-4.6",
+            "max_tokens":256,
+            "messages":[
+                {"role":"user","content":"look it up"},
+                {"role":"assistant","content":[{
+                    "type":"tool_use","id":"toolu_1","name":"mcp.a/read","input":{}
+                }]},
+                {"role":"user","content":[{
+                    "type":"tool_result","tool_use_id":"toolu_1","content":"done"
+                }]}
+            ],
+            "tools":[
+                {"name":"mcp.a/read","input_schema":{"type":"object"}},
+                {"name":"mcp_a/read","input_schema":{"type":"object"}}
+            ]
+        }))
+        .expect("request");
+
+        let payload = claude_to_kiro(
+            &request,
+            &TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR"),
+        );
+        let context = payload
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .as_ref()
+            .expect("context");
+        let mapped = ToolNameRegistry::new(["mcp.a/read", "mcp_a/read"]).kiro_name("mcp.a/read");
+        assert!(context
+            .tools
+            .iter()
+            .any(|tool| tool.tool_specification.name == mapped));
+        let history_name = &payload.conversation_state.history[1]
+            .assistant_response_message
+            .as_ref()
+            .expect("assistant")
+            .tool_uses[0]
+            .name;
+        assert_eq!(history_name, &mapped);
+    }
+
+    #[test]
+    fn ordinary_web_prefixed_tool_name_is_not_treated_as_a_server_tool_alias() {
+        let request: ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-sonnet-4.6",
+            "max_tokens":256,
+            "messages":[
+                {"role":"user","content":"search the private index"},
+                {"role":"assistant","content":[{
+                    "type":"tool_use","id":"toolu_1","name":"web_search_custom","input":{}
+                }]},
+                {"role":"user","content":[{
+                    "type":"tool_result","tool_use_id":"toolu_1","content":"done"
+                }]}
+            ],
+            "tools":[
+                {
+                    "type":"web_search_20250305",
+                    "name":"web_search",
+                    "description":"Search the public web",
+                    "input_schema":{}
+                },
+                {
+                    "name":"web_search_custom",
+                    "description":"Search a private index",
+                    "input_schema":{"type":"object"}
+                }
+            ]
+        }))
+        .expect("request");
+
+        let mut payload = claude_to_kiro(
+            &request,
+            &TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR"),
+        );
+        let history_name = payload.conversation_state.history[1]
+            .assistant_response_message
+            .as_ref()
+            .expect("assistant")
+            .tool_uses[0]
+            .name
+            .clone();
+        assert_eq!(history_name, "web_search_custom");
+
+        let stats = crate::sanitize_kiro_tool_history(&mut payload);
+        assert_eq!(stats.flattened_tool_uses, 0);
+        assert!(crate::validate_kiro_tool_history(&payload).is_ok());
     }
 
     #[test]

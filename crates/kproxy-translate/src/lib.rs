@@ -5,6 +5,7 @@ pub mod error;
 pub mod model;
 pub mod protocol;
 pub mod tokenizer;
+pub mod tool_history;
 pub mod translate;
 pub mod validate;
 
@@ -19,6 +20,9 @@ pub use protocol::*;
 pub use tokenizer::{
     compaction_summary_payload, ContextCompactionStats, KiroCompactionPlan, TokenCountCache,
     TokenCountStats,
+};
+pub use tool_history::{
+    sanitize_kiro_tool_history, validate_kiro_tool_history, KiroToolHistoryStats,
 };
 pub use translate::{
     auto_continue_payload, claude_loaded_tools, claude_pending_server_tool_uses, claude_to_kiro,
