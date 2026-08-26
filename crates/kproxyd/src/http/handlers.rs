@@ -21,10 +21,11 @@ use kproxy_translate::{
     claude_pending_server_tool_uses, claude_to_kiro, compact_trigger_tokens,
     compaction_summary_payload, error_envelope, has_context_management_edits, matches_type_family,
     openai_to_kiro, resume_tool_search_payload, resume_web_search_payload, sanitize_error_message,
-    tool_search_continue_payload_batch, validate_claude, validate_openai,
-    web_search_continue_payload_batch, ClaudeRequest, ClaudeToolSearchBudget,
-    ClaudeToolSearchCatalog, ClaudeWebSearchTrace, ErrorFormat, KiroCompactionPlan, KiroPayload,
-    KiroToolUse, OpenAiRequest, TranslationOptions, ValidationError,
+    sanitize_kiro_tool_history, tool_search_continue_payload_batch, validate_claude,
+    validate_kiro_tool_history, validate_openai, web_search_continue_payload_batch, ClaudeRequest,
+    ClaudeToolSearchBudget, ClaudeToolSearchCatalog, ClaudeWebSearchTrace, ErrorFormat,
+    KiroCompactionPlan, KiroPayload, KiroToolUse, OpenAiRequest, TranslationOptions,
+    ValidationError,
 };
 use rand::Rng;
 use serde_json::{json, Value};
@@ -807,6 +808,18 @@ async fn handle_claude(
         budget_tokens = decision.budget_tokens,
         "adaptive thinking decision"
     );
+    prepare_kiro_payload(
+        &mut payload,
+        "request-preparation",
+        "initial Claude request",
+    )
+    .map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.message,
+            ErrorFormat::Claude,
+        )
+    })?;
     let mut input_tokens = state
         .tokenizer
         .estimate_kiro_payload(&payload)
@@ -1164,7 +1177,6 @@ async fn handle_claude(
         attempts,
         input_tokens,
         compacted,
-        estimate,
         started,
         prompt_cache,
         compaction_summary,
@@ -1270,6 +1282,18 @@ async fn handle_openai(
         budget_tokens = decision.budget_tokens,
         "adaptive thinking decision"
     );
+    prepare_kiro_payload(
+        &mut payload,
+        "request-preparation",
+        "initial OpenAI request",
+    )
+    .map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.message,
+            ErrorFormat::OpenAi,
+        )
+    })?;
     let input_tokens = state
         .tokenizer
         .estimate_kiro_payload(&payload)
@@ -1445,7 +1469,6 @@ async fn handle_openai(
         attempts,
         input_tokens,
         max_tokens,
-        estimate,
         started,
         prompt_cache,
         diagnostics,
@@ -2041,7 +2064,7 @@ async fn extractive_compaction(
     preserve_recent_turns: usize,
 ) -> Result<(KiroPayload, kproxy_translate::ContextCompactionStats), ApiError> {
     let mut payload = source_payload.clone();
-    let stats = state
+    let mut stats = state
         .tokenizer
         .compact_kiro_payload(&mut payload, target_tokens as usize, preserve_recent_turns)
         .await
@@ -2052,7 +2075,35 @@ async fn extractive_compaction(
                 ErrorFormat::Claude,
             )
         })?;
+    finalize_compaction_payload(state, &mut payload, &mut stats, "extractive compaction").await?;
     Ok((payload, stats))
+}
+
+async fn finalize_compaction_payload(
+    state: &Arc<AppState>,
+    payload: &mut KiroPayload,
+    stats: &mut kproxy_translate::ContextCompactionStats,
+    stage: &str,
+) -> Result<(), ApiError> {
+    prepare_kiro_payload(payload, "compaction", stage).map_err(|error| {
+        ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            error.message,
+            ErrorFormat::Claude,
+        )
+    })?;
+    stats.compacted_tokens = state
+        .tokenizer
+        .estimate_kiro_payload(payload)
+        .await
+        .map_err(|error| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                error,
+                ErrorFormat::Claude,
+            )
+        })?;
+    Ok(())
 }
 
 async fn compaction_operation_target(
@@ -2223,22 +2274,33 @@ async fn run_compaction(
             )
             .await
         {
-            Ok(stats) => {
-                return Ok(CompactionRun {
-                    payload,
-                    stats,
-                    artifact: Some(CompactionArtifact::Semantic {
-                        source_payload: source_payload.clone(),
-                        plan,
-                        summary: generated.content,
-                        usage: generated.usage,
-                    }),
-                    mode: "semantic",
-                    summary_model: Some(summary_model.to_owned()),
-                    summary_input_tokens: Some(summary_input_tokens),
-                    fallback_reason: None,
-                    iteration_usage: Some(generated.usage),
-                });
+            Ok(mut stats) => {
+                finalize_compaction_payload(state, &mut payload, &mut stats, "semantic compaction")
+                    .await?;
+                if stats.compacted_tokens as u64 <= operation_target {
+                    return Ok(CompactionRun {
+                        payload,
+                        stats,
+                        artifact: Some(CompactionArtifact::Semantic {
+                            source_payload: source_payload.clone(),
+                            plan,
+                            summary: generated.content,
+                            usage: generated.usage,
+                        }),
+                        mode: "semantic",
+                        summary_model: Some(summary_model.to_owned()),
+                        summary_input_tokens: Some(summary_input_tokens),
+                        fallback_reason: None,
+                        iteration_usage: Some(generated.usage),
+                    });
+                }
+                fallback_reason = Some("semantic_target_not_reached_after_tool_history_repair");
+                tracing::warn!(
+                    trace_id,
+                    compacted_tokens = stats.compacted_tokens,
+                    target_tokens = operation_target,
+                    "semantic compaction exceeded the target after tool-history preparation; using extractive fallback"
+                );
             }
             Err(error) => {
                 fallback_reason = Some("semantic_target_not_reached");
@@ -2306,7 +2368,7 @@ async fn reapply_compaction(
                 .tokenizer
                 .apply_semantic_compaction(&mut payload, plan, summary, operation_target as usize)
                 .await;
-            let stats = match first {
+            let mut stats = match first {
                 Ok(stats) => stats,
                 Err(error) if operation_target < decision.maximum_tokens => {
                     tracing::warn!(
@@ -2375,6 +2437,13 @@ async fn reapply_compaction(
                     ));
                 }
             };
+            finalize_compaction_payload(
+                state,
+                &mut payload,
+                &mut stats,
+                "reapplied semantic compaction",
+            )
+            .await?;
             (payload, stats, "semantic", Some(*usage))
         }
         CompactionArtifact::Extractive {
@@ -3206,7 +3275,6 @@ async fn collect_nonstream_rounds(
     trace_id: &str,
     lease: &AccountLease,
     reservation: &mut CreditReservation,
-    estimated_credits: f64,
     mut upstream: KiroResponse,
     mut payload: kproxy_translate::KiroPayload,
     compact: bool,
@@ -3621,6 +3689,8 @@ async fn collect_nonstream_rounds(
                 accumulated_usage.output_tokens,
             );
             debug_assert!(budget_available);
+            prepare_kiro_payload(&mut payload, &endpoint, "Tool Search")
+                .map_err(ExecuteError::Upstream)?;
             let next_input_tokens = state
                 .tokenizer
                 .estimate_kiro_payload(&payload)
@@ -3703,7 +3773,15 @@ async fn collect_nonstream_rounds(
                 loaded_tool_count = next_loaded_tools,
                 "Tool Search continuation prepared"
             );
-            if let Err(error) = reservation.extend(estimated_credits) {
+            let continuation_estimate = estimated_credits(
+                next_input_tokens,
+                payload
+                    .inference_config
+                    .as_ref()
+                    .map_or(max_output_tokens, |inference| inference.max_tokens),
+                &config.pool,
+            );
+            if let Err(error) = reservation.extend(continuation_estimate) {
                 return Err(ExecuteError::Meter(error));
             }
             let account = lease.account().await;
@@ -3844,9 +3922,9 @@ async fn collect_nonstream_rounds(
                 accumulated_usage.output_tokens,
             );
             debug_assert!(budget_available);
-            validate_internal_continuation(
+            let next_input_tokens = validate_internal_continuation(
                 state,
-                &payload,
+                &mut payload,
                 compact,
                 &endpoint,
                 "Web Search",
@@ -3854,7 +3932,15 @@ async fn collect_nonstream_rounds(
             )
             .await
             .map_err(ExecuteError::Upstream)?;
-            if let Err(error) = reservation.extend(estimated_credits) {
+            let continuation_estimate = estimated_credits(
+                next_input_tokens,
+                payload
+                    .inference_config
+                    .as_ref()
+                    .map_or(max_output_tokens, |inference| inference.max_tokens),
+                &config.pool,
+            );
+            if let Err(error) = reservation.extend(continuation_estimate) {
                 return Err(ExecuteError::Meter(error));
             }
             let account = lease.account().await;
@@ -3926,7 +4012,25 @@ async fn collect_nonstream_rounds(
             accumulated_usage.output_tokens,
         );
         debug_assert!(budget_available);
-        if let Err(error) = reservation.extend(estimated_credits) {
+        let next_input_tokens = validate_internal_continuation(
+            state,
+            &mut payload,
+            compact,
+            &endpoint,
+            "automatic continuation",
+            tool_search.is_some(),
+        )
+        .await
+        .map_err(ExecuteError::Upstream)?;
+        let continuation_estimate = estimated_credits(
+            next_input_tokens,
+            payload
+                .inference_config
+                .as_ref()
+                .map_or(max_output_tokens, |inference| inference.max_tokens),
+            &config.pool,
+        );
+        if let Err(error) = reservation.extend(continuation_estimate) {
             return Err(ExecuteError::Meter(error));
         }
         let account = lease.account().await;
@@ -4055,14 +4159,43 @@ async fn ensure_web_search_profile_arn(
     })
 }
 
+pub(super) fn prepare_kiro_payload(
+    payload: &mut kproxy_translate::KiroPayload,
+    endpoint: &str,
+    stage: &str,
+) -> Result<(), KiroError> {
+    let repairs = sanitize_kiro_tool_history(payload);
+    if repairs.repaired() {
+        tracing::warn!(
+            endpoint,
+            stage,
+            flattened_tool_uses = repairs.flattened_tool_uses,
+            flattened_tool_results = repairs.flattened_tool_results,
+            relocated_tool_results = repairs.relocated_tool_results,
+            synthesized_tool_results = repairs.synthesized_tool_results,
+            normalized_tool_results = repairs.normalized_tool_results,
+            removed_historical_tool_definitions = repairs.removed_historical_tool_definitions,
+            removed_duplicate_tool_definitions = repairs.removed_duplicate_tool_definitions,
+            inserted_messages = repairs.inserted_messages,
+            "repaired Kiro tool history before request accounting"
+        );
+    }
+    validate_kiro_tool_history(payload).map_err(|message| KiroError {
+        status: Some(400),
+        endpoint: endpoint.into(),
+        message: format!("translated Kiro tool history is invalid after repair: {message}"),
+    })
+}
+
 pub(super) async fn validate_internal_continuation(
     state: &Arc<AppState>,
-    payload: &kproxy_translate::KiroPayload,
+    payload: &mut kproxy_translate::KiroPayload,
     compact: bool,
     endpoint: &str,
     stage: &str,
     enforce_tool_search_budget: bool,
 ) -> Result<u64, KiroError> {
+    prepare_kiro_payload(payload, endpoint, stage)?;
     let config = state.config.current();
     let input_tokens = state
         .tokenizer
@@ -4170,7 +4303,6 @@ async fn nonstream_claude(
     attempts: Vec<UpstreamAttemptLog>,
     input_tokens: u64,
     compact: bool,
-    estimated_credits: f64,
     started: Instant,
     prompt_cache: Option<PromptCacheProfile>,
     compaction_summary: Option<String>,
@@ -4192,7 +4324,6 @@ async fn nonstream_claude(
         &trace_id,
         &lease,
         &mut reservation,
-        estimated_credits,
         upstream,
         payload,
         compact,
@@ -4300,7 +4431,6 @@ async fn nonstream_openai(
     attempts: Vec<UpstreamAttemptLog>,
     _input_tokens: u64,
     max_tokens: u32,
-    estimated_credits: f64,
     started: Instant,
     prompt_cache: Option<PromptCacheProfile>,
     diagnostics: RequestDiagnostics,
@@ -4311,7 +4441,6 @@ async fn nonstream_openai(
         &trace_id,
         &lease,
         &mut reservation,
-        estimated_credits,
         upstream,
         payload,
         false,
@@ -4401,6 +4530,12 @@ async fn nonstream_openai(
 fn openai_tool_identities(
     request: &OpenAiRequest,
 ) -> std::collections::HashMap<String, OpenAiToolIdentity> {
+    let names = kproxy_translate::ToolNameRegistry::new(request.tools.iter().filter_map(|tool| {
+        tool.body
+            .get(&tool.r#type)
+            .and_then(|definition| definition.get("name"))
+            .and_then(Value::as_str)
+    }));
     request
         .tools
         .iter()
@@ -4408,7 +4543,7 @@ fn openai_tool_identities(
             let definition = tool.body.get(&tool.r#type)?;
             let name = definition.get("name")?.as_str()?;
             Some((
-                kproxy_translate::tool_name(name),
+                names.kiro_name(name),
                 OpenAiToolIdentity {
                     kind: tool.r#type.clone(),
                     name: name.into(),
@@ -5177,7 +5312,7 @@ fn model_token_limit(state: &Arc<AppState>, model: &str, input: bool) -> Option<
         })
 }
 
-fn estimated_credits(
+pub(super) fn estimated_credits(
     input_tokens: u64,
     max_tokens: u32,
     config: &kproxy_core::config::PoolConfig,
@@ -5678,6 +5813,83 @@ mod model_tests {
         );
         assert!(check_context_limit(&state, 900_000, false, "claude-4.6-sonnet").is_ok());
         assert!(check_context_limit(&state, 960_000, false, "claude-4.6-sonnet").is_err());
+    }
+
+    #[tokio::test]
+    async fn continuation_budget_is_checked_after_tool_history_repair() {
+        let mut payload: KiroPayload = serde_json::from_value(json!({
+            "conversationState": {
+                "chatTriggerType": "MANUAL",
+                "conversationId": "conversation",
+                "history": [
+                    {"userInputMessage": {
+                        "content": "start", "modelId": "model", "origin": "AI_EDITOR"
+                    }},
+                    {"assistantResponseMessage": {
+                        "content": "calling", "toolUses": [{
+                            "toolUseId": "call_1", "name": "lookup", "input": {}
+                        }]
+                    }}
+                ],
+                "currentMessage": {"userInputMessage": {
+                    "content": "latest", "modelId": "model", "origin": "AI_EDITOR",
+                    "userInputMessageContext": {
+                        "tools": [{"toolSpecification": {
+                            "name": "lookup", "description": "",
+                            "inputSchema": {"json": {"type": "object"}}
+                        }}],
+                        "toolResults": [{
+                            "toolUseId": "orphan", "status": "success",
+                            "content": [{"text": "valuable orphan output"}]
+                        }]
+                    }
+                }}
+            }
+        }))
+        .expect("payload");
+        let before_bytes = serde_json::to_vec(&payload).expect("before").len();
+        let mut repaired = payload.clone();
+        prepare_kiro_payload(&mut repaired, "test", "test repair").expect("repair");
+        let repaired_bytes = serde_json::to_vec(&repaired).expect("after").len();
+        assert!(repaired_bytes > before_bytes);
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = kproxy_core::paths::Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        let accounts = kproxy_store::accounts::AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("accounts");
+        let mut config = kproxy_core::config::Config::default();
+        config.context.max_upstream_payload_bytes = repaired_bytes - 1;
+        let state = Arc::new(AppState::new(
+            paths,
+            kproxy_store::config_loader::ConfigHandle::new(config),
+            accounts,
+        ));
+
+        let error = validate_internal_continuation(
+            &state,
+            &mut payload,
+            false,
+            "test",
+            "regression test",
+            false,
+        )
+        .await
+        .expect_err("repaired payload must be checked against the byte budget");
+
+        assert_eq!(
+            serde_json::to_vec(&payload).expect("prepared").len(),
+            repaired_bytes
+        );
+        assert!(error.message.contains("too large after regression test"));
     }
 
     #[tokio::test]
