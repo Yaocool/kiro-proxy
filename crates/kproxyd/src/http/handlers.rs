@@ -675,7 +675,6 @@ async fn handle_claude(
     );
     let mut options = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
     options.enhance_system_prompt = config.features.enhance_system_prompt;
-    options.compact_mode = compact_trigger.is_some() || config.context.auto_compact_on_overflow;
     options.web_search_replay = Some(state.web_search_replay.clone());
     let mut payload = claude_to_kiro(&request, &options);
     let original_tool_count = request.tools.len();
@@ -2278,7 +2277,7 @@ async fn compaction_operation_target(
     decision: &CompactionDecision,
 ) -> Result<u64, ApiError> {
     let mut minimum_payload = source_payload.clone();
-    minimum_payload.conversation_state.history.clear();
+    minimum_payload.retain_protected_history();
     let minimum_tokens = state
         .tokenizer
         .estimate_kiro_payload(&minimum_payload)
@@ -5072,7 +5071,6 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
                 ErrorFormat::Claude,
             ));
         }
-        let compact_trigger = compact_trigger_tokens(request.context_management.as_ref());
         let route = map_model(
             &request.model,
             &config.model_mapping,
@@ -5082,7 +5080,6 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         );
         let mut normal = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
         normal.enhance_system_prompt = config.features.enhance_system_prompt;
-        normal.compact_mode = compact_trigger.is_some() || config.context.auto_compact_on_overflow;
         let mut original_payload = claude_to_kiro(&original_request, &normal);
         let thinking_limit = model_token_limit(&state, &route.mapped, false)
             .unwrap_or(config.features.max_thinking_budget_tokens)
@@ -6735,8 +6732,7 @@ mod model_tests {
             ]
         }))
         .expect("request");
-        let mut options = TranslationOptions::new("mapped-tiny", "AI_EDITOR");
-        options.compact_mode = true;
+        let options = TranslationOptions::new("mapped-tiny", "AI_EDITOR");
         let source_payload = claude_to_kiro(&request, &options);
         let decision = CompactionDecision {
             reasons: vec![CompactionReason::MappedWindowOverflow],
@@ -6780,7 +6776,7 @@ mod model_tests {
         ));
 
         let mut minimum_payload = source_payload.clone();
-        minimum_payload.conversation_state.history.clear();
+        minimum_payload.retain_protected_history();
         let indivisible_tokens = state
             .tokenizer
             .estimate_kiro_payload(&minimum_payload)

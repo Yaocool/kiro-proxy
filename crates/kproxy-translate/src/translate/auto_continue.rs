@@ -85,10 +85,7 @@ pub fn tool_search_continue_payload_batch(
         tool_results,
         tools,
     });
-    if next.conversation_state.history.len() > 30 {
-        let remove = next.conversation_state.history.len() - 30;
-        next.conversation_state.history.drain(..remove);
-    }
+    next.truncate_history_preserving_protected_prefix(30);
     next
 }
 
@@ -201,10 +198,7 @@ pub fn auto_continue_payload(
         tool_results: results,
         tools,
     });
-    if next.conversation_state.history.len() > 30 {
-        let remove = next.conversation_state.history.len() - 30;
-        next.conversation_state.history.drain(..remove);
-    }
+    next.truncate_history_preserving_protected_prefix(30);
     next
 }
 
@@ -220,8 +214,9 @@ fn tail_chars(value: &str, maximum: usize) -> String {
 mod tests {
     use super::*;
     use crate::{
-        ClaudeToolSearchTrace, KiroConversationState, KiroCurrentMessage, KiroInputSchema,
-        KiroTool, KiroToolSpecification, KiroUserInputMessage,
+        claude_to_kiro, ClaudeRequest, ClaudeToolSearchTrace, KiroConversationState,
+        KiroCurrentMessage, KiroInputSchema, KiroTool, KiroToolSpecification, KiroUserInputMessage,
+        TranslationOptions,
     };
     use serde_json::json;
 
@@ -244,6 +239,7 @@ mod tests {
             },
             profile_arn: None,
             inference_config: None,
+            protected_history_messages: 0,
         };
         let next = auto_continue_payload(
             &payload,
@@ -266,6 +262,84 @@ mod tests {
     }
 
     #[test]
+    fn long_internal_continuation_preserves_system_prefix() {
+        let mut messages = Vec::new();
+        for index in 0..16 {
+            messages.push(json!({"role":"user","content":format!("user {index}")}));
+            messages.push(json!({"role":"assistant","content":format!("assistant {index}")}));
+        }
+        messages.push(json!({"role":"user","content":"current"}));
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-opus-5",
+            "max_tokens":128,
+            "system":"You are Claude Code, Anthropic's official CLI for Claude.",
+            "messages":messages
+        }))
+        .expect("request");
+        let payload = claude_to_kiro(
+            &request,
+            &TranslationOptions::new("mapped-opus", "AI_EDITOR"),
+        );
+
+        let continued = auto_continue_payload(&payload, "using a tool", Vec::new());
+        assert_eq!(continued.protected_history_len(), 2);
+        assert_eq!(continued.conversation_state.history.len(), 30);
+        assert!(continued.conversation_state.history[0]
+            .user_input_message
+            .as_ref()
+            .expect("protected system")
+            .content
+            .contains("You are Claude Code"));
+        assert_eq!(
+            continued.conversation_state.history[1]
+                .assistant_response_message
+                .as_ref()
+                .expect("protected acknowledgement")
+                .content,
+            super::super::SYSTEM_PROMPT_ACKNOWLEDGEMENT
+        );
+
+        let search_use = KiroToolUse {
+            tool_use_id: "srvtoolu_1".into(),
+            name: "tool_search_tool_regex".into(),
+            input: json!({"pattern":"issue"}),
+        };
+        let outcome = ClaudeToolSearchOutcome {
+            trace: ClaudeToolSearchTrace {
+                id: search_use.tool_use_id.clone(),
+                name: search_use.name.clone(),
+                input: search_use.input.clone(),
+                references: vec![],
+                error: None,
+                requested_limit: 5,
+                matched_count: 0,
+                budget_truncated: false,
+                emission: crate::ClaudeServerToolEmission::Complete,
+            },
+            tools: vec![],
+            documentation: vec![],
+            truncated: false,
+        };
+        let searched = tool_search_continue_payload(&payload, "searching", search_use, &outcome);
+        assert_eq!(searched.protected_history_len(), 2);
+        assert_eq!(searched.conversation_state.history.len(), 30);
+        assert!(searched.conversation_state.history[0]
+            .user_input_message
+            .as_ref()
+            .expect("protected system")
+            .content
+            .contains("You are Claude Code"));
+        assert_eq!(
+            searched.conversation_state.history[1]
+                .assistant_response_message
+                .as_ref()
+                .expect("protected acknowledgement")
+                .content,
+            super::super::SYSTEM_PROMPT_ACKNOWLEDGEMENT
+        );
+    }
+
+    #[test]
     fn tool_search_continuation_loads_only_matched_definitions() {
         let mut payload = KiroPayload {
             conversation_state: KiroConversationState {
@@ -284,6 +358,7 @@ mod tests {
             },
             profile_arn: None,
             inference_config: None,
+            protected_history_messages: 0,
         };
         payload
             .conversation_state

@@ -26,12 +26,19 @@ pub use web_search::{
     ClaudeWebSearchError, ClaudeWebSearchTrace, WebSearchReplayCodec,
 };
 
+/// Assistant half of the synthetic history pair that carries a caller's
+/// system prompt. Protection is tracked separately in proxy-local metadata,
+/// so ordinary conversations containing the same text are not misclassified.
+pub(crate) const SYSTEM_PROMPT_ACKNOWLEDGEMENT: &str = "I will follow these instructions.";
+
 #[derive(Debug, Clone)]
 pub struct TranslationOptions {
     pub model_id: String,
     pub origin: String,
     pub profile_arn: Option<String>,
     pub enhance_system_prompt: bool,
+    /// Retained for source compatibility. System prompts are now always
+    /// represented by a protected history pair, independent of compaction.
     pub compact_mode: bool,
     pub web_search_replay: Option<WebSearchReplayCodec>,
 }

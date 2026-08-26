@@ -164,6 +164,42 @@ pub struct KiroPayload {
     pub profile_arn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inference_config: Option<KiroInferenceConfig>,
+    /// Proxy-local metadata. This is deliberately excluded from the upstream
+    /// wire payload so protected history cannot be forged through JSON or
+    /// interpreted as part of the prompt by Kiro.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub protected_history_messages: usize,
+}
+
+impl KiroPayload {
+    pub fn protected_history_len(&self) -> usize {
+        self.protected_history_messages
+            .min(self.conversation_state.history.len())
+    }
+
+    /// Removes compactable history while retaining the proxy-owned prefix.
+    pub fn retain_protected_history(&mut self) {
+        let protected = self.protected_history_len();
+        self.conversation_state.history.truncate(protected);
+    }
+
+    /// Applies an internal history bound without discarding the proxy-owned
+    /// prefix. Valid Kiro histories and the protected prefix both contain
+    /// complete user/assistant pairs, so retaining an even recent capacity
+    /// also preserves turn boundaries.
+    pub(crate) fn truncate_history_preserving_protected_prefix(&mut self, maximum: usize) {
+        let history_len = self.conversation_state.history.len();
+        if history_len <= maximum {
+            return;
+        }
+        let protected = self.protected_history_len();
+        let recent_capacity = maximum.saturating_sub(protected);
+        let recent_start = history_len.saturating_sub(recent_capacity).max(protected);
+        let recent = self.conversation_state.history.split_off(recent_start);
+        self.conversation_state.history.truncate(protected);
+        self.conversation_state.history.extend(recent);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
