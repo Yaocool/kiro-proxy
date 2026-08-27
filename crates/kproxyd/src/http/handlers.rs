@@ -4461,12 +4461,14 @@ pub(super) fn prepare_kiro_payload(
     stage: &str,
 ) -> Result<(), KiroError> {
     let repairs = sanitize_kiro_tool_history(payload);
-    if repairs.repaired() {
+    if repairs.has_structured_tool_repair() {
         tracing::warn!(
             endpoint,
             stage,
             flattened_tool_uses = repairs.flattened_tool_uses,
             flattened_tool_results = repairs.flattened_tool_results,
+            normalized_tool_uses = repairs.normalized_tool_uses,
+            removed_invalid_tool_uses = repairs.removed_invalid_tool_uses,
             relocated_tool_results = repairs.relocated_tool_results,
             synthesized_tool_results = repairs.synthesized_tool_results,
             normalized_tool_results = repairs.normalized_tool_results,
@@ -4474,6 +4476,13 @@ pub(super) fn prepare_kiro_payload(
             removed_duplicate_tool_definitions = repairs.removed_duplicate_tool_definitions,
             inserted_messages = repairs.inserted_messages,
             "repaired Kiro tool history before request accounting"
+        );
+    } else if repairs.inserted_messages > 0 {
+        tracing::info!(
+            endpoint,
+            stage,
+            inserted_messages = repairs.inserted_messages,
+            "normalized Kiro conversation roles before request accounting"
         );
     }
     validate_kiro_tool_history(payload).map_err(|message| KiroError {
