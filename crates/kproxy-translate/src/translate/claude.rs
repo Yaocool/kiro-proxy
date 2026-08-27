@@ -949,6 +949,63 @@ mod tests {
     }
 
     #[test]
+    fn removed_historical_tool_is_archived_without_flattening_active_tools() {
+        let request: ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-sonnet-4.6",
+            "max_tokens":256,
+            "messages":[
+                {"role":"user","content":"use the old tool"},
+                {"role":"assistant","content":[{
+                    "type":"tool_use","id":"old_call","name":"removed_tool","input":{"path":"old"}
+                }]},
+                {"role":"user","content":[{
+                    "type":"tool_result","tool_use_id":"old_call","content":"old output"
+                }]},
+                {"role":"assistant","content":[{
+                    "type":"tool_use","id":"active_call","name":"active_tool","input":{"path":"new"}
+                }]},
+                {"role":"user","content":[{
+                    "type":"tool_result","tool_use_id":"active_call","content":"new output"
+                }]}
+            ],
+            "tools":[{
+                "name":"active_tool",
+                "description":"The tool that remains available",
+                "input_schema":{"type":"object"}
+            }]
+        }))
+        .expect("request");
+
+        let mut payload = claude_to_kiro(
+            &request,
+            &TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR"),
+        );
+        let stats = crate::sanitize_kiro_tool_history(&mut payload);
+
+        assert_eq!(stats.flattened_tool_uses, 1);
+        assert_eq!(stats.flattened_tool_results, 1);
+        assert!(crate::validate_kiro_tool_history(&payload).is_ok());
+
+        let calls = payload
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| message.assistant_response_message.as_ref())
+            .flat_map(|assistant| assistant.tool_uses.iter())
+            .map(|tool_use| (tool_use.tool_use_id.as_str(), tool_use.name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(calls, vec![("active_call", "active_tool")]);
+
+        let serialized = serde_json::to_string(&payload).expect("serialize");
+        assert!(serialized.contains("archived_tool_call"));
+        assert!(serialized.contains("archived_tool_result"));
+        assert!(serialized.contains("old output"));
+        assert!(!serialized.contains("Historical tool call preserved"));
+        assert!(!serialized.contains("Historical tool result preserved"));
+        assert!(!serialized.contains("non-executable data"));
+    }
+
+    #[test]
     fn assistant_thinking_history_is_not_flattened_into_kiro_text() {
         let request: ClaudeRequest = serde_json::from_value(serde_json::json!({
             "model":"claude-sonnet-4.6",
