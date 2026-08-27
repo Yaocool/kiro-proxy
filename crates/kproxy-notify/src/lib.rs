@@ -1,6 +1,9 @@
 //! Non-blocking multi-target webhook notifications.
 
 use std::collections::{HashMap, VecDeque};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -10,7 +13,7 @@ use kproxy_core::config::{NotifyConfig, WebhookConfig};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
@@ -85,7 +88,20 @@ pub struct Notifier {
     senders: Arc<HashMap<String, mpsc::Sender<Delivery>>>,
     targets: Arc<Vec<WebhookConfig>>,
     active_incidents: Arc<Mutex<HashMap<String, i64>>>,
+    incident_file: Arc<Option<PathBuf>>,
     history: Arc<Mutex<VecDeque<DeliveryLog>>>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct PersistedIncidents {
+    #[serde(default = "incident_state_version")]
+    version: u32,
+    #[serde(default)]
+    incidents: HashMap<String, i64>,
+}
+
+fn incident_state_version() -> u32 {
+    1
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -104,6 +120,27 @@ struct Delivery {
     event: WebhookEvent,
 }
 
+#[derive(Debug)]
+struct DeliveryError {
+    message: String,
+    retryable_before_delivery: bool,
+}
+
+impl std::fmt::Display for DeliveryError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl DeliveryError {
+    fn permanent(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            retryable_before_delivery: false,
+        }
+    }
+}
+
 const ACCOUNT_EVENT_AGGREGATION_WINDOW: Duration = Duration::from_millis(500);
 
 enum SuppressionMark {
@@ -118,6 +155,28 @@ impl Notifier {
             config,
             queue_size,
             Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(None),
+            Arc::new(Mutex::new(VecDeque::new())),
+        )
+    }
+
+    /// Build a notifier whose incident suppression state survives daemon
+    /// restarts. The state is written before an event enters the delivery
+    /// queue, so startup reconciliation does not replay an already active
+    /// incident.
+    pub fn persistent(
+        targets: Vec<WebhookConfig>,
+        config: NotifyConfig,
+        queue_size: usize,
+        incident_file: PathBuf,
+    ) -> Self {
+        let incidents = load_incidents(&incident_file);
+        Self::with_state(
+            targets,
+            config,
+            queue_size,
+            Arc::new(Mutex::new(incidents)),
+            Arc::new(Some(incident_file)),
             Arc::new(Mutex::new(VecDeque::new())),
         )
     }
@@ -127,6 +186,7 @@ impl Notifier {
         _config: NotifyConfig,
         queue_size: usize,
         active_incidents: Arc<Mutex<HashMap<String, i64>>>,
+        incident_file: Arc<Option<PathBuf>>,
         history: Arc<Mutex<VecDeque<DeliveryLog>>>,
     ) -> Self {
         let senders = targets
@@ -141,6 +201,7 @@ impl Notifier {
             senders: Arc::new(senders),
             targets: Arc::new(targets),
             active_incidents,
+            incident_file,
             history,
         }
     }
@@ -158,6 +219,7 @@ impl Notifier {
             config,
             queue_size,
             Arc::clone(&self.active_incidents),
+            Arc::clone(&self.incident_file),
             Arc::clone(&self.history),
         )
     }
@@ -224,9 +286,34 @@ impl Notifier {
 
     fn mark_send(&self, target: &WebhookConfig, event: &WebhookEvent) -> Option<SuppressionMark> {
         let account = event.account_id.as_deref().unwrap_or("global");
-        let key = format!("{}:{}:{account}", target.name, event.kind.as_str());
+        let key = format!(
+            "{}:{}:{account}",
+            target_incident_identity(target),
+            event.kind.as_str()
+        );
         let now = now_millis();
         let mut incidents = lock(&self.active_incidents);
+        if let Some(path) = self.incident_file.as_deref() {
+            match mutate_incidents(path, |persisted| {
+                if persisted.contains_key(&key) {
+                    (false, false)
+                } else {
+                    persisted.insert(key.clone(), now);
+                    (true, true)
+                }
+            }) {
+                Ok((persisted, inserted)) => {
+                    *incidents = persisted;
+                    return inserted.then_some(SuppressionMark::Incident {
+                        key,
+                        timestamp: now,
+                    });
+                }
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "failed to update webhook incident state");
+                }
+            }
+        }
         if incidents.contains_key(&key) {
             return None;
         }
@@ -242,6 +329,24 @@ impl Notifier {
             SuppressionMark::None => {}
             SuppressionMark::Incident { key, timestamp } => {
                 let mut incidents = lock(&self.active_incidents);
+                if let Some(path) = self.incident_file.as_deref() {
+                    match mutate_incidents(path, |persisted| {
+                        if persisted.get(&key) == Some(&timestamp) {
+                            persisted.remove(&key);
+                            ((), true)
+                        } else {
+                            ((), false)
+                        }
+                    }) {
+                        Ok((persisted, ())) => {
+                            *incidents = persisted;
+                            return;
+                        }
+                        Err(error) => {
+                            warn!(path = %path.display(), %error, "failed to roll back webhook incident state");
+                        }
+                    }
+                }
                 if incidents.get(&key) == Some(&timestamp) {
                     incidents.remove(&key);
                 }
@@ -253,7 +358,35 @@ impl Notifier {
     pub fn resolve_incident(&self, kind: WebhookEventKind, account_id: Option<&str>) {
         let account = account_id.unwrap_or("global");
         let suffix = format!(":{}:{account}", kind.as_str());
-        lock(&self.active_incidents).retain(|key, _| !key.ends_with(&suffix));
+        let mut incidents = lock(&self.active_incidents);
+        if let Some(path) = self.incident_file.as_deref() {
+            match mutate_incidents(path, |persisted| {
+                let previous = persisted.len();
+                persisted.retain(|key, _| !key.ends_with(&suffix));
+                ((), persisted.len() != previous)
+            }) {
+                Ok((persisted, ())) => {
+                    *incidents = persisted;
+                    return;
+                }
+                Err(error) => {
+                    warn!(path = %path.display(), %error, "failed to resolve webhook incident state");
+                }
+            }
+        }
+        incidents.retain(|key, _| !key.ends_with(&suffix));
+    }
+
+    /// Return whether any configured destination currently has this incident
+    /// marked active. Quota reconciliation uses this to debounce recovery and
+    /// downgrade transitions without treating repeated sync calls as new
+    /// observations.
+    pub fn incident_active(&self, kind: WebhookEventKind, account_id: Option<&str>) -> bool {
+        let account = account_id.unwrap_or("global");
+        let suffix = format!(":{}:{account}", kind.as_str());
+        lock(&self.active_incidents)
+            .keys()
+            .any(|key| key.ends_with(&suffix))
     }
 
     pub fn logs(&self, tail: usize) -> Vec<DeliveryLog> {
@@ -264,6 +397,182 @@ impl Notifier {
             .cloned()
             .collect()
     }
+}
+
+fn target_incident_identity(target: &WebhookConfig) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(target.kind.trim().to_ascii_lowercase().as_bytes());
+    hasher.update([0]);
+    hasher.update(target.url.trim().as_bytes());
+    hasher.update([0]);
+    if let Some(chat_id) = target.telegram_chat_id.as_deref() {
+        hasher.update(chat_id.trim().as_bytes());
+    }
+    let digest = hasher.finalize();
+    digest[..16]
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+struct IncidentFileLock {
+    #[cfg(unix)]
+    file: File,
+}
+
+#[cfg(unix)]
+impl Drop for IncidentFileLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+
+        // SAFETY: the descriptor belongs to `file` for the duration of this
+        // call. Closing it would also release the advisory lock.
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
+fn incident_lock_path(path: &Path) -> PathBuf {
+    let mut value = path.as_os_str().to_os_string();
+    value.push(".lock");
+    PathBuf::from(value)
+}
+
+fn lock_incident_file(path: &Path) -> Result<IncidentFileLock, String> {
+    let lock_path = incident_lock_path(path);
+    if let Some(parent) = lock_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+            .map_err(|error| error.to_string())?;
+        loop {
+            // SAFETY: `file` owns a live descriptor and flock does not retain
+            // it after the call returns.
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+            if result == 0 {
+                break;
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error.to_string());
+            }
+        }
+        Ok(IncidentFileLock { file })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = lock_path;
+        Ok(IncidentFileLock {})
+    }
+}
+
+fn mutate_incidents<T>(
+    path: &Path,
+    mutate: impl FnOnce(&mut HashMap<String, i64>) -> (T, bool),
+) -> Result<(HashMap<String, i64>, T), String> {
+    let _file_lock = lock_incident_file(path)?;
+    let mut incidents = read_incidents(path)?;
+    let (value, changed) = mutate(&mut incidents);
+    if changed {
+        write_incidents(path, &incidents)?;
+    }
+    Ok((incidents, value))
+}
+
+fn load_incidents(path: &Path) -> HashMap<String, i64> {
+    match read_incidents(path) {
+        Ok(incidents) => incidents,
+        Err(error) => {
+            warn!(path = %path.display(), %error, "failed to read webhook incident state");
+            HashMap::new()
+        }
+    }
+}
+
+fn read_incidents(path: &Path) -> Result<HashMap<String, i64>, String> {
+    let raw = match std::fs::read(path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashMap::new()),
+        Err(error) => return Err(error.to_string()),
+    };
+    match serde_json::from_slice::<PersistedIncidents>(&raw) {
+        Ok(persisted) if persisted.version == incident_state_version() => Ok(persisted.incidents),
+        Ok(persisted) => Err(format!(
+            "unsupported webhook incident state version {}",
+            persisted.version
+        )),
+        Err(error) => {
+            let quarantine = path.with_extension(format!("corrupt.{}", now_millis()));
+            if let Err(rename_error) = std::fs::rename(path, &quarantine) {
+                warn!(
+                    path = %path.display(),
+                    %rename_error,
+                    "failed to quarantine corrupt webhook incident state"
+                );
+            }
+            warn!(
+                path = %path.display(),
+                %error,
+                "corrupt webhook incident state was ignored"
+            );
+            Ok(HashMap::new())
+        }
+    }
+}
+
+fn write_incidents(path: &Path, incidents: &HashMap<String, i64>) -> Result<(), String> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+    }
+    let persisted = PersistedIncidents {
+        version: incident_state_version(),
+        incidents: incidents.clone(),
+    };
+    let raw = serde_json::to_vec_pretty(&persisted).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension(format!("{}.{}.tmp", std::process::id(), now_millis()));
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let result = (|| -> std::io::Result<()> {
+        let mut file = options.open(&temporary)?;
+        file.write_all(&raw)?;
+        file.sync_all()?;
+        std::fs::rename(&temporary, path)?;
+        #[cfg(unix)]
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::File::open(parent)?.sync_all()?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result.map_err(|error| error.to_string())
 }
 
 async fn worker(
@@ -361,13 +670,20 @@ async fn deliver(client: Client, history: Arc<Mutex<VecDeque<DeliveryLog>>>, del
                 record_delivery(&history, &delivery, true, attempt + 1, None);
                 break;
             }
-            Err(error) if attempt < 2 => {
+            Err(error) if attempt < 2 && error.retryable_before_delivery => {
                 warn!(webhook = %delivery.target.name, %error, attempt, "webhook retrying");
                 tokio::time::sleep(Duration::from_millis(1_500 * (1 << attempt))).await;
             }
             Err(error) => {
                 warn!(webhook = %delivery.target.name, %error, "webhook delivery failed");
-                record_delivery(&history, &delivery, false, attempt + 1, Some(error));
+                record_delivery(
+                    &history,
+                    &delivery,
+                    false,
+                    attempt + 1,
+                    Some(error.to_string()),
+                );
+                break;
             }
         }
     }
@@ -394,19 +710,51 @@ fn record_delivery(
     }
 }
 
-async fn send(client: &Client, target: &WebhookConfig, event: &WebhookEvent) -> Result<(), String> {
-    let (url, payload) = payload(target, event)?;
+async fn send(
+    client: &Client,
+    target: &WebhookConfig,
+    event: &WebhookEvent,
+) -> Result<(), DeliveryError> {
+    let (url, payload) = payload(target, event).map_err(DeliveryError::permanent)?;
     let response = client
         .post(url)
         .json(&payload)
         .send()
         .await
-        .map_err(|error| error.to_string())?;
-    if response.status().is_success() {
-        Ok(())
-    } else {
-        Err(format!("HTTP {}", response.status()))
+        .map_err(|error| DeliveryError {
+            // Only retry failures for which reqwest knows that no HTTP
+            // response was received and the connection failed before a
+            // delivery could be confirmed. Timeouts are intentionally not
+            // retried: the robot may already have accepted the request.
+            retryable_before_delivery: error.is_connect() && !error.is_timeout(),
+            message: error.to_string(),
+        })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(DeliveryError::permanent(format!("HTTP {status}")));
     }
+    if target.kind.eq_ignore_ascii_case("dingtalk") {
+        let body = response.bytes().await.map_err(|error| {
+            DeliveryError::permanent(format!("cannot read DingTalk response: {error}"))
+        })?;
+        let response: Value = serde_json::from_slice(&body).map_err(|error| {
+            DeliveryError::permanent(format!("invalid DingTalk response: {error}"))
+        })?;
+        let errcode = response.get("errcode").and_then(Value::as_i64);
+        if errcode != Some(0) {
+            let errmsg = response
+                .get("errmsg")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown DingTalk error");
+            return Err(DeliveryError::permanent(format!(
+                "DingTalk errcode {}: {errmsg}",
+                errcode
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "missing".into())
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn payload(target: &WebhookConfig, event: &WebhookEvent) -> Result<(String, Value), String> {
@@ -536,6 +884,67 @@ mod tests {
         assert!(notifier.mark_send(&target, &event).is_none());
         notifier.resolve_incident(WebhookEventKind::AccountQuotaExhausted, Some("acc_1"));
         assert!(notifier.mark_send(&target, &event).is_some());
+    }
+
+    #[tokio::test]
+    async fn persistent_incidents_survive_restart_and_target_rename() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("alert-incidents.json");
+        let original = target("dingtalk", &["account-quota-exhausted"]);
+        let mut event = WebhookEvent::new(WebhookEventKind::AccountQuotaExhausted, "title", "body");
+        event.account_id = Some("acc_1".into());
+
+        let notifier = Notifier::persistent(
+            vec![original.clone()],
+            NotifyConfig::default(),
+            1,
+            path.clone(),
+        );
+        let peer = Notifier::persistent(
+            vec![original.clone()],
+            NotifyConfig::default(),
+            1,
+            path.clone(),
+        );
+        assert!(notifier.mark_send(&original, &event).is_some());
+        assert!(peer.mark_send(&original, &event).is_none());
+        notifier.resolve_incident(WebhookEventKind::AccountQuotaExhausted, Some("acc_1"));
+        assert!(peer.mark_send(&original, &event).is_some());
+        drop(notifier);
+        drop(peer);
+
+        let mut renamed = original.clone();
+        renamed.name = "renamed-target".into();
+        let restarted = Notifier::persistent(
+            vec![renamed.clone()],
+            NotifyConfig::default(),
+            1,
+            path.clone(),
+        );
+        assert!(restarted.mark_send(&renamed, &event).is_none());
+        restarted.resolve_incident(WebhookEventKind::AccountQuotaExhausted, Some("acc_1"));
+        drop(restarted);
+
+        let recovered =
+            Notifier::persistent(vec![renamed.clone()], NotifyConfig::default(), 1, path);
+        assert!(recovered.mark_send(&renamed, &event).is_some());
+    }
+
+    #[tokio::test]
+    async fn destinations_with_different_names_share_incident_suppression() {
+        let first = target("dingtalk", &["account-quota-exhausted"]);
+        let mut second = first.clone();
+        second.name = "another-name".into();
+        let notifier = Notifier::new(
+            vec![first.clone(), second.clone()],
+            NotifyConfig::default(),
+            1,
+        );
+        let mut event = WebhookEvent::new(WebhookEventKind::AccountQuotaExhausted, "title", "body");
+        event.account_id = Some("acc_1".into());
+
+        assert!(notifier.mark_send(&first, &event).is_some());
+        assert!(notifier.mark_send(&second, &event).is_none());
     }
 
     #[test]

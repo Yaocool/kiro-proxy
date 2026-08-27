@@ -1,21 +1,21 @@
 //! 服务运行态共享句柄。
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use kproxy_core::account::Account;
+use kproxy_core::account::{Account, Usage};
 use kproxy_core::config::Config;
 use kproxy_core::paths::Paths;
 use kproxy_kiro::endpoint::EndpointOverrides;
 use kproxy_kiro::{KiroClient, KiroError, KiroResponse, ModelInfo};
 use kproxy_notify::Notifier;
 use kproxy_pool::{
-    AccountPool, RefreshError, RefreshOutcome, RefreshedCredentials, ReloadedCredentials,
-    TokenRefresher,
+    AccountCreditState, AccountPool, RefreshError, RefreshOutcome, RefreshedCredentials,
+    ReloadedCredentials, TokenRefresher,
 };
 use kproxy_store::accounts::AccountStore;
 use kproxy_store::atomic::{lock_file_exclusive, ExclusiveFileLock};
@@ -56,6 +56,19 @@ struct AdaptiveFeedbackWindow {
     attempts: usize,
     overloads: usize,
     stream_slot_wait_ms: VecDeque<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct AuthoritativeUsageObservation {
+    pub usage: Usage,
+    pub generation: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingCreditObservation {
+    generation: u64,
+    state: AccountCreditState,
+    consecutive: u8,
 }
 
 #[derive(Default)]
@@ -151,6 +164,10 @@ pub struct AppState {
     /// 启动时刻。
     pub started_at: Instant,
     config_reloaded_at: AtomicI64,
+    authoritative_usage: RwLock<HashMap<String, AuthoritativeUsageObservation>>,
+    authoritative_usage_generation: AtomicU64,
+    pending_credit_observations: Mutex<HashMap<String, PendingCreditObservation>>,
+    quota_alert_sync: tokio::sync::Mutex<()>,
     account_mutation: tokio::sync::Mutex<()>,
     config_mutation: tokio::sync::Mutex<()>,
 }
@@ -241,7 +258,12 @@ impl AppState {
         let refresher = TokenRefresher::new(current.effective_token_refresh_before_expiry())
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
         let pool = AccountPool::new(accounts.all().to_vec(), current.pool.clone());
-        let notifier = Notifier::new(current.webhook.clone(), current.notify.clone(), 1_024);
+        let notifier = Notifier::persistent(
+            current.webhook.clone(),
+            current.notify.clone(),
+            1_024,
+            paths.alert_incidents_file.clone(),
+        );
         let admission_limit = current.server.max_concurrent_requests.max(1);
         let connection_limit = current.server.max_connections.max(1);
         Ok(Self {
@@ -272,6 +294,10 @@ impl AppState {
             shutdown: CancellationToken::new(),
             started_at: Instant::now(),
             config_reloaded_at: AtomicI64::new(0),
+            authoritative_usage: RwLock::new(HashMap::new()),
+            authoritative_usage_generation: AtomicU64::new(0),
+            pending_credit_observations: Mutex::new(HashMap::new()),
+            quota_alert_sync: tokio::sync::Mutex::new(()),
             account_mutation: tokio::sync::Mutex::new(()),
             config_mutation: tokio::sync::Mutex::new(()),
         })
@@ -478,6 +504,68 @@ impl AppState {
 
     pub fn notifier(&self) -> Notifier {
         read_lock(&self.notifier).clone()
+    }
+
+    /// Records usage returned by the upstream quota endpoint. Request-side
+    /// optimistic settlement deliberately does not update this observation,
+    /// so alerts never treat a scheduling estimate as authoritative quota.
+    pub(crate) fn record_authoritative_usage(&self, account_id: &str, usage: Usage) {
+        let generation = self
+            .authoritative_usage_generation
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        write_lock(&self.authoritative_usage).insert(
+            account_id.to_owned(),
+            AuthoritativeUsageObservation { usage, generation },
+        );
+    }
+
+    pub(crate) fn authoritative_usage(
+        &self,
+        account_id: &str,
+    ) -> Option<AuthoritativeUsageObservation> {
+        read_lock(&self.authoritative_usage)
+            .get(account_id)
+            .cloned()
+    }
+
+    /// Counts distinct upstream observations of a candidate credit state.
+    /// Repeated config reloads or concurrent reconciliation of the same
+    /// generation therefore cannot prematurely confirm a recovery.
+    pub(crate) fn observe_credit_transition(
+        &self,
+        account_id: &str,
+        generation: u64,
+        state: AccountCreditState,
+    ) -> u8 {
+        let mut observations = lock(&self.pending_credit_observations);
+        let observation =
+            observations
+                .entry(account_id.to_owned())
+                .or_insert(PendingCreditObservation {
+                    generation,
+                    state,
+                    consecutive: 1,
+                });
+        if observation.generation == generation {
+            return observation.consecutive;
+        }
+        observation.consecutive = if observation.state == state {
+            observation.consecutive.saturating_add(1)
+        } else {
+            1
+        };
+        observation.generation = generation;
+        observation.state = state;
+        observation.consecutive
+    }
+
+    pub(crate) fn clear_credit_transition(&self, account_id: &str) {
+        lock(&self.pending_credit_observations).remove(account_id);
+    }
+
+    pub(crate) async fn lock_quota_alert_sync(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.quota_alert_sync.lock().await
     }
 
     pub fn refresher(&self) -> TokenRefresher {

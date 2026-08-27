@@ -17,6 +17,8 @@ pub struct Paths {
     pub daily_file: PathBuf,
     /// 累计统计文件。
     pub stats_file: PathBuf,
+    /// 持久化的告警事件去重状态。
+    pub alert_incidents_file: PathBuf,
     /// Web Search opaque replay records的本地加密密钥。
     pub web_search_replay_key_file: PathBuf,
 }
@@ -74,6 +76,7 @@ impl Paths {
             accounts_file: data_dir.join("accounts.json"),
             daily_file: data_dir.join("daily.json"),
             stats_file: data_dir.join("stats.json"),
+            alert_incidents_file: data_dir.join("alert-incidents.json"),
             web_search_replay_key_file: data_dir.join("web-search-replay.key"),
             config_dir,
             data_dir,

@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -138,18 +138,23 @@ pub fn spawn_config_watcher_with_hook(
         .unwrap_or_else(|| PathBuf::from("."));
 
     let reload_path = path.clone();
+    let reload_watch_target = watch_target.clone();
     let event_handle = handle.clone();
     let event_hook = Arc::clone(&hook);
+    let last_seen_contents = Arc::new(Mutex::new(std::fs::read(&path).ok()));
+    let event_last_seen_contents = Arc::clone(&last_seen_contents);
     let mut debouncer = new_debouncer(
         debounce,
         None,
         move |result: notify_debouncer_full::DebounceEventResult| match result {
             Ok(events) => {
-                // 监听目标是配置文件所在目录。部分平台/编辑器的原子保存只
-                // 上报目录 rename 事件而不附最终文件路径，因此目录内任一
-                // 防抖后的事件都重新读取指定配置文件。
-                if !events.is_empty() {
-                    let _outcome = apply_reload(&reload_path, &event_handle, &event_hook);
+                if events_affect_config(&events, &reload_path, &reload_watch_target) {
+                    let _outcome = apply_reload_if_contents_changed(
+                        &reload_path,
+                        &event_handle,
+                        &event_hook,
+                        &event_last_seen_contents,
+                    );
                 }
             }
             Err(errors) => {
@@ -176,7 +181,7 @@ pub fn spawn_config_watcher_with_hook(
     let poll_path = path;
     let poll_handle = handle;
     let poll_hook = hook;
-    let initial_contents = std::fs::read(&poll_path).ok();
+    let poll_last_seen_contents = Arc::clone(&last_seen_contents);
     let poll_interval = if debounce < Duration::from_millis(50) {
         Duration::from_millis(50)
     } else {
@@ -185,14 +190,14 @@ pub fn spawn_config_watcher_with_hook(
     let poller = std::thread::Builder::new()
         .name("kproxy-config-poller".into())
         .spawn(move || {
-            let mut previous = initial_contents;
             while !poller_stop.load(Ordering::Acquire) {
                 std::thread::sleep(poll_interval);
-                let current = std::fs::read(&poll_path).ok();
-                if current != previous {
-                    previous = current;
-                    let _outcome = apply_reload(&poll_path, &poll_handle, &poll_hook);
-                }
+                let _outcome = apply_reload_if_contents_changed(
+                    &poll_path,
+                    &poll_handle,
+                    &poll_hook,
+                    &poll_last_seen_contents,
+                );
             }
         })
         .context("spawn config polling fallback")?;
@@ -202,6 +207,39 @@ pub fn spawn_config_watcher_with_hook(
         poll_stop,
         _poller: poller,
     })
+}
+
+fn events_affect_config(
+    events: &[notify_debouncer_full::DebouncedEvent],
+    config_path: &Path,
+    watch_target: &Path,
+) -> bool {
+    events.iter().any(|event| {
+        event.paths.is_empty()
+            || event
+                .paths
+                .iter()
+                .any(|path| path == config_path || path == watch_target)
+    })
+}
+
+fn apply_reload_if_contents_changed(
+    path: &Path,
+    handle: &ConfigHandle,
+    hook: &ConfigApplyHook,
+    last_seen_contents: &Mutex<Option<Vec<u8>>>,
+) -> ReloadOutcome {
+    let current = std::fs::read(path).ok();
+    {
+        let mut last_seen = last_seen_contents
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if *last_seen == current {
+            return ReloadOutcome::default();
+        }
+        *last_seen = current;
+    }
+    apply_reload(path, handle, hook)
 }
 
 fn apply_reload(path: &Path, handle: &ConfigHandle, hook: &ConfigApplyHook) -> ReloadOutcome {
@@ -386,5 +424,43 @@ mod tests {
             .expect("break");
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(handle.current().features.enable_prompt_cache);
+    }
+
+    #[tokio::test]
+    async fn watcher_ignores_sibling_files_and_unchanged_config_contents() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("config.toml");
+        let initial = "[server]\nport = 5580\n";
+        tokio::fs::write(&path, initial).await.expect("seed");
+        let handle = ConfigHandle::new(load_config(&path).await.expect("load"));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let hook_calls = Arc::clone(&calls);
+        let hook: ConfigApplyHook = Arc::new(move |_| {
+            hook_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        });
+        let _watcher =
+            spawn_config_watcher_with_hook(path.clone(), handle, Duration::from_millis(50), hook)
+                .expect("watcher");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        tokio::fs::write(directory.path().join("accounts.json"), "[]")
+            .await
+            .expect("sibling edit");
+        tokio::fs::write(&path, initial)
+            .await
+            .expect("unchanged config edit");
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(calls.load(Ordering::Relaxed), 0);
+
+        tokio::fs::write(&path, "[server]\nport = 6001\n")
+            .await
+            .expect("config edit");
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while calls.load(Ordering::Relaxed) == 0 {
+            assert!(std::time::Instant::now() < deadline, "reload timeout");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
     }
 }
