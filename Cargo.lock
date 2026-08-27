@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "kproxy"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "clap",
@@ -1092,7 +1092,7 @@ dependencies = [
 
 [[package]]
 name = "kproxy-core"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "rand 0.8.5",
  "serde",
@@ -1103,7 +1103,7 @@ dependencies = [
 
 [[package]]
 name = "kproxy-ipc"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "kproxy-core",
  "serde",
@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "kproxy-kiro"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -1148,7 +1148,7 @@ dependencies = [
 
 [[package]]
 name = "kproxy-notify"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "base64 0.22.1",
  "hmac",
@@ -1166,7 +1166,7 @@ dependencies = [
 
 [[package]]
 name = "kproxy-pool"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "indexmap",
  "kproxy-core",
@@ -1186,7 +1186,7 @@ dependencies = [
 
 [[package]]
 name = "kproxy-store"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -1209,7 +1209,7 @@ dependencies = [
 
 [[package]]
 name = "kproxy-translate"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "base64 0.22.1",
  "fancy-regex",
@@ -1230,7 +1230,7 @@ dependencies = [
 
 [[package]]
 name = "kproxyd"
-version = "0.2.2"
+version = "0.2.3"
 dependencies = [
  "anyhow",
  "async-stream",
