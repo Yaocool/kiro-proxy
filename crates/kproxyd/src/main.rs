@@ -87,6 +87,7 @@ async fn main() -> Result<()> {
     let admin = admin::server::serve(Arc::clone(&state), socket_path, shutdown.clone());
     let result = admin.await;
     shutdown.cancel();
+    tasks::flush_before_shutdown(&state).await;
     result
 }
 

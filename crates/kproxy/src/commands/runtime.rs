@@ -634,10 +634,11 @@ pub async fn show_stats(
     client: &mut AdminClient,
     detail: bool,
     recent: Option<usize>,
-    since_secs: Option<u64>,
+    range: (Option<u64>, Option<i64>, Option<i64>),
     by: Option<&str>,
     json: bool,
 ) -> Result<()> {
+    let (since_secs, start_secs, end_secs) = range;
     let effective_recent = detail.then_some(recent.unwrap_or(20));
     let value: serde_json::Value = client
         .call(
@@ -646,6 +647,8 @@ pub async fn show_stats(
                 "detail":detail,
                 "recent":effective_recent,
                 "since_secs":since_secs,
+                "start_secs":start_secs,
+                "end_secs":end_secs,
                 "by":by,
             }),
         )
@@ -656,6 +659,8 @@ pub async fn show_stats(
     if value.get("by_apikey").is_some() {
         return print_stats_by_apikey(&value["by_apikey"]);
     }
+
+    print_stats_range(&value);
 
     let summary = if detail {
         &value["stats"]["total"]
@@ -671,6 +676,43 @@ pub async fn show_stats(
         print_stats_group(dimension, &value["grouped"])?;
     }
     print_recent_stats_requests(&value["stats"]["recent_requests"])
+}
+
+fn print_stats_range(value: &serde_json::Value) {
+    let range = &value["range"];
+    let start = range["start"].as_i64();
+    let end = range["end"].as_i64();
+    if start.is_none() && end.is_none() {
+        println!("范围    持久化累计（跨 daemon 重启）");
+    } else {
+        println!(
+            "范围    持久化 {} ～ {}（分钟级聚合）",
+            start.map_or_else(|| "最早可用".into(), format_timestamp),
+            end.map_or_else(|| "现在".into(), format_timestamp)
+        );
+    }
+    if range["truncated"].as_bool().unwrap_or(false) {
+        if range["prefix_truncated"].as_bool().unwrap_or(false) {
+            let available = range["available_start"]
+                .as_i64()
+                .map_or_else(|| "未知".into(), format_timestamp);
+            println!("提示    指定范围早于可用时间序列，结果从 {available} 起统计");
+        }
+        if let Some(gaps) = range["missing_ranges"].as_array() {
+            for gap in gaps.iter().take(3) {
+                let start = gap["start"]
+                    .as_i64()
+                    .map_or_else(|| "未知".into(), format_timestamp);
+                let end = gap["end"]
+                    .as_i64()
+                    .map_or_else(|| "未知".into(), format_timestamp);
+                println!("提示    {start} ～ {end} 的历史分片不可用，结果不包含该时段");
+            }
+            if gaps.len() > 3 {
+                println!("提示    另有 {} 个历史缺口未逐项展示", gaps.len() - 3);
+            }
+        }
+    }
 }
 
 fn print_stats_summary(summary: &serde_json::Value, latency: &serde_json::Value) {
@@ -700,6 +742,10 @@ fn print_stats_summary(summary: &serde_json::Value, latency: &serde_json::Value)
         vec![
             "Credits".into(),
             format_credits(summary["credits"].as_f64().unwrap_or(0.0)),
+        ],
+        vec![
+            "平均延迟".into(),
+            format!("{} ms", latency["average_ms"].as_u64().unwrap_or(0)),
         ],
         vec![
             "延迟 P50/P95/P99".into(),
@@ -927,6 +973,122 @@ pub fn parse_duration(value: &str) -> Result<u64> {
     amount
         .checked_mul(multiplier)
         .ok_or_else(|| anyhow!("时间窗口过大: {value}"))
+}
+
+/// Parse Unix seconds or an RFC 3339 timestamp with an explicit timezone.
+pub fn parse_timestamp(value: &str) -> Result<i64> {
+    let value = value.trim();
+    if let Ok(timestamp) = value.parse::<i64>() {
+        return Ok(timestamp);
+    }
+    let (date, time_and_zone) = value
+        .split_once('T')
+        .or_else(|| value.split_once(' '))
+        .ok_or_else(|| {
+            anyhow!(
+                "无效时间 {value}；请使用 Unix 秒或带时区的 RFC 3339，例如 2026-08-27T10:00:00+08:00"
+            )
+        })?;
+    let (time, offset_seconds) = if let Some(time) = time_and_zone
+        .strip_suffix('Z')
+        .or_else(|| time_and_zone.strip_suffix('z'))
+    {
+        (time, 0i64)
+    } else {
+        let offset_index = time_and_zone
+            .char_indices()
+            .rfind(|(_, character)| matches!(character, '+' | '-'))
+            .map(|(index, _)| index)
+            .ok_or_else(|| anyhow!("时间必须包含时区：{value}；例如使用 Z 或 +08:00"))?;
+        let (time, offset) = time_and_zone.split_at(offset_index);
+        (time, parse_timezone_offset(offset, value)?)
+    };
+    let (year, month, day) = parse_date(date, value)?;
+    let (hour, minute, second) = parse_clock(time, value)?;
+    let days = days_from_civil(year, month, day);
+    days.checked_mul(86_400)
+        .and_then(|timestamp| timestamp.checked_add(i64::from(hour) * 3_600))
+        .and_then(|timestamp| timestamp.checked_add(i64::from(minute) * 60))
+        .and_then(|timestamp| timestamp.checked_add(i64::from(second)))
+        .and_then(|timestamp| timestamp.checked_sub(offset_seconds))
+        .ok_or_else(|| anyhow!("时间超出支持范围: {value}"))
+}
+
+fn parse_date(value: &str, original: &str) -> Result<(i64, u32, u32)> {
+    let mut parts = value.split('-');
+    let year = parts.next().and_then(|value| value.parse::<i64>().ok());
+    let month = parts.next().and_then(|value| value.parse::<u32>().ok());
+    let day = parts.next().and_then(|value| value.parse::<u32>().ok());
+    if parts.next().is_some() {
+        return Err(anyhow!("无效日期: {original}"));
+    }
+    let (Some(year), Some(month), Some(day)) = (year, month, day) else {
+        return Err(anyhow!("无效日期: {original}"));
+    };
+    let maximum_day = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if is_leap_year(year) => 29,
+        2 => 28,
+        _ => return Err(anyhow!("无效月份: {original}")),
+    };
+    if day == 0 || day > maximum_day {
+        return Err(anyhow!("无效日期: {original}"));
+    }
+    Ok((year, month, day))
+}
+
+fn parse_clock(value: &str, original: &str) -> Result<(u32, u32, u32)> {
+    let value = value.split('.').next().unwrap_or(value);
+    let mut parts = value.split(':');
+    let hour = parts.next().and_then(|value| value.parse::<u32>().ok());
+    let minute = parts.next().and_then(|value| value.parse::<u32>().ok());
+    let second = parts.next().and_then(|value| value.parse::<u32>().ok());
+    if parts.next().is_some() {
+        return Err(anyhow!("无效时间: {original}"));
+    }
+    let (Some(hour), Some(minute), Some(second)) = (hour, minute, second) else {
+        return Err(anyhow!("无效时间: {original}"));
+    };
+    if hour > 23 || minute > 59 || second > 59 {
+        return Err(anyhow!("无效时间: {original}"));
+    }
+    Ok((hour, minute, second))
+}
+
+fn parse_timezone_offset(value: &str, original: &str) -> Result<i64> {
+    let sign = match value.as_bytes().first().copied() {
+        Some(b'+') => 1i64,
+        Some(b'-') => -1i64,
+        _ => return Err(anyhow!("无效时间时区: {original}")),
+    };
+    let Some((hours, minutes)) = value[1..].split_once(':') else {
+        return Err(anyhow!("无效时间时区: {original}"));
+    };
+    let hours = hours
+        .parse::<u32>()
+        .map_err(|_| anyhow!("无效时间时区: {original}"))?;
+    let minutes = minutes
+        .parse::<u32>()
+        .map_err(|_| anyhow!("无效时间时区: {original}"))?;
+    if hours > 23 || minutes > 59 {
+        return Err(anyhow!("无效时间时区: {original}"));
+    }
+    Ok(sign * (i64::from(hours) * 3_600 + i64::from(minutes) * 60))
+}
+
+fn is_leap_year(year: i64) -> bool {
+    (year % 4 == 0 && year % 100 != 0) || year % 400 == 0
+}
+
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year.rem_euclid(400);
+    let month_prime = i64::from(month) + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + i64::from(day) - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
 }
 
 pub async fn show_logs(
@@ -2975,7 +3137,7 @@ pub fn print_topic(topic: Option<&str>) -> Result<()> {
     };
     let text = match topic {
         "status" => {
-            "`kproxy status` 展示 daemon 版本、代理服务、账号池、并发、统计和配置重载状态；`--watch` 每 2 秒刷新。"
+            "`kproxy status` 展示 daemon 版本、代理服务、账号池和本次启动后的请求统计；支持 `--since` 或 `--start/--end`，`--watch` 每 2 秒刷新。"
         }
         "health" => {
             "`kproxy health` 检查 daemon 管理面是否可用，供容器和 systemd 健康检查使用；账号或代理服务为空不会让该检查失败。"
@@ -3018,7 +3180,7 @@ pub fn print_topic(topic: Option<&str>) -> Result<()> {
             "`kproxy tasks` 查看 token 刷新、状态探测、统计持久化、模型缓存等周期任务；`kproxy tasks run <name>` 立即执行。"
         }
         "stats" => {
-            "`kproxy stats [--since 1h]` 默认只显示请求、成功率、tokens、credits 和延迟汇总。`--detail` 显示最近请求，并可用 `--by model|account|apikey|endpoint` 分组。"
+            "`kproxy stats` 默认显示跨 daemon 重启的持久化累计统计；可用 `--since 1h` 或带时区的 `--start/--end` 查询时间段。`--detail` 显示最近请求，并可用 `--by model|account|endpoint` 分组。"
         }
         "logs" => {
             "`kproxy logs show` 查看内存中的结构化请求日志，`follow` 持续跟踪；支持 `--level`、`--account` 和 `--tail`。`kproxy logs files [--level error]` 列出实际日志文件，`logs path` 显示目录、基础路径和当前日志配置。旧的 `kproxy logs --tail ...` 与 `kproxy logs -f` 继续兼容。"
@@ -3354,5 +3516,25 @@ mod tests {
             "model_mapping_rule": "force-opus"
         });
         assert_eq!(log_model_route(&forced).mapping_rule, Some("force-opus"));
+    }
+
+    #[test]
+    fn timestamps_accept_unix_and_timezone_aware_rfc3339() {
+        assert_eq!(parse_timestamp("0").expect("unix epoch"), 0);
+        assert_eq!(
+            parse_timestamp("2026-08-27T10:00:00+08:00").expect("China time"),
+            parse_timestamp("2026-08-27T02:00:00Z").expect("UTC time")
+        );
+        assert_eq!(
+            parse_timestamp("2024-02-29T00:00:00Z").expect("leap day"),
+            1_709_164_800
+        );
+    }
+
+    #[test]
+    fn timestamps_reject_ambiguous_or_invalid_values() {
+        assert!(parse_timestamp("2026-08-27T10:00:00").is_err());
+        assert!(parse_timestamp("2026-02-29T10:00:00Z").is_err());
+        assert!(parse_timestamp("2026-08-27T25:00:00+08:00").is_err());
     }
 }

@@ -1184,7 +1184,7 @@ mod tests {
             .as_u64()
             .is_some_and(|tokens| tokens > 0));
 
-        let invalid = router(state)
+        let invalid = router(Arc::clone(&state))
             .oneshot(
                 Request::post("/v1/messages/count_tokens")
                     .header(header::USER_AGENT, "claude-cli/1.0 (external, test)")
@@ -1195,6 +1195,10 @@ mod tests {
             .await
             .expect("invalid");
         assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        let stats = state.stats.snapshot(None);
+        assert_eq!(stats.total.requests, 2);
+        assert_eq!(stats.total.successes, 1);
+        assert_eq!(stats.total.failures, 1);
     }
 
     #[tokio::test]

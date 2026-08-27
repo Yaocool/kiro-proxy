@@ -342,15 +342,18 @@ kproxy logs files --level error
 ```bash
 cargo run -p kproxy -- logs show --tail 100
 cargo run -p kproxy -- logs follow --level warn
+cargo run -p kproxy -- status --since 30m
 cargo run -p kproxy -- stats --since 1h
+cargo run -p kproxy -- stats --start 2026-08-27T10:00:00+08:00 --end 2026-08-27T12:00:00+08:00
 cargo run -p kproxy -- stats --detail --since 1h --by endpoint
 ```
 
 旧的 `kproxy logs --tail ...` 与 `kproxy logs -f` 用法继续兼容。
 
-`kproxy stats` 用于查看请求量、成功率、Tokens、Credits 和延迟等聚合运维指标。默认只显示
-紧凑汇总，`--detail` 才显示最近请求和按 model/account/apikey/endpoint 的分组统计；逐条
-故障信息仍应使用 `kproxy logs` 和 Trace ID。
+`kproxy status` 显示本次 daemon 启动后的请求统计，`kproxy stats` 默认显示跨重启持久化的
+累计统计。两者都支持相对窗口 `--since`，或使用带时区的 `--start/--end` 查询起止时间；
+聚合时间分辨率为一分钟。`kproxy stats --detail` 才显示最近请求和按
+model/account/endpoint 的分组统计；逐条故障信息仍应使用 `kproxy logs` 和 Trace ID。
 
 需要更多细节时，将 `RUST_LOG` 或 `log.level` 调整为 `debug` 或 `trace`。日志不会记录
 提示词、生成的回复正文或 API Key 值。

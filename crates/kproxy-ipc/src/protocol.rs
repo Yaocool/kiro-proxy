@@ -295,6 +295,21 @@ pub struct StatusResult {
     /// 已记录 credits。
     #[serde(default)]
     pub credits: f64,
+    /// 统计作用域；`session` 表示当前 daemon 启动后。
+    #[serde(default)]
+    pub stats_scope: String,
+    /// 当前统计范围的有效起点（Unix 秒，含）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats_start: Option<i64>,
+    /// 当前统计范围的有效终点（Unix 秒，含）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stats_end: Option<i64>,
+    /// 聚合统计的时间分辨率。
+    #[serde(default)]
+    pub stats_resolution_secs: u64,
+    /// 请求范围是否早于当前可查询的时间序列历史。
+    #[serde(default)]
+    pub stats_truncated: bool,
     #[serde(default)]
     pub daily_credit_day: String,
     #[serde(default)]
@@ -784,6 +799,11 @@ mod tests {
             success_rate: 0.0,
             average_latency_ms: 0,
             credits: 0.0,
+            stats_scope: "session".into(),
+            stats_start: Some(1_700_000_000),
+            stats_end: Some(1_700_000_005),
+            stats_resolution_secs: 60,
+            stats_truncated: false,
             daily_credit_day: "2026-08-06".into(),
             daily_credit_used: 0.0,
             daily_credit_reserved: 0.0,

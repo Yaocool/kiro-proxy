@@ -1,16 +1,16 @@
 //! Bounded request statistics and model cache.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use kproxy_kiro::ModelInfo;
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
 const MAX_DIMENSION_KEYS: usize = 1_024;
-const MAX_BUCKET_DIMENSION_KEYS: usize = 64;
+const MAX_BUCKET_DIMENSION_KEYS: usize = MAX_DIMENSION_KEYS;
 const MAX_BUCKET_LATENCIES: usize = 256;
-const MAX_MINUTE_BUCKETS: usize = 7 * 24 * 60;
 const OTHER_DIMENSION: &str = "other";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -109,7 +109,7 @@ pub struct RequestLog {
     pub diagnostics: RequestDiagnostics,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Counter {
     pub requests: u64,
     pub successes: u64,
@@ -117,6 +117,12 @@ pub struct Counter {
     pub credits: f64,
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Sum of request durations used for an exact average over the selected range.
+    #[serde(default)]
+    pub duration_ms: u64,
+    /// Number of requests represented by `duration_ms` (zero for legacy state).
+    #[serde(default)]
+    pub duration_samples: u64,
 }
 
 impl Counter {
@@ -127,6 +133,8 @@ impl Counter {
         self.credits += request.credits;
         self.input_tokens += request.input_tokens;
         self.output_tokens += request.output_tokens;
+        self.duration_ms = self.duration_ms.saturating_add(request.duration_ms);
+        self.duration_samples = self.duration_samples.saturating_add(1);
     }
 
     fn merge(&mut self, other: &Self) {
@@ -136,10 +144,12 @@ impl Counter {
         self.credits += other.credits;
         self.input_tokens += other.input_tokens;
         self.output_tokens += other.output_tokens;
+        self.duration_ms = self.duration_ms.saturating_add(other.duration_ms);
+        self.duration_samples = self.duration_samples.saturating_add(other.duration_samples);
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WindowBucket {
     pub total: Counter,
     pub by_account: HashMap<String, Counter>,
@@ -176,7 +186,7 @@ impl WindowBucket {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyStats {
     pub total: Counter,
     pub by_account: HashMap<String, Counter>,
@@ -186,6 +196,44 @@ pub struct ProxyStats {
     pub latencies_ms: VecDeque<u64>,
     #[serde(default)]
     pub minute_buckets: BTreeMap<i64, WindowBucket>,
+    /// Earliest minute for which time-window aggregates are available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub history_started_at: Option<i64>,
+    /// Whether history before `history_started_at` is known to be complete.
+    /// Legacy files default to false because older versions evicted buckets.
+    /// Known gaps after that point are tracked separately in `history_gaps`.
+    #[serde(default)]
+    pub history_complete: bool,
+    /// Known holes in the retained time series, for example quarantined shards.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history_gaps: Vec<HistoryGap>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryGap {
+    /// Inclusive Unix-second start of the unavailable interval.
+    pub start: i64,
+    /// Inclusive Unix-second end of the unavailable interval.
+    pub end: i64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+
+impl Default for ProxyStats {
+    fn default() -> Self {
+        Self {
+            total: Counter::default(),
+            by_account: HashMap::new(),
+            by_endpoint: HashMap::new(),
+            by_model: HashMap::new(),
+            recent_requests: VecDeque::new(),
+            latencies_ms: VecDeque::new(),
+            minute_buckets: BTreeMap::new(),
+            history_started_at: None,
+            history_complete: true,
+            history_gaps: Vec::new(),
+        }
+    }
 }
 
 impl ProxyStats {
@@ -201,7 +249,12 @@ impl ProxyStats {
                 bucket.latencies_ms.pop_front();
             }
         }
-        bound_minute_buckets(&mut self.minute_buckets);
+        if self.history_started_at.is_none() {
+            self.history_started_at = self
+                .minute_buckets
+                .first_key_value()
+                .map(|(minute, _)| minute.saturating_mul(60));
+        }
     }
 
     pub fn percentiles(&self) -> (u64, u64, u64) {
@@ -217,13 +270,45 @@ impl ProxyStats {
 
 pub struct StatsStore {
     path: PathBuf,
-    state: Mutex<ProxyStats>,
+    history_dir: PathBuf,
+    state: Mutex<StatsRuntimeState>,
+    persist_lock: tokio::sync::Mutex<()>,
+    session_started_at: i64,
     sender: tokio::sync::broadcast::Sender<RequestLog>,
 }
 
+#[derive(Default)]
+struct StatsRuntimeState {
+    persistent: ProxyStats,
+    recent_requests: VecDeque<Arc<RequestLog>>,
+    /// Absolute minute buckets for the current UTC hour and any checkpoint
+    /// minutes that have not yet been migrated to hourly history files.
+    active_minutes: BTreeMap<i64, Arc<WindowBucket>>,
+    /// Minutes whose absolute buckets have not completed the checkpoint ->
+    /// history-shard -> compact-checkpoint transaction.
+    dirty_minutes: BTreeSet<i64>,
+    session: SessionStats,
+}
+
+#[derive(Default)]
+struct SessionStats {
+    total: Counter,
+    minute_buckets: BTreeMap<i64, Counter>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct HistoryDay {
+    #[serde(default)]
+    version: u32,
+    #[serde(default)]
+    minutes: BTreeMap<i64, WindowBucket>,
+}
+
+const HISTORY_VERSION: u32 = 1;
+
 impl StatsStore {
     pub async fn load(path: &Path) -> anyhow::Result<Self> {
-        let mut state = match tokio::fs::read_to_string(path).await {
+        let mut persistent = match tokio::fs::read_to_string(path).await {
             // Bootstrap and older releases used `{}` as the canonical empty
             // statistics document. Keep that representation compatible while
             // still rejecting partially corrupt/non-conforming objects.
@@ -233,11 +318,74 @@ impl StatsStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProxyStats::default(),
             Err(error) => return Err(error.into()),
         };
-        state.bound_dimensions();
+        persistent.bound_dimensions();
+        let recent_requests = std::mem::take(&mut persistent.recent_requests)
+            .into_iter()
+            .map(Arc::new)
+            .collect::<VecDeque<_>>();
+        let history_dir = history_dir_for(path);
+        let legacy_minutes = std::mem::take(&mut persistent.minute_buckets);
+        let now = crate::now_secs();
+        let current_minute = now.div_euclid(60);
+        let current_day = utc_day_from_minute(current_minute);
+        let current_day_start = now.div_euclid(86_400).saturating_mul(86_400);
+        let current_day_path = history_dir.join(format!("{current_day}.json"));
+        let (current_history, daily_gap) = read_current_history_shard(
+            &current_day_path,
+            current_day_start,
+            current_day_start.saturating_add(86_399),
+        )
+        .await?;
+        if let Some(gap) = daily_gap {
+            insert_history_gap(&mut persistent, gap);
+        }
+        let current_hour = utc_hour_from_minute(current_minute);
+        let current_hour_start = now.div_euclid(3_600).saturating_mul(3_600);
+        let current_hour_path = history_dir.join(format!("{current_hour}.json"));
+        let (hour_history, hour_gap) = read_current_history_shard(
+            &current_hour_path,
+            current_hour_start,
+            current_hour_start.saturating_add(3_599),
+        )
+        .await?;
+        if let Some(gap) = hour_gap {
+            insert_history_gap(&mut persistent, gap);
+        }
+        let current_hour_minute = current_minute.div_euclid(60);
+        let mut active_minutes = current_history
+            .minutes
+            .into_iter()
+            .filter(|(minute, _)| minute.div_euclid(60) == current_hour_minute)
+            .map(|(minute, bucket)| (minute, Arc::new(bucket)))
+            .collect::<BTreeMap<_, _>>();
+        active_minutes.extend(
+            hour_history
+                .minutes
+                .into_iter()
+                .map(|(minute, bucket)| (minute, Arc::new(bucket))),
+        );
+        // A legacy stats.json is authoritative for the minutes it contains.
+        // Replacing instead of merging makes migration idempotent after a
+        // partially completed persistence cycle.
+        let dirty_minutes = legacy_minutes.keys().copied().collect();
+        active_minutes.extend(
+            legacy_minutes
+                .into_iter()
+                .map(|(minute, bucket)| (minute, Arc::new(bucket))),
+        );
         let (sender, _) = tokio::sync::broadcast::channel(1_024);
         Ok(Self {
             path: path.into(),
-            state: Mutex::new(state),
+            history_dir,
+            state: Mutex::new(StatsRuntimeState {
+                persistent,
+                recent_requests,
+                active_minutes,
+                dirty_minutes,
+                session: SessionStats::default(),
+            }),
+            persist_lock: tokio::sync::Mutex::new(()),
+            session_started_at: crate::now_secs(),
             sender,
         })
     }
@@ -246,84 +394,278 @@ impl StatsStore {
         let (sender, _) = tokio::sync::broadcast::channel(1_024);
         Self {
             path: path.into(),
-            state: Mutex::new(ProxyStats::default()),
+            history_dir: history_dir_for(path),
+            state: Mutex::new(StatsRuntimeState::default()),
+            persist_lock: tokio::sync::Mutex::new(()),
+            session_started_at: crate::now_secs(),
             sender,
         }
     }
 
     pub fn record(&self, request: RequestLog) {
         let notification = request.clone();
+        let request = Arc::new(request);
         let mut state = lock(&self.state);
-        state.total.record(&request);
-        record_dimension(&mut state.by_account, &request.account_id, &request);
-        record_dimension(&mut state.by_endpoint, &request.endpoint, &request);
-        record_dimension(&mut state.by_model, &request.model, &request);
-        state.latencies_ms.push_back(request.duration_ms);
+        record_persistent(&mut state.persistent, &request);
         let minute = request.timestamp.div_euclid(60);
+        Arc::make_mut(
+            state
+                .active_minutes
+                .entry(minute)
+                .or_insert_with(|| Arc::new(WindowBucket::default())),
+        )
+        .record(&request);
+        state.dirty_minutes.insert(minute);
+        state.session.total.record(&request);
         state
+            .session
             .minute_buckets
             .entry(minute)
             .or_default()
             .record(&request);
-        bound_minute_buckets(&mut state.minute_buckets);
-        state.recent_requests.push_back(request);
+        state.recent_requests.push_back(Arc::clone(&request));
         while state.recent_requests.len() > 1_000 {
             state.recent_requests.pop_front();
-        }
-        while state.latencies_ms.len() > 10_000 {
-            state.latencies_ms.pop_front();
         }
         drop(state);
         let _result = self.sender.send(notification);
     }
 
+    pub fn session_started_at(&self) -> i64 {
+        self.session_started_at
+    }
+
     pub fn snapshot(&self, recent: Option<usize>) -> ProxyStats {
-        let mut output = lock(&self.state).clone();
-        if let Some(maximum) = recent {
-            while output.recent_requests.len() > maximum {
-                output.recent_requests.pop_front();
-            }
-        }
+        let (mut output, active_minutes, recent_requests) = {
+            let state = lock(&self.state);
+            (
+                state.persistent.clone(),
+                state.active_minutes.clone(),
+                recent_refs(&state.recent_requests, recent),
+            )
+        };
+        output.minute_buckets = active_minutes
+            .into_iter()
+            .map(|(minute, bucket)| (minute, (*bucket).clone()))
+            .collect();
+        output.recent_requests = materialize_recent(&recent_requests);
         output
     }
 
-    pub fn window(&self, since: Option<i64>, recent: Option<usize>) -> ProxyStats {
-        if since.is_none() {
-            return self.snapshot(recent);
-        }
-        let cutoff = since.unwrap_or(i64::MIN);
-        let state = lock(&self.state);
-        let mut output = ProxyStats::default();
-        for bucket in state
-            .minute_buckets
-            .range(cutoff.div_euclid(60)..)
-            .map(|(_, bucket)| bucket)
-        {
-            output.total.merge(&bucket.total);
-            merge_dimensions(&mut output.by_account, &bucket.by_account);
-            merge_dimensions(&mut output.by_endpoint, &bucket.by_endpoint);
-            merge_dimensions(&mut output.by_model, &bucket.by_model);
-            output
+    /// A compact persisted snapshot that excludes the retained time-series buckets.
+    pub fn summary_snapshot(&self, recent: Option<usize>) -> ProxyStats {
+        let (mut output, recent_requests) = {
+            let state = lock(&self.state);
+            (
+                compact_snapshot(&state.persistent),
+                recent_refs(&state.recent_requests, recent),
+            )
+        };
+        output.recent_requests = materialize_recent(&recent_requests);
+        output
+    }
+
+    /// Returns cumulative latency percentiles without cloning dimension maps
+    /// or the recent request ring during the periodic persistence task.
+    pub fn latency_percentiles(&self) -> (u64, u64, u64) {
+        let mut values = {
+            let state = lock(&self.state);
+            state
+                .persistent
                 .latencies_ms
-                .extend(bucket.latencies_ms.iter().copied());
+                .iter()
+                .copied()
+                .collect::<Vec<_>>()
+        };
+        values.sort_unstable();
+        (
+            percentile(&values, 0.50),
+            percentile(&values, 0.95),
+            percentile(&values, 0.99),
+        )
+    }
+
+    #[cfg(test)]
+    pub async fn window(
+        &self,
+        since: Option<i64>,
+        recent: Option<usize>,
+    ) -> anyhow::Result<ProxyStats> {
+        self.window_between(since, None, recent).await
+    }
+
+    /// Returns persisted statistics in the inclusive Unix-second range.
+    ///
+    /// Aggregates use minute buckets, while recent request details are filtered
+    /// at their exact timestamps.
+    pub async fn window_between(
+        &self,
+        start: Option<i64>,
+        end: Option<i64>,
+        recent: Option<usize>,
+    ) -> anyhow::Result<ProxyStats> {
+        if start.is_none() && end.is_none() {
+            return Ok(self.summary_snapshot(recent));
         }
-        output.recent_requests = state
-            .recent_requests
-            .iter()
-            .filter(|request| request.timestamp >= cutoff)
-            .cloned()
-            .collect();
-        if let Some(maximum) = recent {
-            while output.recent_requests.len() > maximum {
-                output.recent_requests.pop_front();
+
+        let (active_minutes, recent_requests, history_started_at, history_complete, history_gaps) = {
+            let state = lock(&self.state);
+            (
+                active_buckets_between(&state.active_minutes, start, end),
+                recent_between(&state.recent_requests, start, end, recent),
+                state.persistent.history_started_at,
+                state.persistent.history_complete && state.persistent.history_gaps.is_empty(),
+                state.persistent.history_gaps.clone(),
+            )
+        };
+        let active_keys = active_minutes.keys().copied().collect::<BTreeSet<_>>();
+        let mut output = read_history_between(
+            &self.history_dir,
+            start,
+            end,
+            &active_keys,
+            history_started_at,
+            history_complete,
+            history_gaps,
+        )
+        .await?;
+        if !output.history_gaps.is_empty() {
+            let mut state = lock(&self.state);
+            for gap in output.history_gaps.iter().cloned() {
+                insert_history_gap(&mut state.persistent, gap);
             }
         }
-        output
+        tokio::task::spawn_blocking(move || {
+            for bucket in active_minutes.values() {
+                merge_bucket(&mut output, bucket);
+            }
+            output.recent_requests = materialize_recent(&recent_requests);
+            output
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("join statistics aggregator: {error}"))
+    }
+
+    /// Returns statistics recorded by the current daemon process only.
+    pub fn session_window(
+        &self,
+        start: Option<i64>,
+        end: Option<i64>,
+        _recent: Option<usize>,
+    ) -> ProxyStats {
+        let state = lock(&self.state);
+        if start.is_none() && end.is_none() {
+            return ProxyStats {
+                total: state.session.total.clone(),
+                history_started_at: Some(self.session_started_at),
+                ..ProxyStats::default()
+            };
+        }
+        let mut total = Counter::default();
+        if !start.zip(end).is_some_and(|(start, end)| start > end) {
+            let start_minute = start.unwrap_or(i64::MIN).div_euclid(60);
+            let end_minute = end.unwrap_or(i64::MAX).div_euclid(60);
+            for counter in state
+                .session
+                .minute_buckets
+                .range(start_minute..=end_minute)
+                .map(|(_, counter)| counter)
+            {
+                total.merge(counter);
+            }
+        }
+        ProxyStats {
+            total,
+            history_started_at: Some(self.session_started_at),
+            ..ProxyStats::default()
+        }
+    }
+
+    pub fn persistent_history_started_at(&self) -> Option<i64> {
+        lock(&self.state).persistent.history_started_at
+    }
+
+    #[cfg(test)]
+    pub fn persistent_history_complete(&self) -> bool {
+        let state = lock(&self.state);
+        state.persistent.history_complete && state.persistent.history_gaps.is_empty()
+    }
+
+    pub fn persistent_history_prefix_complete(&self) -> bool {
+        lock(&self.state).persistent.history_complete
+    }
+
+    #[cfg(test)]
+    pub fn persistent_history_gaps(&self) -> Vec<HistoryGap> {
+        lock(&self.state).persistent.history_gaps.clone()
+    }
+
+    #[cfg(test)]
+    pub fn session_snapshot(&self) -> ProxyStats {
+        let state = lock(&self.state);
+        ProxyStats {
+            total: state.session.total.clone(),
+            history_started_at: Some(self.session_started_at),
+            ..ProxyStats::default()
+        }
     }
 
     pub async fn persist(&self) -> anyhow::Result<()> {
-        let snapshot = lock(&self.state).clone();
-        kproxy_store::atomic::write_json_atomically(&self.path, &snapshot, Some(0o600)).await
+        // Manual task runs and the periodic worker may overlap. Serialize the
+        // complete read-modify-write transaction so an older snapshot can
+        // never overwrite a newer hourly shard or cumulative summary.
+        let _persist_guard = self.persist_lock.lock().await;
+        let (mut snapshot, recent_requests, dirty_minutes) = {
+            let state = lock(&self.state);
+            (
+                compact_snapshot(&state.persistent),
+                state.recent_requests.clone(),
+                state
+                    .dirty_minutes
+                    .iter()
+                    .filter_map(|minute| {
+                        state
+                            .active_minutes
+                            .get(minute)
+                            .map(|bucket| (*minute, Arc::clone(bucket)))
+                    })
+                    .collect::<BTreeMap<_, _>>(),
+            )
+        };
+        // Deep-cloning recent diagnostic strings happens after releasing the
+        // request accounting lock.
+        snapshot.recent_requests = materialize_recent(&recent_requests);
+        if dirty_minutes.is_empty() {
+            write_json_off_thread(&self.path, snapshot).await?;
+        } else {
+            // stats.json first becomes a self-contained recovery checkpoint.
+            // If any later write or the process fails, startup reloads these
+            // absolute dirty buckets and idempotently finishes the transaction.
+            let (checkpoint, compact) = serialize_stats_documents(snapshot, &dirty_minutes).await?;
+            kproxy_store::atomic::write_bytes_atomically(&self.path, &checkpoint, Some(0o600))
+                .await?;
+            persist_history(&self.history_dir, &dirty_minutes).await?;
+            kproxy_store::atomic::write_bytes_atomically(&self.path, &compact, Some(0o600)).await?;
+        }
+
+        // A bucket changed during I/O remains dirty. Clean buckets outside the
+        // current hour can be released because their shard is now durable.
+        let current_hour = crate::now_secs().div_euclid(3_600);
+        let mut state = lock(&self.state);
+        for (minute, persisted) in &dirty_minutes {
+            if state
+                .active_minutes
+                .get(minute)
+                .is_some_and(|current| current.as_ref() == persisted.as_ref())
+            {
+                state.dirty_minutes.remove(minute);
+            }
+        }
+        let dirty = state.dirty_minutes.clone();
+        state.active_minutes.retain(|minute, _current| {
+            minute.div_euclid(60) >= current_hour || dirty.contains(minute)
+        });
+        Ok(())
     }
 
     pub async fn follow(
@@ -362,25 +704,494 @@ impl StatsStore {
         level: Option<&str>,
         account: Option<&str>,
     ) -> Vec<RequestLog> {
-        let state = lock(&self.state);
-        let start = after_request_id
-            .and_then(|id| {
-                state
-                    .recent_requests
-                    .iter()
-                    .position(|request| request.request_id == id)
-                    .map(|index| index + 1)
-            })
-            .unwrap_or_else(|| state.recent_requests.len().saturating_sub(tail));
-        state
-            .recent_requests
-            .iter()
-            .skip(start)
-            .filter(|request| matches_log(request, level, account))
-            .take(tail.min(1_000))
-            .cloned()
+        let entries = {
+            let state = lock(&self.state);
+            let start = after_request_id
+                .and_then(|id| {
+                    state
+                        .recent_requests
+                        .iter()
+                        .position(|request| request.request_id == id)
+                        .map(|index| index + 1)
+                })
+                .unwrap_or_else(|| state.recent_requests.len().saturating_sub(tail));
+            state
+                .recent_requests
+                .iter()
+                .skip(start)
+                .filter(|request| matches_log(request, level, account))
+                .take(tail.min(1_000))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        entries
+            .into_iter()
+            .map(|request| (*request).clone())
             .collect()
     }
+}
+
+fn record_persistent(state: &mut ProxyStats, request: &RequestLog) {
+    state.total.record(request);
+    record_dimension(&mut state.by_account, &request.account_id, request);
+    record_dimension(&mut state.by_endpoint, &request.endpoint, request);
+    record_dimension(&mut state.by_model, &request.model, request);
+    state.latencies_ms.push_back(request.duration_ms);
+    let minute = request.timestamp.div_euclid(60);
+    state.history_started_at = Some(state.history_started_at.map_or_else(
+        || minute.saturating_mul(60),
+        |current| current.min(minute.saturating_mul(60)),
+    ));
+    while state.latencies_ms.len() > 10_000 {
+        state.latencies_ms.pop_front();
+    }
+}
+
+fn active_buckets_between(
+    buckets: &BTreeMap<i64, Arc<WindowBucket>>,
+    start: Option<i64>,
+    end: Option<i64>,
+) -> BTreeMap<i64, Arc<WindowBucket>> {
+    if start.zip(end).is_some_and(|(start, end)| start > end) {
+        return BTreeMap::new();
+    }
+    let start_minute = start.unwrap_or(i64::MIN).div_euclid(60);
+    let end_minute = end.unwrap_or(i64::MAX).div_euclid(60);
+    buckets
+        .range(start_minute..=end_minute)
+        .map(|(minute, bucket)| (*minute, Arc::clone(bucket)))
+        .collect()
+}
+
+fn recent_between(
+    requests: &VecDeque<Arc<RequestLog>>,
+    start: Option<i64>,
+    end: Option<i64>,
+    recent: Option<usize>,
+) -> VecDeque<Arc<RequestLog>> {
+    let mut output: VecDeque<Arc<RequestLog>> = requests
+        .iter()
+        .filter(|request| {
+            start.is_none_or(|start| request.timestamp >= start)
+                && end.is_none_or(|end| request.timestamp <= end)
+        })
+        .cloned()
+        .collect();
+    if let Some(maximum) = recent {
+        while output.len() > maximum {
+            output.pop_front();
+        }
+    }
+    output
+}
+
+fn merge_bucket(output: &mut ProxyStats, bucket: &WindowBucket) {
+    output.total.merge(&bucket.total);
+    merge_dimensions(&mut output.by_account, &bucket.by_account);
+    merge_dimensions(&mut output.by_endpoint, &bucket.by_endpoint);
+    merge_dimensions(&mut output.by_model, &bucket.by_model);
+    output
+        .latencies_ms
+        .extend(bucket.latencies_ms.iter().copied());
+    while output.latencies_ms.len() > 10_000 {
+        output.latencies_ms.pop_front();
+    }
+}
+
+fn history_dir_for(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("stats");
+    path.parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(format!("{stem}-history"))
+}
+
+async fn read_history_day(path: &Path) -> anyhow::Result<HistoryDay> {
+    let history = match tokio::fs::read_to_string(path).await {
+        Ok(raw) if matches!(raw.trim(), "" | "{}") => Ok(HistoryDay::default()),
+        Ok(raw) => {
+            let path = path.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                serde_json::from_str(&raw)
+                    .map_err(|error| anyhow::anyhow!("parse {}: {error}", path.display()))
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("join history parser: {error}"))?
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(HistoryDay::default()),
+        Err(error) => Err(error.into()),
+    }?;
+    if history.version > HISTORY_VERSION {
+        anyhow::bail!(
+            "unsupported statistics history version {} in {}",
+            history.version,
+            path.display()
+        );
+    }
+    Ok(history)
+}
+
+async fn read_current_history_shard(
+    path: &Path,
+    start: i64,
+    end: i64,
+) -> anyhow::Result<(HistoryDay, Option<HistoryGap>)> {
+    match read_history_day(path).await {
+        Ok(history) => Ok((history, None)),
+        Err(error) => {
+            let quarantine = quarantine_history_file(path).await.map_err(|quarantine_error| {
+                anyhow::anyhow!(
+                    "read current statistics history: {error}; quarantine failed: {quarantine_error}"
+                )
+            })?;
+            warn!(
+                error = %error,
+                path = %path.display(),
+                quarantine = %quarantine.display(),
+                "quarantined unreadable current statistics history shard"
+            );
+            Ok((
+                HistoryDay::default(),
+                Some(HistoryGap {
+                    start,
+                    end,
+                    reason: "unreadable history shard was quarantined".into(),
+                }),
+            ))
+        }
+    }
+}
+
+async fn quarantine_history_file(path: &Path) -> anyhow::Result<PathBuf> {
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("history.json");
+    let quarantine = path.with_file_name(format!("{file_name}.corrupt-{unique}"));
+    tokio::fs::rename(path, &quarantine).await?;
+    Ok(quarantine)
+}
+
+async fn read_history_between(
+    history_dir: &Path,
+    start: Option<i64>,
+    end: Option<i64>,
+    active_minutes: &BTreeSet<i64>,
+    history_started_at: Option<i64>,
+    history_complete: bool,
+    history_gaps: Vec<HistoryGap>,
+) -> anyhow::Result<ProxyStats> {
+    let mut output = ProxyStats {
+        history_started_at,
+        history_complete,
+        history_gaps,
+        ..ProxyStats::default()
+    };
+    if start.zip(end).is_some_and(|(start, end)| start > end) {
+        return Ok(output);
+    }
+    let mut entries = match tokio::fs::read_dir(history_dir).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(output);
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let requested_start = start.unwrap_or(i64::MIN);
+    let requested_end = end.unwrap_or(i64::MAX);
+    let start_minute = start.unwrap_or(i64::MIN).div_euclid(60);
+    let end_minute = end.unwrap_or(i64::MAX).div_euclid(60);
+    let mut shards: BTreeMap<String, Vec<(u8, String, PathBuf)>> = BTreeMap::new();
+    while let Some(entry) = entries.next_entry().await? {
+        let name = entry.file_name();
+        let Some((day, priority, shard_name)) = name
+            .to_str()
+            .and_then(|name| name.strip_suffix(".json"))
+            .and_then(history_shard_descriptor)
+        else {
+            continue;
+        };
+        let Some((shard_start, shard_end)) = history_range_from_shard_name(&shard_name) else {
+            continue;
+        };
+        if shard_end < requested_start || shard_start > requested_end {
+            continue;
+        }
+        shards
+            .entry(day)
+            .or_default()
+            .push((priority, shard_name, entry.path()));
+    }
+
+    let active_minutes = Arc::new(active_minutes.clone());
+    for day_shards in shards.values_mut() {
+        // Legacy daily files are the base; newer hourly shards replace any
+        // overlapping minute with a more recent absolute bucket.
+        day_shards.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
+        let mut day_minutes = BTreeMap::new();
+        for (_, _, path) in day_shards.drain(..) {
+            let history = match read_history_day(&path).await {
+                Ok(history) => history,
+                Err(error) => {
+                    let Some((start, end)) = path
+                        .file_stem()
+                        .and_then(|name| name.to_str())
+                        .and_then(history_range_from_shard_name)
+                    else {
+                        return Err(error);
+                    };
+                    let quarantine = quarantine_history_file(&path).await.map_err(
+                        |quarantine_error| {
+                            anyhow::anyhow!(
+                                "read statistics history: {error}; quarantine failed: {quarantine_error}"
+                            )
+                        },
+                    )?;
+                    warn!(
+                        error = %error,
+                        path = %path.display(),
+                        quarantine = %quarantine.display(),
+                        "quarantined unreadable statistics history shard"
+                    );
+                    output.history_complete = false;
+                    insert_history_gap(
+                        &mut output,
+                        HistoryGap {
+                            start,
+                            end,
+                            reason: "unreadable history shard was quarantined".into(),
+                        },
+                    );
+                    continue;
+                }
+            };
+            day_minutes.extend(
+                history
+                    .minutes
+                    .into_iter()
+                    .filter(|(minute, _)| *minute >= start_minute && *minute <= end_minute),
+            );
+        }
+        let active_minutes = Arc::clone(&active_minutes);
+        output = tokio::task::spawn_blocking(move || {
+            let mut output = output;
+            for (minute, bucket) in day_minutes {
+                if !active_minutes.contains(&minute) {
+                    merge_bucket(&mut output, &bucket);
+                }
+            }
+            output
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("join statistics shard aggregator: {error}"))?;
+    }
+    Ok(output)
+}
+
+fn history_shard_descriptor(stem: &str) -> Option<(String, u8, String)> {
+    let bytes = stem.as_bytes();
+    let valid_day = bytes.len() >= 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes[..4].iter().all(u8::is_ascii_digit)
+        && bytes[5..7].iter().all(u8::is_ascii_digit)
+        && bytes[8..10].iter().all(u8::is_ascii_digit);
+    if !valid_day {
+        return None;
+    }
+    let day = stem[..10].to_owned();
+    if bytes.len() == 10 {
+        return Some((day, 0, stem.to_owned()));
+    }
+    if bytes.len() == 13
+        && bytes[10] == b'-'
+        && bytes[11..13].iter().all(u8::is_ascii_digit)
+        && stem[11..13]
+            .parse::<u8>()
+            .ok()
+            .is_some_and(|hour| hour < 24)
+    {
+        return Some((day, 1, stem.to_owned()));
+    }
+    None
+}
+
+fn history_range_from_shard_name(stem: &str) -> Option<(i64, i64)> {
+    let (day, priority, _) = history_shard_descriptor(stem)?;
+    let year = day[..4].parse::<i64>().ok()?;
+    let month = day[5..7].parse::<i64>().ok()?;
+    let date = day[8..10].parse::<i64>().ok()?;
+    let days = days_from_civil(year, month, date);
+    if civil_from_days(days) != (year, month, date) {
+        return None;
+    }
+    let day_start = days.saturating_mul(86_400);
+    if priority == 0 {
+        return Some((day_start, day_start.saturating_add(86_399)));
+    }
+    let hour = stem[11..13].parse::<i64>().ok()?;
+    let start = day_start.saturating_add(hour.saturating_mul(3_600));
+    Some((start, start.saturating_add(3_599)))
+}
+
+async fn persist_history(
+    history_dir: &Path,
+    minutes: &BTreeMap<i64, Arc<WindowBucket>>,
+) -> anyhow::Result<()> {
+    if minutes.is_empty() {
+        return Ok(());
+    }
+    let mut hours: BTreeMap<String, BTreeMap<i64, Arc<WindowBucket>>> = BTreeMap::new();
+    for (minute, bucket) in minutes {
+        hours
+            .entry(utc_hour_from_minute(*minute))
+            .or_default()
+            .insert(*minute, Arc::clone(bucket));
+    }
+    tokio::fs::create_dir_all(history_dir).await?;
+    for (hour, hour_minutes) in hours {
+        let path = history_dir.join(format!("{hour}.json"));
+        let history = read_history_day(&path).await?;
+        let display = path.display().to_string();
+        let raw = tokio::task::spawn_blocking(move || {
+            let mut history = history;
+            history.version = HISTORY_VERSION;
+            history.minutes.extend(
+                hour_minutes
+                    .into_iter()
+                    .map(|(minute, bucket)| (minute, (*bucket).clone())),
+            );
+            serde_json::to_vec_pretty(&history)
+                .map_err(|error| anyhow::anyhow!("serialize json for {display}: {error}"))
+        })
+        .await
+        .map_err(|error| anyhow::anyhow!("join statistics serializer: {error}"))??;
+        kproxy_store::atomic::write_bytes_atomically(&path, &raw, Some(0o600)).await?;
+    }
+    Ok(())
+}
+
+async fn serialize_stats_documents(
+    mut snapshot: ProxyStats,
+    dirty_minutes: &BTreeMap<i64, Arc<WindowBucket>>,
+) -> anyhow::Result<(Vec<u8>, Vec<u8>)> {
+    let dirty_minutes = dirty_minutes.clone();
+    tokio::task::spawn_blocking(move || {
+        let compact = serde_json::to_vec_pretty(&snapshot)
+            .map_err(|error| anyhow::anyhow!("serialize compact statistics: {error}"))?;
+        snapshot.minute_buckets = dirty_minutes
+            .into_iter()
+            .map(|(minute, bucket)| (minute, (*bucket).clone()))
+            .collect();
+        let checkpoint = serde_json::to_vec_pretty(&snapshot)
+            .map_err(|error| anyhow::anyhow!("serialize statistics checkpoint: {error}"))?;
+        Ok((checkpoint, compact))
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("join statistics checkpoint serializer: {error}"))?
+}
+
+async fn write_json_off_thread<T>(path: &Path, value: T) -> anyhow::Result<()>
+where
+    T: Serialize + Send + 'static,
+{
+    let display = path.display().to_string();
+    let raw = tokio::task::spawn_blocking(move || {
+        serde_json::to_vec_pretty(&value)
+            .map_err(|error| anyhow::anyhow!("serialize json for {display}: {error}"))
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("join statistics serializer: {error}"))??;
+    kproxy_store::atomic::write_bytes_atomically(path, &raw, Some(0o600)).await
+}
+
+fn utc_day_from_minute(minute: i64) -> String {
+    let (year, month, day) = civil_from_days(minute.div_euclid(1_440));
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+fn utc_hour_from_minute(minute: i64) -> String {
+    let day = utc_day_from_minute(minute);
+    let hour = minute.rem_euclid(1_440).div_euclid(60);
+    format!("{day}-{hour:02}")
+}
+
+fn insert_history_gap(stats: &mut ProxyStats, gap: HistoryGap) {
+    stats.history_gaps.push(gap);
+    stats.history_gaps.sort_by_key(|gap| gap.start);
+    let mut merged: Vec<HistoryGap> = Vec::with_capacity(stats.history_gaps.len());
+    for gap in std::mem::take(&mut stats.history_gaps) {
+        if let Some(previous) = merged.last_mut() {
+            if gap.start <= previous.end.saturating_add(1) {
+                previous.end = previous.end.max(gap.end);
+                if previous.reason != gap.reason {
+                    previous.reason = "one or more history shards are unavailable".into();
+                }
+                continue;
+            }
+        }
+        merged.push(gap);
+    }
+    stats.history_gaps = merged;
+}
+
+fn civil_from_days(days_since_epoch: i64) -> (i64, i64, i64) {
+    let days = days_since_epoch + 719_468;
+    let era = if days >= 0 { days } else { days - 146_096 } / 146_097;
+    let day_of_era = days - era * 146_097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let mut year = year_of_era + era * 400;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_prime = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_prime + 2) / 5 + 1;
+    let month = month_prime + if month_prime < 10 { 3 } else { -9 };
+    year += i64::from(month <= 2);
+    (year, month, day)
+}
+
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = if year >= 0 { year } else { year - 399 } / 400;
+    let year_of_era = year - era * 400;
+    let month_prime = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * month_prime + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146_097 + day_of_era - 719_468
+}
+
+fn compact_snapshot(state: &ProxyStats) -> ProxyStats {
+    ProxyStats {
+        total: state.total.clone(),
+        by_account: state.by_account.clone(),
+        by_endpoint: state.by_endpoint.clone(),
+        by_model: state.by_model.clone(),
+        recent_requests: VecDeque::new(),
+        latencies_ms: state.latencies_ms.clone(),
+        minute_buckets: BTreeMap::new(),
+        history_started_at: state.history_started_at,
+        history_complete: state.history_complete,
+        history_gaps: state.history_gaps.clone(),
+    }
+}
+
+fn recent_refs(
+    requests: &VecDeque<Arc<RequestLog>>,
+    recent: Option<usize>,
+) -> VecDeque<Arc<RequestLog>> {
+    let skip = recent.map_or(0, |maximum| requests.len().saturating_sub(maximum));
+    requests.iter().skip(skip).cloned().collect()
+}
+
+fn materialize_recent(requests: &VecDeque<Arc<RequestLog>>) -> VecDeque<RequestLog> {
+    requests.iter().map(|request| (**request).clone()).collect()
 }
 
 fn matches_log(request: &RequestLog, level: Option<&str>, account: Option<&str>) -> bool {
@@ -448,12 +1259,6 @@ fn bound_dimensions_to(dimensions: &mut HashMap<String, Counter>, maximum: usize
     let entries = std::mem::take(dimensions);
     for (key, counter) in entries {
         dimension_entry_with_limit(dimensions, &key, maximum).merge(&counter);
-    }
-}
-
-fn bound_minute_buckets(buckets: &mut BTreeMap<i64, WindowBucket>) {
-    while buckets.len() > MAX_MINUTE_BUCKETS {
-        buckets.pop_first();
     }
 }
 
@@ -564,8 +1369,8 @@ mod tests {
         assert_eq!(decoded.diagnostics.loaded_tool_count, 0);
     }
 
-    #[test]
-    fn time_windows_are_not_limited_by_the_recent_request_ring() {
+    #[tokio::test]
+    async fn time_windows_are_not_limited_by_the_recent_request_ring() {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = StatsStore::empty(&directory.path().join("stats.json"));
         let now = 2_000_000_000;
@@ -573,11 +1378,19 @@ mod tests {
             store.record(request(&format!("req-{index}"), now, 200));
         }
         assert_eq!(store.snapshot(None).recent_requests.len(), 1_000);
-        assert_eq!(store.window(Some(now - 60), None).total.requests, 1_500);
+        assert_eq!(
+            store
+                .window(Some(now - 60), None)
+                .await
+                .expect("window")
+                .total
+                .requests,
+            1_500
+        );
     }
 
-    #[test]
-    fn dimensions_are_bounded_in_totals_buckets_and_merged_windows() {
+    #[tokio::test]
+    async fn dimensions_are_bounded_in_totals_buckets_and_merged_windows() {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = StatsStore::empty(&directory.path().join("stats.json"));
         let request_count = MAX_DIMENSION_KEYS + 100;
@@ -611,7 +1424,7 @@ mod tests {
                 && bucket.latencies_ms.len() <= MAX_BUCKET_LATENCIES
         }));
 
-        let window = store.window(Some(0), None);
+        let window = store.window(Some(0), None).await.expect("window");
         assert_eq!(window.total.requests, request_count as u64);
         assert!(window.by_account.len() <= MAX_DIMENSION_KEYS);
         assert!(window.by_endpoint.len() <= MAX_DIMENSION_KEYS);
@@ -619,7 +1432,7 @@ mod tests {
     }
 
     #[test]
-    fn minute_buckets_have_hard_cardinality_and_retention_bounds() {
+    fn minute_buckets_bound_cardinality_without_dropping_history() {
         let directory = tempfile::tempdir().expect("tempdir");
         let store = StatsStore::empty(&directory.path().join("stats.json"));
         for index in 0..(MAX_BUCKET_DIMENSION_KEYS + 100) {
@@ -638,8 +1451,12 @@ mod tests {
         assert_eq!(bucket.by_account.len(), MAX_BUCKET_DIMENSION_KEYS);
         assert_eq!(bucket.by_endpoint.len(), MAX_BUCKET_DIMENSION_KEYS);
         assert_eq!(bucket.by_model.len(), MAX_BUCKET_DIMENSION_KEYS);
-        assert_eq!(bucket.latencies_ms.len(), MAX_BUCKET_LATENCIES.min(164));
-        for minute in 0..(MAX_MINUTE_BUCKETS + 100) {
+        assert_eq!(
+            bucket.latencies_ms.len(),
+            MAX_BUCKET_LATENCIES.min(MAX_BUCKET_DIMENSION_KEYS + 100)
+        );
+        let history_minutes = 7 * 24 * 60 + 100;
+        for minute in 0..history_minutes {
             store.record(request(
                 &format!("minute-{minute}"),
                 2_000_000 + minute as i64 * 60,
@@ -648,7 +1465,7 @@ mod tests {
         }
 
         let snapshot = store.snapshot(None);
-        assert_eq!(snapshot.minute_buckets.len(), MAX_MINUTE_BUCKETS);
+        assert_eq!(snapshot.minute_buckets.len(), history_minutes + 1);
         assert!(snapshot.minute_buckets.values().all(|bucket| {
             bucket.by_account.len() <= MAX_BUCKET_DIMENSION_KEYS
                 && bucket.by_endpoint.len() <= MAX_BUCKET_DIMENSION_KEYS
@@ -685,5 +1502,359 @@ mod tests {
             .await
             .expect("write partial");
         assert!(StatsStore::load(&path).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn legacy_time_series_is_marked_incomplete() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("stats.json");
+        let store = StatsStore::empty(&path);
+        store.record(request("legacy", 1_000_000, 200));
+        store.persist().await.expect("persist");
+        let mut value: serde_json::Value = serde_json::from_str(
+            &tokio::fs::read_to_string(&path)
+                .await
+                .expect("read persisted stats"),
+        )
+        .expect("stats JSON");
+        value
+            .as_object_mut()
+            .expect("stats object")
+            .remove("history_complete");
+        tokio::fs::write(&path, serde_json::to_vec(&value).expect("encode legacy"))
+            .await
+            .expect("write legacy");
+
+        let legacy = StatsStore::load(&path).await.expect("load legacy");
+        assert!(!legacy.persistent_history_complete());
+        assert_eq!(legacy.persistent_history_started_at(), Some(999_960));
+    }
+
+    #[tokio::test]
+    async fn persisted_and_current_session_statistics_are_independent() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("stats.json");
+        let store = StatsStore::empty(&path);
+        store.record(request("before-restart", crate::now_secs(), 200));
+        store.persist().await.expect("persist");
+
+        let reloaded = StatsStore::load(&path).await.expect("reload");
+        assert_eq!(reloaded.snapshot(None).total.requests, 1);
+        assert_eq!(reloaded.session_snapshot().total.requests, 0);
+
+        reloaded.record(request("after-restart", crate::now_secs(), 503));
+        assert_eq!(reloaded.snapshot(None).total.requests, 2);
+        let session = reloaded.session_snapshot();
+        assert_eq!(session.total.requests, 1);
+        assert_eq!(session.total.failures, 1);
+    }
+
+    #[tokio::test]
+    async fn persistence_shards_history_by_utc_hour_and_keeps_summary_compact() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("stats.json");
+        let store = StatsStore::empty(&path);
+        store.record(request("day-one", 60, 200));
+        store.record(request("day-two", 86_460, 503));
+        store.persist().await.expect("persist");
+
+        let persisted: ProxyStats = serde_json::from_str(
+            &tokio::fs::read_to_string(&path)
+                .await
+                .expect("read summary"),
+        )
+        .expect("parse summary");
+        assert!(persisted.minute_buckets.is_empty());
+        assert_eq!(persisted.total.requests, 2);
+
+        let history_dir = history_dir_for(&path);
+        assert!(
+            tokio::fs::try_exists(history_dir.join("1970-01-01-00.json"))
+                .await
+                .expect("first shard")
+        );
+        assert!(
+            tokio::fs::try_exists(history_dir.join("1970-01-02-00.json"))
+                .await
+                .expect("second shard")
+        );
+
+        let reloaded = StatsStore::load(&path).await.expect("reload");
+        let window = reloaded
+            .window_between(Some(0), Some(172_799), None)
+            .await
+            .expect("history window");
+        assert_eq!(window.total.requests, 2);
+        assert_eq!(window.total.successes, 1);
+        assert_eq!(window.total.failures, 1);
+    }
+
+    #[tokio::test]
+    async fn current_day_memory_overrides_persisted_bucket_without_double_counting() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("stats.json");
+        let now = crate::now_secs();
+        let store = StatsStore::empty(&path);
+        store.record(request("first", now, 200));
+        store.record(request("second", now, 200));
+        store.persist().await.expect("persist");
+
+        let reloaded = StatsStore::load(&path).await.expect("reload");
+        let window = reloaded
+            .window_between(Some(now - 60), Some(now + 60), None)
+            .await
+            .expect("history window");
+        assert_eq!(window.total.requests, 2);
+    }
+
+    #[tokio::test]
+    async fn legacy_embedded_minutes_migrate_idempotently_to_hourly_shards() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("stats.json");
+        let legacy_store = StatsStore::empty(&path);
+        legacy_store.record(request("legacy", 60, 200));
+        let legacy = legacy_store.snapshot(None);
+        write_json_off_thread(&path, legacy)
+            .await
+            .expect("write legacy state");
+
+        let migrated = StatsStore::load(&path).await.expect("load legacy state");
+        migrated.persist().await.expect("migrate");
+        // Repeating the migration write must replace the same absolute bucket.
+        migrated
+            .persist()
+            .await
+            .expect("repeat migration persistence");
+        let reloaded = StatsStore::load(&path)
+            .await
+            .expect("reload migrated state");
+        let window = reloaded
+            .window_between(Some(0), Some(120), None)
+            .await
+            .expect("migrated window");
+        assert_eq!(window.total.requests, 1);
+    }
+
+    #[tokio::test]
+    async fn failed_history_persistence_checkpoint_survives_a_restart() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("stats.json");
+        let history_dir = history_dir_for(&path);
+        tokio::fs::write(&history_dir, b"blocks directory creation")
+            .await
+            .expect("write blocking file");
+        let store = StatsStore::empty(&path);
+        store.record(request("retained", crate::now_secs(), 200));
+
+        assert!(store.persist().await.is_err());
+        drop(store);
+        tokio::fs::remove_file(&history_dir)
+            .await
+            .expect("remove blocking file");
+        let recovered = StatsStore::load(&path).await.expect("recover checkpoint");
+        assert_eq!(recovered.snapshot(None).total.requests, 1);
+        recovered.persist().await.expect("retry persistence");
+
+        let reloaded = StatsStore::load(&path).await.expect("reload");
+        assert_eq!(reloaded.snapshot(None).total.requests, 1);
+    }
+
+    #[tokio::test]
+    async fn corrupt_current_history_is_quarantined_without_losing_summary() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("stats.json");
+        let now = crate::now_secs();
+        let store = StatsStore::empty(&path);
+        store.record(request("persisted", now, 200));
+        store.persist().await.expect("persist");
+        let current_hour = utc_hour_from_minute(now.div_euclid(60));
+        let current_path = history_dir_for(&path).join(format!("{current_hour}.json"));
+        tokio::fs::write(&current_path, b"not-json")
+            .await
+            .expect("corrupt shard");
+
+        let recovered = StatsStore::load(&path).await.expect("recover");
+        assert_eq!(recovered.snapshot(None).total.requests, 1);
+        assert!(!recovered.persistent_history_complete());
+        let gaps = recovered.persistent_history_gaps();
+        assert_eq!(gaps.len(), 1);
+        assert_eq!(gaps[0].end - gaps[0].start, 3_599);
+        assert!(!tokio::fs::try_exists(&current_path)
+            .await
+            .expect("current shard removed"));
+        let mut entries = tokio::fs::read_dir(history_dir_for(&path))
+            .await
+            .expect("history directory");
+        let mut found_quarantine = false;
+        while let Some(entry) = entries.next_entry().await.expect("history entry") {
+            found_quarantine |= entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(&format!("{current_hour}.json.corrupt-"));
+        }
+        assert!(found_quarantine);
+    }
+
+    #[tokio::test]
+    async fn historical_corruption_is_reported_as_a_persisted_range_gap() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("stats.json");
+        let summary = ProxyStats {
+            history_started_at: Some(0),
+            ..ProxyStats::default()
+        };
+        write_json_off_thread(&path, summary)
+            .await
+            .expect("write summary");
+        let history_dir = history_dir_for(&path);
+        tokio::fs::create_dir_all(&history_dir)
+            .await
+            .expect("create history directory");
+        let corrupt_path = history_dir.join("1970-01-01-00.json");
+        tokio::fs::write(&corrupt_path, b"not-json")
+            .await
+            .expect("write corrupt history");
+
+        let store = StatsStore::load(&path).await.expect("load summary");
+        let window = store
+            .window_between(Some(0), Some(3_599), None)
+            .await
+            .expect("read partial history");
+        assert!(!window.history_complete);
+        assert_eq!(window.history_gaps.len(), 1);
+        assert_eq!(window.history_gaps[0].start, 0);
+        assert_eq!(window.history_gaps[0].end, 3_599);
+        assert_eq!(store.persistent_history_gaps(), window.history_gaps);
+
+        store.persist().await.expect("persist discovered gap");
+        let reloaded = StatsStore::load(&path).await.expect("reload gap metadata");
+        assert_eq!(reloaded.persistent_history_gaps(), window.history_gaps);
+    }
+
+    #[tokio::test]
+    async fn hourly_history_overrides_legacy_daily_minutes() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("stats.json");
+        write_json_off_thread(&path, ProxyStats::default())
+            .await
+            .expect("write summary");
+        let history_dir = history_dir_for(&path);
+        tokio::fs::create_dir_all(&history_dir)
+            .await
+            .expect("create history directory");
+        let mut daily_bucket = WindowBucket::default();
+        daily_bucket.record(&request("daily", 60, 200));
+        write_json_off_thread(
+            &history_dir.join("1970-01-01.json"),
+            HistoryDay {
+                version: HISTORY_VERSION,
+                minutes: BTreeMap::from([(1, daily_bucket)]),
+            },
+        )
+        .await
+        .expect("write legacy daily shard");
+        let mut hourly_bucket = WindowBucket::default();
+        hourly_bucket.record(&request("hourly-one", 60, 200));
+        hourly_bucket.record(&request("hourly-two", 61, 200));
+        write_json_off_thread(
+            &history_dir.join("1970-01-01-00.json"),
+            HistoryDay {
+                version: HISTORY_VERSION,
+                minutes: BTreeMap::from([(1, hourly_bucket)]),
+            },
+        )
+        .await
+        .expect("write hourly shard");
+
+        let store = StatsStore::load(&path).await.expect("load history");
+        let window = store
+            .window_between(Some(0), Some(120), None)
+            .await
+            .expect("query history");
+        assert_eq!(window.total.requests, 2);
+    }
+
+    #[tokio::test]
+    async fn narrow_queries_do_not_open_unrelated_hourly_shards() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("stats.json");
+        let store = StatsStore::empty(&path);
+        store.record(request("first-hour", 60, 200));
+        store.persist().await.expect("persist first hour");
+        let unrelated = history_dir_for(&path).join("1970-01-01-01.json");
+        tokio::fs::write(&unrelated, b"not-json")
+            .await
+            .expect("write unrelated corrupt shard");
+
+        let reloaded = StatsStore::load(&path).await.expect("reload");
+        let window = reloaded
+            .window_between(Some(0), Some(120), None)
+            .await
+            .expect("narrow query");
+        assert_eq!(window.total.requests, 1);
+        assert!(window.history_gaps.is_empty());
+        assert!(tokio::fs::try_exists(unrelated)
+            .await
+            .expect("unrelated shard remains untouched"));
+    }
+
+    #[tokio::test]
+    async fn multi_day_ranges_stream_all_hourly_shards_without_double_counting() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("stats.json");
+        let store = StatsStore::empty(&path);
+        for hour in 0..72 {
+            store.record(request(
+                &format!("hour-{hour}"),
+                hour * 3_600 + 60,
+                if hour % 2 == 0 { 200 } else { 503 },
+            ));
+        }
+        store.persist().await.expect("persist hourly history");
+
+        let reloaded = StatsStore::load(&path).await.expect("reload");
+        let window = reloaded
+            .window_between(Some(0), Some(72 * 3_600 - 1), None)
+            .await
+            .expect("multi-day range");
+        assert_eq!(window.total.requests, 72);
+        assert_eq!(window.total.successes, 36);
+        assert_eq!(window.total.failures, 36);
+    }
+
+    #[test]
+    fn utc_history_day_names_cover_epoch_boundaries() {
+        assert_eq!(utc_day_from_minute(-1), "1969-12-31");
+        assert_eq!(utc_day_from_minute(0), "1970-01-01");
+        assert_eq!(utc_day_from_minute(1_440), "1970-01-02");
+        assert_eq!(utc_hour_from_minute(-1), "1969-12-31-23");
+        assert_eq!(utc_hour_from_minute(60), "1970-01-01-01");
+        assert_eq!(
+            history_range_from_shard_name("1970-01-01"),
+            Some((0, 86_399))
+        );
+        assert_eq!(
+            history_range_from_shard_name("1970-01-01-01"),
+            Some((3_600, 7_199))
+        );
+        assert_eq!(history_range_from_shard_name("2026-02-30-01"), None);
+    }
+
+    #[tokio::test]
+    async fn bounded_ranges_keep_all_minute_aggregates_and_exact_recent_details() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = StatsStore::empty(&directory.path().join("stats.json"));
+        store.record(request("first", 120, 200));
+        store.record(request("middle", 180, 200));
+        store.record(request("last", 240, 500));
+
+        let window = store
+            .window_between(Some(180), Some(239), None)
+            .await
+            .expect("window");
+        assert_eq!(window.total.requests, 1);
+        assert_eq!(window.total.successes, 1);
+        assert_eq!(window.recent_requests.len(), 1);
+        assert_eq!(window.recent_requests[0].request_id, "middle");
     }
 }
