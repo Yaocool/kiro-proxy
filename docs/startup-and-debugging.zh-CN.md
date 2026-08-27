@@ -262,7 +262,9 @@ cargo run -p kproxy -- config reload
 kproxy alert events
 kproxy alert platforms
 kproxy alert config
-kproxy alert add --name alerts --platform dingtalk --url https://example/hook \
+kproxy alert add --name alerts --platform dingtalk \
+  --webhook-url 'https://oapi.dingtalk.com/robot/send?access_token=replace-me' \
+  --dingtalk-sign 'SEC-replace-me' \
   --event token-refresh-failed,account-credit-protected,account-quota-exhausted,service-quota-exhausted
 kproxy alert edit --name alerts --event token-refresh-failed --event service-quota-exhausted
 kproxy alert delete alerts
@@ -277,7 +279,8 @@ kproxy model-map delete low-credit
 `kproxy alert events` 会说明每个事件的实际触发条件。一个告警目标可重复传入 `--event`，
 也可使用逗号分隔订阅多个事件；`alert edit --event ...` 会整体替换该目标原有的事件列表。
 `kproxy alert platforms` 会说明 `--platform` 选择的通知平台及平台专用参数；旧参数名
-`--kind` 作为兼容别名继续可用。
+`--kind` 和 `--url` 作为兼容别名继续可用。钉钉机器人开启加签后，将机器人提供的
+`SEC...` 密钥传给 `--dingtalk-sign`；代理会在每次投递时动态生成 `timestamp` 和 `sign`。
 同一账号或服务在异常持续期间只发送一次 Markdown 告警，恢复后再次发生异常才会重新告警。
 同一告警目标在短时间内收到多个同类型账号事件时，会按账号聚合为一条消息，避免群机器人刷屏。
 `account-credit-protected` 使用与调度器相同的 `pool.low_credit_ratio` 和

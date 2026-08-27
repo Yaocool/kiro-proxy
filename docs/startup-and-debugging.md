@@ -291,7 +291,9 @@ and hot reloads the daemon:
 kproxy alert events
 kproxy alert platforms
 kproxy alert config
-kproxy alert add --name alerts --platform dingtalk --url https://example/hook \
+kproxy alert add --name alerts --platform dingtalk \
+  --webhook-url 'https://oapi.dingtalk.com/robot/send?access_token=replace-me' \
+  --dingtalk-sign 'SEC-replace-me' \
   --event token-refresh-failed,account-credit-protected,account-quota-exhausted,service-quota-exhausted
 kproxy alert edit --name alerts --event token-refresh-failed --event service-quota-exhausted
 kproxy alert delete alerts
@@ -308,8 +310,10 @@ subscribe to multiple events by repeating `--event` or by passing a
 comma-separated list; `alert edit --event ...` replaces the target's complete
 subscription list.
 `kproxy alert platforms` explains the notification platform selected by
-`--platform` and lists platform-specific options. The former `--kind` spelling
-remains available as a compatibility alias.
+`--platform` and lists platform-specific options. The former `--kind` and
+`--url` spellings remain available as compatibility aliases. For a DingTalk
+robot with signing enabled, pass its `SEC...` secret through `--dingtalk-sign`;
+the proxy generates a fresh `timestamp` and `sign` for every delivery.
 Each account or service incident emits one Markdown alert and stays suppressed
 until that incident recovers.
 Account-scoped events of the same kind that reach one target within a short
