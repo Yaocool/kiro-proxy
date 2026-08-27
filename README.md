@@ -309,6 +309,7 @@ under one directory. Without `KPROXY_HOME`, XDG locations are used:
 | `accounts.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | Contains credentials; created with mode `0600`. |
 | `daily.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | Daily credit accounting, reset on UTC boundaries. |
 | `stats.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | Persisted aggregate request statistics. |
+| `stats-history/` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | One-minute request aggregates split into bounded UTC hourly shards. |
 | `web-search-replay.key` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | AES-256-GCM replay key; created with mode `0600` and never overwritten. |
 | `admin.sock` | `${XDG_RUNTIME_DIR}/kproxy/` or `/run/kproxy/` | Local administration plane. |
 | Logs | `${XDG_DATA_HOME:-~/.local/share}/kproxy/logs/` | Split by UTC date and severity. |
@@ -414,7 +415,9 @@ kproxy alert config
 kproxy alert add --name alerts --platform dingtalk --webhook-url 'https://oapi.dingtalk.com/robot/send?access_token=replace-me' --dingtalk-sign 'SEC-replace-me' --event token-refresh-failed,account-credit-protected,account-quota-exhausted,service-quota-exhausted
 kproxy alert edit --name alerts --event token-refresh-failed --event service-quota-exhausted
 kproxy alert delete alerts
+kproxy status --since 30m
 kproxy stats --since 1h
+kproxy stats --start 2026-08-27T10:00:00+08:00 --end 2026-08-27T12:00:00+08:00
 kproxy stats --detail --since 1h --by endpoint
 kproxy logs show --tail 100
 kproxy logs follow --level warn
@@ -449,9 +452,17 @@ base path, format, and filter. When invoked through the Docker host wrapper, bot
 path commands also report the named volume's real path on the Docker host. The
 legacy `kproxy logs --tail ...` and `-f` forms remain supported.
 
-`kproxy stats` reports aggregate operational traffic, success, token, credit, and
-latency metrics; it does not replace per-request logs. Its default output is a
-compact summary. Add `--detail` for grouped counters and recent requests.
+`kproxy status` reports request, success, credit, and average-latency metrics for
+the current daemon session. `kproxy stats` defaults to persisted cumulative
+metrics across restarts. Both commands accept `--since 1h` or an explicit
+timezone-aware RFC 3339 `--start`/`--end` range. Time-series aggregates are kept
+at one-minute resolution without the previous seven-day eviction. History that
+was already evicted before upgrading cannot be recovered; the CLI reports the
+earliest available time. The cumulative summary stays compact in `stats.json`;
+minute history is stored in bounded UTC hourly files under `stats-history/`, and
+range parsing/aggregation runs outside the proxy request lock. Use
+`kproxy stats --detail` for recent requests and
+grouped counters, and `kproxy logs` plus trace IDs for individual failures.
 
 Dynamic model discovery runs immediately at daemon startup, again when accounts
 change, and thereafter when the model-cache TTL expires. The one-minute account

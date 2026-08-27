@@ -33,14 +33,31 @@ struct Cli {
     command: Option<Command>,
 }
 
+#[derive(Debug, Clone, Default, Args)]
+struct TimeRangeArgs {
+    /// 相对当前时间的窗口，例如 30m、1h、7d。
+    #[arg(long, value_name = "DURATION", conflicts_with_all = ["start", "end"])]
+    since: Option<String>,
+    /// 起始时间（含）；使用 Unix 秒或带时区的 RFC 3339 时间。
+    #[arg(long, value_name = "TIME")]
+    start: Option<String>,
+    /// 结束时间（含）；使用 Unix 秒或带时区的 RFC 3339 时间。
+    #[arg(long, value_name = "TIME")]
+    end: Option<String>,
+}
+
 #[derive(Debug, Subcommand)]
 enum Command {
     /// 服务总览。
-    #[command(after_help = "示例：\n  kproxy status\n  kproxy status --watch")]
+    #[command(
+        after_help = "示例：\n  kproxy status\n  kproxy status --since 30m\n  kproxy status --start 2026-08-27T10:00:00+08:00 --end 2026-08-27T12:00:00+08:00\n  kproxy status --watch"
+    )]
     Status {
         /// 每 2 秒刷新。
         #[arg(long)]
         watch: bool,
+        #[command(flatten)]
+        range: TimeRangeArgs,
     },
     /// 供容器和 systemd 使用的健康检查。
     #[command(after_help = "示例：\n  kproxy health\n  kproxy --json health")]
@@ -113,7 +130,7 @@ enum Command {
     },
     /// 显示代理统计。
     #[command(
-        after_help = "示例：\n  kproxy stats --since 1h\n  kproxy stats --detail --by model --recent 20"
+        after_help = "示例：\n  kproxy stats --since 1h\n  kproxy stats --start 2026-08-27T10:00:00+08:00 --end 2026-08-27T12:00:00+08:00\n  kproxy stats --detail --by model --recent 20"
     )]
     Stats {
         /// 显示分组和最近请求明细。
@@ -121,9 +138,8 @@ enum Command {
         detail: bool,
         #[arg(long, requires = "detail")]
         recent: Option<usize>,
-        /// 时间窗口，例如 30m、1h、7d。
-        #[arg(long)]
-        since: Option<String>,
+        #[command(flatten)]
+        range: TimeRangeArgs,
         /// 分组维度：model/account/apikey/endpoint。
         #[arg(long, requires = "detail")]
         by: Option<String>,
@@ -434,21 +450,33 @@ async fn main() -> Result<()> {
     let mut client = AdminClient::connect(socket);
 
     match command {
-        Command::Status { watch } => loop {
-            let status: StatusResult = client.call(method::STATUS, serde_json::json!({})).await?;
-            if cli.json {
-                print_json(&status)?;
-            } else {
-                print_status(&status);
+        Command::Status { watch, range } => {
+            let (since_secs, start_secs, end_secs) = parse_time_range_args(&range)?;
+            loop {
+                let status: StatusResult = client
+                    .call(
+                        method::STATUS,
+                        serde_json::json!({
+                            "since_secs":since_secs,
+                            "start_secs":start_secs,
+                            "end_secs":end_secs
+                        }),
+                    )
+                    .await?;
+                if cli.json {
+                    print_json(&status)?;
+                } else {
+                    print_status(&status);
+                }
+                if !watch {
+                    break;
+                }
+                tokio::select! {
+                    result = tokio::signal::ctrl_c() => { result?; break; }
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
+                }
             }
-            if !watch {
-                break;
-            }
-            tokio::select! {
-                result = tokio::signal::ctrl_c() => { result?; break; }
-                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {}
-            }
-        },
+        }
         Command::Health => {
             let status: StatusResult = client.call(method::STATUS, serde_json::json!({})).await?;
             if cli.json {
@@ -669,18 +697,15 @@ async fn main() -> Result<()> {
         Command::Stats {
             detail,
             recent,
-            since,
+            range,
             by,
         } => {
-            let since_secs = since
-                .as_deref()
-                .map(crate::commands::runtime::parse_duration)
-                .transpose()?;
+            let range = parse_time_range_args(&range)?;
             crate::commands::runtime::show_stats(
                 &mut client,
                 detail,
                 recent,
-                since_secs,
+                range,
                 by.as_deref(),
                 cli.json,
             )
@@ -792,6 +817,31 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn parse_time_range_args(range: &TimeRangeArgs) -> Result<(Option<u64>, Option<i64>, Option<i64>)> {
+    let since_secs = range
+        .since
+        .as_deref()
+        .map(crate::commands::runtime::parse_duration)
+        .transpose()?;
+    let start_secs = range
+        .start
+        .as_deref()
+        .map(crate::commands::runtime::parse_timestamp)
+        .transpose()?;
+    let end_secs = range
+        .end
+        .as_deref()
+        .map(crate::commands::runtime::parse_timestamp)
+        .transpose()?;
+    if start_secs
+        .zip(end_secs)
+        .is_some_and(|(start, end)| start > end)
+    {
+        anyhow::bail!("起始时间不能晚于结束时间");
+    }
+    Ok((since_secs, start_secs, end_secs))
+}
+
 fn print_status(status: &StatusResult) {
     println!(
         "kproxyd {}   运行 {}   PID {}",
@@ -827,10 +877,29 @@ fn print_status(status: &StatusResult) {
         "并发    {} 进行中 / 上限 {}     队列 {} 等待",
         status.active_requests, status.max_concurrent_requests, status.queued_requests
     );
+    let stats_scope = if status.stats_scope == "session" {
+        "本次启动"
+    } else {
+        "累计"
+    };
     println!(
-        "统计    {} 请求   {:.1}% 成功   均值 {}ms   credits {:.2}",
-        status.request_count, status.success_rate, status.average_latency_ms, status.credits
+        "统计    {}   {} 请求   {:.1}% 成功   均值 {}ms   credits {:.2}",
+        stats_scope,
+        status.request_count,
+        status.success_rate,
+        status.average_latency_ms,
+        status.credits
     );
+    if let (Some(start), Some(end)) = (status.stats_start, status.stats_end) {
+        println!(
+            "范围    {} ～ {}（分钟级聚合）",
+            format_timestamp(start),
+            format_timestamp(end)
+        );
+    }
+    if status.stats_truncated {
+        println!("提示    指定范围早于本次服务启动时间，已从启动时间起统计");
+    }
     if status.daily_credit_limit > 0.0 {
         println!(
             "日额度  {}   {:.2} 已用 + {:.2} 在途 / {:.2}",
@@ -864,6 +933,40 @@ mod tests {
             cli.command,
             Some(Command::Config(ConfigCommand::Reset))
         ));
+    }
+
+    #[test]
+    fn status_and_stats_accept_explicit_time_ranges() {
+        let status = Cli::try_parse_from([
+            "kproxy",
+            "status",
+            "--start",
+            "2026-08-27T10:00:00+08:00",
+            "--end",
+            "2026-08-27T12:00:00+08:00",
+        ])
+        .expect("status range");
+        let Some(Command::Status { range, .. }) = status.command else {
+            panic!("expected status command");
+        };
+        let (_, start, end) = parse_time_range_args(&range).expect("parsed range");
+        assert_eq!(start, Some(1_787_796_000));
+        assert_eq!(end, Some(1_787_803_200));
+
+        let stats = Cli::try_parse_from(["kproxy", "stats", "--since", "1h"]).expect("stats since");
+        let Some(Command::Stats { range, .. }) = stats.command else {
+            panic!("expected stats command");
+        };
+        assert_eq!(parse_time_range_args(&range).expect("since").0, Some(3_600));
+        assert!(Cli::try_parse_from([
+            "kproxy",
+            "stats",
+            "--since",
+            "1h",
+            "--start",
+            "2026-08-27T10:00:00+08:00"
+        ])
+        .is_err());
     }
 
     #[test]

@@ -5140,6 +5140,32 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
                 "original_input_tokens":original_input_tokens
             });
         }
+        state.stats.record(RequestLog {
+            timestamp: now_secs(),
+            trace_id: trace_id.clone(),
+            request_id: format!("req_{}", Uuid::new_v4().simple()),
+            path: path.clone(),
+            model: route.mapped.clone(),
+            original_model: request.model.clone(),
+            kiro_model: route.mapped.clone(),
+            account_id: String::new(),
+            account_name: String::new(),
+            endpoint: "local-tokenizer".into(),
+            model_path: vec![request.model.clone(), route.mapped.clone()],
+            model_mapping_rule: route.rule.clone(),
+            attempts: Vec::new(),
+            duration_ms: started.elapsed().as_millis() as u64,
+            status: 200,
+            input_tokens: input_tokens as u64,
+            output_tokens: 0,
+            credits: 0.0,
+            error: None,
+            diagnostics: RequestDiagnostics {
+                client_status: 200,
+                payload_bytes: body.len(),
+                ..RequestDiagnostics::default()
+            },
+        });
         tracing::info!(
             trace_id = %trace_id,
             protocol = "claude_count_tokens",

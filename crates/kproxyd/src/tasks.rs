@@ -473,10 +473,7 @@ fn spawn_persistence(state: Arc<AppState>, shutdown: CancellationToken) {
                         .max(1_000),
                 );
                 tokio::select! {
-                    _ = shutdown.cancelled() => {
-                        persist_usage(&state).await;
-                        break;
-                    }
+                    _ = shutdown.cancelled() => break,
                     _ = tokio::time::sleep(delay) => persist_usage(&state).await,
                 }
             }
@@ -539,7 +536,7 @@ async fn persist_usage(state: &Arc<AppState>) {
         warn!(%error, "failed to persist proxy stats");
         errors.push(error.to_string());
     }
-    let (p50, p95, p99) = state.stats.snapshot(None).percentiles();
+    let (p50, p95, p99) = state.stats.latency_percentiles();
     debug!(
         p50_ms = p50,
         p95_ms = p95,
@@ -554,6 +551,25 @@ async fn persist_usage(state: &Arc<AppState>) {
             format!("failed: {}", errors.join("; "))
         },
     );
+}
+
+/// Completes the final metering/statistics checkpoint before the daemon exits.
+/// A bounded wait prevents a broken filesystem from hanging service shutdown.
+pub(crate) async fn flush_before_shutdown(state: &Arc<AppState>) {
+    const FINAL_PERSIST_TIMEOUT: Duration = Duration::from_secs(30);
+    if tokio::time::timeout(FINAL_PERSIST_TIMEOUT, persist_usage(state))
+        .await
+        .is_err()
+    {
+        warn!(
+            timeout_secs = FINAL_PERSIST_TIMEOUT.as_secs(),
+            "timed out waiting for final usage persistence during shutdown"
+        );
+        state.task_registry.record(
+            "stats_persist",
+            "failed: final shutdown persistence timed out".to_string(),
+        );
+    }
 }
 
 pub(crate) async fn refresh_models(state: &Arc<AppState>) -> anyhow::Result<String> {
@@ -798,6 +814,65 @@ mod tests {
     use kproxy_store::config_loader::ConfigHandle;
 
     use super::*;
+
+    fn recorded_request() -> crate::stats::RequestLog {
+        crate::stats::RequestLog {
+            timestamp: crate::now_secs(),
+            trace_id: "trace-shutdown".into(),
+            request_id: "request-shutdown".into(),
+            path: "/v1/messages".into(),
+            model: "claude-sonnet-4.6".into(),
+            original_model: "claude-sonnet-4.6".into(),
+            kiro_model: "claude-sonnet-4.6".into(),
+            account_id: "acc_test".into(),
+            account_name: "test".into(),
+            endpoint: "AmazonQ".into(),
+            model_path: Vec::new(),
+            model_mapping_rule: None,
+            attempts: Vec::new(),
+            duration_ms: 10,
+            status: 200,
+            input_tokens: 1,
+            output_tokens: 1,
+            credits: 0.1,
+            error: None,
+            diagnostics: crate::stats::RequestDiagnostics::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn final_shutdown_flush_is_durable_before_returning() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        let accounts = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("accounts");
+        let state = Arc::new(AppState::new(
+            paths.clone(),
+            ConfigHandle::new(Config::default()),
+            accounts,
+        ));
+        state.stats.record(recorded_request());
+
+        flush_before_shutdown(&state).await;
+
+        let persisted: crate::stats::ProxyStats = serde_json::from_str(
+            &tokio::fs::read_to_string(&paths.stats_file)
+                .await
+                .expect("read final checkpoint"),
+        )
+        .expect("parse final checkpoint");
+        assert_eq!(persisted.total.requests, 1);
+        assert!(persisted.minute_buckets.is_empty());
+    }
 
     #[tokio::test]
     async fn supervisor_restarts_a_panicked_background_task() {

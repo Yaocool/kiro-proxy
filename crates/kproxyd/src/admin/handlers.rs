@@ -22,7 +22,7 @@ type Handled = Result<serde_json::Value, RpcError>;
 pub async fn dispatch(state: &Arc<AppState>, request: Request) -> Response {
     let id = request.id;
     let outcome = match request.method.as_str() {
-        method::STATUS => handle_status(state).await,
+        method::STATUS => handle_status(state, request.params).await,
         method::CONFIG_SHOW => handle_config_show(state).await,
         method::CONFIG_PATH => to_value(handle_config_path(state)),
         method::CONFIG_RELOAD => handle_config_reload(state).await,
@@ -47,7 +47,7 @@ pub async fn dispatch(state: &Arc<AppState>, request: Request) -> Response {
         method::POOL => handle_pool(state, request.params).await,
         method::TASKS => Ok(state.task_registry.snapshot(state)),
         method::TASK_RUN => handle_task_run(state, request.params).await,
-        method::STATS => handle_stats(state, request.params),
+        method::STATS => handle_stats(state, request.params).await,
         method::LOGS => handle_logs(state, request.params).await,
         method::LOG_FILES => handle_log_files(state).await,
         method::MODELS => handle_models(state).await,
@@ -302,7 +302,81 @@ fn compare_display_text(left: &str, right: &str) -> std::cmp::Ordering {
         .then_with(|| left.cmp(right))
 }
 
-async fn handle_status(state: &Arc<AppState>) -> Handled {
+#[derive(Debug, Default, serde::Deserialize)]
+struct TimeRangeParams {
+    since_secs: Option<u64>,
+    start_secs: Option<i64>,
+    end_secs: Option<i64>,
+}
+
+#[derive(Debug)]
+struct ResolvedTimeRange {
+    start: Option<i64>,
+    end: Option<i64>,
+    filtered: bool,
+    truncated: bool,
+}
+
+fn resolve_time_range(
+    params: &TimeRangeParams,
+    default_start: Option<i64>,
+    clamp_start: Option<i64>,
+) -> Result<ResolvedTimeRange, RpcError> {
+    if params.since_secs.is_some() && (params.start_secs.is_some() || params.end_secs.is_some()) {
+        return Err(RpcError::bad_params(
+            "since_secs cannot be combined with start_secs or end_secs",
+        ));
+    }
+    let now = now_secs();
+    let filtered =
+        params.since_secs.is_some() || params.start_secs.is_some() || params.end_secs.is_some();
+    let requested_start = match params.since_secs {
+        Some(seconds) => Some(now.saturating_sub(
+            i64::try_from(seconds).map_err(|_| RpcError::bad_params("since_secs is too large"))?,
+        )),
+        None => params.start_secs,
+    };
+    let requested_end = if filtered || default_start.is_some() {
+        Some(params.end_secs.unwrap_or(now).min(now))
+    } else {
+        None
+    };
+    if requested_start
+        .zip(requested_end)
+        .is_some_and(|(start, end)| start > end)
+    {
+        return Err(RpcError::bad_params(
+            "statistics start time must not be after end time",
+        ));
+    }
+    let mut start = requested_start.or(default_start);
+    let mut truncated = false;
+    if let Some(minimum) = clamp_start {
+        if requested_end.is_some_and(|end| end < minimum) {
+            return Err(RpcError::bad_params(
+                "statistics range ends before the current daemon session started",
+            ));
+        }
+        let unclamped = start.unwrap_or(minimum);
+        truncated = unclamped < minimum;
+        start = Some(unclamped.max(minimum));
+    }
+    Ok(ResolvedTimeRange {
+        start,
+        end: requested_end,
+        filtered,
+        truncated,
+    })
+}
+
+async fn handle_status(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
+    let params: TimeRangeParams = if params.is_null() {
+        TimeRangeParams::default()
+    } else {
+        parse_params(params)?
+    };
+    let session_started_at = state.stats.session_started_at();
+    let range = resolve_time_range(&params, Some(session_started_at), Some(session_started_at))?;
     let config = state.config.current();
     let services = state.proxy_services.views(&config.proxy_service).await;
     let running_services = services
@@ -333,18 +407,24 @@ async fn handle_status(state: &Arc<AppState>) -> Handled {
     };
     let pool = state.pool();
     let account_counts = pool.scheduling_counts().await;
-    let stats = state.stats.snapshot(None);
+    let stats = if range.filtered {
+        state.stats.session_window(range.start, range.end, None)
+    } else {
+        // The default status view is the full process session and can use the
+        // O(1) cumulative counter instead of walking every retained minute.
+        state.stats.session_window(None, None, None)
+    };
     let request_count = stats.total.requests;
     let success_rate = if request_count == 0 {
         0.0
     } else {
         stats.total.successes as f64 * 100.0 / request_count as f64
     };
-    let average_latency_ms = if stats.latencies_ms.is_empty() {
-        0
-    } else {
-        stats.latencies_ms.iter().sum::<u64>() / stats.latencies_ms.len() as u64
-    };
+    let average_latency_ms = stats
+        .total
+        .duration_ms
+        .checked_div(stats.total.duration_samples)
+        .unwrap_or(0);
     let (daily_credit_day, daily_credit_used, daily_credit_reserved, daily_credit_limit) =
         state.meter.daily_snapshot();
     let enabled_services = services.iter().filter(|service| service.enabled).count();
@@ -387,6 +467,11 @@ async fn handle_status(state: &Arc<AppState>) -> Handled {
         success_rate,
         average_latency_ms,
         credits: stats.total.credits,
+        stats_scope: "session".to_string(),
+        stats_start: range.start,
+        stats_end: range.end,
+        stats_resolution_secs: 60,
+        stats_truncated: range.truncated,
         daily_credit_day,
         daily_credit_used,
         daily_credit_reserved,
@@ -1258,28 +1343,67 @@ struct StatsParams {
     #[serde(default)]
     detail: bool,
     recent: Option<usize>,
-    since_secs: Option<u64>,
+    #[serde(flatten)]
+    range: TimeRangeParams,
     by: Option<String>,
     account: Option<String>,
     level: Option<String>,
 }
 
-fn handle_stats(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
+async fn handle_stats(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
     let params: StatsParams = if params.is_null() {
         StatsParams::default()
     } else {
         parse_params(params)?
     };
+    let range = resolve_time_range(&params.range, None, None)?;
     if params.by.as_deref() == Some("apikey") {
         if !params.detail {
             return Err(RpcError::bad_params("stats grouping requires detail=true"));
         }
-        return to_value(serde_json::json!({"by_apikey":state.meter.list()}));
+        if range.filtered {
+            return Err(RpcError::bad_params(
+                "time ranges are not supported for API key usage grouping; use `kproxy apikey history`",
+            ));
+        }
+        return to_value(serde_json::json!({
+            "scope":"persistent",
+            "range":{"start":null,"end":null,"resolution_secs":60,"truncated":false},
+            "by_apikey":state.meter.list()
+        }));
     }
-    let cutoff = params
-        .since_secs
-        .map(|seconds| now_secs().saturating_sub(seconds as i64));
-    let mut stats = state.stats.window(cutoff, params.recent);
+    let available_start = state.stats.persistent_history_started_at();
+    let prefix_complete = state.stats.persistent_history_prefix_complete();
+    let requested_recent = if params.detail {
+        params.recent
+    } else {
+        // Summary-only queries never serialize request diagnostics. Avoid even
+        // cloning references for the bounded diagnostic ring.
+        Some(0)
+    };
+    let mut stats = state
+        .stats
+        .window_between(range.start, range.end, requested_recent)
+        .await
+        .map_err(|error| RpcError::internal(format!("read statistics history: {error}")))?;
+    let missing_ranges = if range.filtered {
+        stats
+            .history_gaps
+            .iter()
+            .filter(|gap| {
+                range.start.is_none_or(|start| gap.end >= start)
+                    && range.end.is_none_or(|end| gap.start <= end)
+            })
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+    let history_complete = prefix_complete && stats.history_gaps.is_empty();
+    let prefix_truncated = !prefix_complete
+        && available_start
+            .is_none_or(|available| range.start.is_none_or(|start| start < available));
+    let truncated = range.filtered && (prefix_truncated || !missing_ranges.is_empty());
     if params.account.is_some() || params.level.is_some() {
         stats.recent_requests.retain(|request| {
             params
@@ -1294,10 +1418,34 @@ fn handle_stats(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
         });
     }
     let percentiles = stats.percentiles();
+    let average_ms = stats
+        .total
+        .duration_ms
+        .checked_div(stats.total.duration_samples)
+        .unwrap_or_else(|| {
+            stats
+                .latencies_ms
+                .iter()
+                .fold(0u64, |total, value| total.saturating_add(*value))
+                .checked_div(stats.latencies_ms.len() as u64)
+                .unwrap_or(0)
+        });
+    let range_json = serde_json::json!({
+        "start":range.start,
+        "end":range.end,
+        "available_start":available_start,
+        "history_complete":history_complete,
+        "prefix_truncated":range.filtered && prefix_truncated,
+        "missing_ranges":missing_ranges,
+        "resolution_secs":60,
+        "truncated":truncated
+    });
     if !params.detail {
         return to_value(serde_json::json!({
+            "scope":"persistent",
+            "range":range_json,
             "summary":stats.total,
-            "latency":{"p50_ms":percentiles.0,"p95_ms":percentiles.1,"p99_ms":percentiles.2}
+            "latency":{"average_ms":average_ms,"p50_ms":percentiles.0,"p95_ms":percentiles.1,"p99_ms":percentiles.2}
         }));
     }
     let grouped = match params.by.as_deref() {
@@ -1313,9 +1461,11 @@ fn handle_stats(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
     }
     .map_err(|error| RpcError::internal(error.to_string()))?;
     to_value(serde_json::json!({
+        "scope":"persistent",
+        "range":range_json,
         "stats":stats,
         "grouped":grouped,
-        "latency":{"p50_ms":percentiles.0,"p95_ms":percentiles.1,"p99_ms":percentiles.2}
+        "latency":{"average_ms":average_ms,"p50_ms":percentiles.0,"p95_ms":percentiles.1,"p99_ms":percentiles.2}
     }))
 }
 
@@ -2071,6 +2221,24 @@ mod tests {
             .iter()
             .any(|reason| reason.contains("proxy service")));
 
+        let truncated: StatusResult = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(
+                    2,
+                    method::STATUS,
+                    serde_json::json!({"start_secs":0,"end_secs":now_secs()}),
+                ),
+            )
+            .await,
+        ))
+        .expect("truncated status");
+        assert!(truncated.stats_truncated);
+        assert_eq!(
+            truncated.stats_start,
+            Some(state.stats.session_started_at())
+        );
+
         let (_directory, empty) = state_with(vec![]).await;
         let empty_status: StatusResult = serde_json::from_value(expect_ok(
             dispatch(
@@ -2164,6 +2332,8 @@ mod tests {
             .await,
         );
         assert_eq!(compact["summary"]["requests"], 1);
+        assert_eq!(compact["scope"], "persistent");
+        assert_eq!(compact["latency"]["average_ms"], 25);
         assert_eq!(compact["latency"]["p50_ms"], 25);
         assert!(compact.get("stats").is_none());
         assert!(compact.get("grouped").is_none());
@@ -2184,6 +2354,36 @@ mod tests {
             "Enterprise stats"
         );
         assert_eq!(detail["grouped"]["claude-sonnet-4.6"]["requests"], 1);
+
+        let status: StatusResult = serde_json::from_value(expect_ok(
+            dispatch(
+                &state,
+                Request::new(3, method::STATUS, serde_json::json!({})),
+            )
+            .await,
+        ))
+        .expect("status");
+        assert_eq!(status.stats_scope, "session");
+        assert_eq!(status.request_count, 1);
+        assert_eq!(status.average_latency_ms, 25);
+        assert!(status.stats_start.is_some());
+        assert!(status.stats_end.is_some());
+
+        let historical = expect_ok(
+            dispatch(
+                &state,
+                Request::new(
+                    4,
+                    method::STATS,
+                    serde_json::json!({"start_secs":0,"end_secs":60}),
+                ),
+            )
+            .await,
+        );
+        assert_eq!(historical["summary"]["requests"], 0);
+        assert_eq!(historical["range"]["start"], 0);
+        assert_eq!(historical["range"]["end"], 60);
+        assert_eq!(historical["range"]["truncated"], false);
     }
 
     #[tokio::test]

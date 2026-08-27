@@ -389,16 +389,19 @@ View or follow structured request records:
 ```bash
 cargo run -p kproxy -- logs show --tail 100
 cargo run -p kproxy -- logs follow --level warn
+cargo run -p kproxy -- status --since 30m
 cargo run -p kproxy -- stats --since 1h
+cargo run -p kproxy -- stats --start 2026-08-27T10:00:00+08:00 --end 2026-08-27T12:00:00+08:00
 cargo run -p kproxy -- stats --detail --since 1h --by endpoint
 ```
 
 The legacy `kproxy logs --tail ...` and `kproxy logs -f` forms remain supported.
 
-`kproxy stats` reports aggregate request, success, token, credit, and latency
-metrics. The default is a compact summary; `--detail` adds recent requests and
-grouping by model/account/apikey/endpoint. Use `kproxy logs` and trace IDs for
-individual failures.
+`kproxy status` reports request metrics for the current daemon session, while
+`kproxy stats` defaults to persisted cumulative metrics across restarts. Both
+accept `--since` or a timezone-aware `--start`/`--end` range at one-minute
+aggregation resolution. `--detail` adds recent requests and grouping by
+model/account/endpoint. Use `kproxy logs` and trace IDs for individual failures.
 
 For more detail, set `RUST_LOG` or `log.level` to `debug` or `trace`. Logs do not
 record prompts, generated response bodies, or API-key values.

@@ -250,6 +250,7 @@ XDG 目录：
 | `accounts.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | 包含凭证，创建权限为 `0600`。 |
 | `daily.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | 按 UTC 日期重置的每日额度记录。 |
 | `stats.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | 持久化请求聚合统计。 |
+| `stats-history/` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | 按 UTC 小时分片保存的分钟级请求聚合。 |
 | `web-search-replay.key` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | AES-256-GCM 回放密钥，以 `0600` 创建且永不覆盖。 |
 | `admin.sock` | `${XDG_RUNTIME_DIR}/kproxy/` 或 `/run/kproxy/` | 本地管理面。 |
 | 日志 | `${XDG_DATA_HOME:-~/.local/share}/kproxy/logs/` | 按 UTC 日期和级别拆分。 |
@@ -349,7 +350,9 @@ kproxy alert config
 kproxy alert add --name alerts --platform dingtalk --url https://example/hook --event token-refresh-failed,account-credit-protected,account-quota-exhausted,service-quota-exhausted
 kproxy alert edit --name alerts --event token-refresh-failed --event service-quota-exhausted
 kproxy alert delete alerts
+kproxy status --since 30m
 kproxy stats --since 1h
+kproxy stats --start 2026-08-27T10:00:00+08:00 --end 2026-08-27T12:00:00+08:00
 kproxy stats --detail --since 1h --by endpoint
 kproxy logs show --tail 100
 kproxy logs follow --level warn
@@ -376,8 +379,15 @@ kproxy help
 日志目录、基础路径、格式和过滤规则。通过 Docker 宿主机 wrapper 执行时，这两个路径命令
 还会显示 named volume 在宿主机上的真实路径。旧的 `kproxy logs --tail ...` 与 `-f` 用法继续兼容。
 
-`kproxy stats` 用于查看代理流量、成功率、Token、Credits 和延迟等聚合运维指标，不替代逐条
-请求日志。默认只输出紧凑汇总；增加 `--detail` 后才输出分组统计和最近请求。
+`kproxy status` 的请求量、成功率、Credits 和平均延迟只统计本次 daemon 启动后的数据；
+`kproxy stats` 默认查看跨重启持久化的累计数据。两个命令都支持 `--since 1h`，也支持使用
+带时区的 RFC 3339 时间指定 `--start` 和 `--end`，例如
+`--start 2026-08-27T10:00:00+08:00 --end 2026-08-27T12:00:00+08:00`。
+时间序列按分钟聚合并持续保留，不再按 7 天淘汰；从旧版本升级时已经被淘汰的历史无法恢复，
+命令会明确提示可查询的最早时间。累计汇总以紧凑格式保存在 `stats.json`，分钟历史按 UTC 小时
+拆分到 `stats-history/`；时间范围的文件读取和聚合不会占用 API 请求统计锁。
+`kproxy stats --detail` 仍只输出最近请求和分组统计，逐条
+故障追踪应使用 `kproxy logs` 和 Trace ID。
 
 动态模型探测会在 daemon 启动时立即执行、账号变化时再次触发，之后按模型缓存 TTL 刷新。
 每分钟的账号状态任务只刷新额度信息，不再重复请求模型列表。
