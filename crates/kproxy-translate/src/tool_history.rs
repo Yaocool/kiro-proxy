@@ -2,8 +2,9 @@
 //!
 //! Client histories can become incomplete after context editing, compaction,
 //! or retries. Kiro rejects the entire request when a structured tool call is
-//! unknown, duplicated, or not followed by exactly one matching result. This
-//! module repairs those histories without discarding their textual data.
+//! undefined, malformed, duplicated, or not followed by exactly one matching
+//! result. This module repairs valid calls locally and archives only the calls
+//! that cannot be represented safely as structured Kiro history.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -22,6 +23,8 @@ const MISSING_RESULT_TEXT: &str =
 pub struct KiroToolHistoryStats {
     pub flattened_tool_uses: usize,
     pub flattened_tool_results: usize,
+    pub normalized_tool_uses: usize,
+    pub removed_invalid_tool_uses: usize,
     pub relocated_tool_results: usize,
     pub synthesized_tool_results: usize,
     pub normalized_tool_results: usize,
@@ -32,14 +35,21 @@ pub struct KiroToolHistoryStats {
 
 impl KiroToolHistoryStats {
     pub fn repaired(&self) -> bool {
+        self.has_structured_tool_repair() || self.inserted_messages > 0
+    }
+
+    /// Whether normalization changed structured tool data rather than only
+    /// adding a role placeholder to meet Kiro's alternating-turn contract.
+    pub fn has_structured_tool_repair(&self) -> bool {
         self.flattened_tool_uses > 0
             || self.flattened_tool_results > 0
+            || self.normalized_tool_uses > 0
+            || self.removed_invalid_tool_uses > 0
             || self.relocated_tool_results > 0
             || self.synthesized_tool_results > 0
             || self.normalized_tool_results > 0
             || self.removed_historical_tool_definitions > 0
             || self.removed_duplicate_tool_definitions > 0
-            || self.inserted_messages > 0
     }
 }
 
@@ -67,10 +77,10 @@ struct SourcedResult {
 /// Repairs a Kiro payload so ordinary and proxy-executed tool calls form
 /// strict, adjacent, one-to-one call/result pairs.
 ///
-/// Unsupported or irreparably ambiguous structured history is converted to
-/// readable text instead of being silently dropped. Missing historical
-/// results are represented by an explicit error result so the model cannot
-/// mistake an incomplete execution for success.
+/// Calls whose definitions are still active remain structured. Undefined,
+/// malformed, or ambiguous calls are archived as neutral JSON records while
+/// the rest of the history remains structured, so one bad call cannot flatten
+/// unrelated tool calls or make model-visible text resemble an instruction.
 pub fn sanitize_kiro_tool_history(payload: &mut KiroPayload) -> KiroToolHistoryStats {
     let mut stats = KiroToolHistoryStats::default();
     let state = &mut payload.conversation_state;
@@ -104,14 +114,8 @@ pub fn sanitize_kiro_tool_history(payload: &mut KiroPayload) -> KiroToolHistoryS
     }
     messages.push(ConversationMessage::User(current));
 
-    let flatten_all = tool_uses_are_ambiguous(&messages, &active_tool_names);
-    if flatten_all {
-        flatten_structured_history(&mut messages, &mut stats);
-        messages = normalize_roles(messages, HashMap::new(), &mut stats);
-    } else {
-        let scheduled = repair_tool_pairs(&mut messages, &mut stats);
-        messages = normalize_roles(messages, scheduled, &mut stats);
-    }
+    let scheduled = repair_tool_pairs(&mut messages, &active_tool_names, &mut stats);
+    messages = normalize_roles(messages, scheduled, &mut stats);
 
     let current = match messages.pop() {
         Some(ConversationMessage::User(user)) => user,
@@ -250,12 +254,14 @@ fn sanitize_current_tool_definitions(
 ) -> HashSet<String> {
     let mut names = HashSet::new();
     if let Some(context) = context {
-        context.tools.retain(|tool| {
+        context.tools.retain_mut(|tool| {
             let name = tool.tool_specification.name.trim();
             let keep = !name.is_empty() && names.insert(name.to_owned());
             if !keep {
                 stats.removed_duplicate_tool_definitions =
                     stats.removed_duplicate_tool_definitions.saturating_add(1);
+            } else if name != tool.tool_specification.name {
+                tool.tool_specification.name = name.to_owned();
             }
             keep
         });
@@ -263,50 +269,9 @@ fn sanitize_current_tool_definitions(
     names
 }
 
-fn tool_uses_are_ambiguous(
-    messages: &[ConversationMessage],
-    active_names: &HashSet<String>,
-) -> bool {
-    let mut ids = HashSet::new();
-    messages.iter().any(|message| {
-        let ConversationMessage::Assistant(assistant) = message else {
-            return false;
-        };
-        assistant.tool_uses.iter().any(|tool_use| {
-            tool_use.tool_use_id.trim().is_empty()
-                || tool_use.name.trim().is_empty()
-                || !tool_use.input.is_object()
-                || !active_names.contains(&tool_use.name)
-                || !ids.insert(tool_use.tool_use_id.as_str())
-        })
-    })
-}
-
-fn flatten_structured_history(
-    messages: &mut [ConversationMessage],
-    stats: &mut KiroToolHistoryStats,
-) {
-    for message in messages {
-        match message {
-            ConversationMessage::Assistant(assistant) => {
-                for tool_use in std::mem::take(&mut assistant.tool_uses) {
-                    append_text(&mut assistant.content, &render_tool_use(&tool_use));
-                    stats.flattened_tool_uses = stats.flattened_tool_uses.saturating_add(1);
-                }
-            }
-            ConversationMessage::User(user) => {
-                let results = take_tool_results(user);
-                for result in results {
-                    append_text(&mut user.content, &render_tool_result(&result));
-                    stats.flattened_tool_results = stats.flattened_tool_results.saturating_add(1);
-                }
-            }
-        }
-    }
-}
-
 fn repair_tool_pairs(
     messages: &mut [ConversationMessage],
+    active_tool_names: &HashSet<String>,
     stats: &mut KiroToolHistoryStats,
 ) -> HashMap<usize, Vec<KiroToolResult>> {
     let mut results = Vec::<SourcedResult>::new();
@@ -318,7 +283,7 @@ fn repair_tool_pairs(
         for result in take_tool_results(user) {
             let index = results.len();
             result_indexes
-                .entry(result.tool_use_id.clone())
+                .entry(result.tool_use_id.trim().to_owned())
                 .or_default()
                 .push_back(index);
             results.push(SourcedResult {
@@ -328,14 +293,67 @@ fn repair_tool_pairs(
         }
     }
 
+    let tool_use_id_counts = messages
+        .iter()
+        .filter_map(|message| match message {
+            ConversationMessage::Assistant(assistant) => Some(&assistant.tool_uses),
+            ConversationMessage::User(_) => None,
+        })
+        .flatten()
+        .map(|tool_use| tool_use.tool_use_id.trim())
+        .filter(|id| !id.is_empty())
+        .fold(HashMap::<String, usize>::new(), |mut counts, id| {
+            *counts.entry(id.to_owned()).or_default() += 1;
+            counts
+        });
     let mut scheduled = HashMap::<usize, Vec<KiroToolResult>>::new();
-    for (assistant_index, message) in messages.iter().enumerate() {
+    for (assistant_index, message) in messages.iter_mut().enumerate() {
         let ConversationMessage::Assistant(assistant) = message else {
             continue;
         };
-        for tool_use in &assistant.tool_uses {
+        let original_uses = std::mem::take(&mut assistant.tool_uses);
+        let mut repaired_uses = Vec::with_capacity(original_uses.len());
+        for mut tool_use in original_uses {
+            let original_id = tool_use.tool_use_id.clone();
+            let mut normalized = false;
+
+            let trimmed_name = tool_use.name.trim();
+            let trimmed_id = original_id.trim();
+            let duplicate_id = !trimmed_id.is_empty()
+                && tool_use_id_counts
+                    .get(trimmed_id)
+                    .copied()
+                    .unwrap_or_default()
+                    > 1;
+            let malformed = trimmed_name.is_empty()
+                || trimmed_id.is_empty()
+                || duplicate_id
+                || !tool_use.input.is_object();
+            let undefined = !trimmed_name.is_empty() && !active_tool_names.contains(trimmed_name);
+            if malformed || undefined {
+                append_text(&mut assistant.content, &render_tool_use(&tool_use));
+                stats.flattened_tool_uses = stats.flattened_tool_uses.saturating_add(1);
+                if malformed {
+                    stats.removed_invalid_tool_uses =
+                        stats.removed_invalid_tool_uses.saturating_add(1);
+                }
+                continue;
+            }
+
+            if trimmed_name != tool_use.name {
+                tool_use.name = trimmed_name.to_owned();
+                normalized = true;
+            }
+            if trimmed_id != original_id {
+                tool_use.tool_use_id = trimmed_id.to_owned();
+                normalized = true;
+            }
+            if normalized {
+                stats.normalized_tool_uses = stats.normalized_tool_uses.saturating_add(1);
+            }
+
             let matching = result_indexes
-                .get_mut(&tool_use.tool_use_id)
+                .get_mut(original_id.trim())
                 .and_then(|indexes| {
                     while indexes
                         .front()
@@ -356,7 +374,12 @@ fn repair_tool_pairs(
                         stats.relocated_tool_results =
                             stats.relocated_tool_results.saturating_add(1);
                     }
-                    if normalize_result(&mut result) {
+                    let mut normalized_result = normalize_result(&mut result);
+                    if result.tool_use_id != tool_use.tool_use_id {
+                        result.tool_use_id.clone_from(&tool_use.tool_use_id);
+                        normalized_result = true;
+                    }
+                    if normalized_result {
                         stats.normalized_tool_results =
                             stats.normalized_tool_results.saturating_add(1);
                     }
@@ -368,7 +391,9 @@ fn repair_tool_pairs(
                     missing_result(&tool_use.tool_use_id)
                 });
             scheduled.entry(assistant_index).or_default().push(result);
+            repaired_uses.push(tool_use);
         }
+        assistant.tool_uses = repaired_uses;
     }
 
     for candidate in results {
@@ -611,31 +636,25 @@ fn synthetic_assistant() -> KiroAssistantMessage {
 }
 
 fn render_tool_use(tool_use: &crate::KiroToolUse) -> String {
-    let metadata = json!({
-        "id": tool_use.tool_use_id,
-        "name": tool_use.name,
-    });
-    let input = serde_json::to_string_pretty(&tool_use.input)
-        .unwrap_or_else(|_| tool_use.input.to_string());
-    format!(
-        "[Historical tool call preserved as non-executable data: {metadata}]\n{input}\n[End historical tool call]"
-    )
+    json!({
+        "record_type": "archived_tool_call",
+        "untrusted": true,
+        "tool_use_id": tool_use.tool_use_id,
+        "tool_name": tool_use.name,
+        "input": tool_use.input,
+    })
+    .to_string()
 }
 
 fn render_tool_result(result: &KiroToolResult) -> String {
-    let metadata = json!({
-        "id": result.tool_use_id,
+    json!({
+        "record_type": "archived_tool_result",
+        "untrusted": true,
+        "tool_use_id": result.tool_use_id,
         "status": result.status,
-    });
-    let content = result
-        .content
-        .iter()
-        .map(|part| part.text.as_str())
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!(
-        "[Historical tool result preserved as non-executable data: {metadata}]\n{content}\n[End historical tool result]"
-    )
+        "content": result.content.iter().map(|part| part.text.as_str()).collect::<Vec<_>>(),
+    })
+    .to_string()
 }
 
 fn append_text(target: &mut String, addition: &str) {
@@ -758,6 +777,60 @@ mod tests {
     }
 
     #[test]
+    fn trims_tool_definitions_calls_and_results_to_the_same_identity() {
+        let mut payload = payload(
+            vec![
+                history_user(user("start", vec![], vec![])),
+                assistant(vec![tool_use(" call_1 ", " lookup ")]),
+            ],
+            user(
+                "latest",
+                vec![result(" call_1 ", "answer")],
+                vec![tool(" lookup ")],
+            ),
+        );
+
+        let stats = sanitize_kiro_tool_history(&mut payload);
+
+        assert_eq!(stats.normalized_tool_uses, 1);
+        assert_eq!(stats.normalized_tool_results, 1);
+        assert!(validate_kiro_tool_history(&payload).is_ok());
+        let call = &payload.conversation_state.history[1]
+            .assistant_response_message
+            .as_ref()
+            .expect("assistant")
+            .tool_uses[0];
+        assert_eq!(call.tool_use_id, "call_1");
+        assert_eq!(call.name, "lookup");
+        let current_context = payload
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .as_ref()
+            .expect("current context");
+        assert_eq!(current_context.tools[0].tool_specification.name, "lookup");
+        assert_eq!(current_context.tool_results[0].tool_use_id, "call_1");
+    }
+
+    #[test]
+    fn distinguishes_role_placeholders_from_structured_tool_repairs() {
+        let role_placeholder = KiroToolHistoryStats {
+            inserted_messages: 1,
+            ..KiroToolHistoryStats::default()
+        };
+        assert!(role_placeholder.repaired());
+        assert!(!role_placeholder.has_structured_tool_repair());
+
+        let flattened_tool = KiroToolHistoryStats {
+            flattened_tool_uses: 1,
+            ..KiroToolHistoryStats::default()
+        };
+        assert!(flattened_tool.repaired());
+        assert!(flattened_tool.has_structured_tool_repair());
+    }
+
+    #[test]
     fn relocates_result_to_the_user_immediately_after_its_call() {
         let mut payload = payload(
             vec![
@@ -856,17 +929,80 @@ mod tests {
     }
 
     #[test]
-    fn flattens_unknown_tool_history_without_losing_data() {
+    fn archives_only_undefined_calls_when_other_tools_are_active() {
+        let mut payload = payload(
+            vec![
+                history_user(user("start", vec![], vec![])),
+                assistant(vec![
+                    tool_use("old_call", "removed_tool"),
+                    tool_use("active_call", "lookup"),
+                ]),
+            ],
+            user(
+                "latest",
+                vec![
+                    result("old_call", "old output"),
+                    result("active_call", "active output"),
+                ],
+                vec![tool("lookup")],
+            ),
+        );
+        assert!(validate_kiro_tool_history(&payload)
+            .expect_err("undefined historical tool must fail validation before repair")
+            .contains("references undefined tool 'removed_tool'"));
+
+        let stats = sanitize_kiro_tool_history(&mut payload);
+        let repaired = serde_json::to_value(&payload).expect("serialize repaired payload");
+        let second = sanitize_kiro_tool_history(&mut payload);
+
+        assert_eq!(stats.flattened_tool_uses, 1);
+        assert_eq!(stats.flattened_tool_results, 1);
+        assert!(!second.repaired());
+        assert_eq!(
+            serde_json::to_value(&payload).expect("serialize second pass"),
+            repaired
+        );
+        assert!(validate_kiro_tool_history(&payload).is_ok());
+        let historical_call = payload.conversation_state.history[1]
+            .assistant_response_message
+            .as_ref()
+            .expect("assistant");
+        assert_eq!(historical_call.tool_uses.len(), 1);
+        assert_eq!(historical_call.tool_uses[0].tool_use_id, "active_call");
+        assert_eq!(historical_call.tool_uses[0].name, "lookup");
+        assert!(historical_call
+            .content
+            .contains("\"record_type\":\"archived_tool_call\""));
+        assert!(historical_call.content.contains("removed_tool"));
+        assert!(!historical_call.content.contains("non-executable data"));
+        let current = &payload
+            .conversation_state
+            .current_message
+            .user_input_message;
+        assert!(current.content.contains("old output"));
+        assert!(current
+            .content
+            .contains("\"record_type\":\"archived_tool_result\""));
+        assert_eq!(
+            current
+                .user_input_message_context
+                .as_ref()
+                .expect("current context")
+                .tool_results[0]
+                .content[0]
+                .text,
+            "active output"
+        );
+    }
+
+    #[test]
+    fn archives_all_tool_history_when_current_request_has_no_tools() {
         let mut payload = payload(
             vec![
                 history_user(user("start", vec![], vec![])),
                 assistant(vec![tool_use("old_call", "removed_tool")]),
             ],
-            user(
-                "latest",
-                vec![result("old_call", "old output")],
-                vec![tool("different_tool")],
-            ),
+            user("latest", vec![result("old_call", "old output")], vec![]),
         );
 
         let stats = sanitize_kiro_tool_history(&mut payload);
@@ -874,18 +1010,211 @@ mod tests {
         assert_eq!(stats.flattened_tool_uses, 1);
         assert_eq!(stats.flattened_tool_results, 1);
         assert!(validate_kiro_tool_history(&payload).is_ok());
-        assert!(payload.conversation_state.history[1]
+        let historical_call = payload.conversation_state.history[1]
             .assistant_response_message
             .as_ref()
-            .expect("assistant")
+            .expect("assistant");
+        assert!(historical_call.tool_uses.is_empty());
+        assert!(historical_call.content.contains("removed_tool"));
+        assert!(historical_call
             .content
-            .contains("removed_tool"));
+            .contains("\"record_type\":\"archived_tool_call\""));
+        assert!(!historical_call.content.contains("Historical tool call"));
+        assert!(!historical_call.content.contains("non-executable data"));
+        let current = &payload
+            .conversation_state
+            .current_message
+            .user_input_message;
+        assert!(current.content.contains("old output"));
+        assert!(current
+            .content
+            .contains("\"record_type\":\"archived_tool_result\""));
+        assert!(!current.content.contains("Historical tool result"));
+        assert!(current
+            .user_input_message_context
+            .as_ref()
+            .is_none_or(|context| context.tool_results.is_empty()));
+    }
+
+    #[test]
+    fn repairs_malformed_calls_locally_without_flattening_valid_calls() {
+        let mut duplicate_second = tool_use("duplicate", "lookup");
+        duplicate_second.input = json!({"which":"second"});
+        let mut malformed_input = tool_use("bad_input", "lookup");
+        malformed_input.input = json!("raw arguments must survive");
+        let missing_identity = tool_use(" ", "lookup");
+        let mut missing_name = tool_use("missing_name", " ");
+        missing_name.input = json!({"path":"must survive"});
+        let mut payload = payload(
+            vec![
+                history_user(user("start", vec![], vec![])),
+                assistant(vec![
+                    tool_use("valid", "lookup"),
+                    tool_use("duplicate", "lookup"),
+                    duplicate_second,
+                    malformed_input,
+                    missing_identity,
+                    missing_name,
+                    tool_use("unknown", "removed_tool"),
+                ]),
+            ],
+            user(
+                "latest",
+                vec![
+                    result("valid", "valid output"),
+                    result("duplicate", "first"),
+                    result("duplicate", "second"),
+                    result("bad_input", "bad input output"),
+                    result("", "empty id output"),
+                    result("missing_name", "unnamed output"),
+                    result("unknown", "unknown output"),
+                    result("orphan", "orphan output"),
+                ],
+                vec![tool("lookup")],
+            ),
+        );
+
+        let stats = sanitize_kiro_tool_history(&mut payload);
+
+        assert_eq!(stats.normalized_tool_uses, 0);
+        assert_eq!(stats.normalized_tool_results, 0);
+        assert_eq!(stats.removed_invalid_tool_uses, 5);
+        assert_eq!(stats.flattened_tool_uses, 6);
+        assert_eq!(stats.flattened_tool_results, 7);
+        assert_eq!(stats.synthesized_tool_results, 0);
+        assert!(validate_kiro_tool_history(&payload).is_ok());
+
+        let assistant = payload.conversation_state.history[1]
+            .assistant_response_message
+            .as_ref()
+            .expect("assistant");
+        assert_eq!(assistant.tool_uses.len(), 1);
+        assert_eq!(assistant.tool_uses[0].tool_use_id, "valid");
+        assert_eq!(assistant.tool_uses[0].name, "lookup");
+        assert!(assistant.content.contains("raw arguments must survive"));
+        assert!(assistant.content.contains("must survive"));
+        assert!(assistant.content.contains("removed_tool"));
+        assert!(!assistant.content.contains("Historical tool call"));
+
+        let current = &payload
+            .conversation_state
+            .current_message
+            .user_input_message;
+        assert!(current.content.contains("orphan output"));
+        assert!(current.content.contains("unnamed output"));
+        assert!(current.content.contains("empty id output"));
+        assert!(current.content.contains("unknown output"));
+        let results = &current
+            .user_input_message_context
+            .as_ref()
+            .expect("current context")
+            .tool_results;
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].tool_use_id, "valid");
+        assert_eq!(results[0].content[0].text, "valid output");
+    }
+
+    #[test]
+    fn archives_undefined_consecutive_call_without_losing_the_next_call() {
+        let mut payload = payload(
+            vec![
+                history_user(user("start", vec![], vec![])),
+                assistant(vec![tool_use("old_call", "removed_tool")]),
+                assistant(vec![tool_use("new_call", "lookup")]),
+            ],
+            user(
+                "latest",
+                vec![
+                    result("old_call", "old output"),
+                    result("new_call", "new output"),
+                ],
+                vec![tool("lookup")],
+            ),
+        );
+
+        let stats = sanitize_kiro_tool_history(&mut payload);
+
+        assert_eq!(stats.flattened_tool_uses, 1);
+        assert_eq!(stats.flattened_tool_results, 1);
+        assert_eq!(stats.relocated_tool_results, 0);
+        assert_eq!(stats.inserted_messages, 1);
+        assert!(validate_kiro_tool_history(&payload).is_ok());
+
+        let first_call = payload.conversation_state.history[1]
+            .assistant_response_message
+            .as_ref()
+            .expect("first assistant");
+        assert!(first_call.tool_uses.is_empty());
+        assert!(first_call.content.contains("removed_tool"));
+
+        let second_call = payload.conversation_state.history[3]
+            .assistant_response_message
+            .as_ref()
+            .expect("second assistant");
+        assert_eq!(second_call.tool_uses[0].tool_use_id, "new_call");
+        let second_result = payload
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .as_ref()
+            .expect("second paired result");
+        assert_eq!(second_result.tool_results[0].tool_use_id, "new_call");
         assert!(payload
             .conversation_state
             .current_message
             .user_input_message
             .content
             .contains("old output"));
+        assert!(!serde_json::to_string(&payload)
+            .expect("serialize")
+            .contains("Historical tool call preserved"));
+    }
+
+    #[test]
+    fn ambiguous_duplicate_ids_are_archived_instead_of_stealing_later_results() {
+        let mut payload = payload(
+            vec![
+                history_user(user("start", vec![], vec![])),
+                assistant(vec![tool_use("duplicate", "lookup")]),
+                history_user(user("first call had no result", vec![], vec![])),
+                assistant(vec![tool_use("duplicate", "lookup")]),
+            ],
+            user(
+                "latest",
+                vec![result("duplicate", "second execution output")],
+                vec![tool("lookup")],
+            ),
+        );
+
+        let stats = sanitize_kiro_tool_history(&mut payload);
+
+        assert_eq!(stats.flattened_tool_uses, 2);
+        assert_eq!(stats.flattened_tool_results, 1);
+        assert_eq!(stats.removed_invalid_tool_uses, 2);
+        assert_eq!(stats.synthesized_tool_results, 0);
+        assert!(validate_kiro_tool_history(&payload).is_ok());
+        assert!(payload.conversation_state.history[1]
+            .assistant_response_message
+            .as_ref()
+            .expect("first assistant")
+            .tool_uses
+            .is_empty());
+        assert!(payload.conversation_state.history[3]
+            .assistant_response_message
+            .as_ref()
+            .expect("second assistant")
+            .tool_uses
+            .is_empty());
+        let current = &payload
+            .conversation_state
+            .current_message
+            .user_input_message;
+        assert!(current.content.contains("second execution output"));
+        assert!(current
+            .user_input_message_context
+            .as_ref()
+            .is_none_or(|context| context.tool_results.is_empty()));
     }
 
     #[test]
