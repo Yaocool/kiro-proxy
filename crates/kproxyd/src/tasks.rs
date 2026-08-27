@@ -677,6 +677,7 @@ pub(crate) async fn refresh_account_usage(
     if usage.is_none() && subscription.is_none() && upstream_user_id.is_none() {
         return Ok(false);
     }
+    let authoritative_usage = usage.clone();
     let mut account = runtime.account.write().await;
     if let Some(user_id) = upstream_user_id {
         account.upstream_user_id = Some(user_id);
@@ -687,6 +688,10 @@ pub(crate) async fn refresh_account_usage(
     }
     if let Some(subscription) = subscription {
         account.subscription = Some(subscription);
+    }
+    drop(account);
+    if let Some(usage) = authoritative_usage {
+        state.record_authoritative_usage(account_id, usage);
     }
     Ok(true)
 }

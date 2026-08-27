@@ -1153,6 +1153,7 @@ dependencies = [
  "base64 0.22.1",
  "hmac",
  "kproxy-core",
+ "libc",
  "reqwest 0.12.7",
  "serde",
  "serde_json",
