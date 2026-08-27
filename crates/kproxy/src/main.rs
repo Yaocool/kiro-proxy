@@ -1003,16 +1003,22 @@ mod tests {
             "ops",
             "--platform",
             "dingtalk",
-            "--url",
+            "--webhook-url",
             "https://example.com/hook",
+            "--dingtalk-sign",
+            "SEC-test-sign",
             "--event",
             "account-credit-protected,account-quota-exhausted,service-quota-exhausted",
             "--event",
             "token-refresh-failed",
         ])
         .expect("multi-event alert target");
-        let Some(Command::Alert(crate::commands::runtime::AlertCommand::Add { events, .. })) =
-            cli.command
+        let Some(Command::Alert(crate::commands::runtime::AlertCommand::Add {
+            webhook_url,
+            events,
+            dingtalk_sign,
+            ..
+        })) = cli.command
         else {
             panic!("expected alert add command");
         };
@@ -1025,10 +1031,12 @@ mod tests {
                 crate::commands::runtime::AlertEvent::TokenRefreshFailed,
             ]
         );
+        assert_eq!(webhook_url, "https://example.com/hook");
+        assert_eq!(dingtalk_sign.as_deref(), Some("SEC-test-sign"));
     }
 
     #[test]
-    fn alert_add_accepts_legacy_kind_alias() {
+    fn alert_add_accepts_legacy_kind_and_url_aliases() {
         let cli = Cli::try_parse_from([
             "kproxy",
             "alert",
@@ -1042,7 +1050,7 @@ mod tests {
             "--event",
             "token-refresh-failed",
         ])
-        .expect("legacy --kind alias");
+        .expect("legacy --kind and --url aliases");
         let Some(Command::Alert(crate::commands::runtime::AlertCommand::Add { platform, .. })) =
             cli.command
         else {
@@ -1061,18 +1069,24 @@ mod tests {
             "alert",
             "edit",
             "ops",
+            "--webhook-url",
+            "https://example.com/new-hook",
             "--event",
             "token-refresh-failed",
         ])
         .expect("positional alert target");
         let Some(Command::Alert(crate::commands::runtime::AlertCommand::Edit {
-            target, name, ..
+            target,
+            name,
+            webhook_url,
+            ..
         })) = positional.command
         else {
             panic!("expected alert edit command");
         };
         assert_eq!(target.as_deref(), Some("ops"));
         assert_eq!(name, None);
+        assert_eq!(webhook_url.as_deref(), Some("https://example.com/new-hook"));
 
         let named = Cli::try_parse_from([
             "kproxy",
@@ -1111,7 +1125,7 @@ mod tests {
             "ops",
             "--platform",
             "unknown",
-            "--url",
+            "--webhook-url",
             "https://example.com/hook",
             "--event",
             "token-refresh-failed",

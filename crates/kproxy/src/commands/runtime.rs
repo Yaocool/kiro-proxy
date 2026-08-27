@@ -255,7 +255,7 @@ pub enum AlertCommand {
     List,
     /// 添加告警目标。
     #[command(
-        after_help = "`--platform` 表示接收 Webhook 的通知平台；先用 `kproxy alert platforms` 查看平台说明。\n用 `kproxy alert events` 查看事件说明。多选可重复传入 --event，也可使用逗号分隔。\n\n示例：\n  kproxy alert add --name alerts --platform dingtalk --url https://example/hook --event account-credit-protected --event account-quota-exhausted\n  kproxy alert add --name alerts --platform feishu --url https://example/hook --event account-credit-protected,account-quota-exhausted,service-quota-exhausted"
+        after_help = "`--platform` 表示接收 Webhook 的通知平台；先用 `kproxy alert platforms` 查看平台说明。\n用 `kproxy alert events` 查看事件说明。多选可重复传入 --event，也可使用逗号分隔。\n\n示例：\n  kproxy alert add --name alerts --platform dingtalk --webhook-url 'https://oapi.dingtalk.com/robot/send?access_token=replace-me' --dingtalk-sign 'SEC-replace-me' --event account-credit-protected --event account-quota-exhausted\n  kproxy alert add --name alerts --platform feishu --webhook-url https://example/hook --event account-credit-protected,account-quota-exhausted,service-quota-exhausted"
     )]
     Add {
         /// 告警目标的唯一名称。
@@ -265,8 +265,8 @@ pub enum AlertCommand {
         #[arg(long = "platform", visible_alias = "kind", value_name = "PLATFORM")]
         platform: AlertPlatform,
         /// Webhook 接收地址。
-        #[arg(long)]
-        url: String,
+        #[arg(long = "webhook-url", visible_alias = "url", value_name = "URL")]
+        webhook_url: String,
         /// 要订阅的异常事件；可重复传入或使用逗号分隔。
         #[arg(
             long = "event",
@@ -290,7 +290,7 @@ pub enum AlertCommand {
     },
     /// 编辑告警目标。
     #[command(
-        after_help = "目标名称既可写成位置参数，也可通过 --name 指定。\n`--event` 会整体替换原订阅；可重复传入或使用逗号分隔。\n\n示例：\n  kproxy alert edit alerts --url https://example/new-hook\n  kproxy alert edit --name alerts --event token-refresh-failed --event service-quota-exhausted\n  kproxy alert edit --name alerts --platform feishu"
+        after_help = "目标名称既可写成位置参数，也可通过 --name 指定。\n`--event` 会整体替换原订阅；可重复传入或使用逗号分隔。\n\n示例：\n  kproxy alert edit alerts --webhook-url https://example/new-hook\n  kproxy alert edit alerts --dingtalk-sign 'SEC-replace-me'\n  kproxy alert edit --name alerts --event token-refresh-failed --event service-quota-exhausted\n  kproxy alert edit --name alerts --platform feishu"
     )]
     Edit {
         /// 当前名称；也可使用 --name。
@@ -306,8 +306,8 @@ pub enum AlertCommand {
         #[arg(long = "platform", visible_alias = "kind", value_name = "PLATFORM")]
         platform: Option<AlertPlatform>,
         /// 修改 Webhook 接收地址。
-        #[arg(long)]
-        url: Option<String>,
+        #[arg(long = "webhook-url", visible_alias = "url", value_name = "URL")]
+        webhook_url: Option<String>,
         /// 整体替换要订阅的异常事件；可重复传入或使用逗号分隔。
         #[arg(
             long = "event",
@@ -1242,7 +1242,7 @@ pub async fn run_alert(client: &mut AdminClient, command: AlertCommand, json: bo
         AlertCommand::Add {
             name,
             platform,
-            url,
+            webhook_url,
             events,
             disabled,
             dingtalk_sign,
@@ -1256,7 +1256,7 @@ pub async fn run_alert(client: &mut AdminClient, command: AlertCommand, json: bo
                 let mut table = toml::map::Map::new();
                 table.insert("name".into(), toml::Value::String(name.clone()));
                 table.insert("kind".into(), toml::Value::String(platform.as_str().into()));
-                table.insert("url".into(), toml::Value::String(url.clone()));
+                table.insert("url".into(), toml::Value::String(webhook_url.clone()));
                 table.insert("enabled".into(), toml::Value::Boolean(!disabled));
                 table.insert("events".into(), alert_event_array_value(&events));
                 insert_optional_string(&mut table, "dingtalk_sign", dingtalk_sign.as_deref());
@@ -1274,7 +1274,7 @@ pub async fn run_alert(client: &mut AdminClient, command: AlertCommand, json: bo
             name,
             rename,
             platform,
-            url,
+            webhook_url,
             events,
             clear_events,
             enable,
@@ -1293,7 +1293,7 @@ pub async fn run_alert(client: &mut AdminClient, command: AlertCommand, json: bo
                 let table = find_named_table_mut(array, &name, "告警目标")?;
                 replace_optional_string(table, "name", rename.as_deref());
                 replace_optional_string(table, "kind", platform.map(AlertPlatform::as_str));
-                replace_optional_string(table, "url", url.as_deref());
+                replace_optional_string(table, "url", webhook_url.as_deref());
                 replace_or_clear_optional_string(
                     table,
                     "dingtalk_sign",
@@ -1466,7 +1466,9 @@ pub fn show_alert_platforms(json: bool) -> Result<()> {
         "{}",
         render_table(&["PLATFORM", "通知平台", "平台专用参数"], &rows)
     );
-    println!("\n所有平台都需要 --url；旧参数名 --kind 继续兼容，建议新命令使用 --platform。");
+    println!(
+        "\n所有平台都需要 --webhook-url；旧参数 --url 和 --kind 继续兼容，建议新命令使用 --webhook-url 和 --platform。"
+    );
     Ok(())
 }
 
