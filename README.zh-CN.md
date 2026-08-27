@@ -347,7 +347,7 @@ kproxy apikey limit ci --clear
 kproxy alert events
 kproxy alert platforms
 kproxy alert config
-kproxy alert add --name alerts --platform dingtalk --url https://example/hook --event token-refresh-failed,account-credit-protected,account-quota-exhausted,service-quota-exhausted
+kproxy alert add --name alerts --platform dingtalk --webhook-url https://example/hook --dingtalk-sign SEC-replace-me --event token-refresh-failed,account-credit-protected,account-quota-exhausted,service-quota-exhausted
 kproxy alert edit --name alerts --event token-refresh-failed --event service-quota-exhausted
 kproxy alert delete alerts
 kproxy status --since 30m
