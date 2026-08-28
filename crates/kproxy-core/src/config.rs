@@ -174,9 +174,9 @@ pub struct UpstreamPoolConfig {
     pub stream_max_connections: usize,
     /// 流式连接必须为 1，避免队首阻塞。
     pub stream_pipelining: usize,
-    /// 连接空闲时间。
+    /// 连接池目标空闲回收时间。
     pub keep_alive_idle_ms: u64,
-    /// 连接最大寿命。
+    /// 连接池空闲回收时间上限；不限制正在使用连接的总寿命。
     pub keep_alive_max_ms: u64,
 }
 
@@ -1402,9 +1402,9 @@ http_pipelining = 5
 stream_max_connections = 256
 # 必须为 1，让每个流独占连接，避免队首阻塞。
 stream_pipelining = 1
-# 上游连接空闲超过该时间后允许回收。
+# 上游连接池的目标空闲回收时间。
 keep_alive_idle_ms = 30000
-# 单条上游连接的最大寿命，降低长期连接失效风险。
+# 空闲回收时间上限；不会切断正在使用的流式连接。
 keep_alive_max_ms = 60000
 
 # ----------------------------------------------------------------------------
