@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::convert::Infallible;
+use std::error::Error as StdError;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -179,6 +180,206 @@ fn build_claude_state(context: &StreamContext, prompt_cache: &PromptCachePlan) -
     claude
 }
 
+#[derive(Debug, Clone)]
+struct UpstreamStreamMetrics {
+    started: Instant,
+    last_chunk_at: Option<Instant>,
+    chunks: u64,
+    bytes: u64,
+    events: u64,
+}
+
+impl UpstreamStreamMetrics {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            last_chunk_at: None,
+            chunks: 0,
+            bytes: 0,
+            events: 0,
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+
+    fn observe_chunk(&mut self, length: usize) {
+        self.last_chunk_at = Some(Instant::now());
+        self.chunks = self.chunks.saturating_add(1);
+        self.bytes = self.bytes.saturating_add(length as u64);
+    }
+
+    fn observe_event(&mut self) {
+        self.events = self.events.saturating_add(1);
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct StreamFailureDiagnostics {
+    kind: &'static str,
+    transport_class: &'static str,
+    transport_timeout: bool,
+    transport_decode: bool,
+    transport_body: bool,
+    transport_connect: bool,
+    source_chain: String,
+    stream_elapsed_ms: u64,
+    upstream_idle_ms: u64,
+    chunk_seen: bool,
+    chunks: u64,
+    bytes: u64,
+    events: u64,
+    buffered_bytes: usize,
+    configured_read_timeout_ms: u64,
+}
+
+impl StreamFailureDiagnostics {
+    fn from_http_body(
+        error: &reqwest::Error,
+        metrics: &UpstreamStreamMetrics,
+        buffered_bytes: usize,
+        configured_read_timeout_ms: u64,
+    ) -> Self {
+        let transport_class = if error.is_timeout() {
+            "timeout"
+        } else if error.is_connect() {
+            "connect"
+        } else if error.is_decode() {
+            "decode"
+        } else if error.is_body() {
+            "body"
+        } else {
+            "other"
+        };
+        Self::new(
+            "http_body_read",
+            transport_class,
+            error,
+            metrics,
+            buffered_bytes,
+            configured_read_timeout_ms,
+            Some(error),
+        )
+    }
+
+    fn from_event_stream(
+        kind: &'static str,
+        error: &(dyn StdError + 'static),
+        metrics: &UpstreamStreamMetrics,
+        buffered_bytes: usize,
+        configured_read_timeout_ms: u64,
+    ) -> Self {
+        Self::new(
+            kind,
+            "not_applicable",
+            error,
+            metrics,
+            buffered_bytes,
+            configured_read_timeout_ms,
+            None,
+        )
+    }
+
+    fn from_upstream_event(
+        metrics: &UpstreamStreamMetrics,
+        buffered_bytes: usize,
+        configured_read_timeout_ms: u64,
+    ) -> Self {
+        Self::from_metrics(
+            "upstream_error_event",
+            "not_applicable",
+            String::new(),
+            metrics,
+            buffered_bytes,
+            configured_read_timeout_ms,
+        )
+    }
+
+    fn new(
+        kind: &'static str,
+        transport_class: &'static str,
+        error: &(dyn StdError + 'static),
+        metrics: &UpstreamStreamMetrics,
+        buffered_bytes: usize,
+        configured_read_timeout_ms: u64,
+        reqwest_error: Option<&reqwest::Error>,
+    ) -> Self {
+        let mut diagnostics = Self::from_metrics(
+            kind,
+            transport_class,
+            format_error_chain(error),
+            metrics,
+            buffered_bytes,
+            configured_read_timeout_ms,
+        );
+        if let Some(error) = reqwest_error {
+            diagnostics.transport_timeout = error.is_timeout();
+            diagnostics.transport_decode = error.is_decode();
+            diagnostics.transport_body = error.is_body();
+            diagnostics.transport_connect = error.is_connect();
+        }
+        diagnostics
+    }
+
+    fn from_metrics(
+        kind: &'static str,
+        transport_class: &'static str,
+        source_chain: String,
+        metrics: &UpstreamStreamMetrics,
+        buffered_bytes: usize,
+        configured_read_timeout_ms: u64,
+    ) -> Self {
+        let now = Instant::now();
+        let stream_elapsed_ms = elapsed_ms(metrics.started, now);
+        let chunk_seen = metrics.last_chunk_at.is_some();
+        let upstream_idle_ms = metrics
+            .last_chunk_at
+            .map_or(stream_elapsed_ms, |last_chunk| elapsed_ms(last_chunk, now));
+        Self {
+            kind,
+            transport_class,
+            source_chain,
+            stream_elapsed_ms,
+            upstream_idle_ms,
+            chunk_seen,
+            chunks: metrics.chunks,
+            bytes: metrics.bytes,
+            events: metrics.events,
+            buffered_bytes,
+            configured_read_timeout_ms,
+            ..Self::default()
+        }
+    }
+}
+
+fn elapsed_ms(started: Instant, finished: Instant) -> u64 {
+    finished.duration_since(started).as_millis() as u64
+}
+
+fn format_error_chain(error: &(dyn StdError + 'static)) -> String {
+    const MAX_SOURCES: usize = 8;
+    const MAX_CHARS: usize = 2_048;
+
+    let mut messages = Vec::new();
+    let mut current = Some(error);
+    while let Some(error) = current.take().filter(|_| messages.len() < MAX_SOURCES) {
+        let message = error.to_string().replace(['\r', '\n'], " ");
+        if messages.last() != Some(&message) {
+            messages.push(message);
+        }
+        current = error.source();
+    }
+    let chain = messages.join(" <- ");
+    if chain.chars().count() <= MAX_CHARS {
+        chain
+    } else {
+        let mut truncated = chain.chars().take(MAX_CHARS).collect::<String>();
+        truncated.push_str("...");
+        truncated
+    }
+}
+
 pub fn response(
     upstream: KiroResponse,
     protocol: StreamProtocol,
@@ -188,6 +389,14 @@ pub fn response(
     let mut source = initial_response.bytes_stream();
     let mut endpoint = initial_endpoint.name.to_string();
     let mut keepalive = context.state.keepalive.subscribe();
+    let upstream_config = context.state.runtime_config_snapshot().upstream;
+    let configured_read_timeout_ms = upstream_config.stream_read_timeout_ms;
+    let configured_pool_idle_timeout_ms = upstream_config
+        .pool
+        .keep_alive_idle_ms
+        .saturating_sub(2_000)
+        .max(1)
+        .min(upstream_config.pool.keep_alive_max_ms.max(1));
     let bridge_trace_id = context.trace_id.clone();
     let bridge_request_id = context.request_id.clone();
     tracing::info!(
@@ -197,6 +406,11 @@ pub fn response(
         account_id = %context.lease.account_id(),
         endpoint,
         model = %context.model,
+        upstream_total_timeout = "disabled",
+        upstream_connect_timeout_ms = 15_000u64,
+        upstream_stream_slot_wait_timeout_ms = upstream_config.stream_slot_wait_timeout_ms,
+        upstream_stream_read_timeout_ms = configured_read_timeout_ms,
+        upstream_pool_idle_timeout_ms = configured_pool_idle_timeout_ms,
         "client stream response started"
     );
     let stream = async_stream::stream! {
@@ -226,6 +440,8 @@ pub fn response(
         };
         let created = now_secs();
         let mut failed = None;
+        let mut stream_failure = None::<StreamFailureDiagnostics>;
+        let mut upstream_metrics = UpstreamStreamMetrics::new();
         let mut upstream_access_token = context.upstream_access_token.clone();
         let mut pre_data_retries = 0;
         let mut attempted_accounts = HashSet::new();
@@ -257,10 +473,12 @@ pub fn response(
                 tokio::select! {
                     chunk = source.next() => match chunk {
                         Some(Ok(chunk)) => {
+                            upstream_metrics.observe_chunk(chunk.len());
                             buffer.extend_from_slice(&chunk);
                             loop {
                                 match decoder.decode(&mut buffer) {
                                     Ok(Some(event)) => {
+                                        upstream_metrics.observe_event();
                                         tracing::trace!(
                                             trace_id = %context.trace_id,
                                             request_id = %context.request_id,
@@ -268,6 +486,13 @@ pub fn response(
                                             "upstream stream event decoded"
                                         );
                                         if let KiroEvent::Error { kind, message } = &event {
+                                            stream_failure = Some(
+                                                StreamFailureDiagnostics::from_upstream_event(
+                                                    &upstream_metrics,
+                                                    buffer.len(),
+                                                    configured_read_timeout_ms,
+                                                ),
+                                            );
                                             failed = Some(format!("{kind}: {message}"));
                                             break;
                                         }
@@ -355,6 +580,15 @@ pub fn response(
                                     }
                                     Ok(None) => break,
                                     Err(error) => {
+                                        stream_failure = Some(
+                                            StreamFailureDiagnostics::from_event_stream(
+                                                "event_stream_decode",
+                                                &error,
+                                                &upstream_metrics,
+                                                buffer.len(),
+                                                configured_read_timeout_ms,
+                                            ),
+                                        );
                                         failed = Some(error.to_string());
                                         break;
                                     }
@@ -363,11 +597,26 @@ pub fn response(
                             if failed.is_some() || stop_filter.matched().is_some() { break; }
                         }
                         Some(Err(error)) => {
+                            stream_failure = Some(StreamFailureDiagnostics::from_http_body(
+                                &error,
+                                &upstream_metrics,
+                                buffer.len(),
+                                configured_read_timeout_ms,
+                            ));
                             failed = Some(error.to_string());
                             break;
                         }
                         None => {
                             if let Err(error) = decoder.decode_eof(&mut buffer) {
+                                stream_failure = Some(
+                                    StreamFailureDiagnostics::from_event_stream(
+                                        "event_stream_eof",
+                                        &error,
+                                        &upstream_metrics,
+                                        buffer.len(),
+                                        configured_read_timeout_ms,
+                                    ),
+                                );
                                 failed = Some(error.to_string());
                             }
                             break;
@@ -482,6 +731,17 @@ pub fn response(
                 if is_model_capacity_error {
                     context.state.record_stream_overload();
                 }
+                let failure_diagnostics = stream_failure.clone().unwrap_or_default();
+                let stream_failure_kind = if failure_diagnostics.kind.is_empty() {
+                    "none"
+                } else {
+                    failure_diagnostics.kind
+                };
+                let transport_error_class = if failure_diagnostics.transport_class.is_empty() {
+                    "none"
+                } else {
+                    failure_diagnostics.transport_class
+                };
                 tracing::warn!(
                     trace_id = %context.trace_id,
                     request_id = %context.request_id,
@@ -493,6 +753,21 @@ pub fn response(
                     throttle_error = is_throttle,
                     model_unavailable = is_model_unavailable,
                     request_rejection = is_request_rejection,
+                    stream_failure_kind,
+                    transport_error_class,
+                    transport_timeout = failure_diagnostics.transport_timeout,
+                    transport_decode = failure_diagnostics.transport_decode,
+                    transport_body = failure_diagnostics.transport_body,
+                    transport_connect = failure_diagnostics.transport_connect,
+                    transport_error_chain = %failure_diagnostics.source_chain,
+                    upstream_stream_elapsed_ms = failure_diagnostics.stream_elapsed_ms,
+                    upstream_idle_ms = failure_diagnostics.upstream_idle_ms,
+                    upstream_chunk_seen = failure_diagnostics.chunk_seen,
+                    upstream_chunks = failure_diagnostics.chunks,
+                    upstream_bytes = failure_diagnostics.bytes,
+                    upstream_events = failure_diagnostics.events,
+                    upstream_buffered_bytes = failure_diagnostics.buffered_bytes,
+                    configured_stream_read_timeout_ms = failure_diagnostics.configured_read_timeout_ms,
                     error = %kproxy_translate::sanitize_error_message(&failure_text),
                     "upstream stream failed"
                 );
@@ -529,6 +804,8 @@ pub fn response(
                                 let (next_endpoint, next_response, next_permit) = retry.into_parts();
                                 endpoint = next_endpoint.name.to_string();
                                 source = next_response.bytes_stream();
+                                upstream_metrics.reset();
+                                stream_failure = None;
                                 upstream_permit = next_permit;
                                 buffer.clear();
                                 decoder = EventStreamDecoder;
@@ -548,6 +825,7 @@ pub fn response(
                             }
                             Err(error) => {
                                 disable_account = error.is_auth();
+                                stream_failure = None;
                                 failed = Some(error.to_string());
                             }
                         }
@@ -612,6 +890,8 @@ pub fn response(
                                         retry.into_parts();
                                     endpoint = next_endpoint.name.to_string();
                                     source = next_response.bytes_stream();
+                                    upstream_metrics.reset();
+                                    stream_failure = None;
                                     upstream_permit = next_permit;
                                     buffer.clear();
                                     decoder = EventStreamDecoder;
@@ -621,7 +901,10 @@ pub fn response(
                                     pre_data_retries += 1;
                                     continue 'rounds;
                                 }
-                                Err(error) => failed = Some(error.to_string()),
+                                Err(error) => {
+                                    stream_failure = None;
+                                    failed = Some(error.to_string());
+                                }
                             }
                         }
                     }
@@ -689,6 +972,7 @@ pub fn response(
                                 {
                                     crate::alerts::sync_service_quota(&context.state).await;
                                 }
+                                stream_failure = None;
                                 failed = Some(error.to_string());
                                 yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error.to_string())));
                                 break 'rounds;
@@ -806,6 +1090,8 @@ pub fn response(
                             let (next_endpoint, next_response, next_permit) = retry.into_parts();
                             endpoint = next_endpoint.name.to_string();
                             source = next_response.bytes_stream();
+                            upstream_metrics.reset();
+                            stream_failure = None;
                             upstream_permit = next_permit;
                             buffer.clear();
                             decoder = EventStreamDecoder;
@@ -815,7 +1101,10 @@ pub fn response(
                             pre_data_retries += 1;
                             continue 'rounds;
                         }
-                        Err(error) => failed = Some(error.to_string()),
+                        Err(error) => {
+                            stream_failure = None;
+                            failed = Some(error.to_string());
+                        }
                     }
                 }
                 if let Some(message) = failed.as_deref() {
@@ -1188,6 +1477,8 @@ pub fn response(
                         let (next_endpoint, next_response, next_permit) = next.into_parts();
                         endpoint = next_endpoint.name.to_string();
                         source = next_response.bytes_stream();
+                        upstream_metrics.reset();
+                        stream_failure = None;
                         upstream_permit = next_permit;
                         buffer.clear();
                         decoder = EventStreamDecoder;
@@ -1346,6 +1637,8 @@ pub fn response(
                         let (next_endpoint, next_response, next_permit) = next.into_parts();
                         endpoint = next_endpoint.name.to_string();
                         source = next_response.bytes_stream();
+                        upstream_metrics.reset();
+                        stream_failure = None;
                         upstream_permit = next_permit;
                         buffer.clear();
                         decoder = EventStreamDecoder;
@@ -1433,6 +1726,8 @@ pub fn response(
                     let (next_endpoint, next_response, next_permit) = next.into_parts();
                     endpoint = next_endpoint.name.to_string();
                     source = next_response.bytes_stream();
+                    upstream_metrics.reset();
+                    stream_failure = None;
                     upstream_permit = next_permit;
                     buffer.clear();
                     decoder = EventStreamDecoder;
@@ -1526,7 +1821,15 @@ pub fn response(
             }
         }
         drop(upstream_permit);
-        finish_accounting(context, endpoint, decoded, failed, &payload).await;
+        finish_accounting(
+            context,
+            endpoint,
+            decoded,
+            failed,
+            stream_failure,
+            &payload,
+        )
+        .await;
     };
     // A bounded bridge supplies backpressure and ensures a client that stops
     // reading cannot hold an account lease forever.
@@ -2236,6 +2539,7 @@ async fn finish_accounting(
     endpoint: String,
     mut decoded: DecodedResponse,
     failure: Option<String>,
+    stream_failure: Option<StreamFailureDiagnostics>,
     payload: &KiroPayload,
 ) {
     context.diagnostics.tool_search_rounds = decoded.tool_searches.len();
@@ -2344,6 +2648,17 @@ async fn finish_accounting(
     let account = context.lease.account().await;
     let account_name = account.display_name().to_owned();
     if let Some(error) = failure.as_deref() {
+        let failure_diagnostics = stream_failure.unwrap_or_default();
+        let stream_failure_kind = if failure_diagnostics.kind.is_empty() {
+            "none"
+        } else {
+            failure_diagnostics.kind
+        };
+        let transport_error_class = if failure_diagnostics.transport_class.is_empty() {
+            "none"
+        } else {
+            failure_diagnostics.transport_class
+        };
         tracing::error!(
             trace_id = %context.trace_id,
             request_id = %context.request_id,
@@ -2357,6 +2672,21 @@ async fn finish_accounting(
             output_tokens = decoded.usage.output_tokens,
             credits,
             duration_ms,
+            stream_failure_kind,
+            transport_error_class,
+            transport_timeout = failure_diagnostics.transport_timeout,
+            transport_decode = failure_diagnostics.transport_decode,
+            transport_body = failure_diagnostics.transport_body,
+            transport_connect = failure_diagnostics.transport_connect,
+            transport_error_chain = %failure_diagnostics.source_chain,
+            upstream_stream_elapsed_ms = failure_diagnostics.stream_elapsed_ms,
+            upstream_idle_ms = failure_diagnostics.upstream_idle_ms,
+            upstream_chunk_seen = failure_diagnostics.chunk_seen,
+            upstream_chunks = failure_diagnostics.chunks,
+            upstream_bytes = failure_diagnostics.bytes,
+            upstream_events = failure_diagnostics.events,
+            upstream_buffered_bytes = failure_diagnostics.buffered_bytes,
+            configured_stream_read_timeout_ms = failure_diagnostics.configured_read_timeout_ms,
             error = %kproxy_translate::sanitize_error_message(error),
             "client stream response completed with failure"
         );
@@ -2497,6 +2827,46 @@ mod tests {
             .filter(|line| *line != "[DONE]")
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect()
+    }
+
+    #[test]
+    fn stream_failure_diagnostics_preserve_error_sources_and_metrics() {
+        let error = std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "peer closed early"),
+        );
+        let mut metrics = UpstreamStreamMetrics::new();
+        metrics.observe_chunk(128);
+        metrics.observe_event();
+
+        let diagnostics = StreamFailureDiagnostics::from_event_stream(
+            "event_stream_eof",
+            &error,
+            &metrics,
+            7,
+            600_000,
+        );
+
+        assert_eq!(diagnostics.kind, "event_stream_eof");
+        assert_eq!(diagnostics.transport_class, "not_applicable");
+        assert!(diagnostics.source_chain.contains("peer closed early"));
+        assert!(diagnostics.chunk_seen);
+        assert_eq!(diagnostics.chunks, 1);
+        assert_eq!(diagnostics.bytes, 128);
+        assert_eq!(diagnostics.events, 1);
+        assert_eq!(diagnostics.buffered_bytes, 7);
+        assert_eq!(diagnostics.configured_read_timeout_ms, 600_000);
+    }
+
+    #[test]
+    fn error_chain_is_single_line_and_bounded() {
+        let message = format!("root\n{}", "x".repeat(3_000));
+        let error = std::io::Error::other(message);
+        let chain = format_error_chain(&error);
+
+        assert!(!chain.contains('\n'));
+        assert!(chain.ends_with("..."));
+        assert!(chain.chars().count() <= 2_051);
     }
 
     #[test]
