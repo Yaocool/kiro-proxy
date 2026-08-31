@@ -23,7 +23,7 @@ pub use tool_search::{
 pub use web_search::{
     format_web_search_results, resume_web_search_payload, validate_web_search_replay_content,
     web_search_continue_payload, web_search_continue_payload_batch, ClaudeServerToolEmission,
-    ClaudeWebSearchError, ClaudeWebSearchTrace, WebSearchReplayCodec,
+    ClaudeWebSearchError, ClaudeWebSearchTrace, WebSearchReplayCodec, WebSearchReplayError,
 };
 
 /// Assistant half of the synthetic history pair that carries a caller's

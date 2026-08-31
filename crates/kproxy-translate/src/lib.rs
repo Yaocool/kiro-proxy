@@ -33,6 +33,6 @@ pub use translate::{
     web_search_continue_payload_batch, ClaudeServerToolEmission, ClaudeToolSearchBudget,
     ClaudeToolSearchCatalog, ClaudeToolSearchError, ClaudeToolSearchOutcome, ClaudeToolSearchTrace,
     ClaudeWebSearchError, ClaudeWebSearchTrace, ToolNameRegistry, TranslationOptions,
-    WebSearchReplayCodec, SIGNATURE_PLACEHOLDER,
+    WebSearchReplayCodec, WebSearchReplayError, SIGNATURE_PLACEHOLDER,
 };
 pub use validate::{validate_claude, validate_openai, ValidationError};
