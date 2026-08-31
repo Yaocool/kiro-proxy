@@ -421,6 +421,7 @@ kproxy stats --start 2026-08-27T10:00:00+08:00 --end 2026-08-27T12:00:00+08:00
 kproxy stats --detail --since 1h --by endpoint
 kproxy logs show --tail 100
 kproxy logs follow --level warn
+kproxy logs trace trace_0123456789abcdef0123456789abcdef
 kproxy logs files
 kproxy logs files --level error
 kproxy logs path
@@ -446,11 +447,16 @@ ordering; logs, recent requests, and pool scores retain their semantic time or
 priority order.
 
 `kproxy logs show` and `follow` read structured request records retained by the
-daemon. `kproxy logs files` discovers the physical date/severity shards and prints
-their sizes and complete paths; `kproxy logs path` prints the active directory,
-base path, format, and filter. When invoked through the Docker host wrapper, both
-path commands also report the named volume's real path on the Docker host. The
-legacy `kproxy logs --tail ...` and `-f` forms remain supported.
+daemon. `kproxy logs trace <TRACE_ID>` searches all retained physical severity
+and date shards and orders the matching request-chain events by timestamp; add
+`--level error` to restrict it to one exact severity. Physical files use exact
+severity partitions: `info.log` contains only INFO events, while WARN and ERROR
+events are stored in `warn.log` and `error.log`. `kproxy logs files` discovers
+these shards and prints their sizes and complete paths; `kproxy logs path` prints
+the active directory, base path, format, and filter. When invoked through the
+Docker host wrapper, both path commands also report the named volume's real path
+on the Docker host. The legacy `kproxy logs --tail ...` and `-f` forms remain
+supported.
 
 `kproxy status` reports request, success, credit, and average-latency metrics for
 the current daemon session. `kproxy stats` defaults to persisted cumulative
