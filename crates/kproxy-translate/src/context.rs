@@ -194,41 +194,102 @@ pub fn apply_context_management_edits(request: &mut ClaudeRequest) -> ClaudeCont
     }
 }
 
-/// Claude ignores every content block before the most recent compaction block.
-/// Apply that boundary before translating the request so previously compacted
-/// conversations do not grow back to their pre-summary size.
-pub fn apply_compaction_boundary(request: &mut ClaudeRequest) -> bool {
-    let boundary =
-        request
-            .messages
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(message_index, message)| {
-                message
-                    .content
-                    .as_array()?
-                    .iter()
-                    .enumerate()
-                    .rev()
-                    .find(|(_, block)| {
-                        block.get("type").and_then(Value::as_str) == Some("compaction")
-                    })
-                    .map(|(block_index, _)| (message_index, block_index))
-            });
-    let Some((message_index, block_index)) = boundary else {
-        return false;
-    };
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ClaudeCompactionNormalizationStats {
+    pub boundary_applied: bool,
+    pub removed_noop_blocks: usize,
+    pub removed_noop_messages: usize,
+}
 
-    request.messages.drain(..message_index);
-    if let Some(blocks) = request
-        .messages
-        .first_mut()
-        .and_then(|message| message.content.as_array_mut())
-    {
-        blocks.drain(..block_index);
+impl ClaudeCompactionNormalizationStats {
+    pub fn changed(self) -> bool {
+        self.boundary_applied || self.removed_noop_blocks > 0 || self.removed_noop_messages > 0
     }
-    true
+}
+
+/// Claude ignores every content block before the most recent completed
+/// compaction block. A missing or `null` compaction content value is a failed
+/// compaction/no-op and must not replace an earlier completed boundary.
+///
+/// Apply the completed boundary before translating the request so previously
+/// compacted conversations do not grow back to their pre-summary size. No-op
+/// assistant compaction blocks are removed after the boundary is applied.
+pub fn normalize_compaction_boundary(
+    request: &mut ClaudeRequest,
+) -> ClaudeCompactionNormalizationStats {
+    let boundary = request
+        .messages
+        .iter()
+        .enumerate()
+        .rev()
+        .filter(|(_, message)| message.role == "assistant")
+        .find_map(|(message_index, message)| {
+            message
+                .content
+                .as_array()?
+                .iter()
+                .enumerate()
+                .rev()
+                .find(|(_, block)| {
+                    block.get("type").and_then(Value::as_str) == Some("compaction")
+                        && block
+                            .get("content")
+                            .and_then(Value::as_str)
+                            .is_some_and(|content| !content.is_empty())
+                })
+                .map(|(block_index, _)| (message_index, block_index))
+        });
+    if let Some((message_index, block_index)) = boundary {
+        request.messages.drain(..message_index);
+        if let Some(blocks) = request
+            .messages
+            .first_mut()
+            .and_then(|message| message.content.as_array_mut())
+        {
+            blocks.drain(..block_index);
+        }
+    }
+
+    let mut removed_noop_blocks = 0;
+    let mut removed_noop_messages = 0;
+    request.messages.retain_mut(|message| {
+        if message.role != "assistant" {
+            return true;
+        }
+        let Some(blocks) = message.content.as_array_mut() else {
+            return true;
+        };
+        let original_len = blocks.len();
+        blocks.retain(|block| {
+            if block.get("type").and_then(Value::as_str) != Some("compaction") {
+                return true;
+            }
+            match block.get("content") {
+                None | Some(Value::Null) => {
+                    removed_noop_blocks += 1;
+                    false
+                }
+                _ => true,
+            }
+        });
+        let keep = original_len == 0 || !blocks.is_empty();
+        if !keep {
+            removed_noop_messages += 1;
+        }
+        keep
+    });
+
+    ClaudeCompactionNormalizationStats {
+        boundary_applied: boundary.is_some(),
+        removed_noop_blocks,
+        removed_noop_messages,
+    }
+}
+
+/// Backward-compatible helper for callers interested only in whether a valid
+/// compaction boundary discarded prior history.
+pub fn apply_compaction_boundary(request: &mut ClaudeRequest) -> bool {
+    normalize_compaction_boundary(request).boundary_applied
 }
 
 #[cfg(test)]
@@ -407,5 +468,104 @@ mod tests {
         assert!(crate::validate_claude(&request).is_err());
         assert!(apply_compaction_boundary(&mut request));
         crate::validate_claude(&request).expect("effective compacted history is valid");
+    }
+
+    #[test]
+    fn null_compaction_is_a_noop_and_does_not_discard_history() {
+        let mut request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-opus-5",
+            "max_tokens":1024,
+            "messages":[
+                {"role":"user","content":"retain me"},
+                {"role":"assistant","content":[{
+                    "type":"compaction","content":null
+                }]},
+                {"role":"user","content":"continue"}
+            ]
+        }))
+        .expect("request");
+
+        assert!(!apply_compaction_boundary(&mut request));
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages[0].content, json!("retain me"));
+        assert_eq!(request.messages[1].content, json!("continue"));
+    }
+
+    #[test]
+    fn null_compaction_does_not_supersede_the_latest_completed_boundary() {
+        let mut request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-opus-5",
+            "max_tokens":1024,
+            "messages":[
+                {"role":"user","content":"discard me"},
+                {"role":"assistant","content":[{
+                    "type":"compaction","content":"completed summary"
+                }]},
+                {"role":"user","content":"retain me"},
+                {"role":"assistant","content":[{
+                    "type":"compaction","content":null
+                }]},
+                {"role":"user","content":"continue"}
+            ]
+        }))
+        .expect("request");
+
+        assert!(apply_compaction_boundary(&mut request));
+        assert_eq!(request.messages.len(), 3);
+        assert_eq!(
+            request.messages[0].content[0]["content"],
+            "completed summary"
+        );
+        assert_eq!(request.messages[1].content, json!("retain me"));
+        assert_eq!(request.messages[2].content, json!("continue"));
+    }
+
+    #[test]
+    fn empty_compaction_is_preserved_for_validation() {
+        let mut request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-opus-5",
+            "max_tokens":1024,
+            "messages":[
+                {"role":"user","content":"retain me"},
+                {"role":"assistant","content":[
+                    {"type":"text","text":"also retain me"},
+                    {"type":"compaction","content":""}
+                ]}
+            ]
+        }))
+        .expect("request");
+
+        assert!(!apply_compaction_boundary(&mut request));
+        assert_eq!(request.messages.len(), 2);
+        assert!(crate::validate_claude(&request)
+            .expect_err("empty compaction summary must be rejected")
+            .to_string()
+            .contains("must not be empty"));
+    }
+
+    #[test]
+    fn missing_compaction_content_is_a_noop_and_reports_normalization() {
+        let mut request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-opus-5",
+            "max_tokens":1024,
+            "messages":[
+                {"role":"user","content":"retain me"},
+                {"role":"assistant","content":[{"type":"compaction"}]},
+                {"role":"user","content":"continue"}
+            ]
+        }))
+        .expect("request");
+
+        let stats = normalize_compaction_boundary(&mut request);
+        assert_eq!(
+            stats,
+            ClaudeCompactionNormalizationStats {
+                boundary_applied: false,
+                removed_noop_blocks: 1,
+                removed_noop_messages: 1,
+            }
+        );
+        assert!(stats.changed());
+        assert_eq!(request.messages.len(), 2);
     }
 }

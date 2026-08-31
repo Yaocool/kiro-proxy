@@ -720,14 +720,14 @@ pub fn response(
             if failed.is_some() {
                 let failure_text = failed.as_deref().unwrap_or_default().to_string();
                 let failed_account_id = context.lease.account_id();
-                let is_auth = kproxy_kiro::client::text_is_auth_error(&failure_text);
-                let is_quota = kproxy_kiro::client::text_is_quota_error(&failure_text);
-                let is_throttle = kproxy_kiro::client::text_is_throttle_error(&failure_text);
-                let is_model_unavailable =
-                    kproxy_kiro::client::text_is_model_temporarily_unavailable(&failure_text);
+                let failure_details =
+                    classify_stream_failure(&failure_text, stream_failure.as_ref());
+                let is_auth = failure_details.is_auth_error();
+                let is_quota = failure_details.is_quota_error();
+                let is_throttle = failure_details.is_throttle_error();
+                let is_model_unavailable = failure_details.is_model_unavailable();
                 let is_model_capacity_error = is_throttle || is_model_unavailable;
-                let is_request_rejection =
-                    kproxy_kiro::client::text_is_request_rejection(&failure_text);
+                let is_request_rejection = failure_details.is_request_rejection();
                 if is_model_capacity_error {
                     context.state.record_stream_overload();
                 }
@@ -753,6 +753,10 @@ pub fn response(
                     throttle_error = is_throttle,
                     model_unavailable = is_model_unavailable,
                     request_rejection = is_request_rejection,
+                    error_code = failure_details.error_code,
+                    error_stage = failure_details.error_stage,
+                    failure_scope = failure_details.scope.as_str(),
+                    account_error = failure_details.account_error(),
                     stream_failure_kind,
                     transport_error_class,
                     transport_timeout = failure_diagnostics.transport_timeout,
@@ -778,6 +782,7 @@ pub fn response(
                     .max(context.state.pool().snapshot().await.len() as u32);
                 let may_switch = (!is_quota || config.pool.auto_switch_on_quota_exhausted)
                     && !is_request_rejection;
+                let mut account_health_handled = false;
                 if !data_started && pre_data_retries < retry_limit && may_switch && is_auth {
                     let mut disable_account = true;
                     if context
@@ -832,6 +837,7 @@ pub fn response(
                     }
                     if disable_account {
                         context.state.pool().mark_banned(&failed_account_id).await;
+                        account_health_handled = true;
                         let account_name = if let Some(runtime) =
                             context.state.pool().get(&failed_account_id).await
                         {
@@ -845,8 +851,6 @@ pub fn response(
                             &account_name,
                             "刷新后流式请求的上游认证仍然失败",
                         );
-                    } else {
-                        context.state.pool().record_error(&failed_account_id).await;
                     }
                 }
 
@@ -910,33 +914,25 @@ pub fn response(
                     }
                 }
 
-                if is_quota && !is_throttle {
-                    context
-                        .state
-                        .pool()
-                        .record_quota_error(&failed_account_id)
-                        .await;
-                    if context.state.pool().get(&failed_account_id).await.is_some_and(|runtime| {
-                        runtime.health() == kproxy_pool::AccountHealth::Exhausted
-                    }) {
-                        if let Err(error) = crate::tasks::persist_pool_accounts(&context.state).await {
-                            tracing::error!(
-                                trace_id = %context.trace_id,
-                                request_id = %context.request_id,
-                                account_id = %failed_account_id,
-                                %error,
-                                "failed to persist stream quota exhaustion"
-                            );
-                        }
-                        crate::alerts::sync_account_quota(
-                            &context.state,
-                            &failed_account_id,
-                        )
-                        .await;
-                        crate::alerts::sync_service_quota(&context.state).await;
-                    }
-                } else if !is_auth && !is_request_rejection && !is_model_unavailable {
-                    context.state.pool().record_error(&failed_account_id).await;
+                // Token refresh and model fallback dispatches can replace the
+                // original stream failure. Reclassify the active error before
+                // mutating health or deciding whether another account may run.
+                let active_failure_text = failed.as_deref().unwrap_or_default();
+                let failure_details =
+                    classify_stream_failure(active_failure_text, stream_failure.as_ref());
+                let is_quota = failure_details.is_quota_error();
+                let is_request_rejection = failure_details.is_request_rejection();
+                let may_switch = (!is_quota || config.pool.auto_switch_on_quota_exhausted)
+                    && !is_request_rejection;
+                if !account_health_handled {
+                    record_account_scoped_stream_failure(
+                        &context.state,
+                        &context.trace_id,
+                        &context.request_id,
+                        &failed_account_id,
+                        failure_details,
+                    )
+                    .await;
                 }
                 attempted_accounts.insert(failed_account_id.clone());
                 if !data_started && pre_data_retries < retry_limit && may_switch {
@@ -952,7 +948,12 @@ pub fn response(
                             .collect::<Vec<_>>();
                         if candidate_ids.is_empty() {
                             if let Some(message) = failed.as_deref() {
-                                yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, message)));
+                                yield Ok::<Bytes, Infallible>(Bytes::from(classified_stream_error(
+                                    &protocol,
+                                    message,
+                                    &context.request_id,
+                                    stream_failure.as_ref(),
+                                )));
                             }
                             break 'rounds;
                         }
@@ -974,7 +975,11 @@ pub fn response(
                                 }
                                 stream_failure = None;
                                 failed = Some(error.to_string());
-                                yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error.to_string())));
+                                yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                                    &protocol,
+                                    &context.request_id,
+                                    &error.to_string(),
+                                )));
                                 break 'rounds;
                             }
                         };
@@ -1102,13 +1107,27 @@ pub fn response(
                             continue 'rounds;
                         }
                         Err(error) => {
+                            let message = error.to_string();
                             stream_failure = None;
-                            failed = Some(error.to_string());
+                            record_account_scoped_stream_failure(
+                                &context.state,
+                                &context.trace_id,
+                                &context.request_id,
+                                &account.id,
+                                classify_stream_failure(&message, None),
+                            )
+                            .await;
+                            failed = Some(message);
                         }
                     }
                 }
                 if let Some(message) = failed.as_deref() {
-                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, message)));
+                    yield Ok::<Bytes, Infallible>(Bytes::from(classified_stream_error(
+                        &protocol,
+                        message,
+                        &context.request_id,
+                        stream_failure.as_ref(),
+                    )));
                 }
                 break 'rounds;
             }
@@ -1230,7 +1249,11 @@ pub fn response(
                     Ok(budget) => budget,
                     Err(error) => {
                         failed = Some(error.clone());
-                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
+                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                            &protocol,
+                            &context.request_id,
+                            &error,
+                        )));
                         break 'rounds;
                     }
                 };
@@ -1336,7 +1359,11 @@ pub fn response(
                     Ok(tokens) => tokens as u64,
                     Err(error) => {
                         failed = Some(error.clone());
-                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
+                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                            &protocol,
+                            &context.request_id,
+                            &error,
+                        )));
                         break 'rounds;
                     }
                 };
@@ -1383,7 +1410,11 @@ pub fn response(
                 ) {
                     let error = error.to_string();
                     failed = Some(error.clone());
-                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
+                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                        &protocol,
+                        &context.request_id,
+                        &error,
+                    )));
                     break 'rounds;
                 }
 
@@ -1391,7 +1422,11 @@ pub fn response(
                     Ok(tokens) => tokens as u64,
                     Err(error) => {
                         failed = Some(error.clone());
-                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
+                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                            &protocol,
+                            &context.request_id,
+                            &error,
+                        )));
                         break 'rounds;
                     }
                 };
@@ -1399,7 +1434,11 @@ pub fn response(
                     Ok(tokens) => (tokens as u64).saturating_add(documentation_tokens),
                     Err(error) => {
                         failed = Some(error.clone());
-                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
+                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                            &protocol,
+                            &context.request_id,
+                            &error,
+                        )));
                         break 'rounds;
                     }
                 };
@@ -1407,7 +1446,11 @@ pub fn response(
                     Ok(payload) => payload.len(),
                     Err(error) => {
                         failed = Some(error.to_string());
-                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error.to_string())));
+                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                            &protocol,
+                            &context.request_id,
+                            &error.to_string(),
+                        )));
                         break 'rounds;
                     }
                 };
@@ -1438,7 +1481,11 @@ pub fn response(
                 };
                 if let Some(error) = budget_error {
                     failed = Some(error.clone());
-                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
+                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                        &protocol,
+                        &context.request_id,
+                        &error,
+                    )));
                     break 'rounds;
                 }
                 let model = payload.conversation_state.current_message.user_input_message.model_id.clone();
@@ -1453,7 +1500,11 @@ pub fn response(
                         limit.input_tokens, limit.maximum
                     );
                     failed = Some(error.clone());
-                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
+                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                        &protocol,
+                        &context.request_id,
+                        &error,
+                    )));
                     break 'rounds;
                 }
                 context.input_tokens = next_input_tokens;
@@ -1467,7 +1518,11 @@ pub fn response(
                 );
                 if let Err(error) = context.reservation.extend(continuation_estimate) {
                     failed = Some(error.to_string());
-                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error.to_string())));
+                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                        &protocol,
+                        &context.request_id,
+                        &error.to_string(),
+                    )));
                     break 'rounds;
                 }
                 let account = context.lease.account().await;
@@ -1486,8 +1541,22 @@ pub fn response(
                         continue 'rounds;
                     }
                     Err(error) => {
-                        failed = Some(error.to_string());
-                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error.to_string())));
+                        let message = error.to_string();
+                        stream_failure = None;
+                        record_account_scoped_stream_failure(
+                            &context.state,
+                            &context.trace_id,
+                            &context.request_id,
+                            &account.id,
+                            classify_stream_failure(&message, None),
+                        )
+                        .await;
+                        failed = Some(message.clone());
+                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                            &protocol,
+                            &context.request_id,
+                            &message,
+                        )));
                         break 'rounds;
                     }
                 }
@@ -1612,7 +1681,11 @@ pub fn response(
                     Err(error) => {
                         let error = error.to_string();
                         failed = Some(error.clone());
-                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
+                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                            &protocol,
+                            &context.request_id,
+                            &error,
+                        )));
                         break 'rounds;
                     }
                 }
@@ -1627,7 +1700,11 @@ pub fn response(
                 );
                 if let Err(error) = context.reservation.extend(continuation_estimate) {
                     failed = Some(error.to_string());
-                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error.to_string())));
+                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                        &protocol,
+                        &context.request_id,
+                        &error.to_string(),
+                    )));
                     break 'rounds;
                 }
                 let account = context.lease.account().await;
@@ -1645,8 +1722,22 @@ pub fn response(
                         continue 'rounds;
                     }
                     Err(error) => {
-                        failed = Some(error.to_string());
-                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error.to_string())));
+                        let message = error.to_string();
+                        stream_failure = None;
+                        record_account_scoped_stream_failure(
+                            &context.state,
+                            &context.trace_id,
+                            &context.request_id,
+                            &account.id,
+                            classify_stream_failure(&message, None),
+                        )
+                        .await;
+                        failed = Some(message.clone());
+                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                            &protocol,
+                            &context.request_id,
+                            &message,
+                        )));
                         break 'rounds;
                     }
                 }
@@ -1701,7 +1792,11 @@ pub fn response(
                 Err(error) => {
                     let error = error.to_string();
                     failed = Some(error.clone());
-                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error)));
+                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                        &protocol,
+                        &context.request_id,
+                        &error,
+                    )));
                     break 'rounds;
                 }
             }
@@ -1716,7 +1811,11 @@ pub fn response(
             );
             if let Err(error) = context.reservation.extend(continuation_estimate) {
                 failed = Some(error.to_string());
-                yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error.to_string())));
+                yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                    &protocol,
+                    &context.request_id,
+                    &error.to_string(),
+                )));
                 break 'rounds;
             }
             let account = context.lease.account().await;
@@ -1734,8 +1833,22 @@ pub fn response(
                     auto_round += 1;
                 }
                 Err(error) => {
-                    failed = Some(error.to_string());
-                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &error.to_string())));
+                    let message = error.to_string();
+                    stream_failure = None;
+                    record_account_scoped_stream_failure(
+                        &context.state,
+                        &context.trace_id,
+                        &context.request_id,
+                        &account.id,
+                        classify_stream_failure(&message, None),
+                    )
+                    .await;
+                    failed = Some(message.clone());
+                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                        &protocol,
+                        &context.request_id,
+                        &message,
+                    )));
                     break 'rounds;
                 }
             }
@@ -2508,16 +2621,38 @@ fn stream_finish(
     }
 }
 
-fn stream_error(protocol: &StreamProtocol, message: &str) -> String {
+fn stream_error(protocol: &StreamProtocol, request_id: &str, message: &str) -> String {
+    classified_stream_error(protocol, message, request_id, None)
+}
+
+fn classified_stream_error(
+    protocol: &StreamProtocol,
+    message: &str,
+    request_id: &str,
+    diagnostics: Option<&StreamFailureDiagnostics>,
+) -> String {
+    let details = classify_stream_failure(message, diagnostics);
+    stream_error_response(protocol, message, details.error_code, request_id)
+}
+
+fn stream_error_response(
+    protocol: &StreamProtocol,
+    message: &str,
+    code: &str,
+    request_id: &str,
+) -> String {
     let safe = kproxy_translate::sanitize_error_message(message);
     match protocol {
         StreamProtocol::Claude => sse(&json!({
-            "type":"error","error":{"type":"api_error","message":safe}
+            "type":"error",
+            "error":{"type":"api_error","message":safe,"code":code},
+            "request_id":request_id,
         })),
         StreamProtocol::OpenAi => format!(
-            "data: {}\n\ndata: [DONE]\n\n",
+            "data: {}\n\n",
             json!({
-                "error":{"type":"server_error","message":safe,"code":Value::Null}
+                "error":{"type":"server_error","message":safe,"code":code},
+                "request_id":request_id,
             })
         ),
     }
@@ -2576,12 +2711,15 @@ async fn finish_accounting(
     // The HTTP status is already committed as 200 once an SSE stream starts;
     // retain the semantic failure in RequestLog.status and these stable fields.
     context.diagnostics.client_status = 200;
-    if let Some(message) = failure.as_deref() {
-        let details = classify_stream_failure(message);
+    let failure_details = failure
+        .as_deref()
+        .map(|message| classify_stream_failure(message, stream_failure.as_ref()));
+    if let Some(details) = failure_details {
         context.diagnostics.upstream_status = details.upstream_status;
         context.diagnostics.error_code = details.error_code.into();
         context.diagnostics.error_stage = details.error_stage.into();
-        context.diagnostics.account_error = details.account_error;
+        context.diagnostics.failure_scope = details.scope.as_str().into();
+        context.diagnostics.account_error = details.account_error();
     } else {
         context.diagnostics.upstream_status = Some(200);
     }
@@ -2648,6 +2786,7 @@ async fn finish_accounting(
     let account = context.lease.account().await;
     let account_name = account.display_name().to_owned();
     if let Some(error) = failure.as_deref() {
+        let details = failure_details.expect("failure details exist when failure exists");
         let failure_diagnostics = stream_failure.unwrap_or_default();
         let stream_failure_kind = if failure_diagnostics.kind.is_empty() {
             "none"
@@ -2672,6 +2811,10 @@ async fn finish_accounting(
             output_tokens = decoded.usage.output_tokens,
             credits,
             duration_ms,
+            error_code = details.error_code,
+            error_stage = details.error_stage,
+            failure_scope = details.scope.as_str(),
+            account_error = details.account_error(),
             stream_failure_kind,
             transport_error_class,
             transport_timeout = failure_diagnostics.transport_timeout,
@@ -2731,22 +2874,100 @@ async fn finish_accounting(
     });
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamFailureScope {
+    Client,
+    Account,
+    Model,
+    Endpoint,
+    Upstream,
+}
+
+impl StreamFailureScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Account => "account",
+            Self::Model => "model",
+            Self::Endpoint => "endpoint",
+            Self::Upstream => "upstream",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
 struct StreamFailureDetails {
     upstream_status: Option<u16>,
     error_code: &'static str,
     error_stage: &'static str,
-    account_error: bool,
+    scope: StreamFailureScope,
 }
 
-fn classify_stream_failure(message: &str) -> StreamFailureDetails {
+impl StreamFailureDetails {
+    fn account_error(self) -> bool {
+        self.scope == StreamFailureScope::Account
+    }
+
+    fn is_auth_error(self) -> bool {
+        self.error_code == "upstream_authentication_failed"
+    }
+
+    fn is_quota_error(self) -> bool {
+        self.error_code == "upstream_quota_exhausted"
+    }
+
+    fn is_throttle_error(self) -> bool {
+        self.error_code == "upstream_rate_limited"
+    }
+
+    fn is_model_unavailable(self) -> bool {
+        self.error_code == "upstream_model_unavailable"
+    }
+
+    fn is_request_rejection(self) -> bool {
+        matches!(
+            self.error_code,
+            "context_length_exceeded" | "tool_budget_exceeded" | "invalid_tool_protocol"
+        )
+    }
+}
+
+fn classify_stream_failure(
+    message: &str,
+    diagnostics: Option<&StreamFailureDiagnostics>,
+) -> StreamFailureDetails {
     let lower = message.to_ascii_lowercase();
     let upstream_status = extract_upstream_status(&lower);
+
+    if let Some(diagnostics) = diagnostics {
+        if diagnostics.kind == "http_body_read" {
+            return StreamFailureDetails {
+                upstream_status,
+                error_code: if diagnostics.transport_timeout {
+                    "upstream_idle_timeout"
+                } else {
+                    "upstream_transport_interrupted"
+                },
+                error_stage: "upstream_stream_transport",
+                scope: StreamFailureScope::Endpoint,
+            };
+        }
+        if matches!(diagnostics.kind, "event_stream_decode" | "event_stream_eof") {
+            return StreamFailureDetails {
+                upstream_status,
+                error_code: "upstream_event_stream_corrupt",
+                error_stage: "upstream_stream_decode",
+                scope: StreamFailureScope::Upstream,
+            };
+        }
+    }
+
     if lower.contains("prompt is too long") || lower.contains("context length") {
         return StreamFailureDetails {
             upstream_status,
             error_code: "context_length_exceeded",
             error_stage: "context_validation",
-            account_error: false,
+            scope: StreamFailureScope::Client,
         };
     }
     if lower.contains("too many loaded tools")
@@ -2758,15 +2979,7 @@ fn classify_stream_failure(message: &str) -> StreamFailureDetails {
             upstream_status,
             error_code: "tool_budget_exceeded",
             error_stage: "request_budget",
-            account_error: false,
-        };
-    }
-    if kproxy_kiro::client::text_is_request_rejection(message) {
-        return StreamFailureDetails {
-            upstream_status,
-            error_code: "invalid_tool_protocol",
-            error_stage: "upstream_stream",
-            account_error: false,
+            scope: StreamFailureScope::Client,
         };
     }
     if kproxy_kiro::client::text_is_model_temporarily_unavailable(message) {
@@ -2774,7 +2987,7 @@ fn classify_stream_failure(message: &str) -> StreamFailureDetails {
             upstream_status,
             error_code: "upstream_model_unavailable",
             error_stage: "upstream_stream",
-            account_error: false,
+            scope: StreamFailureScope::Model,
         };
     }
     if kproxy_kiro::client::text_is_throttle_error(message) {
@@ -2782,18 +2995,70 @@ fn classify_stream_failure(message: &str) -> StreamFailureDetails {
             upstream_status: upstream_status.or(Some(429)),
             error_code: "upstream_rate_limited",
             error_stage: "upstream_stream",
-            account_error: true,
+            scope: StreamFailureScope::Model,
         };
     }
-    let account_error = kproxy_kiro::client::text_is_auth_error(message)
-        || kproxy_kiro::client::text_is_quota_error(message)
-        || upstream_status.is_some_and(|status| status >= 500)
-        || upstream_status.is_none();
+    if kproxy_kiro::client::text_is_auth_error(message) {
+        return StreamFailureDetails {
+            upstream_status,
+            error_code: "upstream_authentication_failed",
+            error_stage: "upstream_stream",
+            scope: StreamFailureScope::Account,
+        };
+    }
+    if kproxy_kiro::client::text_is_quota_error(message) {
+        return StreamFailureDetails {
+            upstream_status,
+            error_code: "upstream_quota_exhausted",
+            error_stage: "upstream_stream",
+            scope: StreamFailureScope::Account,
+        };
+    }
+    if kproxy_kiro::client::text_is_request_rejection(message) {
+        return StreamFailureDetails {
+            upstream_status,
+            error_code: "invalid_tool_protocol",
+            error_stage: "upstream_stream",
+            scope: StreamFailureScope::Client,
+        };
+    }
     StreamFailureDetails {
         upstream_status,
         error_code: "upstream_unavailable",
         error_stage: "upstream_stream",
-        account_error,
+        scope: StreamFailureScope::Upstream,
+    }
+}
+
+async fn record_account_scoped_stream_failure(
+    state: &Arc<AppState>,
+    trace_id: &str,
+    request_id: &str,
+    account_id: &str,
+    details: StreamFailureDetails,
+) {
+    if details.is_quota_error() {
+        state.pool().record_quota_error(account_id).await;
+        if state
+            .pool()
+            .get(account_id)
+            .await
+            .is_some_and(|runtime| runtime.health() == kproxy_pool::AccountHealth::Exhausted)
+        {
+            if let Err(error) = crate::tasks::persist_pool_accounts(state).await {
+                tracing::error!(
+                    trace_id,
+                    request_id,
+                    account_id,
+                    %error,
+                    "failed to persist stream quota exhaustion"
+                );
+            }
+            crate::alerts::sync_account_quota(state, account_id).await;
+            crate::alerts::sync_service_quota(state).await;
+        }
+    } else if details.account_error() {
+        state.pool().record_error(account_id).await;
     }
 }
 
@@ -2873,30 +3138,127 @@ mod tests {
     fn stream_failures_keep_real_upstream_status_and_account_scope() {
         let rejected = classify_stream_failure(
             "Kiro Amazon Q returned Some(400): tool schema payload too large",
+            None,
         );
         assert_eq!(rejected.upstream_status, Some(400));
         assert_eq!(rejected.error_code, "tool_budget_exceeded");
-        assert!(!rejected.account_error);
+        assert_eq!(rejected.scope, StreamFailureScope::Client);
+        assert!(!rejected.account_error());
 
         let rejected_5xx = classify_stream_failure(
             "Kiro Amazon Q returned Some(503): tool schema payload too large",
+            None,
         );
         assert_eq!(rejected_5xx.upstream_status, Some(503));
         assert_eq!(rejected_5xx.error_code, "tool_budget_exceeded");
-        assert!(!rejected_5xx.account_error);
+        assert!(!rejected_5xx.account_error());
 
-        let unavailable =
-            classify_stream_failure("Kiro Amazon Q returned Some(503): Internal Server Error");
+        let unavailable = classify_stream_failure(
+            "Kiro Amazon Q returned Some(503): Internal Server Error",
+            None,
+        );
         assert_eq!(unavailable.upstream_status, Some(503));
         assert_eq!(unavailable.error_code, "upstream_unavailable");
-        assert!(unavailable.account_error);
+        assert_eq!(unavailable.scope, StreamFailureScope::Upstream);
+        assert!(!unavailable.account_error());
 
         let model_unavailable = classify_stream_failure(
             r#"Kiro Amazon Q returned Some(500): {"message":"Encountered unexpectedly high load when processing the request, please try again.","reason":"MODEL_TEMPORARILY_UNAVAILABLE"}"#,
+            None,
         );
         assert_eq!(model_unavailable.upstream_status, Some(500));
         assert_eq!(model_unavailable.error_code, "upstream_model_unavailable");
-        assert!(!model_unavailable.account_error);
+        assert_eq!(model_unavailable.scope, StreamFailureScope::Model);
+        assert!(!model_unavailable.account_error());
+
+        let throttled = classify_stream_failure(
+            "Kiro Amazon Q returned Some(429): throttling exception",
+            None,
+        );
+        assert_eq!(throttled.error_code, "upstream_rate_limited");
+        assert_eq!(throttled.scope, StreamFailureScope::Model);
+        assert!(!throttled.account_error());
+
+        let auth =
+            classify_stream_failure("Kiro Amazon Q returned Some(401): unauthorized token", None);
+        assert_eq!(auth.error_code, "upstream_authentication_failed");
+        assert_eq!(auth.scope, StreamFailureScope::Account);
+        assert!(auth.account_error());
+
+        let quota_validation = classify_stream_failure("ValidationException: quota exceeded", None);
+        assert_eq!(quota_validation.error_code, "upstream_quota_exhausted");
+        assert_eq!(quota_validation.scope, StreamFailureScope::Account);
+
+        let auth_validation =
+            classify_stream_failure("ValidationException: authentication failed", None);
+        assert_eq!(auth_validation.error_code, "upstream_authentication_failed");
+        assert_eq!(auth_validation.scope, StreamFailureScope::Account);
+    }
+
+    #[test]
+    fn transport_and_event_decode_failures_do_not_penalize_accounts() {
+        let transport = StreamFailureDiagnostics {
+            kind: "http_body_read",
+            transport_class: "decode",
+            transport_decode: true,
+            ..StreamFailureDiagnostics::default()
+        };
+        let body_decode = classify_stream_failure("error decoding response body", Some(&transport));
+        assert_eq!(body_decode.error_code, "upstream_transport_interrupted");
+        assert_eq!(body_decode.error_stage, "upstream_stream_transport");
+        assert_eq!(body_decode.scope, StreamFailureScope::Endpoint);
+        assert!(!body_decode.account_error());
+
+        let timeout = StreamFailureDiagnostics {
+            transport_timeout: true,
+            ..transport.clone()
+        };
+        let idle_timeout = classify_stream_failure("operation timed out", Some(&timeout));
+        assert_eq!(idle_timeout.error_code, "upstream_idle_timeout");
+        assert_eq!(idle_timeout.scope, StreamFailureScope::Endpoint);
+        assert!(!idle_timeout.account_error());
+
+        let event_decode = StreamFailureDiagnostics {
+            kind: "event_stream_eof",
+            transport_class: "not_applicable",
+            ..StreamFailureDiagnostics::default()
+        };
+        let corrupt = classify_stream_failure("unexpected eof", Some(&event_decode));
+        assert_eq!(corrupt.error_code, "upstream_event_stream_corrupt");
+        assert_eq!(corrupt.scope, StreamFailureScope::Upstream);
+        assert!(!corrupt.account_error());
+    }
+
+    #[test]
+    fn classified_stream_errors_include_stable_code_and_request_id_without_done() {
+        let claude = classified_stream_error(
+            &StreamProtocol::Claude,
+            "Kiro Amazon Q returned Some(503): Internal Server Error",
+            "req_test",
+            None,
+        );
+        assert!(claude.contains("\"code\":\"upstream_unavailable\""));
+        assert!(claude.contains("\"request_id\":\"req_test\""));
+
+        let openai = classified_stream_error(
+            &StreamProtocol::OpenAi,
+            "Kiro Amazon Q returned Some(503): Internal Server Error",
+            "req_test",
+            None,
+        );
+        assert!(openai.contains("\"code\":\"upstream_unavailable\""));
+        assert!(openai.contains("\"request_id\":\"req_test\""));
+        assert!(!openai.contains("[DONE]"));
+
+        let internal = stream_error(
+            &StreamProtocol::Claude,
+            "req_internal",
+            "Tool Search operation limit was reached",
+        );
+        assert!(internal.contains("\"code\":\"upstream_unavailable\""));
+        assert!(internal.contains("\"request_id\":\"req_internal\""));
+        assert!(!internal.contains("\"code\":null"));
+        assert!(!internal.contains("\"request_id\":null"));
     }
 
     #[test]
