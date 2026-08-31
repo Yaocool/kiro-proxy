@@ -2,7 +2,8 @@ use std::collections::BTreeMap;
 
 use kproxy_kiro::{KiroEvent, UsageInfo};
 use kproxy_translate::{
-    ClaudeServerToolEmission, ClaudeToolSearchTrace, ClaudeWebSearchTrace, WebSearchReplayCodec,
+    ClaudeServerToolEmission, ClaudeToolSearchTrace, ClaudeWebSearchTrace, KiroToolUse,
+    WebSearchReplayCodec, WebSearchReplayError,
 };
 use serde_json::{json, Value};
 
@@ -35,6 +36,29 @@ pub struct DecodedResponse {
     pub stop_reason: Option<String>,
     /// Custom Claude stop sequence matched by the proxy response filter.
     pub stop_sequence: Option<String>,
+}
+
+impl DecodedResponse {
+    /// Removes buffered tool calls matching `predicate` in their stable map order.
+    pub fn take_tool_uses_where(
+        &mut self,
+        mut predicate: impl FnMut(&ToolBuffer) -> bool,
+    ) -> Vec<KiroToolUse> {
+        let tools = std::mem::take(&mut self.tools);
+        let mut selected = Vec::new();
+        for (key, tool) in tools {
+            if predicate(&tool) {
+                selected.push(KiroToolUse {
+                    tool_use_id: tool.id,
+                    name: tool.name,
+                    input: repair_json(&tool.input),
+                });
+            } else {
+                self.tools.insert(key, tool);
+            }
+        }
+        selected
+    }
 }
 
 #[derive(Debug, Default)]
@@ -680,6 +704,7 @@ impl DecodedResponse {
             self.usage.input_tokens,
             web_search_replay,
         )
+        .expect("test response replay encryption")
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -694,7 +719,7 @@ impl DecodedResponse {
         auto_compaction_original_input_tokens: Option<u64>,
         effective_input_tokens: u64,
         web_search_replay: &WebSearchReplayCodec,
-    ) -> Value {
+    ) -> Result<Value, WebSearchReplayError> {
         let mut content = Vec::new();
         if let Some(summary) = compaction_summary {
             content.push(json!({"type":"compaction","content":summary}));
@@ -711,7 +736,7 @@ impl DecodedResponse {
                 append_tool_search_blocks(&mut content, search);
             }
             for search in &self.web_searches {
-                append_web_search_blocks(&mut content, search, web_search_replay);
+                append_web_search_blocks(&mut content, search, web_search_replay)?;
             }
         } else {
             for event in &self.claude_server_events {
@@ -735,13 +760,13 @@ impl DecodedResponse {
                             content.push(json!({"type":"text","text":preceding_text}));
                         }
                         if let Some(search) = self.web_searches.get(*index) {
-                            append_web_search_blocks(&mut content, search, web_search_replay);
+                            append_web_search_blocks(&mut content, search, web_search_replay)?;
                         }
                     }
                 }
             }
         }
-        let citations = web_search_citations(&self.web_searches, &self.text, web_search_replay);
+        let citations = web_search_citations(&self.web_searches, &self.text, web_search_replay)?;
         if !self.text.is_empty() {
             if citations.is_empty() {
                 content.push(json!({"type":"text","text":self.text}));
@@ -816,7 +841,7 @@ impl DecodedResponse {
                 }]
             });
         }
-        response
+        Ok(response)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -929,7 +954,7 @@ fn append_web_search_blocks(
     content: &mut Vec<Value>,
     search: &ClaudeWebSearchTrace,
     web_search_replay: &WebSearchReplayCodec,
-) {
+) -> Result<(), WebSearchReplayError> {
     if search.emission != ClaudeServerToolEmission::ResultOnly {
         content.push(json!({
             "type":"server_tool_use",
@@ -939,7 +964,7 @@ fn append_web_search_blocks(
         }));
     }
     if search.emission == ClaudeServerToolEmission::Pending {
-        return;
+        return Ok(());
     }
     let result = if let Some(error) = &search.error {
         json!({
@@ -952,15 +977,15 @@ fn append_web_search_blocks(
                 .results
                 .iter()
                 .map(|result| {
-                    json!({
+                    Ok(json!({
                         "type":"web_search_result",
                         "url":result.url,
                         "title":result.title,
                         "page_age":Value::Null,
-                        "encrypted_content":web_search_replay.encrypt(result)
-                    })
+                        "encrypted_content":web_search_replay.try_encrypt(result)?
+                    }))
                 })
-                .collect(),
+                .collect::<Result<Vec<_>, WebSearchReplayError>>()?,
         )
     };
     content.push(json!({
@@ -969,13 +994,14 @@ fn append_web_search_blocks(
         "caller":{"type":"direct"},
         "content":result
     }));
+    Ok(())
 }
 
 pub(crate) fn web_search_citations(
     searches: &[ClaudeWebSearchTrace],
     answer_text: &str,
     web_search_replay: &WebSearchReplayCodec,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, WebSearchReplayError> {
     const MAX_CITATIONS: usize = 20;
 
     let mut seen = std::collections::HashSet::new();
@@ -996,13 +1022,13 @@ pub(crate) fn web_search_citations(
             } else {
                 result.snippet.chars().take(150).collect::<String>()
             };
-            json!({
+            Ok(json!({
                 "type":"web_search_result_location",
                 "url":result.url,
                 "title":result.title,
-                "encrypted_index":web_search_replay.encrypt(result),
+                "encrypted_index":web_search_replay.try_encrypt(result)?,
                 "cited_text":cited_text
-            })
+            }))
         })
         .collect()
 }
@@ -1705,20 +1731,22 @@ mod tests {
             },
             ..DecodedResponse::default()
         };
-        let response = decoded.claude_json_with_context_management(
-            "msg",
-            "source-large",
-            100,
-            100,
-            Some("summary"),
-            Some(CompactionIterationUsage {
-                input_tokens: 180_500,
-                output_tokens: 3_500,
-            }),
-            Some(180_000),
-            23_000,
-            &replay_codec(),
-        );
+        let response = decoded
+            .claude_json_with_context_management(
+                "msg",
+                "source-large",
+                100,
+                100,
+                Some("summary"),
+                Some(CompactionIterationUsage {
+                    input_tokens: 180_500,
+                    output_tokens: 3_500,
+                }),
+                Some(180_000),
+                23_000,
+                &replay_codec(),
+            )
+            .expect("encrypt replay data");
 
         let edit = &response["context_management"]["applied_edits"][0];
         assert_eq!(edit["type"], "compact_20260112");
@@ -1791,5 +1819,39 @@ mod tests {
                 stop: false,
             })
             .is_err());
+    }
+
+    #[test]
+    fn buffered_tool_extraction_partitions_in_stable_order() {
+        let mut decoded = DecodedResponse::default();
+        for (id, name) in [
+            ("call_b", "search"),
+            ("call_a", "shell"),
+            ("call_c", "search"),
+        ] {
+            decoded.tools.insert(
+                id.into(),
+                ToolBuffer {
+                    id: id.into(),
+                    name: name.into(),
+                    input: r#"{"command":"true"}"#.into(),
+                    complete: true,
+                },
+            );
+        }
+
+        let selected = decoded.take_tool_uses_where(|tool| tool.name == "search");
+
+        assert_eq!(
+            selected
+                .iter()
+                .map(|tool| tool.tool_use_id.as_str())
+                .collect::<Vec<_>>(),
+            ["call_b", "call_c"]
+        );
+        assert_eq!(
+            decoded.tools.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["call_a"]
+        );
     }
 }
