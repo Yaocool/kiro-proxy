@@ -385,7 +385,7 @@ kproxy account refresh <id|email>
 kproxy account refresh --all
 kproxy account probe --all
 kproxy account regen-machine-id <id|email>
-kproxy account rm <id|email>
+kproxy account rm <id|email> [<id|email> ...]
 
 kproxy config show --effective
 kproxy config path

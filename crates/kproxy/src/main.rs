@@ -964,6 +964,30 @@ mod tests {
     }
 
     #[test]
+    fn account_rm_accepts_one_or_multiple_accounts() {
+        let single = Cli::try_parse_from(["kproxy", "account", "rm", "acc_00000001"])
+            .expect("single account remove");
+        assert!(matches!(
+            single.command,
+            Some(Command::Account(
+                crate::commands::account::AccountCommand::Rm { ids }
+            )) if ids == ["acc_00000001"]
+        ));
+
+        let multiple =
+            Cli::try_parse_from(["kproxy", "account", "rm", "acc_00000001", "a@example.com"])
+                .expect("batch account remove");
+        assert!(matches!(
+            multiple.command,
+            Some(Command::Account(
+                crate::commands::account::AccountCommand::Rm { ids }
+            )) if ids == ["acc_00000001", "a@example.com"]
+        ));
+
+        assert!(Cli::try_parse_from(["kproxy", "account", "rm"]).is_err());
+    }
+
+    #[test]
     fn status_and_stats_accept_explicit_time_ranges() {
         let status = Cli::try_parse_from([
             "kproxy",

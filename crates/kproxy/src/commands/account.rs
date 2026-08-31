@@ -113,14 +113,15 @@ pub enum AccountCommand {
         #[arg(long)]
         headful: bool,
     },
-    /// 删除账号。
+    /// 删除一个或多个账号。
     #[command(
         visible_alias = "delete",
-        long_about = "删除账号，执行前需输入 y 或 yes 确认。\n\n示例：\n  kproxy account rm acc_7f3a2b1c\n  kproxy account rm user@example.com"
+        long_about = "删除一个或多个账号，整批执行前只需输入一次 y 或 yes 确认。\n\n示例：\n  kproxy account rm acc_7f3a2b1c\n  kproxy account rm user@example.com another@example.com"
     )]
     Rm {
-        /// 账号 ID 或邮箱。
-        id: String,
+        /// 一个或多个账号 ID/邮箱，以空格分隔。
+        #[arg(required = true, num_args = 1.., value_name = "ID_OR_EMAIL")]
+        ids: Vec<String>,
     },
     /// 启用账号。
     #[command(
@@ -440,19 +441,12 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             )
             .await?;
         }
-        AccountCommand::Rm { id } => {
-            if !crate::commands::confirm(&format!("确认删除账号 {id}？")).await? {
+        AccountCommand::Rm { ids } => {
+            if !crate::commands::confirm(&remove_confirmation_prompt(&ids)).await? {
                 println!("已取消");
                 return Ok(());
             }
-            let result: serde_json::Value = client
-                .call(method::ACCOUNT_REMOVE, serde_json::json!({"id": id}))
-                .await?;
-            if json {
-                print_json(&result)?;
-            } else {
-                println!("已删除 {id}");
-            }
+            remove_accounts(client, &ids, json).await?;
         }
         AccountCommand::Enable { id } => set_enabled(client, &id, true, json).await?,
         AccountCommand::Disable { id } => set_enabled(client, &id, false, json).await?,
@@ -580,6 +574,49 @@ fn print_result(value: &serde_json::Value, json: bool, message: &str) -> Result<
         println!("{message}");
     }
     Ok(())
+}
+
+fn remove_confirmation_prompt(ids: &[String]) -> String {
+    if let [id] = ids {
+        format!("确认删除账号 {id}？")
+    } else {
+        format!("确认删除以下 {} 个账号：{}？", ids.len(), ids.join("、"))
+    }
+}
+
+async fn remove_accounts(client: &mut AdminClient, ids: &[String], json: bool) -> Result<()> {
+    if let [id] = ids {
+        let result: serde_json::Value = client
+            .call(method::ACCOUNT_REMOVE, serde_json::json!({"id": id}))
+            .await?;
+        if json {
+            print_json(&result)?;
+        } else {
+            println!("已删除 {id}");
+        }
+        return Ok(());
+    }
+
+    let mut failures = Vec::new();
+    for id in ids {
+        match client
+            .call::<serde_json::Value>(method::ACCOUNT_REMOVE, serde_json::json!({"id": id}))
+            .await
+        {
+            Ok(result) if json => print_json(&result)?,
+            Ok(_) => println!("已删除 {id}"),
+            Err(error) => failures.push(format!("{id}: {error}")),
+        }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{} 个账号删除失败：\n{}",
+            failures.len(),
+            failures.join("\n")
+        ))
+    }
 }
 
 async fn set_enabled(client: &mut AdminClient, id: &str, enabled: bool, json: bool) -> Result<()> {
@@ -923,5 +960,72 @@ mod tests {
             Some(std::ffi::OsStr::new("0"))
         ));
         assert!(!sso_batch_reads_stdin("accounts.csv", None));
+    }
+
+    #[test]
+    fn remove_confirmation_describes_single_and_multiple_accounts() {
+        assert_eq!(
+            remove_confirmation_prompt(&["acc_00000001".into()]),
+            "确认删除账号 acc_00000001？"
+        );
+        assert_eq!(
+            remove_confirmation_prompt(&["acc_00000001".into(), "a@example.com".into()]),
+            "确认删除以下 2 个账号：acc_00000001、a@example.com？"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_remove_continues_after_an_account_fails() {
+        use kproxy_ipc::protocol::{decode_line, encode_line, Request, Response, RpcError};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket = directory.path().join("admin.sock");
+        let listener = UnixListener::bind(&socket).expect("bind socket");
+        let server = tokio::spawn(async move {
+            let mut received = Vec::new();
+            for index in 0..2 {
+                let (stream, _) = listener.accept().await.expect("accept client");
+                let (read_half, mut write_half) = stream.into_split();
+                let raw = BufReader::new(read_half)
+                    .lines()
+                    .next_line()
+                    .await
+                    .expect("read request")
+                    .expect("request line");
+                let request: Request = decode_line(&raw).expect("decode request");
+                received.push(
+                    request.params["id"]
+                        .as_str()
+                        .expect("account id")
+                        .to_owned(),
+                );
+                let response = if index == 0 {
+                    Response::err(request.id, RpcError::bad_params("account not found"))
+                } else {
+                    Response::ok(request.id, serde_json::json!({"removed": received[index]}))
+                };
+                write_half
+                    .write_all(encode_line(&response).expect("encode response").as_bytes())
+                    .await
+                    .expect("write response");
+            }
+            received
+        });
+
+        let mut client = AdminClient::connect(socket);
+        let error = remove_accounts(
+            &mut client,
+            &["missing@example.com".into(), "acc_00000002".into()],
+            false,
+        )
+        .await
+        .expect_err("first removal should fail");
+        assert!(error.to_string().contains("missing@example.com"));
+        assert_eq!(
+            server.await.expect("server task"),
+            ["missing@example.com", "acc_00000002"]
+        );
     }
 }
