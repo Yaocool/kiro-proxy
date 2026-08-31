@@ -1535,7 +1535,7 @@ fn alert_event_catalog() -> [AlertEventInfo; 4] {
         AlertEventInfo {
             event: AlertEvent::AccountCreditProtected.as_str(),
             condition:
-                "单个启用账号仍有额度，但达到 pool.low_credit_ratio 或 low_credit_min_remaining 保护阈值并暂停调度；额度恢复后才允许再次告警。",
+                "单个启用账号仍有额度，但达到 pool.low_credit_min_remaining 保护阈值并暂停调度；额度恢复后才允许再次告警。",
         },
         AlertEventInfo {
             event: AlertEvent::AccountQuotaExhausted.as_str(),

@@ -66,10 +66,7 @@ pub fn account_credit_state(account: &Account, config: &PoolConfig) -> AccountCr
     if remaining <= 0.0 {
         return AccountCreditState::Exhausted;
     }
-    let ratio = remaining / usage.limit;
-    if (config.low_credit_ratio > 0.0 && ratio <= config.low_credit_ratio)
-        || (config.low_credit_min_remaining > 0.0 && remaining <= config.low_credit_min_remaining)
-    {
+    if config.low_credit_min_remaining > 0.0 && remaining <= config.low_credit_min_remaining {
         AccountCreditState::Protected
     } else {
         AccountCreditState::Available
@@ -315,7 +312,6 @@ impl AccountPool {
             return false;
         }
         if account_credit_state(&account, &self.config()) != AccountCreditState::Available {
-            state.set_health(AccountHealth::Exhausted);
             return false;
         }
         if model.is_empty() {
@@ -570,8 +566,7 @@ impl AccountPool {
 
     /// Count accounts using the same health and credit gates as scheduling.
     ///
-    /// Credit protection is kept separate from true exhaustion even when an
-    /// earlier eligibility check marked the runtime health as exhausted.
+    /// Credit protection is kept separate from true exhaustion.
     pub async fn scheduling_counts(&self) -> AccountPoolCounts {
         let states = self
             .accounts
@@ -732,6 +727,43 @@ mod tests {
         );
     }
 
+    #[test]
+    fn credit_protection_uses_absolute_remaining_credits_only() {
+        let config = PoolConfig::default();
+        let mut account = account("low-percent", 0.0, SubscriptionKind::Pro);
+        account.usage = Some(Usage {
+            current: 995.0,
+            limit: 1_000.0,
+            percent_used: 99.5,
+            next_reset_date: None,
+            updated_at: 0,
+        });
+
+        assert_eq!(
+            account_credit_state(&account, &config),
+            AccountCreditState::Available
+        );
+    }
+
+    #[tokio::test]
+    async fn credit_protection_does_not_poison_runtime_health() {
+        let protected = account("protected", 97.0, SubscriptionKind::Pro);
+        let pool = AccountPool::new(vec![protected], immediate_config());
+        let runtime = pool.get("protected").await.expect("protected account");
+
+        assert!(matches!(
+            pool.acquire("claude-sonnet", 0.0, &[]).await,
+            Err(PoolError::NoAvailableAccount(_))
+        ));
+        assert_eq!(runtime.health(), AccountHealth::Available);
+
+        pool.update_config(PoolConfig {
+            low_credit_min_remaining: 2.0,
+            ..immediate_config()
+        });
+        assert!(pool.acquire("claude-sonnet", 0.0, &[]).await.is_ok());
+    }
+
     #[tokio::test]
     async fn scheduling_counts_apply_credit_protection_and_runtime_health() {
         let ready = account("ready", 10.0, SubscriptionKind::Pro);
@@ -748,10 +780,6 @@ mod tests {
             ],
             immediate_config(),
         );
-        pool.get("protected")
-            .await
-            .expect("protected")
-            .set_health(AccountHealth::Exhausted);
         pool.get("cooling")
             .await
             .expect("cooling")

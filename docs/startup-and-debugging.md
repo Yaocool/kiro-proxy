@@ -318,8 +318,8 @@ Each account or service incident emits one Markdown alert and stays suppressed
 until that incident recovers.
 Account-scoped events of the same kind that reach one target within a short
 window are combined into one message, avoiding webhook floods. The
-`account-credit-protected` event uses the scheduler's `pool.low_credit_ratio`
-and `pool.low_credit_min_remaining` rules: the account still has credits but is
+`account-credit-protected` event uses the scheduler's
+`pool.low_credit_min_remaining` rule: the account still has credits but is
 removed from scheduling to preserve its final usable allowance.
 
 A mapping with `--below-credits-percent` is evaluated against each selected

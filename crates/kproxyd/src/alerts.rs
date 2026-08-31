@@ -336,19 +336,7 @@ fn account_credit_protected_event(
     let usage = (usage.limit > 0.0).then_some(usage)?;
     let remaining = (usage.limit - usage.current).max(0.0);
     let remaining_percent = (remaining / usage.limit * 100.0).clamp(0.0, 100.0);
-    let mut thresholds = Vec::new();
-    if config.low_credit_ratio > 0.0 {
-        thresholds.push(format!(
-            "剩余比例 ≤ {:.2}%",
-            config.low_credit_ratio * 100.0
-        ));
-    }
-    if config.low_credit_min_remaining > 0.0 {
-        thresholds.push(format!(
-            "剩余额度 ≤ {:.2} credits",
-            config.low_credit_min_remaining
-        ));
-    }
+    let threshold = format!("剩余额度 ≤ {:.2} credits", config.low_credit_min_remaining);
     let message = format!(
         "- **账号：** `{}`\n\
          - **账号 ID：** `{}`\n\
@@ -360,7 +348,7 @@ fn account_credit_protected_event(
         markdown_code(&account.id),
         usage.current,
         usage.limit,
-        thresholds.join(" 或 "),
+        threshold,
     );
     let mut event = WebhookEvent::new(
         WebhookEventKind::AccountCreditProtected,

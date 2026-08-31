@@ -302,8 +302,6 @@ pub struct PoolConfig {
     pub max_queue_wait_ms: u64,
     /// 队列满时等待时间。
     pub queue_full_wait_ms: u64,
-    /// 低额度百分比阈值。
-    pub low_credit_ratio: f64,
     /// 低额度绝对值阈值。
     pub low_credit_min_remaining: f64,
     /// 每日额度上限；0 表示不限。
@@ -327,7 +325,6 @@ impl Default for PoolConfig {
             max_queue_size: 10,
             max_queue_wait_ms: 30_000,
             queue_full_wait_ms: 5_000,
-            low_credit_ratio: 0.0,
             low_credit_min_remaining: 4.0,
             daily_credit_limit: 0.0,
             credit_estimate_per_1k_tokens: 1.0,
@@ -870,13 +867,10 @@ impl Config {
                 return Err(ConfigError::RatioOutOfRange { field, value });
             }
         }
-        for (field, value) in [
-            ("pool.low_credit_ratio", self.pool.low_credit_ratio),
-            (
-                "notify.low_credit_threshold_percent",
-                self.notify.low_credit_threshold_percent / 100.0,
-            ),
-        ] {
+        for (field, value) in [(
+            "notify.low_credit_threshold_percent",
+            self.notify.low_credit_threshold_percent / 100.0,
+        )] {
             if !value.is_finite() || !(0.0..=1.0).contains(&value) {
                 return invalid_config(field, "must be a finite value in 0.0..=1.0");
             }
@@ -1419,8 +1413,6 @@ max_queue_size = 10
 max_queue_wait_ms = 30000
 # 队列已满后，为短暂释放槽位额外等待的时间。
 queue_full_wait_ms = 5000
-# 按剩余额度百分比停用账号；范围 0.0-1.0，0 表示关闭百分比保护。
-low_credit_ratio = 0.0
 # 按剩余 credits 绝对值停用账号；剩余值小于等于该值时不再分配请求，0 表示关闭。
 low_credit_min_remaining = 4.0
 # 整个代理服务每天最多消耗的 credits；0 表示不限，按 UTC 自然日重置。
@@ -1734,7 +1726,6 @@ mod tests {
         assert_eq!(config.pool.max_queue_size, 10);
         assert_eq!(config.pool.max_queue_wait_ms, 30_000);
         assert_eq!(config.pool.queue_full_wait_ms, 5_000);
-        assert_eq!(config.pool.low_credit_ratio, 0.0);
         assert_eq!(config.pool.low_credit_min_remaining, 4.0);
         assert_eq!(config.pool.credit_estimate_per_1k_tokens, 1.0);
         assert_eq!(config.pool.credit_estimate_output_token_cap, 8_192);
@@ -1816,6 +1807,15 @@ mod tests {
             parsed.upstream.pool.stream_pipelining,
             expected.upstream.pool.stream_pipelining
         );
+    }
+
+    #[test]
+    fn legacy_credit_ratio_setting_is_ignored() {
+        let parsed: Config =
+            toml::from_str("[pool]\nlow_credit_ratio = 0.25\nlow_credit_min_remaining = 6.0\n")
+                .expect("legacy credit ratio must remain forward-compatible");
+
+        assert_eq!(parsed.pool.low_credit_min_remaining, 6.0);
     }
 
     #[test]
