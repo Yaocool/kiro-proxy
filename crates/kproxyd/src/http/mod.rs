@@ -82,7 +82,8 @@ fn router_for_service(
         service: Arc::new(service),
         allowed_api_key_ids: Arc::new(allowed_api_key_ids),
     };
-    let middleware_state = router_state.clone();
+    let keep_alive_state = router_state.clone();
+    let trace_state = router_state.clone();
     Router::new()
         .route("/", get(handlers::root))
         .route("/health", get(handlers::health))
@@ -132,33 +133,54 @@ fn router_for_service(
         .layer(DefaultBodyLimit::max(50 * 1024 * 1024))
         .layer(middleware::from_fn(catch_panics))
         .layer(middleware::from_fn_with_state(
-            middleware_state,
+            keep_alive_state,
             keep_alive_headers,
         ))
         .layer(middleware::from_fn(cors))
-        .layer(middleware::from_fn(trace_requests))
+        .layer(middleware::from_fn_with_state(trace_state, trace_requests))
         .with_state(router_state)
 }
 
-async fn trace_requests(mut request: axum::extract::Request, next: Next) -> Response {
+async fn trace_requests(
+    State(state): State<ServiceHttpState>,
+    mut request: axum::extract::Request,
+    next: Next,
+) -> Response {
     let trace_id = format!("trace_{}", Uuid::new_v4().simple());
     let method = request.method().clone();
     let path = request.uri().path().to_string();
+    let http_version = format!("{:?}", request.version());
+    let content_length = request
+        .headers()
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("unknown")
+        .to_owned();
+    let service_id = state.service.id.clone();
+    let service_name = state.service.name.clone();
     let started = Instant::now();
     request.extensions_mut().insert(RequestTrace {
         id: trace_id.clone(),
     });
     tracing::info!(
+        event = "http.request.received",
         trace_id = %trace_id,
+        service_id = %service_id,
+        service_name = %service_name,
         http_method = %method,
         http_path = %path,
+        http_version,
+        content_length,
         "client request received"
     );
     let span = tracing::info_span!(
         "client_request",
         trace_id = %trace_id,
+        service_id = %service_id,
+        service_name = %service_name,
         http_method = %method,
-        http_path = %path
+        http_path = %path,
+        http_version = %http_version
     );
     let mut response = next.run(request).instrument(span).await;
     let status = response.status();
@@ -196,7 +218,10 @@ async fn trace_requests(mut request: axum::extract::Request, next: Next) -> Resp
     let handled_error = !error_code.is_empty();
     if status.is_server_error() && !handled_error {
         tracing::error!(
+            event = "http.response.ready",
             trace_id = %trace_id,
+            service_id = %service_id,
+            service_name = %service_name,
             request_id = %response_request_id,
             http_method = %method,
             http_path = %path,
@@ -210,7 +235,10 @@ async fn trace_requests(mut request: axum::extract::Request, next: Next) -> Resp
         );
     } else if status.is_client_error() || status.is_server_error() {
         tracing::warn!(
+            event = "http.response.ready",
             trace_id = %trace_id,
+            service_id = %service_id,
+            service_name = %service_name,
             request_id = %response_request_id,
             http_method = %method,
             http_path = %path,
@@ -224,7 +252,10 @@ async fn trace_requests(mut request: axum::extract::Request, next: Next) -> Resp
         );
     } else {
         tracing::info!(
+            event = "http.response.ready",
             trace_id = %trace_id,
+            service_id = %service_id,
+            service_name = %service_name,
             request_id = %response_request_id,
             http_method = %method,
             http_path = %path,
@@ -310,20 +341,34 @@ async fn keep_alive_headers(
 
 async fn catch_panics(request: axum::extract::Request, next: Next) -> Response {
     let request_id = request_trace_id(&request);
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
     match std::panic::AssertUnwindSafe(next.run(request))
         .catch_unwind()
         .await
     {
         Ok(response) => response,
-        Err(_) => (
-            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "type": "error",
-                "error":{"type":"api_error","message":"Internal server error"},
-                "request_id": request_id
-            })),
-        )
-            .into_response(),
+        Err(_) => {
+            tracing::error!(
+                event = "http.request.panic",
+                trace_id = %request_id,
+                http_method = %method,
+                http_path = %path,
+                http_status = 500u16,
+                error_code = "internal_panic",
+                error_stage = "request_handler",
+                "request handler panicked"
+            );
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "type": "error",
+                    "error":{"type":"api_error","message":"Internal server error"},
+                    "request_id": request_id
+                })),
+            )
+                .into_response()
+        }
     }
 }
 
