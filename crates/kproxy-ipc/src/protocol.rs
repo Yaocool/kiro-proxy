@@ -56,6 +56,8 @@ pub mod method {
     pub const LOGS: &str = "logs.follow";
     /// List physical daemon log files and their resolved locations.
     pub const LOG_FILES: &str = "logs.files";
+    /// Search physical daemon log files for one request trace.
+    pub const LOG_TRACE: &str = "logs.trace";
     /// 动态模型列表。
     pub const MODELS: &str = "models";
     /// 解析客户端模型 ID 到账号实际模型。
@@ -106,6 +108,7 @@ pub mod method {
         STATS,
         LOGS,
         LOG_FILES,
+        LOG_TRACE,
         MODELS,
         MODEL_RESOLVE,
         APIKEY_LIST,
@@ -642,6 +645,38 @@ pub struct LogFilesResult {
     pub level_filter: String,
     /// Physical files, sorted newest first.
     pub files: Vec<LogFileView>,
+}
+
+/// One physical log record associated with a trace ID.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogTraceEntry {
+    /// Physical log file containing the record.
+    pub path: String,
+    /// Exact severity shard containing the record.
+    pub level: String,
+    /// UTC date shard in YYYY-MM-DD form.
+    pub date: String,
+    /// One-based line number in the physical file.
+    pub line: u64,
+    /// Parsed JSON record, or a string for pretty-formatted logs.
+    pub record: serde_json::Value,
+}
+
+/// `logs.trace` result.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogTraceResult {
+    /// Exact trace ID used for the search.
+    pub trace_id: String,
+    /// Matching records ordered by timestamp.
+    pub entries: Vec<LogTraceEntry>,
+    /// Number of physical shards scanned.
+    pub files_scanned: usize,
+    /// Number of bytes read from physical shards.
+    pub bytes_scanned: u64,
+    /// Total matching records encountered before the tail limit.
+    pub matched_records: usize,
+    /// Whether safety or tail limits truncated the result.
+    pub truncated: bool,
 }
 
 /// `config.reload` 结果。
