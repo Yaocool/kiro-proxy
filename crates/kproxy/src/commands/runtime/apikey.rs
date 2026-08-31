@@ -1,0 +1,299 @@
+use super::{
+    anyhow, clear_key_field_and_reload, generate_key, key_id, matches_key, method,
+    mutate_config_array, mutate_key_and_reload, print_json, render_table, show_keys, simple_rpc,
+    AdminClient, ApiKeyCommand, Context, Deserialize, Result,
+};
+
+pub async fn run_apikey(
+    client: &mut AdminClient,
+    command: ApiKeyCommand,
+    json: bool,
+) -> Result<()> {
+    match command {
+        ApiKeyCommand::List { detail } => show_key_list(client, detail, json).await,
+        ApiKeyCommand::Show { id } => show_keys(client, Some(&id), None, json).await,
+        ApiKeyCommand::Usage { id } => show_keys(client, Some(&id), None, json).await,
+        ApiKeyCommand::History { id, tail } => show_keys(client, Some(&id), Some(tail), json).await,
+        ApiKeyCommand::ResetUsage { id } => {
+            if !crate::commands::confirm(&format!("确认重置 API key {id} 的全部用量统计？")).await?
+            {
+                println!("已取消");
+                return Ok(());
+            }
+            simple_rpc(
+                client,
+                method::APIKEY_RESET_USAGE,
+                serde_json::json!({"id":id}),
+                json,
+            )
+            .await
+        }
+        ApiKeyCommand::Add {
+            name,
+            format,
+            credits_limit,
+        } => {
+            let key = generate_key(&format)?;
+            let id = key_id(&key);
+            mutate_config_array(client, "api_key", |array| {
+                let mut table = toml::map::Map::new();
+                table.insert("id".into(), toml::Value::String(id.clone()));
+                table.insert("name".into(), toml::Value::String(name.clone()));
+                table.insert("key".into(), toml::Value::String(key.clone()));
+                table.insert("format".into(), toml::Value::String(format.clone()));
+                table.insert("enabled".into(), toml::Value::Boolean(true));
+                if let Some(limit) = credits_limit {
+                    table.insert("credits_limit".into(), toml::Value::Float(limit));
+                }
+                array.push(toml::Value::Table(table));
+                Ok(())
+            })
+            .await?;
+            if json {
+                print_json(&serde_json::json!({"id":id,"name":name,"key":key}))?;
+            } else {
+                println!("已创建 {id} ({name})\n请立即保存密钥；之后列表不再显示：\n{key}");
+            }
+            Ok(())
+        }
+        ApiKeyCommand::Rm { id } => {
+            if !crate::commands::confirm(&format!("确认删除 API key {id}？")).await? {
+                println!("已取消");
+                return Ok(());
+            }
+            mutate_config_array(client, "api_key", |array| {
+                let before = array.len();
+                array.retain(|value| !matches_key(value, &id));
+                (array.len() < before)
+                    .then_some(())
+                    .ok_or_else(|| anyhow!("API key not found: {id}"))
+            })
+            .await?;
+            if json {
+                print_json(&serde_json::json!({"removed":true,"id":id}))
+            } else {
+                println!("已删除 API key {id}");
+                Ok(())
+            }
+        }
+        ApiKeyCommand::Enable { id } => {
+            mutate_key_and_reload(client, &id, "enabled", toml::Value::Boolean(true)).await?;
+            report_apikey_change(client, &id, "已启用", json).await
+        }
+        ApiKeyCommand::Disable { id } => {
+            mutate_key_and_reload(client, &id, "enabled", toml::Value::Boolean(false)).await?;
+            report_apikey_change(client, &id, "已停用", json).await
+        }
+        ApiKeyCommand::Limit { id, credits, clear } => {
+            if clear {
+                clear_key_field_and_reload(client, &id, "credits_limit").await?;
+            } else {
+                let credits = credits
+                    .ok_or_else(|| anyhow!("--credits is required unless --clear is used"))?;
+                mutate_key_and_reload(client, &id, "credits_limit", toml::Value::Float(credits))
+                    .await?;
+            }
+            report_apikey_change(client, &id, "已更新额度上限", json).await
+        }
+    }
+}
+
+async fn report_apikey_change(
+    client: &mut AdminClient,
+    id: &str,
+    message: &str,
+    json: bool,
+) -> Result<()> {
+    if json {
+        show_keys(client, Some(id), None, true).await
+    } else {
+        println!("{message} API key {id}");
+        Ok(())
+    }
+}
+
+#[derive(Debug, Deserialize)]
+pub(super) struct ApiKeyListEntry {
+    id: String,
+    name: String,
+    enabled: bool,
+    credits_limit: Option<f64>,
+    #[serde(default)]
+    reserved_credits: f64,
+    #[serde(default)]
+    usage: ApiKeyListUsage,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ApiKeyListUsage {
+    #[serde(default)]
+    total_requests: u64,
+    #[serde(default)]
+    total_credits: f64,
+    #[serde(default)]
+    total_input_tokens: u64,
+    #[serde(default)]
+    total_output_tokens: u64,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct ApiKeyListSummary {
+    total: usize,
+    enabled: usize,
+    total_requests: u64,
+    total_credits: f64,
+    reserved_credits: f64,
+    total_input_tokens: u64,
+    total_output_tokens: u64,
+}
+
+impl ApiKeyListSummary {
+    pub(super) fn from_entries(entries: &[ApiKeyListEntry]) -> Self {
+        entries.iter().fold(Self::default(), |mut summary, entry| {
+            summary.total += 1;
+            summary.enabled += usize::from(entry.enabled);
+            summary.total_requests += entry.usage.total_requests;
+            summary.total_credits += entry.usage.total_credits;
+            summary.reserved_credits += entry.reserved_credits;
+            summary.total_input_tokens += entry.usage.total_input_tokens;
+            summary.total_output_tokens += entry.usage.total_output_tokens;
+            summary
+        })
+    }
+
+    fn disabled(&self) -> usize {
+        self.total.saturating_sub(self.enabled)
+    }
+}
+
+async fn show_key_list(client: &mut AdminClient, detail: bool, json: bool) -> Result<()> {
+    let value: serde_json::Value = client
+        .call(method::APIKEY_LIST, serde_json::json!({}))
+        .await?;
+    let mut entries = serde_json::from_value::<Vec<ApiKeyListEntry>>(value)
+        .context("daemon 返回的 API key 列表无效")?;
+    entries.sort_by(|left, right| {
+        left.name
+            .cmp(&right.name)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    let summary = ApiKeyListSummary::from_entries(&entries);
+
+    if json {
+        return print_json(&apikey_list_json(&entries, &summary, detail));
+    }
+    if entries.is_empty() {
+        println!("暂无 API key。");
+        return Ok(());
+    }
+
+    let rows = entries
+        .iter()
+        .map(|entry| {
+            let mut row = vec![
+                entry.id.clone(),
+                entry.name.clone(),
+                if entry.enabled { "enabled" } else { "disabled" }.into(),
+                entry
+                    .credits_limit
+                    .map(format_credits)
+                    .unwrap_or_else(|| "-".into()),
+            ];
+            if detail {
+                row.extend([
+                    entry.usage.total_requests.to_string(),
+                    entry.usage.total_input_tokens.to_string(),
+                    entry.usage.total_output_tokens.to_string(),
+                    format_credits(entry.usage.total_credits),
+                    format_credits(entry.reserved_credits),
+                ]);
+            }
+            row
+        })
+        .collect::<Vec<_>>();
+    let headers = if detail {
+        vec![
+            "ID",
+            "名称",
+            "状态",
+            "Credits 上限",
+            "请求",
+            "输入 Tokens",
+            "输出 Tokens",
+            "Credits",
+            "预留 Credits",
+        ]
+    } else {
+        vec!["ID", "名称", "状态", "Credits 上限"]
+    };
+    println!("{}", render_table(&headers, &rows));
+    if detail {
+        println!(
+            "总计：{} 个 API key，{} 启用 / {} 停用，{} 请求，{} 输入 tokens，{} 输出 tokens，{} credits，{} 预留。",
+            summary.total,
+            summary.enabled,
+            summary.disabled(),
+            summary.total_requests,
+            summary.total_input_tokens,
+            summary.total_output_tokens,
+            format_credits(summary.total_credits),
+            format_credits(summary.reserved_credits),
+        );
+    } else {
+        println!(
+            "总计：{} 个 API key，{} 启用 / {} 停用，{} 请求，{} 输入 tokens，{} 输出 tokens，{} credits，{} 预留。使用 --detail 查看分 key 消耗。",
+            summary.total,
+            summary.enabled,
+            summary.disabled(),
+            summary.total_requests,
+            summary.total_input_tokens,
+            summary.total_output_tokens,
+            format_credits(summary.total_credits),
+            format_credits(summary.reserved_credits),
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn apikey_list_json(
+    entries: &[ApiKeyListEntry],
+    summary: &ApiKeyListSummary,
+    detail: bool,
+) -> serde_json::Value {
+    let api_keys = entries
+        .iter()
+        .map(|entry| {
+            let mut value = serde_json::json!({
+                "id":entry.id,
+                "name":entry.name,
+                "enabled":entry.enabled,
+                "credits_limit":entry.credits_limit,
+            });
+            if detail {
+                value["total_requests"] = entry.usage.total_requests.into();
+                value["total_input_tokens"] = entry.usage.total_input_tokens.into();
+                value["total_output_tokens"] = entry.usage.total_output_tokens.into();
+                value["total_credits"] = entry.usage.total_credits.into();
+                value["reserved_credits"] = entry.reserved_credits.into();
+            }
+            value
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "summary":{
+            "total":summary.total,
+            "enabled":summary.enabled,
+            "disabled":summary.disabled(),
+            "total_requests":summary.total_requests,
+            "total_input_tokens":summary.total_input_tokens,
+            "total_output_tokens":summary.total_output_tokens,
+            "total_credits":summary.total_credits,
+            "reserved_credits":summary.reserved_credits,
+        },
+        "api_keys":api_keys,
+    })
+}
+
+pub(super) fn format_credits(value: f64) -> String {
+    format!("{value:.2}")
+}

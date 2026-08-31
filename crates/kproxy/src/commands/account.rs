@@ -80,7 +80,7 @@ pub enum AccountCommand {
     AddSso {
         #[arg(long)]
         email: Option<String>,
-        /// IAM Identity Center start URL；未提供时读取 [sso].start_url。
+        /// IAM Identity Center start URL；未提供时读取 `[sso].start_url`。
         #[arg(long)]
         start_url: Option<String>,
         #[arg(long, default_value = "us-east-1")]
