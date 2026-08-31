@@ -177,7 +177,9 @@ fn redact_domain_token(message: &str, domain: &str) -> String {
         output.push_str("upstream");
         cursor = start + domain.len();
         while cursor < message.len() {
-            let character = message[cursor..].chars().next().expect("character");
+            let Some(character) = message[cursor..].chars().next() else {
+                break;
+            };
             if character.is_whitespace() {
                 break;
             }

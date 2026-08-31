@@ -21,6 +21,16 @@ pub struct WebSearchReplayCodec {
     key: [u8; 32],
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum WebSearchReplayError {
+    #[error("failed to serialize web-search replay record: {0}")]
+    Serialize(#[source] serde_json::Error),
+    #[error("web-search replay key was rejected by AES-256-GCM")]
+    InvalidKey,
+    #[error("failed to encrypt web-search replay record")]
+    Encrypt,
+}
+
 impl std::fmt::Debug for WebSearchReplayCodec {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -45,25 +55,25 @@ impl WebSearchReplayCodec {
         Ok(Self { key })
     }
 
-    pub fn encrypt(&self, result: &WebSearchResult) -> String {
+    pub fn try_encrypt(&self, result: &WebSearchResult) -> Result<String, WebSearchReplayError> {
         let mut nonce_bytes = [0u8; 12];
         rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
-        let mut plaintext =
-            serde_json::to_vec(result).expect("WebSearchResult serialization cannot fail");
+        let mut plaintext = serde_json::to_vec(result).map_err(WebSearchReplayError::Serialize)?;
         self.key()
+            .map_err(|_| WebSearchReplayError::InvalidKey)?
             .seal_in_place_append_tag(
                 Nonce::assume_unique_for_key(nonce_bytes),
                 Aad::from(WEB_SEARCH_REPLAY_AAD),
                 &mut plaintext,
             )
-            .expect("AES-256-GCM encryption failed");
+            .map_err(|_| WebSearchReplayError::Encrypt)?;
         let mut envelope = Vec::with_capacity(nonce_bytes.len() + plaintext.len());
         envelope.extend_from_slice(&nonce_bytes);
         envelope.extend_from_slice(&plaintext);
-        format!(
+        Ok(format!(
             "{WEB_SEARCH_REPLAY_PREFIX}{}",
             URL_SAFE_NO_PAD.encode(envelope)
-        )
+        ))
     }
 
     pub fn decrypt(&self, value: &str) -> Result<WebSearchResult, String> {
@@ -85,6 +95,7 @@ impl WebSearchReplayCodec {
         let mut ciphertext = ciphertext.to_vec();
         let plaintext = self
             .key()
+            .map_err(|_| "web-search replay key was rejected by AES-256-GCM".to_owned())?
             .open_in_place(
                 Nonce::assume_unique_for_key(nonce),
                 Aad::from(WEB_SEARCH_REPLAY_AAD),
@@ -95,11 +106,8 @@ impl WebSearchReplayCodec {
             .map_err(|_| "web-search encrypted_content contains an invalid record".to_owned())
     }
 
-    fn key(&self) -> LessSafeKey {
-        LessSafeKey::new(
-            UnboundKey::new(&aead::AES_256_GCM, &self.key)
-                .expect("WebSearchReplayCodec always holds a 256-bit key"),
-        )
+    fn key(&self) -> Result<LessSafeKey, ring::error::Unspecified> {
+        UnboundKey::new(&aead::AES_256_GCM, &self.key).map(LessSafeKey::new)
     }
 }
 
@@ -571,7 +579,7 @@ mod tests {
         };
 
         let codec = WebSearchReplayCodec::from_key([0x33; 32]);
-        let opaque = codec.encrypt(&result);
+        let opaque = codec.try_encrypt(&result).expect("encrypt replay record");
         assert!(opaque.starts_with("kproxy.v2."));
         assert_eq!(codec.decrypt(&opaque), Ok(result));
 
@@ -592,7 +600,7 @@ mod tests {
             snippet: "data".into(),
             published_date: None,
         };
-        let encrypted = codec.encrypt(&result);
+        let encrypted = codec.try_encrypt(&result).expect("encrypt replay record");
         let mut request: crate::ClaudeRequest = serde_json::from_value(json!({
             "model":"claude-sonnet-4",
             "max_tokens":100,
