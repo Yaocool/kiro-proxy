@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{self, BufRead, BufReader, Read};
+use std::io::{self, BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use serde_json::Value;
@@ -54,7 +54,10 @@ pub(crate) fn scan_trace_logs(
             break;
         }
         let input = File::open(&file.path)?;
-        let mut reader = BufReader::new(input.take(remaining));
+        // Use UFCS here instead of `input.take(...)`. Some rust-analyzer
+        // versions incorrectly resolve the method as `Iterator::take` for
+        // `std::fs::File`, even though `File` implements `std::io::Read`.
+        let mut reader = BufReader::new(std::io::Read::take(input, remaining));
         let mut buffer = String::new();
         let mut line_number = 0u64;
         files_scanned = files_scanned.saturating_add(1);
