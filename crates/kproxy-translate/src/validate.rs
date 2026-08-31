@@ -755,11 +755,21 @@ fn validate_claude_block(
             }
         }
         "compaction" if !tool_result_content => {
-            if role != "assistant" || !block.get("content").is_some_and(Value::is_string) {
+            if role != "assistant" {
                 return invalid(
-                    format!("{field}.content"),
-                    "compaction blocks require an assistant role and string content",
+                    format!("{field}.type"),
+                    "compaction blocks require an assistant role",
                 );
+            }
+            match block.get("content") {
+                None | Some(Value::Null) => {}
+                Some(Value::String(content)) if content.is_empty() => {
+                    return invalid(format!("{field}.content"), "must not be empty");
+                }
+                Some(Value::String(_)) => {}
+                _ => {
+                    return invalid(format!("{field}.content"), "expected a string or null");
+                }
             }
         }
         "document" => {
@@ -1710,6 +1720,36 @@ mod tests {
             .expect_err("missing edit type")
             .to_string()
             .contains("expected a string"));
+    }
+
+    #[test]
+    fn validates_assistant_compaction_content_contract() {
+        let mut input = request();
+        input.messages[0].role = "assistant".into();
+        input.messages[0].content = serde_json::json!([{
+            "type":"compaction","content":null
+        }]);
+        validate_claude(&input).expect("null assistant compaction is a protocol no-op");
+
+        input.messages[0].content = serde_json::json!([{"type":"compaction"}]);
+        validate_claude(&input).expect("missing assistant compaction content is a protocol no-op");
+
+        input.messages[0].role = "user".into();
+        let error = validate_claude(&input).expect_err("user compaction must be rejected");
+        assert!(error.to_string().contains("require an assistant role"));
+
+        input.messages[0].role = "assistant".into();
+        input.messages[0].content = serde_json::json!([{
+            "type":"compaction","content":{"summary":"invalid"}
+        }]);
+        let error = validate_claude(&input).expect_err("object content must be rejected");
+        assert!(error.to_string().contains("expected a string or null"));
+
+        input.messages[0].content = serde_json::json!([{
+            "type":"compaction","content":""
+        }]);
+        let error = validate_claude(&input).expect_err("empty content must be rejected");
+        assert!(error.to_string().contains("must not be empty"));
     }
 
     #[test]

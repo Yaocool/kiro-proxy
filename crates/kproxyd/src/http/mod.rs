@@ -1265,6 +1265,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn count_tokens_normalizes_failed_compaction_blocks() {
+        let (_directory, state) = test_state(Config::default()).await;
+        let effective = serde_json::json!({
+            "model":"model",
+            "messages":[
+                {"role":"user","content":"first"},
+                {"role":"user","content":"second"}
+            ]
+        });
+        let with_null = serde_json::json!({
+            "model":"model",
+            "messages":[
+                {"role":"user","content":"first"},
+                {"role":"assistant","content":[{
+                    "type":"compaction","content":null
+                }]},
+                {"role":"user","content":"second"}
+            ]
+        });
+        let with_missing = serde_json::json!({
+            "model":"model",
+            "messages":[
+                {"role":"user","content":"first"},
+                {"role":"assistant","content":[{"type":"compaction"}]},
+                {"role":"user","content":"second"}
+            ]
+        });
+
+        let mut counts = Vec::new();
+        for request in [effective, with_null, with_missing] {
+            let response = router(Arc::clone(&state))
+                .oneshot(
+                    Request::post("/v1/messages/count_tokens")
+                        .header(header::USER_AGENT, "claude-cli/1.0 (external, test)")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(request.to_string()))
+                        .expect("request"),
+                )
+                .await
+                .expect("count");
+            assert_eq!(response.status(), StatusCode::OK);
+            counts.push(body_json(response).await["input_tokens"].clone());
+        }
+        assert_eq!(counts[0], counts[1]);
+        assert_eq!(counts[0], counts[2]);
+
+        let empty = serde_json::json!({
+            "model":"model",
+            "messages":[
+                {"role":"user","content":"first"},
+                {"role":"assistant","content":[{
+                    "type":"compaction","content":""
+                }]},
+                {"role":"user","content":"second"}
+            ]
+        });
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::post("/v1/messages/count_tokens")
+                    .header(header::USER_AGENT, "claude-cli/1.0 (external, test)")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(empty.to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("count");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(body_json(response).await["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("must not be empty")));
+    }
+
+    #[tokio::test]
     async fn count_tokens_accepts_claude_code_context_edits() {
         let (_directory, state) = test_state(Config::default()).await;
         let clear_thinking = serde_json::json!({

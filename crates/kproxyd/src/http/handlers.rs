@@ -17,9 +17,9 @@ use kproxy_translate::model::{
     apply_adaptive_thinking, map_model, resolve_dynamic_model, thinking_enabled_for_model,
 };
 use kproxy_translate::{
-    apply_compaction_boundary, apply_context_management_edits, claude_loaded_tools,
-    claude_pending_server_tool_uses, claude_to_kiro, compact_trigger_tokens,
-    compaction_summary_payload, error_envelope, has_context_management_edits, matches_type_family,
+    apply_context_management_edits, claude_loaded_tools, claude_pending_server_tool_uses,
+    claude_to_kiro, compact_trigger_tokens, compaction_summary_payload, error_envelope,
+    has_context_management_edits, matches_type_family, normalize_compaction_boundary,
     openai_to_kiro, resume_tool_search_payload, resume_web_search_payload, sanitize_error_message,
     sanitize_kiro_tool_history, tool_search_continue_payload_batch, validate_claude,
     validate_kiro_tool_history, validate_openai, web_search_continue_payload_batch, ClaudeRequest,
@@ -591,7 +591,8 @@ async fn handle_claude(
     // Claude discards everything before the latest compaction block. Apply
     // that semantic boundary before validating references or authenticated
     // replay records so ignored history cannot reject the effective request.
-    let compact_boundary_applied = apply_compaction_boundary(&mut request);
+    let compaction_normalization = normalize_compaction_boundary(&mut request);
+    let compact_boundary_applied = compaction_normalization.boundary_applied;
     validate_claude(&request).map_err(claude_validation_error)?;
     let context_edit_stats = apply_context_management_edits(&mut request);
     if context_edit_stats.changed() {
@@ -612,6 +613,8 @@ async fn handle_claude(
         message_count = request.messages.len(),
         tool_count = request.tools.len(),
         max_tokens = request.max_tokens,
+        removed_noop_compaction_blocks = compaction_normalization.removed_noop_blocks,
+        removed_noop_compaction_messages = compaction_normalization.removed_noop_messages,
         "client request validated"
     );
     let config = state.config.current();
@@ -5034,7 +5037,8 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         })?;
         let mut original_request = request.clone();
         let has_context_edits = has_context_management_edits(request.context_management.as_ref());
-        let boundary_applied = apply_compaction_boundary(&mut request);
+        let compaction_normalization = normalize_compaction_boundary(&mut request);
+        let boundary_applied = compaction_normalization.boundary_applied;
         validate_claude(&request).map_err(claude_validation_error)?;
         let context_edit_stats = apply_context_management_edits(&mut request);
         tracing::info!(
@@ -5111,7 +5115,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
                     ErrorFormat::Claude,
                 )
             })?;
-        let input_tokens = if boundary_applied || context_edit_stats.changed() {
+        let input_tokens = if compaction_normalization.changed() || context_edit_stats.changed() {
             let mut effective_payload = claude_to_kiro(&request, &normal);
             apply_adaptive_thinking(
                 &mut effective_payload,
@@ -5173,6 +5177,8 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             input_tokens,
             original_input_tokens,
             compaction_boundary_applied = boundary_applied,
+            removed_noop_compaction_blocks = compaction_normalization.removed_noop_blocks,
+            removed_noop_compaction_messages = compaction_normalization.removed_noop_messages,
             cleared_tool_results = context_edit_stats.cleared_tool_results,
             cleared_tool_inputs = context_edit_stats.cleared_tool_inputs,
             duration_ms = started.elapsed().as_millis() as u64,

@@ -70,6 +70,8 @@ pub struct RequestDiagnostics {
     pub error_code: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub error_stage: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub failure_scope: String,
     #[serde(default)]
     pub account_error: bool,
 }
