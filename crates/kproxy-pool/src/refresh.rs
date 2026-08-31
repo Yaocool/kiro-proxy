@@ -69,14 +69,27 @@ impl RefreshOutcome {
     }
 }
 
-struct RefreshRequestFailure {
-    status: Option<u16>,
-    message: String,
+enum RefreshRequestFailure {
+    NotRefreshable,
+    Upstream {
+        status: Option<u16>,
+        message: String,
+    },
 }
 
 impl RefreshRequestFailure {
+    fn status(&self) -> Option<u16> {
+        match self {
+            Self::NotRefreshable => None,
+            Self::Upstream { status, .. } => *status,
+        }
+    }
+
     fn into_refresh_error(self) -> RefreshError {
-        RefreshError::Upstream(self.message)
+        match self {
+            Self::NotRefreshable => RefreshError::NotRefreshable,
+            Self::Upstream { message, .. } => RefreshError::Upstream(message),
+        }
     }
 }
 
@@ -215,7 +228,7 @@ impl TokenRefresher {
         if snapshot.credentials.auth_method == AuthMethod::Idc
             && result
                 .as_ref()
-                .is_err_and(|failure| failure.status == Some(400))
+                .is_err_and(|failure| failure.status() == Some(400))
         {
             let reloaded = match reload().await {
                 Ok(reloaded) => reloaded,
@@ -296,24 +309,20 @@ impl TokenRefresher {
         &self,
         snapshot: &Account,
     ) -> Result<RefreshResponse, RefreshRequestFailure> {
-        let refresh_token = snapshot
-            .credentials
-            .refresh_token
-            .as_deref()
-            .expect("refreshability is validated before making the request");
+        let Some(refresh_token) = snapshot.credentials.refresh_token.as_deref() else {
+            return Err(RefreshRequestFailure::NotRefreshable);
+        };
         let response = match snapshot.credentials.auth_method {
             AuthMethod::Idc => {
+                let (Some(client_id), Some(client_secret)) = (
+                    snapshot.credentials.client_id.as_deref(),
+                    snapshot.credentials.client_secret.as_deref(),
+                ) else {
+                    return Err(RefreshRequestFailure::NotRefreshable);
+                };
                 let request = RefreshRequest {
-                    client_id: snapshot
-                        .credentials
-                        .client_id
-                        .as_deref()
-                        .expect("IdC client ID is validated before making the request"),
-                    client_secret: snapshot
-                        .credentials
-                        .client_secret
-                        .as_deref()
-                        .expect("IdC client secret is validated before making the request"),
+                    client_id,
+                    client_secret,
                     grant_type: "refresh_token",
                     refresh_token,
                 };
@@ -346,18 +355,17 @@ impl TokenRefresher {
         match response {
             Ok(response) if response.status().is_success() => {
                 let status = response.status().as_u16();
-                response
-                    .json::<RefreshResponse>()
-                    .await
-                    .map_err(|error| RefreshRequestFailure {
+                response.json::<RefreshResponse>().await.map_err(|error| {
+                    RefreshRequestFailure::Upstream {
                         status: Some(status),
                         message: error.to_string(),
-                    })
+                    }
+                })
             }
             Ok(response) => {
                 let status = response.status();
                 let body = response.text().await.unwrap_or_default();
-                Err(RefreshRequestFailure {
+                Err(RefreshRequestFailure::Upstream {
                     status: Some(status.as_u16()),
                     message: format!(
                         "HTTP {status}: {}",
@@ -365,7 +373,7 @@ impl TokenRefresher {
                     ),
                 })
             }
-            Err(error) => Err(RefreshRequestFailure {
+            Err(error) => Err(RefreshRequestFailure::Upstream {
                 status: None,
                 message: error.to_string(),
             }),
