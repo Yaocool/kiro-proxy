@@ -314,10 +314,19 @@ kproxyd-2026-08-10-warn.log
 kproxyd-2026-08-10-error.1.log
 ```
 
-日志按级别和 UTC 日期拆分。默认每个分片最大 100 MB，保留三天。`log.file_path` 控制基础
-路径；留空时使用数据目录下的 `logs/kproxyd.log` 作为基础路径。
+日志按精确级别和 UTC 日期拆分：`info.log` **只包含 INFO**，不会重复写入 WARN 或 ERROR；
+WARN 和 ERROR 分别写入 `warn.log`、`error.log`。默认每个分片最大 100 MB，保留三天。
+`log.file_path` 控制基础路径；留空时使用数据目录下的 `logs/kproxyd.log` 作为基础路径。
 
-使用响应中的 Trace ID 搜索：
+使用响应头 `x-trace-id`（`request-id` 也返回同一个值）跨级别、跨日期查询完整请求链路：
+
+```bash
+kproxy logs trace trace_0123456789abcdef0123456789abcdef
+kproxy logs trace trace_0123456789abcdef0123456789abcdef --level error --tail 500
+```
+
+该命令默认扫描所有保留的 trace/debug/info/warn/error 物理分片，并按时间排序；为避免影响
+daemon，请求带有文件数、扫描字节数、命中数和输出条数上限。也可以直接搜索物理文件：
 
 ```bash
 rg 'trace_f028' .kproxy-dev/logs/
@@ -342,6 +351,7 @@ kproxy logs files --level error
 ```bash
 cargo run -p kproxy -- logs show --tail 100
 cargo run -p kproxy -- logs follow --level warn
+cargo run -p kproxy -- logs trace trace_0123456789abcdef0123456789abcdef
 cargo run -p kproxy -- status --since 30m
 cargo run -p kproxy -- stats --since 1h
 cargo run -p kproxy -- stats --start 2026-08-27T10:00:00+08:00 --end 2026-08-27T12:00:00+08:00

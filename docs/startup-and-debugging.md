@@ -358,11 +358,23 @@ kproxyd-2026-08-10-warn.log
 kproxyd-2026-08-10-error.1.log
 ```
 
-Logs are split by severity and UTC date. The default maximum is 100 MB per shard,
-and the default retention period is three days. `log.file_path` controls the
-base path; an empty value uses the data directory's `logs/kproxyd.log` base.
+Logs are split by exact severity and UTC date: `info.log` contains INFO events
+only and does not duplicate WARN or ERROR events; those are stored in `warn.log`
+and `error.log`. The default maximum is 100 MB per shard, and the default
+retention period is three days. `log.file_path` controls the base path; an empty
+value uses the data directory's `logs/kproxyd.log` base.
 
-Search by the response trace ID:
+Use the response `x-trace-id` header (`request-id` contains the same value) to
+search the complete request chain across severities and dates:
+
+```bash
+kproxy logs trace trace_0123456789abcdef0123456789abcdef
+kproxy logs trace trace_0123456789abcdef0123456789abcdef --level error --tail 500
+```
+
+The command scans all retained trace/debug/info/warn/error physical shards by
+default and orders matches by timestamp. File-count, byte, match, and output
+limits protect the daemon. You can also search the physical files directly:
 
 ```bash
 rg 'trace_f028' .kproxy-dev/logs/
@@ -389,6 +401,7 @@ View or follow structured request records:
 ```bash
 cargo run -p kproxy -- logs show --tail 100
 cargo run -p kproxy -- logs follow --level warn
+cargo run -p kproxy -- logs trace trace_0123456789abcdef0123456789abcdef
 cargo run -p kproxy -- status --since 30m
 cargo run -p kproxy -- stats --since 1h
 cargo run -p kproxy -- stats --start 2026-08-27T10:00:00+08:00 --end 2026-08-27T12:00:00+08:00
