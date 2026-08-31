@@ -1,5 +1,9 @@
 //! Tracing initialization with level-, date-, and size-partitioned log files.
 
+mod trace_log;
+
+pub(crate) use trace_log::scan_trace_logs;
+
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Write};
@@ -41,6 +45,11 @@ pub fn init(config: &LogConfig, default_file_path: PathBuf) -> Result<()> {
         .with(
             tracing_subscriber::fmt::layer()
                 .pretty()
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_thread_names(true)
+                .with_file(true)
+                .with_line_number(true)
                 .with_writer(buffered_stdout.clone().and(buffered_file.clone()))
                 .with_filter(tracing_subscriber::filter::filter_fn(move |_| {
                     !pretty_switch.load(Ordering::Acquire)
@@ -49,6 +58,13 @@ pub fn init(config: &LogConfig, default_file_path: PathBuf) -> Result<()> {
         .with(
             tracing_subscriber::fmt::layer()
                 .json()
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_thread_names(true)
+                .with_file(true)
+                .with_line_number(true)
+                .with_current_span(true)
+                .with_span_list(true)
                 .with_writer(buffered_stdout.and(buffered_file))
                 .with_filter(tracing_subscriber::filter::filter_fn(move |_| {
                     json_switch.load(Ordering::Acquire)
@@ -360,21 +376,20 @@ impl DatedLogFiles {
             self.current_day = Some(day);
         }
         let name = level_name(level);
-        if !self.files.contains_key(name) {
-            let date = date_string(day);
-            let state = DatedRotationState::open(
-                self.base_path.clone(),
-                date,
-                name,
-                self.maximum,
-                self.max_files_per_day,
-            )?;
-            self.files.insert(name, state);
-        }
-        self.files
-            .get_mut(name)
-            .expect("level file must exist")
-            .write_all(buffer)
+        let state = match self.files.entry(name) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let date = date_string(day);
+                entry.insert(DatedRotationState::open(
+                    self.base_path.clone(),
+                    date,
+                    name,
+                    self.maximum,
+                    self.max_files_per_day,
+                )?)
+            }
+        };
+        state.write_all(buffer)
     }
 
     fn flush(&mut self) -> io::Result<()> {
@@ -665,6 +680,21 @@ mod tests {
         assert!(dated_path(&base, &date, "warn", 0).exists());
         assert!(dated_path(&base, &date, "error", 0).exists());
         assert!(!dated_path(&base, &date, "debug", 0).exists());
+        let info_contents = (0..3)
+            .map(|shard| {
+                std::fs::read_to_string(dated_path(&base, &date, "info", shard))
+                    .expect("read info shard")
+            })
+            .collect::<String>();
+        let warn_contents =
+            std::fs::read_to_string(dated_path(&base, &date, "warn", 0)).expect("read warn");
+        let error_contents =
+            std::fs::read_to_string(dated_path(&base, &date, "error", 0)).expect("read error");
+        assert_eq!(info_contents, "12345\n12345\n12345\n");
+        assert!(!info_contents.contains("warning"));
+        assert!(!info_contents.contains("failure"));
+        assert_eq!(warn_contents, "warning\n");
+        assert_eq!(error_contents, "failure\n");
     }
 
     #[test]

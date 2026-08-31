@@ -253,6 +253,20 @@ enum LogsCommand {
     /// 持续跟踪新的结构化请求日志。
     #[command(after_help = "示例：\n  kproxy logs follow\n  kproxy logs follow --level error")]
     Follow(RequestLogArgs),
+    /// 按 trace ID 跨日期、跨级别查询完整请求链路。
+    #[command(
+        after_help = "默认查询 info/warn/error/debug/trace 的所有物理分片。\n\n示例：\n  kproxy logs trace trace_0123456789abcdef0123456789abcdef\n  kproxy logs trace trace_0123456789abcdef0123456789abcdef --level error --tail 500"
+    )]
+    Trace {
+        /// 响应头 x-trace-id 或 request-id 中的 trace ID。
+        trace_id: String,
+        /// 最多显示最近多少条匹配记录（1～1000）。
+        #[arg(long, default_value_t = 200)]
+        tail: usize,
+        /// 只查询一个精确级别的物理分片。
+        #[arg(long, value_enum)]
+        level: Option<LogFileLevel>,
+    },
     /// 列出所有实际 daemon 日志文件、大小、级别和完整路径。
     #[command(
         after_help = "示例：\n  kproxy logs files\n  kproxy logs files --level error\n  kproxy --json logs files"
@@ -738,6 +752,20 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             }
+            Some(LogsCommand::Trace {
+                trace_id,
+                tail,
+                level,
+            }) => {
+                crate::commands::runtime::show_trace_logs(
+                    &mut client,
+                    &trace_id,
+                    tail,
+                    level.map(LogFileLevel::as_str),
+                    cli.json,
+                )
+                .await?;
+            }
             Some(LogsCommand::Files { level }) => {
                 crate::commands::runtime::show_log_files(
                     &mut client,
@@ -1042,6 +1070,22 @@ mod tests {
                 }),
                 ..
             })
+        ));
+        let trace_id = "trace_0123456789abcdef0123456789abcdef";
+        let trace = Cli::try_parse_from([
+            "kproxy", "logs", "trace", trace_id, "--tail", "250", "--level", "warn",
+        ])
+        .expect("trace log command");
+        assert!(matches!(
+            trace.command,
+            Some(Command::Logs {
+                command: Some(LogsCommand::Trace {
+                    trace_id: parsed,
+                    tail: 250,
+                    level: Some(LogFileLevel::Warn),
+                }),
+                ..
+            }) if parsed == trace_id
         ));
         assert!(Cli::try_parse_from(["kproxy", "logs", "--tail", "10", "files"]).is_err());
     }
