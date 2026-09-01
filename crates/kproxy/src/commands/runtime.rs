@@ -13,7 +13,9 @@ use rand::RngCore;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
+use toml_edit::DocumentMut;
 
 use crate::client::AdminClient;
 use crate::output::{format_timestamp, print_json, render_table};
@@ -1237,6 +1239,381 @@ fn key_id(key: &str) -> String {
         })
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ConfigModule {
+    name: &'static str,
+    key: &'static str,
+    category: &'static str,
+    description: &'static str,
+    preferred_command: &'static str,
+    aliases: &'static [&'static str],
+    is_array: bool,
+}
+
+impl ConfigModule {
+    fn resettable(&self) -> bool {
+        !matches!(self.key, "api_key" | "proxy_service")
+    }
+}
+
+const CONFIG_MODULES: &[ConfigModule] = &[
+    ConfigModule {
+        name: "server",
+        key: "server",
+        category: "通用",
+        description: "API 服务默认监听、准入、连接与 TLS",
+        preferred_command: "-",
+        aliases: &[],
+        is_array: false,
+    },
+    ConfigModule {
+        name: "upstream",
+        key: "upstream",
+        category: "通用",
+        description: "Kiro 上游请求、重试、超时与连接池",
+        preferred_command: "-",
+        aliases: &[],
+        is_array: false,
+    },
+    ConfigModule {
+        name: "pool",
+        key: "pool",
+        category: "通用",
+        description: "账号池并发、排队、额度保护与选号",
+        preferred_command: "-",
+        aliases: &[],
+        is_array: false,
+    },
+    ConfigModule {
+        name: "features",
+        key: "features",
+        category: "通用",
+        description: "协议转换、工具、缓存与 thinking 开关",
+        preferred_command: "-",
+        aliases: &[],
+        is_array: false,
+    },
+    ConfigModule {
+        name: "models",
+        key: "models",
+        category: "通用",
+        description: "动态模型发现与缓存",
+        preferred_command: "-",
+        aliases: &[],
+        is_array: false,
+    },
+    ConfigModule {
+        name: "tasks",
+        key: "tasks",
+        category: "通用",
+        description: "后台周期任务间隔",
+        preferred_command: "-",
+        aliases: &[],
+        is_array: false,
+    },
+    ConfigModule {
+        name: "context",
+        key: "context",
+        category: "通用",
+        description: "上下文限制、压缩与工具保护",
+        preferred_command: "-",
+        aliases: &[],
+        is_array: false,
+    },
+    ConfigModule {
+        name: "storage",
+        key: "storage",
+        category: "通用",
+        description: "账号与状态持久化参数",
+        preferred_command: "-",
+        aliases: &[],
+        is_array: false,
+    },
+    ConfigModule {
+        name: "notify",
+        key: "notify",
+        category: "告警",
+        description: "告警阈值、抑制与投递策略",
+        preferred_command: "kproxy alert config",
+        aliases: &["alert", "alerts"],
+        is_array: false,
+    },
+    ConfigModule {
+        name: "log",
+        key: "log",
+        category: "通用",
+        description: "日志级别、格式、路径与保留策略",
+        preferred_command: "-",
+        aliases: &["logging"],
+        is_array: false,
+    },
+    ConfigModule {
+        name: "admin",
+        key: "admin",
+        category: "通用",
+        description: "本地管理面 socket",
+        preferred_command: "-",
+        aliases: &[],
+        is_array: false,
+    },
+    ConfigModule {
+        name: "sso",
+        key: "sso",
+        category: "通用",
+        description: "企业 SSO 默认入口与区域",
+        preferred_command: "-",
+        aliases: &[],
+        is_array: false,
+    },
+    ConfigModule {
+        name: "model-mapping",
+        key: "model_mapping",
+        category: "规则",
+        description: "客户端模型到 Kiro 模型的映射规则",
+        preferred_command: "kproxy model-map",
+        aliases: &["model-map"],
+        is_array: true,
+    },
+    ConfigModule {
+        name: "model-thinking-mode",
+        key: "model_thinking_mode",
+        category: "规则",
+        description: "模型级 thinking 默认开关",
+        preferred_command: "-",
+        aliases: &["thinking"],
+        is_array: false,
+    },
+    ConfigModule {
+        name: "webhook",
+        key: "webhook",
+        category: "告警",
+        description: "告警投递目标",
+        preferred_command: "kproxy alert",
+        aliases: &["webhooks"],
+        is_array: true,
+    },
+    ConfigModule {
+        name: "api-key",
+        key: "api_key",
+        category: "基础服务",
+        description: "客户端访问凭据与额度限制",
+        preferred_command: "kproxy apikey",
+        aliases: &["apikey"],
+        is_array: true,
+    },
+    ConfigModule {
+        name: "proxy-service",
+        key: "proxy_service",
+        category: "基础服务",
+        description: "代理监听实例及 API key 绑定",
+        preferred_command: "kproxy service",
+        aliases: &["service"],
+        is_array: true,
+    },
+];
+
+pub fn list_config_modules(json: bool) -> Result<()> {
+    if json {
+        let modules = CONFIG_MODULES
+            .iter()
+            .map(|module| {
+                serde_json::json!({
+                    "name":module.name,
+                    "toml_key":module.key,
+                    "category":module.category,
+                    "description":module.description,
+                    "preferred_command":(module.preferred_command != "-")
+                        .then_some(module.preferred_command),
+                    "aliases":module.aliases,
+                    "resettable":module.resettable(),
+                })
+            })
+            .collect::<Vec<_>>();
+        return print_json(&modules);
+    }
+
+    let rows = CONFIG_MODULES
+        .iter()
+        .map(|module| {
+            vec![
+                module.name.to_string(),
+                module.category.to_string(),
+                module.description.to_string(),
+                if module.resettable() { "是" } else { "否" }.to_string(),
+                module.preferred_command.to_string(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    print!(
+        "{}",
+        render_table(&["模块", "类型", "说明", "可重置", "推荐管理命令"], &rows)
+    );
+    Ok(())
+}
+
+pub async fn show_config(
+    client: &mut AdminClient,
+    module: Option<&str>,
+    effective: bool,
+    json: bool,
+) -> Result<()> {
+    let module = module.map(resolve_config_module).transpose()?;
+    let show: ConfigShowResult = client
+        .call(method::CONFIG_SHOW, serde_json::json!({}))
+        .await?;
+    let Some(module) = module else {
+        if json {
+            return print_json(&show);
+        }
+        if effective {
+            println!("{}", serde_json::to_string_pretty(&show.effective_json)?);
+        } else {
+            print!("{}", show.raw);
+        }
+        return Ok(());
+    };
+
+    if effective {
+        let value = show
+            .effective_json
+            .get(module.key)
+            .cloned()
+            .ok_or_else(|| anyhow!("生效配置缺少模块 {}", module.name))?;
+        if json {
+            print_json(&serde_json::json!({
+                "path":show.path,
+                "module":module.name,
+                "toml_key":module.key,
+                "effective":value,
+            }))?;
+        } else {
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        }
+        return Ok(());
+    }
+
+    let raw = render_config_module_document(&show.raw, module)?;
+    if json {
+        print_json(&serde_json::json!({
+            "path":show.path,
+            "module":module.name,
+            "toml_key":module.key,
+            "raw":raw,
+        }))?;
+    } else {
+        print!("{raw}");
+    }
+    Ok(())
+}
+
+fn resolve_config_module(name: &str) -> Result<&'static ConfigModule> {
+    let normalized = name.trim().to_ascii_lowercase().replace('-', "_");
+    CONFIG_MODULES
+        .iter()
+        .find(|module| {
+            module.key == normalized
+                || module.name.replace('-', "_") == normalized
+                || module
+                    .aliases
+                    .iter()
+                    .any(|alias| alias.replace('-', "_") == normalized)
+        })
+        .ok_or_else(|| anyhow!("未知配置模块 {name}；使用 `kproxy config list` 查看可用模块"))
+}
+
+fn render_config_module_document(raw: &str, module: &ConfigModule) -> Result<String> {
+    let source = raw.parse::<DocumentMut>().context("配置文件 TOML 无效")?;
+    let skeleton = if module.is_array {
+        format!("{} = []\n", module.key)
+    } else {
+        format!("[{}]\n", module.key)
+    };
+    let mut output = skeleton
+        .parse::<DocumentMut>()
+        .context("无法生成配置模块模板")?;
+    if let Some(item) = source.as_table().get(module.key) {
+        output.as_table_mut().insert(module.key, item.clone());
+    }
+    Ok(output.to_string())
+}
+
+fn render_config_module_editor(raw: &str, module: &ConfigModule) -> Result<String> {
+    let body = render_config_module_document(raw, module)?;
+    Ok(format!(
+        "# KProxy 配置模块：{}（TOML key: {}）\n\
+         # 只允许编辑本模块；保存后会合并回完整配置并进行整体校验。\n\
+         # 删除整个模块不会保存；要恢复默认值，请保留模块 TOML key 并清空字段或数组。\n\n\
+         {body}",
+        module.name, module.key
+    ))
+}
+
+fn merge_edited_config_module(
+    original: &str,
+    module: &ConfigModule,
+    edited: &str,
+) -> Result<String> {
+    let before = original
+        .parse::<toml::Value>()
+        .context("原配置文件 TOML 无效")?;
+    let edited = edited
+        .parse::<toml::Value>()
+        .with_context(|| format!("配置模块 {} 的 TOML 无效", module.name))?;
+    let edited_table = edited
+        .as_table()
+        .ok_or_else(|| anyhow!("配置模块文件必须是 TOML table"))?;
+    let extra = edited_table
+        .keys()
+        .filter(|key| key.as_str() != module.key)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !extra.is_empty() {
+        return Err(anyhow!(
+            "配置模块 {} 不能包含其他顶层模块：{}",
+            module.name,
+            extra.join(", ")
+        ));
+    }
+    let value = edited_table.get(module.key).cloned().ok_or_else(|| {
+        anyhow!(
+            "配置模块 {} 缺少 TOML key `{}`；请保留该 key",
+            module.name,
+            module.key
+        )
+    })?;
+    let mut after = before.clone();
+    after
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("config root must be a TOML table"))?
+        .insert(module.key.into(), value);
+    let output =
+        kproxy_store::config_update::render_update_preserving_comments(original, &before, &after)
+            .context("合并配置模块失败")?;
+    let config: kproxy_core::config::Config =
+        toml::from_str(&output).context("合并后的配置无法解析")?;
+    config.validate().context("合并后的配置校验失败")?;
+    Ok(output)
+}
+
+/// Reloads the configuration while excluding concurrent `kproxy` and daemon
+/// mutations of the same file.
+pub async fn reload_config(client: &mut AdminClient) -> Result<ConfigReloadResult> {
+    let paths: ConfigPathResult = client
+        .call(method::CONFIG_PATH, serde_json::json!({}))
+        .await?;
+    let path = PathBuf::from(paths.config_file);
+    let _config_lock = kproxy_store::atomic::lock_file_exclusive(&path)
+        .await
+        .with_context(|| format!("锁定配置文件 {} 失败", path.display()))?;
+    reload_config_while_locked(client).await
+}
+
+async fn reload_config_while_locked(client: &mut AdminClient) -> Result<ConfigReloadResult> {
+    client
+        .call(method::CONFIG_RELOAD, serde_json::json!({}))
+        .await
+}
+
 pub async fn validate_config(file: Option<&str>) -> Result<()> {
     let path = file
         .map(std::path::PathBuf::from)
@@ -1251,7 +1628,14 @@ pub async fn validate_config(file: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-pub async fn edit_config(client: &mut AdminClient) -> Result<()> {
+pub async fn edit_config(client: &mut AdminClient, module: Option<&str>) -> Result<()> {
+    if let Some(module) = module {
+        return edit_config_module(client, resolve_config_module(module)?).await;
+    }
+    edit_full_config(client).await
+}
+
+async fn edit_full_config(client: &mut AdminClient) -> Result<()> {
     let paths: ConfigPathResult = client
         .call(method::CONFIG_PATH, serde_json::json!({}))
         .await?;
@@ -1259,9 +1643,59 @@ pub async fn edit_config(client: &mut AdminClient) -> Result<()> {
     let original = tokio::fs::read(&path)
         .await
         .with_context(|| format!("读取 {} 失败", path.display()))?;
+    run_editor(&path).await?;
+    if let Err(error) = validate_config(Some(path.to_string_lossy().as_ref())).await {
+        kproxy_store::atomic::write_bytes_atomically(&path, &original, Some(0o600)).await?;
+        return Err(error.context("配置无效，磁盘文件已回滚"));
+    }
+    let result = reload_edited_config(client, &path, &original).await?;
+    println!("配置已保存并重载");
+    print_restart_required(&result.needs_restart);
+    Ok(())
+}
+
+async fn edit_config_module(client: &mut AdminClient, module: &ConfigModule) -> Result<()> {
+    let paths: ConfigPathResult = client
+        .call(method::CONFIG_PATH, serde_json::json!({}))
+        .await?;
+    let path = PathBuf::from(paths.config_file);
+    let _config_lock = kproxy_store::atomic::lock_file_exclusive(&path)
+        .await
+        .with_context(|| format!("锁定配置文件 {} 失败", path.display()))?;
+    let original = tokio::fs::read_to_string(&path)
+        .await
+        .with_context(|| format!("读取 {} 失败", path.display()))?;
+    let editor_content = render_config_module_editor(&original, module)?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&format!("kproxy-config-{}-", module.name))
+        .suffix(".toml")
+        .tempfile()
+        .context("创建配置模块临时文件失败")?;
+    temporary
+        .write_all(editor_content.as_bytes())
+        .context("写入配置模块临时文件失败")?;
+    temporary.flush().context("刷新配置模块临时文件失败")?;
+    run_editor(temporary.path()).await?;
+    let edited = tokio::fs::read_to_string(temporary.path())
+        .await
+        .context("读取编辑后的配置模块失败")?;
+    let output = merge_edited_config_module(&original, module, &edited)?;
+    if output == original {
+        println!("配置模块 {} 未修改", module.name);
+        return Ok(());
+    }
+
+    kproxy_store::atomic::write_bytes_atomically(&path, output.as_bytes(), Some(0o600)).await?;
+    let result = reload_edited_config(client, &path, original.as_bytes()).await?;
+    println!("配置模块 {} 已保存并重载", module.name);
+    print_restart_required(&result.needs_restart);
+    Ok(())
+}
+
+async fn run_editor(path: &Path) -> Result<()> {
     let editor = resolve_editor()?;
     let mut command = tokio::process::Command::new(&editor.program);
-    command.args(&editor.args).arg(&path);
+    command.args(&editor.args).arg(path);
     ensure_utf8_editor_locale(&mut command);
     let status = command.status().await.with_context(|| {
         format!(
@@ -1272,73 +1706,113 @@ pub async fn edit_config(client: &mut AdminClient) -> Result<()> {
     if !status.success() {
         return Err(anyhow!("编辑器退出状态为 {status}"));
     }
-    if let Err(error) = validate_config(Some(path.to_string_lossy().as_ref())).await {
-        kproxy_store::atomic::write_bytes_atomically(&path, &original, Some(0o600)).await?;
-        return Err(error.context("配置无效，磁盘文件已回滚"));
+    Ok(())
+}
+
+async fn reload_edited_config(
+    client: &mut AdminClient,
+    path: &Path,
+    original: &[u8],
+) -> Result<ConfigReloadResult> {
+    let reload = reload_config_while_locked(client).await;
+    if matches!(&reload, Ok(result) if result.applied) {
+        return reload;
     }
-    let result: ConfigReloadResult = client
-        .call(method::CONFIG_RELOAD, serde_json::json!({}))
-        .await?;
-    if !result.applied {
-        kproxy_store::atomic::write_bytes_atomically(&path, &original, Some(0o600)).await?;
-        let rollback: ConfigReloadResult = client
-            .call(method::CONFIG_RELOAD, serde_json::json!({}))
-            .await?;
-        if !rollback.applied {
-            return Err(anyhow!("配置重载失败，且回滚配置也无法重载"));
-        }
-        return Err(anyhow!(
+
+    kproxy_store::atomic::write_bytes_atomically(path, original, Some(0o600)).await?;
+    let rollback = reload_config_while_locked(client).await;
+    match (reload, rollback) {
+        (Ok(result), Ok(rollback)) if rollback.applied => Err(anyhow!(
             "配置重载失败，磁盘文件已回滚：{}",
             result.error.unwrap_or_else(|| "未知错误".into())
-        ));
+        )),
+        (Err(error), Ok(rollback)) if rollback.applied => {
+            Err(error.context("配置重载请求失败，磁盘文件已回滚"))
+        }
+        (Ok(result), Ok(rollback)) => Err(anyhow!(
+            "配置重载失败，且回滚配置也无法重载：{}；回滚错误：{}",
+            result.error.unwrap_or_else(|| "未知错误".into()),
+            rollback.error.unwrap_or_else(|| "未知错误".into())
+        )),
+        (Err(error), Ok(rollback)) => Err(anyhow!(
+            "配置重载请求失败，且回滚配置也无法重载：{error}；回滚错误：{}",
+            rollback.error.unwrap_or_else(|| "未知错误".into())
+        )),
+        (Ok(result), Err(rollback_error)) => Err(anyhow!(
+            "配置重载失败，且无法确认回滚配置已生效：{}；回滚错误：{rollback_error}",
+            result.error.unwrap_or_else(|| "未知错误".into())
+        )),
+        (Err(error), Err(rollback_error)) => Err(anyhow!(
+            "配置重载请求失败，且无法确认回滚配置已生效：{error}；回滚错误：{rollback_error}"
+        )),
     }
-    println!("配置已保存并重载");
-    Ok(())
+}
+
+fn print_restart_required(fields: &[String]) {
+    for field in fields {
+        println!("注意：{field} 需重启 kproxyd 才能生效");
+    }
 }
 
 /// Successful `config reset` result.
 pub struct ConfigResetResult {
     pub config_file: PathBuf,
     pub backup_file: PathBuf,
+    pub module: Option<String>,
     pub needs_restart: Vec<String>,
 }
 
-/// Back up the current configuration, replace it with the commented defaults, and reload it.
-pub async fn reset_config(client: &mut AdminClient) -> Result<Option<ConfigResetResult>> {
+/// Back up the current configuration, reset one module or all general settings, and reload it.
+pub async fn reset_config(
+    client: &mut AdminClient,
+    module: Option<&str>,
+) -> Result<Option<ConfigResetResult>> {
+    let module = module.map(resolve_config_module).transpose()?;
+    if let Some(module) = module {
+        if !module.resettable() {
+            return Err(anyhow!(
+                "配置模块 {} 属于基础服务资源，不能通过 config reset 清空；请使用 `{}` 显式管理，或执行完整 `kproxy uninstall`",
+                module.name,
+                module.preferred_command
+            ));
+        }
+    }
     let paths: ConfigPathResult = client
         .call(method::CONFIG_PATH, serde_json::json!({}))
         .await?;
     let path = PathBuf::from(paths.config_file);
-    if !crate::commands::confirm(
-        "确认将全部配置恢复为默认设置？代理服务、API key、模型映射和告警目标会被清除",
-    )
-    .await?
-    {
+    let prompt = module.map_or_else(
+        || {
+            "确认将通用配置恢复为默认设置？API key 和代理服务会保留，模型映射和告警目标会被清除"
+                .to_string()
+        },
+        |module| {
+            format!(
+                "确认将配置模块 {} 恢复为默认设置？其他配置不会改动",
+                module.name
+            )
+        },
+    );
+    if !crate::commands::confirm(&prompt).await? {
         return Ok(None);
     }
 
     let original = tokio::fs::read(&path)
         .await
         .with_context(|| format!("读取 {} 失败", path.display()))?;
-    let defaults = kproxy_store::bootstrap::render_default_config(
-        &kproxy_core::config::Config::default().admin.socket,
-    );
-    let config: kproxy_core::config::Config =
-        toml::from_str(&defaults).context("内置默认配置无法解析")?;
-    config.validate().context("内置默认配置校验失败")?;
+    let raw = std::str::from_utf8(&original).context("当前配置不是有效的 UTF-8")?;
+    let reset = match module {
+        Some(module) => render_config_module_reset(raw, module)?,
+        None => render_reset_config_preserving_services(raw)?,
+    };
 
     let backup_file = write_config_backup(&path, &original).await?;
-    kproxy_store::atomic::write_bytes_atomically(&path, defaults.as_bytes(), Some(0o600)).await?;
-    let result: ConfigReloadResult = match client
-        .call(method::CONFIG_RELOAD, serde_json::json!({}))
-        .await
-    {
+    kproxy_store::atomic::write_bytes_atomically(&path, reset.as_bytes(), Some(0o600)).await?;
+    let result: ConfigReloadResult = match reload_config_while_locked(client).await {
         Ok(result) => result,
         Err(reload_error) => {
             kproxy_store::atomic::write_bytes_atomically(&path, &original, Some(0o600)).await?;
-            let rollback = client
-                .call::<ConfigReloadResult>(method::CONFIG_RELOAD, serde_json::json!({}))
-                .await;
+            let rollback = reload_config_while_locked(client).await;
             return match rollback {
                 Ok(rollback) if rollback.applied => Err(reload_error.context(format!(
                     "默认配置重载请求失败，磁盘文件已回滚；原配置备份位于 {}",
@@ -1363,14 +1837,13 @@ pub async fn reset_config(client: &mut AdminClient) -> Result<Option<ConfigReset
         return Ok(Some(ConfigResetResult {
             config_file: path,
             backup_file,
+            module: module.map(|module| module.name.to_string()),
             needs_restart: result.needs_restart,
         }));
     }
 
     kproxy_store::atomic::write_bytes_atomically(&path, &original, Some(0o600)).await?;
-    let rollback: ConfigReloadResult = client
-        .call(method::CONFIG_RELOAD, serde_json::json!({}))
-        .await?;
+    let rollback = reload_config_while_locked(client).await?;
     if !rollback.applied {
         return Err(anyhow!(
             "默认配置重载失败，且回滚后的配置也无法重载；原配置备份位于 {}：{}",
@@ -1383,6 +1856,69 @@ pub async fn reset_config(client: &mut AdminClient) -> Result<Option<ConfigReset
         backup_file.display(),
         result.error.unwrap_or_else(|| "未知错误".into())
     ))
+}
+
+fn render_config_module_reset(raw: &str, module: &ConfigModule) -> Result<String> {
+    if !module.resettable() {
+        return Err(anyhow!(
+            "配置模块 {} 属于基础服务资源，不能通过 config reset 清空",
+            module.name
+        ));
+    }
+    let before = raw.parse::<toml::Value>().context("当前配置 TOML 无效")?;
+    let defaults = toml::Value::try_from(kproxy_core::config::Config::default())
+        .context("内置默认配置无法序列化")?;
+    let default_value = defaults
+        .as_table()
+        .and_then(|table| table.get(module.key))
+        .cloned()
+        .ok_or_else(|| anyhow!("内置默认配置缺少模块 {}", module.name))?;
+    let mut after = before.clone();
+    after
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("config root must be a TOML table"))?
+        .insert(module.key.into(), default_value);
+    let output =
+        kproxy_store::config_update::render_update_preserving_comments(raw, &before, &after)
+            .context("生成模块重置配置失败")?;
+    let config: kproxy_core::config::Config =
+        toml::from_str(&output).context("模块重置后的配置无法解析")?;
+    config.validate().context("模块重置后的配置校验失败")?;
+    Ok(output)
+}
+
+/// Renders defaults while retaining the two resource sections managed by
+/// `kproxy apikey` and `kproxy service`.
+fn render_reset_config_preserving_services(raw: &str) -> Result<String> {
+    const PRESERVED_SECTIONS: [&str; 2] = ["api_key", "proxy_service"];
+
+    let current = raw.parse::<toml::Value>().context("当前配置 TOML 无效")?;
+    let current_table = current
+        .as_table()
+        .ok_or_else(|| anyhow!("config root must be a TOML table"))?;
+    let defaults = kproxy_store::bootstrap::render_default_config(
+        &kproxy_core::config::Config::default().admin.socket,
+    );
+    let before = defaults
+        .parse::<toml::Value>()
+        .context("内置默认配置无法解析")?;
+    let mut after = before.clone();
+    let after_table = after
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("default config root must be a TOML table"))?;
+    for section in PRESERVED_SECTIONS {
+        if let Some(value) = current_table.get(section) {
+            after_table.insert(section.into(), value.clone());
+        }
+    }
+
+    let output =
+        kproxy_store::config_update::render_update_preserving_comments(&defaults, &before, &after)
+            .context("生成重置配置失败")?;
+    let config: kproxy_core::config::Config =
+        toml::from_str(&output).context("重置后的配置无法解析")?;
+    config.validate().context("重置后的配置校验失败")?;
+    Ok(output)
 }
 
 async fn write_config_backup(path: &Path, contents: &[u8]) -> Result<PathBuf> {
@@ -1870,7 +2406,7 @@ pub fn print_topic(topic: Option<&str>) -> Result<()> {
             "`kproxy service list/show/create/edit/enable/disable/apikeys/delete` 管理独立代理监听。edit 可修改监听并按 API key ID 或名称增删绑定；disable 会保留配置和 key；删除时仅级联删除未共享 key，并要求 y/yes 确认。"
         }
         "config" => {
-            "配置默认位于 $KPROXY_HOME/config.toml，修改后热重载；server.host/port、admin.socket 和 TLS 监听变更需要重启。\n`kproxy config validate [file]` 只校验，`kproxy config edit` 保存后校验并重载，`kproxy config show --effective` 查看合并默认值的结果。`kproxy config reset` 确认后备份原文件、恢复全部默认设置并重载。"
+            "配置默认位于 $KPROXY_HOME/config.toml，修改后热重载；server.host/port、admin.socket 和 TLS 监听变更需要重启。\n`kproxy config list` 列出全部顶层模块及是否允许重置；`show [模块]` 可查看完整配置或单个模块，增加 `--effective` 查看合并默认值后的结果；`edit [模块]` 可编辑完整配置或单个模块，保存时会合并、整体校验并重载。`reset [模块]` 只恢复指定模块，其他配置不变；不指定模块时恢复全部通用配置。API key 和代理服务属于基础服务资源，不会被 config reset 清除。`validate [file]` 只校验，不应用。"
         }
         "apikey" => {
             "API key 限额采用在途预留：请求进入时预留估算 credits，结束后按上游实际用量结算，避免并发突破限额。\n`kproxy apikey show <ID|名称>` 查看单项，`list --detail` 查看 token/credits 消耗；`limit <ID|名称> --clear` 可恢复不限，`rm`/`delete` 均可删除。日维度、模型、路径和历史可用 `usage` 与 `history` 查询。"

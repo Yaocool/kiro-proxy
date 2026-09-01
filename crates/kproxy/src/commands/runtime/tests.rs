@@ -104,6 +104,266 @@ async fn config_backup_never_overwrites_an_existing_backup() {
 }
 
 #[test]
+fn config_reset_preserves_api_keys_and_running_proxy_services() {
+    let raw = r#"[server]
+host = "127.0.0.1"
+port = 6200
+max_concurrent_requests = 17
+
+[[api_key]]
+id = "ak_keep"
+name = "keep"
+key = "sk-keep-secret"
+format = "sk"
+enabled = true
+credits_limit = 12.5
+
+[[proxy_service]]
+id = "svc_keep"
+name = "keep"
+host = "127.0.0.1"
+port = 6201
+enabled = true
+api_key_ids = ["ak_keep"]
+created_at = 123
+"#;
+
+    let output = render_reset_config_preserving_services(raw).expect("reset config");
+    let reset: kproxy_core::config::Config = toml::from_str(&output).expect("parse reset config");
+    let defaults = kproxy_core::config::Config::default();
+
+    assert_eq!(reset.server.host, defaults.server.host);
+    assert_eq!(reset.server.port, defaults.server.port);
+    assert_eq!(
+        reset.server.max_concurrent_requests,
+        defaults.server.max_concurrent_requests
+    );
+    assert_eq!(reset.api_key.len(), 1);
+    assert_eq!(reset.api_key[0].id.as_deref(), Some("ak_keep"));
+    assert_eq!(reset.api_key[0].key, "sk-keep-secret");
+    assert!(reset.api_key[0].enabled);
+    assert_eq!(reset.api_key[0].credits_limit, Some(12.5));
+    assert_eq!(reset.proxy_service.len(), 1);
+    assert_eq!(reset.proxy_service[0].id, "svc_keep");
+    assert_eq!(reset.proxy_service[0].port, 6201);
+    assert!(reset.proxy_service[0].enabled);
+    assert_eq!(reset.proxy_service[0].api_key_ids, ["ak_keep"]);
+    assert!(output.contains("# kiro-proxy 配置文件"));
+}
+
+#[test]
+fn config_reset_keeps_unbound_api_keys() {
+    let raw = r#"[[api_key]]
+id = "ak_unbound"
+name = "unbound"
+key = "token_unbound"
+format = "token"
+enabled = true
+"#;
+
+    let output = render_reset_config_preserving_services(raw).expect("reset config");
+    let reset: kproxy_core::config::Config = toml::from_str(&output).expect("parse reset config");
+
+    assert_eq!(reset.api_key.len(), 1);
+    assert_eq!(reset.api_key[0].id.as_deref(), Some("ak_unbound"));
+    assert!(reset.proxy_service.is_empty());
+}
+
+#[test]
+fn config_module_catalog_covers_every_top_level_config_section() {
+    let configured = serde_json::to_value(kproxy_core::config::Config::default())
+        .expect("serialize default config")
+        .as_object()
+        .expect("config object")
+        .keys()
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+    let cataloged = CONFIG_MODULES
+        .iter()
+        .map(|module| module.key.to_string())
+        .collect::<std::collections::BTreeSet<_>>();
+
+    assert_eq!(cataloged, configured);
+}
+
+#[test]
+fn config_module_names_accept_cli_names_toml_keys_and_aliases() {
+    assert_eq!(
+        resolve_config_module("model-mapping")
+            .expect("CLI name")
+            .key,
+        "model_mapping"
+    );
+    assert_eq!(
+        resolve_config_module("model_mapping")
+            .expect("TOML key")
+            .name,
+        "model-mapping"
+    );
+    assert_eq!(
+        resolve_config_module("apikey").expect("alias").key,
+        "api_key"
+    );
+    assert!(resolve_config_module("missing").is_err());
+}
+
+#[test]
+fn config_module_document_is_scoped_and_preserves_comments() {
+    let raw = r#"# server section
+[server]
+# port explanation
+port = 5580
+
+# pool section
+[pool]
+max_queue_size = 10
+"#;
+    let server = resolve_config_module("server").expect("server module");
+
+    let output = render_config_module_document(raw, server).expect("render module");
+    let parsed = output.parse::<toml::Value>().expect("parse module");
+
+    assert_eq!(
+        parsed.as_table().expect("root").keys().collect::<Vec<_>>(),
+        ["server"]
+    );
+    assert!(output.contains("# port explanation"));
+    assert!(!output.contains("max_queue_size"));
+}
+
+#[test]
+fn config_module_edit_changes_only_the_selected_module() {
+    let original = kproxy_store::bootstrap::render_default_config(
+        &kproxy_core::config::Config::default().admin.socket,
+    );
+    let pool = resolve_config_module("pool").expect("pool module");
+    let edited = render_config_module_editor(&original, pool)
+        .expect("editor document")
+        .replace(
+            "max_concurrent_per_account = 50",
+            "max_concurrent_per_account = 7",
+        );
+
+    let output = merge_edited_config_module(&original, pool, &edited).expect("merge module");
+    let before = original.parse::<toml::Value>().expect("original TOML");
+    let after = output.parse::<toml::Value>().expect("updated TOML");
+    let config: kproxy_core::config::Config = toml::from_str(&output).expect("updated config");
+
+    assert_eq!(config.pool.max_concurrent_per_account, 7);
+    assert_eq!(before["server"], after["server"]);
+    assert_eq!(before["features"], after["features"]);
+    assert!(output.contains("# 账号池、排队、额度保护与选号"));
+}
+
+#[test]
+fn config_module_edit_rejects_other_top_level_modules() {
+    let original = kproxy_store::bootstrap::render_default_config(
+        &kproxy_core::config::Config::default().admin.socket,
+    );
+    let pool = resolve_config_module("pool").expect("pool module");
+    let edited = "[pool]\nmax_queue_size = 10\n\n[server]\nport = 6200\n";
+
+    let error = merge_edited_config_module(&original, pool, edited).expect_err("reject module");
+
+    assert!(error.to_string().contains("server"));
+}
+
+#[test]
+fn config_module_edit_validates_references_against_the_full_config() {
+    let original = r#"[[api_key]]
+id = "ak_keep"
+name = "keep"
+key = "sk-keep"
+enabled = true
+
+[[proxy_service]]
+id = "svc_keep"
+name = "keep"
+host = "127.0.0.1"
+port = 6201
+enabled = true
+api_key_ids = ["ak_keep"]
+"#;
+    let api_keys = resolve_config_module("api-key").expect("API key module");
+
+    let error = merge_edited_config_module(original, api_keys, "api_key = []\n")
+        .expect_err("orphaned service reference must fail");
+
+    assert!(error.to_string().contains("配置校验失败"));
+}
+
+#[test]
+fn config_module_reset_restores_only_the_selected_module() {
+    let original = kproxy_store::bootstrap::render_default_config(
+        &kproxy_core::config::Config::default().admin.socket,
+    )
+    .replace("port = 5580", "port = 6200")
+    .replace(
+        "max_concurrent_per_account = 50",
+        "max_concurrent_per_account = 7",
+    );
+    let pool = resolve_config_module("pool").expect("pool module");
+
+    let output = render_config_module_reset(&original, pool).expect("reset pool");
+    let reset: kproxy_core::config::Config = toml::from_str(&output).expect("reset config");
+    let defaults = kproxy_core::config::Config::default();
+
+    assert_eq!(reset.pool.max_concurrent_per_account, 50);
+    assert_eq!(reset.pool.max_queue_size, defaults.pool.max_queue_size);
+    assert_eq!(reset.server.port, 6200);
+    assert!(output.contains("# 账号池、排队、额度保护与选号"));
+}
+
+#[test]
+fn config_module_reset_clears_only_the_selected_rule_map() {
+    let original = r#"[server]
+port = 6200
+
+[model_thinking_mode]
+"claude-opus" = false
+"claude-sonnet" = true
+"#;
+    let thinking = resolve_config_module("thinking").expect("thinking module");
+
+    let output = render_config_module_reset(original, thinking).expect("reset thinking map");
+    let reset: kproxy_core::config::Config = toml::from_str(&output).expect("reset config");
+
+    assert!(reset.model_thinking_mode.is_empty());
+    assert_eq!(reset.server.port, 6200);
+}
+
+#[test]
+fn config_module_reset_clears_only_the_selected_rule_array() {
+    let original = r#"[server]
+port = 6200
+
+[[model_mapping]]
+name = "fallback"
+type = "replace"
+source_models = ["claude-opus-*"]
+target_models = ["claude-sonnet-4.6"]
+priority = 10
+"#;
+    let mappings = resolve_config_module("model-map").expect("mapping module");
+
+    let output = render_config_module_reset(original, mappings).expect("reset mappings");
+    let reset: kproxy_core::config::Config = toml::from_str(&output).expect("reset config");
+
+    assert!(reset.model_mapping.is_empty());
+    assert_eq!(reset.server.port, 6200);
+}
+
+#[test]
+fn config_module_reset_refuses_foundation_service_resources() {
+    for name in ["api-key", "proxy-service"] {
+        let module = resolve_config_module(name).expect("foundation module");
+        assert!(!module.resettable());
+        let error = render_config_module_reset("", module).expect_err("reset must be refused");
+        assert!(error.to_string().contains("基础服务资源"));
+    }
+}
+
+#[test]
 fn configured_editor_preserves_quoted_arguments() {
     assert_eq!(
         parse_editor("code --wait --profile 'K Proxy'").expect("editor command"),
