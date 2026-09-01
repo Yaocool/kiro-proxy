@@ -434,6 +434,17 @@ impl AppState {
     /// 事务化应用热配置；任一代理监听启动失败时恢复上一份运行配置。
     pub async fn apply_config_transaction(self: &Arc<Self>, next: &Config) -> Result<(), String> {
         let _mutation = self.lock_config_mutation().await;
+        self.apply_config_transaction_locked(next).await
+    }
+
+    /// Applies a configuration while the caller holds `config_mutation`.
+    ///
+    /// Keeping the lock across both loading and applying a file snapshot avoids
+    /// an older reload overtaking a newer one.
+    pub(crate) async fn apply_config_transaction_locked(
+        self: &Arc<Self>,
+        next: &Config,
+    ) -> Result<(), String> {
         let previous = self.runtime_config_snapshot();
         self.config.replace(next.clone());
         self.apply_runtime_config(next);

@@ -580,9 +580,8 @@ async fn main() -> Result<()> {
             }
         }
         Command::Config(ConfigCommand::Reload) => {
-            let result: ConfigReloadResult = client
-                .call(method::CONFIG_RELOAD, serde_json::json!({}))
-                .await?;
+            let result: ConfigReloadResult =
+                crate::commands::runtime::reload_config(&mut client).await?;
             if cli.json {
                 print_json(&result)?;
             } else if result.applied {

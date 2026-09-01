@@ -59,36 +59,9 @@ pub async fn lock_file_exclusive(path: &Path) -> Result<ExclusiveFileLock> {
 
     #[cfg(unix)]
     {
-        tokio::task::spawn_blocking(move || {
-            use std::os::fd::AsRawFd;
-            use std::os::unix::fs::OpenOptionsExt;
-
-            let file = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .create(true)
-                .truncate(false)
-                .mode(0o600)
-                .open(&lock_path)
-                .with_context(|| format!("open lock file {}", lock_path.display()))?;
-            loop {
-                // SAFETY: `file` owns a valid descriptor for the duration of
-                // the call and `flock` does not retain the descriptor.
-                let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
-                if result == 0 {
-                    break;
-                }
-                let error = std::io::Error::last_os_error();
-                if error.kind() != ErrorKind::Interrupted {
-                    return Err(
-                        anyhow::Error::new(error).context(format!("lock {}", lock_path.display()))
-                    );
-                }
-            }
-            Ok(ExclusiveFileLock { file })
-        })
-        .await
-        .context("join file lock task")?
+        tokio::task::spawn_blocking(move || acquire_exclusive_file_lock(lock_path))
+            .await
+            .context("join file lock task")?
     }
 
     #[cfg(not(unix))]
@@ -97,6 +70,57 @@ pub async fn lock_file_exclusive(path: &Path) -> Result<ExclusiveFileLock> {
         // platforms where libc flock is unavailable.
         let _ = lock_path;
         Ok(ExclusiveFileLock)
+    }
+}
+
+/// Synchronously acquires the same stable sibling lock as
+/// [`lock_file_exclusive`]. This is intended for dedicated watcher threads that
+/// cannot await the asynchronous variant.
+pub fn lock_file_exclusive_blocking(path: &Path) -> Result<ExclusiveFileLock> {
+    let lock_path = exclusive_lock_path(path);
+    if let Some(parent) = lock_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("create parent dir for {}", lock_path.display()))?;
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        acquire_exclusive_file_lock(lock_path)
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = lock_path;
+        Ok(ExclusiveFileLock)
+    }
+}
+
+#[cfg(unix)]
+fn acquire_exclusive_file_lock(lock_path: PathBuf) -> Result<ExclusiveFileLock> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(&lock_path)
+        .with_context(|| format!("open lock file {}", lock_path.display()))?;
+    loop {
+        // SAFETY: `file` owns a valid descriptor for the duration of the call
+        // and flock does not retain the descriptor.
+        let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+        if result == 0 {
+            return Ok(ExclusiveFileLock { file });
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != ErrorKind::Interrupted {
+            return Err(anyhow::Error::new(error).context(format!("lock {}", lock_path.display())));
+        }
     }
 }
 

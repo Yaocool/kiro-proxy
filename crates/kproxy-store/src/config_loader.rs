@@ -11,7 +11,7 @@ use notify::{RecursiveMode, Watcher};
 use notify_debouncer_full::{new_debouncer, Debouncer, FileIdMap};
 use tracing::{error, info, warn};
 
-use crate::atomic::{is_missing, read_to_string_with_retry};
+use crate::atomic::{is_missing, lock_file_exclusive_blocking, read_to_string_with_retry};
 
 /// Synchronous runtime validation/application hook used by the file watcher.
 pub type ConfigApplyHook = Arc<dyn Fn(&Config) -> std::result::Result<(), String> + Send + Sync>;
@@ -229,6 +229,20 @@ fn apply_reload_if_contents_changed(
     hook: &ConfigApplyHook,
     last_seen_contents: &Mutex<Option<Vec<u8>>>,
 ) -> ReloadOutcome {
+    // Cooperating writers keep this lock for their complete read-modify-write
+    // and runtime-apply transaction. Waiting here prevents the watcher from
+    // applying an intermediate or stale snapshot while such a transaction is
+    // still in progress.
+    let _file_lock = match lock_file_exclusive_blocking(path) {
+        Ok(lock) => lock,
+        Err(lock_error) => {
+            error!(error = %lock_error, path = %path.display(), "cannot lock config for reload");
+            return ReloadOutcome {
+                error: Some(lock_error.to_string()),
+                ..ReloadOutcome::default()
+            };
+        }
+    };
     let current = std::fs::read(path).ok();
     {
         let mut last_seen = last_seen_contents
@@ -424,6 +438,41 @@ mod tests {
             .expect("break");
         tokio::time::sleep(Duration::from_millis(400)).await;
         assert!(handle.current().features.enable_prompt_cache);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn watcher_waits_for_an_active_config_transaction() {
+        let directory = tempdir().expect("tempdir");
+        let path = directory.path().join("config.toml");
+        tokio::fs::write(&path, "[server]\nport = 5580\n")
+            .await
+            .expect("seed");
+        let handle = ConfigHandle::new(load_config(&path).await.expect("load"));
+        let _watcher =
+            spawn_config_watcher(path.clone(), handle.clone(), Duration::from_millis(50))
+                .expect("watcher");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let transaction = crate::atomic::lock_file_exclusive(&path)
+            .await
+            .expect("lock config transaction");
+        tokio::fs::write(&path, "[server]\nport = 6100\n")
+            .await
+            .expect("edit while locked");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            handle.current().server.port,
+            5580,
+            "watcher applied the file before the transaction released its lock"
+        );
+
+        drop(transaction);
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while handle.current().server.port != 6100 {
+            assert!(std::time::Instant::now() < deadline, "reload timeout");
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     #[tokio::test]

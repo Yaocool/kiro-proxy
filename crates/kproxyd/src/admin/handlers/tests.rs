@@ -510,6 +510,47 @@ async fn creating_first_proxy_service_returns_a_scoped_api_key() {
     state.shutdown.cancel();
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn service_mutation_waits_for_the_config_file_lock() {
+    let (_directory, state) = state_with(vec![]).await;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port");
+    let port = listener.local_addr().expect("address").port();
+    drop(listener);
+    let transaction = kproxy_store::atomic::lock_file_exclusive(&state.paths.config_file)
+        .await
+        .expect("lock config transaction");
+
+    let mutation_state = Arc::clone(&state);
+    let mut mutation = tokio::spawn(async move {
+        dispatch(
+            &mutation_state,
+            Request::new(
+                1,
+                method::SERVICE_CREATE,
+                serde_json::json!({"name":"locked","port":port}),
+            ),
+        )
+        .await
+    });
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(100), &mut mutation)
+            .await
+            .is_err(),
+        "service mutation bypassed an active config transaction"
+    );
+
+    drop(transaction);
+    let response = tokio::time::timeout(std::time::Duration::from_secs(5), mutation)
+        .await
+        .expect("service mutation timed out")
+        .expect("join service mutation");
+    let created: ProxyServiceCreateResult =
+        serde_json::from_value(expect_ok(response)).expect("created service");
+    assert_eq!(created.service.name, "locked");
+    state.shutdown.cancel();
+}
+
 #[test]
 fn service_key_cleanup_preserves_keys_shared_with_other_services() {
     let exclusive = ApiKeyConfig {

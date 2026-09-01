@@ -132,6 +132,14 @@ fn spawn_signal_handler(state: Arc<AppState>, shutdown: CancellationToken) {
 
 #[cfg(unix)]
 async fn reload_after_sighup(state: &Arc<AppState>) {
+    let _file_lock = match kproxy_store::atomic::lock_file_exclusive(&state.paths.config_file).await
+    {
+        Ok(lock) => lock,
+        Err(error) => {
+            warn!(%error, "failed to lock config before SIGHUP reload");
+            return;
+        }
+    };
     match load_config(&state.paths.config_file).await {
         Ok(next) => match next.validate() {
             Ok(()) => {
