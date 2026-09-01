@@ -599,6 +599,10 @@ fn handle_config_path(state: &Arc<AppState>) -> ConfigPathResult {
 }
 
 async fn handle_config_reload(state: &Arc<AppState>) -> Handled {
+    // The CLI holds the cross-process config file lock for an enclosing
+    // mutation/reload transaction. Serialize before reading so an older reload
+    // cannot be applied after a newer snapshot.
+    let _mutation = state.lock_config_mutation().await;
     let next = match load_config(&state.paths.config_file).await {
         Ok(config) => config,
         Err(error) => {
@@ -626,7 +630,7 @@ async fn handle_config_reload(state: &Arc<AppState>) -> Handled {
     for field in &needs_restart {
         warn!(field = %field, "configuration field requires restart");
     }
-    if let Err(error) = state.apply_config_transaction(&next).await {
+    if let Err(error) = state.apply_config_transaction_locked(&next).await {
         warn!(%error, "configuration reload rolled back");
         return to_value(ConfigReloadResult {
             applied: false,
@@ -1191,6 +1195,9 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
     if name.is_empty() {
         return Err(RpcError::bad_params("service name must not be empty"));
     }
+    let _file_lock = kproxy_store::atomic::lock_file_exclusive(&state.paths.config_file)
+        .await
+        .map_err(|error| RpcError::internal(format!("lock config: {error}")))?;
     let _mutation = state.lock_config_mutation().await;
     let previous = state.config.current().as_ref().clone();
     if previous
@@ -1307,6 +1314,9 @@ async fn handle_service_delete(state: &Arc<AppState>, params: serde_json::Value)
         return Err(RpcError::bad_params("service ID or name must not be empty"));
     }
 
+    let _file_lock = kproxy_store::atomic::lock_file_exclusive(&state.paths.config_file)
+        .await
+        .map_err(|error| RpcError::internal(format!("lock config: {error}")))?;
     let _mutation = state.lock_config_mutation().await;
     let previous = state.config.current().as_ref().clone();
     let index = previous

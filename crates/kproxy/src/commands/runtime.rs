@@ -754,10 +754,19 @@ pub async fn run_service(
                     "没有指定修改项；请使用 --rename、--host、--port、--add-api-key 或 --remove-api-key"
                 ));
             }
-            let add_api_key = resolve_api_key_ids(client, &add_api_key).await?;
-            let remove_api_key = resolve_api_key_ids(client, &remove_api_key).await?;
             let result_selector = rename.clone().unwrap_or_else(|| service.clone());
-            mutate_config_array(client, "proxy_service", |array| {
+            mutate_config(client, |config| {
+                // Resolve names only after the config file lock has been
+                // acquired and the latest TOML snapshot has been read. This
+                // prevents a concurrent rename/delete from leaving this edit
+                // with selector results derived from an older runtime snapshot.
+                let add_api_key = resolve_api_key_ids(config, &add_api_key)?;
+                let remove_api_key = resolve_api_key_ids(config, &remove_api_key)?;
+                let array = config
+                    .entry("proxy_service")
+                    .or_insert_with(|| toml::Value::Array(Vec::new()))
+                    .as_array_mut()
+                    .ok_or_else(|| anyhow!("proxy_service must be an array of tables"))?;
                 let table = find_service_table_mut(array, &service)?;
                 replace_optional_string(table, "name", rename.as_deref());
                 replace_optional_string(table, "host", host.as_deref());
@@ -965,24 +974,32 @@ fn find_service_table_mut<'a>(
         .ok_or_else(|| anyhow!("proxy service not found: {selector}"))
 }
 
-async fn resolve_api_key_ids(
-    client: &mut AdminClient,
+fn resolve_api_key_ids(
+    config: &toml::map::Map<String, toml::Value>,
     selectors: &[String],
 ) -> Result<Vec<String>> {
     if selectors.is_empty() {
         return Ok(Vec::new());
     }
-    let config = effective_config(client).await?;
+    let api_keys = config
+        .get("api_key")
+        .and_then(toml::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
     let mut ids = Vec::with_capacity(selectors.len());
     for selector in selectors {
-        let key = config
-            .api_key
+        let key = api_keys
             .iter()
-            .find(|key| key.id.as_deref() == Some(selector) || key.name == *selector)
+            .filter_map(toml::Value::as_table)
+            .find(|key| {
+                key.get("id").and_then(toml::Value::as_str) == Some(selector)
+                    || key.get("name").and_then(toml::Value::as_str) == Some(selector)
+            })
             .ok_or_else(|| anyhow!("API key not found: {selector}"))?;
         let id = key
-            .id
-            .clone()
+            .get("id")
+            .and_then(toml::Value::as_str)
+            .map(str::to_owned)
             .ok_or_else(|| anyhow!("API key {selector} does not have a stable ID"))?;
         if !ids.contains(&id) {
             ids.push(id);
@@ -1083,6 +1100,9 @@ async fn mutate_config(
         .call(method::CONFIG_PATH, serde_json::json!({}))
         .await?;
     let path = std::path::PathBuf::from(paths.config_file);
+    let _config_lock = kproxy_store::atomic::lock_file_exclusive(&path)
+        .await
+        .with_context(|| format!("锁定配置文件 {} 失败", path.display()))?;
     let raw = tokio::fs::read_to_string(&path)
         .await
         .with_context(|| format!("读取 {} 失败", path.display()))?;
@@ -1099,16 +1119,12 @@ async fn mutate_config(
         toml::from_str(&output).context("修改后的配置无法解析")?;
     config.validate().context("修改后的配置校验失败")?;
     kproxy_store::atomic::write_bytes_atomically(&path, output.as_bytes(), Some(0o600)).await?;
-    let result: ConfigReloadResult = client
-        .call(method::CONFIG_RELOAD, serde_json::json!({}))
-        .await?;
+    let result = reload_config_while_locked(client).await?;
     if result.applied {
         return Ok(());
     }
     kproxy_store::atomic::write_bytes_atomically(&path, raw.as_bytes(), Some(0o600)).await?;
-    let rollback: ConfigReloadResult = client
-        .call(method::CONFIG_RELOAD, serde_json::json!({}))
-        .await?;
+    let rollback = reload_config_while_locked(client).await?;
     if !rollback.applied {
         return Err(anyhow!(
             "配置重载失败且回滚后的配置也无法重载: {}",
@@ -1640,6 +1656,9 @@ async fn edit_full_config(client: &mut AdminClient) -> Result<()> {
         .call(method::CONFIG_PATH, serde_json::json!({}))
         .await?;
     let path = std::path::PathBuf::from(paths.config_file);
+    let _config_lock = kproxy_store::atomic::lock_file_exclusive(&path)
+        .await
+        .with_context(|| format!("锁定配置文件 {} 失败", path.display()))?;
     let original = tokio::fs::read(&path)
         .await
         .with_context(|| format!("读取 {} 失败", path.display()))?;
@@ -1797,6 +1816,9 @@ pub async fn reset_config(
         return Ok(None);
     }
 
+    let _config_lock = kproxy_store::atomic::lock_file_exclusive(&path)
+        .await
+        .with_context(|| format!("锁定配置文件 {} 失败", path.display()))?;
     let original = tokio::fs::read(&path)
         .await
         .with_context(|| format!("读取 {} 失败", path.display()))?;

@@ -436,6 +436,12 @@ kproxy help
 
 All commands support the global `--json` option. Run `kproxy --help` or a
 subcommand's `--help` for the authoritative option list.
+Every `config.toml` mutation performed through `kproxy` or the daemon holds the
+same cross-process file lock across the complete read, update, atomic write,
+runtime reload, and rollback transaction. Later concurrent mutations wait,
+including while `kproxy config edit` has an editor open. Direct edits made by a
+third-party editor do not voluntarily honor this advisory lock, so prefer
+`kproxy config edit`.
 Subscribe to `account-credit-protected` when accounts should alert after reaching
 the scheduler's remaining-credit protection threshold. Same-kind account events
 for one target are batched into one message while retaining per-account

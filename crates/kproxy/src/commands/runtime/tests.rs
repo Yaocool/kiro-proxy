@@ -85,6 +85,34 @@ fn credits_are_displayed_with_two_decimal_places() {
     assert_eq!(format_credits(4.0), "4.00");
 }
 
+#[test]
+fn api_key_selectors_are_resolved_from_the_supplied_latest_snapshot() {
+    let current = r#"
+[[api_key]]
+id = "ak_current"
+name = "renamed"
+key = "sk-current"
+format = "sk"
+enabled = true
+"#
+    .parse::<toml::Value>()
+    .expect("current config");
+    let table = current.as_table().expect("config table");
+
+    assert_eq!(
+        resolve_api_key_ids(table, &["renamed".into()]).expect("resolve current name"),
+        vec!["ak_current"]
+    );
+    assert_eq!(
+        resolve_api_key_ids(table, &["ak_current".into()]).expect("resolve stable ID"),
+        vec!["ak_current"]
+    );
+    assert!(resolve_api_key_ids(table, &["old-name".into()])
+        .expect_err("stale name must not resolve")
+        .to_string()
+        .contains("API key not found: old-name"));
+}
+
 #[tokio::test]
 async fn config_backup_never_overwrites_an_existing_backup() {
     let directory = tempfile::tempdir().expect("temporary directory");
