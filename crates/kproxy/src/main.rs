@@ -6,9 +6,7 @@ mod output;
 
 use anyhow::Result;
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
-use kproxy_ipc::protocol::{
-    method, ConfigPathResult, ConfigReloadResult, ConfigShowResult, StatusResult,
-};
+use kproxy_ipc::protocol::{method, ConfigPathResult, ConfigReloadResult, StatusResult};
 use std::io::{IsTerminal, Write};
 
 use crate::client::{resolve_socket, AdminClient};
@@ -396,9 +394,16 @@ enum DiagnoseCommand {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
+    /// 列出可查看和编辑的配置模块。
+    #[command(after_help = "示例：\n  kproxy config list\n  kproxy --json config list")]
+    List,
     /// 显示配置。
-    #[command(after_help = "示例：\n  kproxy config show\n  kproxy config show --effective")]
+    #[command(
+        after_help = "示例：\n  kproxy config show\n  kproxy config show server\n  kproxy config show pool --effective"
+    )]
     Show {
+        /// 只显示指定模块；使用 `kproxy config list` 查看模块名。
+        module: Option<String>,
         /// 显示合并默认值后的生效配置。
         #[arg(long)]
         effective: bool,
@@ -409,14 +414,22 @@ enum ConfigCommand {
     /// 手动触发重载。
     #[command(after_help = "示例：\n  kproxy config reload\n  kproxy --json config reload")]
     Reload,
-    /// 用 $VISUAL/$EDITOR 打开配置并在保存后校验、重载。
-    #[command(after_help = "示例：\n  kproxy config edit\n  EDITOR=vim kproxy config edit")]
-    Edit,
-    /// 备份当前配置并恢复全部默认设置，执行前需输入 y 或 yes 确认。
+    /// 用 $VISUAL/$EDITOR 编辑完整配置或指定模块，保存后校验并重载。
     #[command(
-        after_help = "示例：\n  kproxy config reset\n\n会清除配置中的代理服务、API key、模型映射和告警目标；原配置自动备份。"
+        after_help = "示例：\n  kproxy config edit server\n  kproxy config edit pool\n  EDITOR=vim kproxy config edit\n\n不指定模块时编辑完整配置。"
     )]
-    Reset,
+    Edit {
+        /// 只编辑指定模块；使用 `kproxy config list` 查看模块名。
+        module: Option<String>,
+    },
+    /// 备份配置并重置全部通用配置或指定模块，保留基础服务资源。
+    #[command(
+        after_help = "示例：\n  kproxy config reset pool\n  kproxy config reset features\n  kproxy config reset\n\n指定模块时只重置该模块；不指定模块时重置全部通用配置。API key 和代理服务不会被 config reset 清除；原配置自动备份。"
+    )]
+    Reset {
+        /// 只重置指定模块；使用 `kproxy config list` 查看模块名。
+        module: Option<String>,
+    },
     /// 只校验配置，不应用。
     #[command(
         after_help = "示例：\n  kproxy config validate\n  kproxy config validate ./config.toml"
@@ -538,17 +551,17 @@ async fn main() -> Result<()> {
         Command::Restart | Command::Stop | Command::Uninstall { .. } => {
             unreachable!("host lifecycle commands returned before connecting to the daemon")
         }
-        Command::Config(ConfigCommand::Show { effective }) => {
-            let show: ConfigShowResult = client
-                .call(method::CONFIG_SHOW, serde_json::json!({}))
-                .await?;
-            if cli.json {
-                print_json(&show)?;
-            } else if effective {
-                println!("{}", serde_json::to_string_pretty(&show.effective_json)?);
-            } else {
-                print!("{}", show.raw);
-            }
+        Command::Config(ConfigCommand::List) => {
+            crate::commands::runtime::list_config_modules(cli.json)?;
+        }
+        Command::Config(ConfigCommand::Show { module, effective }) => {
+            crate::commands::runtime::show_config(
+                &mut client,
+                module.as_deref(),
+                effective,
+                cli.json,
+            )
+            .await?;
         }
         Command::Config(ConfigCommand::Path) => {
             let paths: ConfigPathResult = client
@@ -584,20 +597,27 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Command::Config(ConfigCommand::Edit) => {
-            crate::commands::runtime::edit_config(&mut client).await?;
+        Command::Config(ConfigCommand::Edit { module }) => {
+            crate::commands::runtime::edit_config(&mut client, module.as_deref()).await?;
         }
-        Command::Config(ConfigCommand::Reset) => {
-            if let Some(result) = crate::commands::runtime::reset_config(&mut client).await? {
+        Command::Config(ConfigCommand::Reset { module }) => {
+            if let Some(result) =
+                crate::commands::runtime::reset_config(&mut client, module.as_deref()).await?
+            {
                 if cli.json {
                     print_json(&serde_json::json!({
                         "config_file": result.config_file,
                         "backup_file": result.backup_file,
+                        "module": result.module,
                         "applied": true,
                         "needs_restart": result.needs_restart,
                     }))?;
                 } else {
-                    println!("配置已恢复为默认设置并重载");
+                    if let Some(module) = result.module.as_deref() {
+                        println!("配置模块 {module} 已恢复为默认设置并重载；其他配置未改动");
+                    } else {
+                        println!("通用配置已恢复为默认设置并重载；API key 和代理服务已保留");
+                    }
                     println!("原配置备份 {}", result.backup_file.display());
                     for field in result.needs_restart {
                         println!("注意：{field} 需重启 kproxyd 才能生效");
@@ -959,7 +979,51 @@ mod tests {
         let cli = Cli::try_parse_from(["kproxy", "config", "reset"]).expect("config reset");
         assert!(matches!(
             cli.command,
-            Some(Command::Config(ConfigCommand::Reset))
+            Some(Command::Config(ConfigCommand::Reset { module: None }))
+        ));
+
+        let scoped = Cli::try_parse_from(["kproxy", "config", "reset", "pool"])
+            .expect("scoped config reset");
+        assert!(matches!(
+            scoped.command,
+            Some(Command::Config(ConfigCommand::Reset {
+                module: Some(module),
+            })) if module == "pool"
+        ));
+    }
+
+    #[test]
+    fn config_commands_accept_module_scoped_show_and_edit() {
+        let list = Cli::try_parse_from(["kproxy", "config", "list"]).expect("config list");
+        assert!(matches!(
+            list.command,
+            Some(Command::Config(ConfigCommand::List))
+        ));
+
+        let show = Cli::try_parse_from(["kproxy", "config", "show", "server", "--effective"])
+            .expect("config show module");
+        assert!(matches!(
+            show.command,
+            Some(Command::Config(ConfigCommand::Show {
+                module: Some(module),
+                effective: true,
+            })) if module == "server"
+        ));
+
+        let edit =
+            Cli::try_parse_from(["kproxy", "config", "edit", "pool"]).expect("config edit module");
+        assert!(matches!(
+            edit.command,
+            Some(Command::Config(ConfigCommand::Edit {
+                module: Some(module),
+            })) if module == "pool"
+        ));
+
+        let full_edit =
+            Cli::try_parse_from(["kproxy", "config", "edit"]).expect("full config edit");
+        assert!(matches!(
+            full_edit.command,
+            Some(Command::Config(ConfigCommand::Edit { module: None }))
         ));
     }
 

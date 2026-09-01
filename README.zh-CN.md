@@ -322,11 +322,15 @@ kproxy account probe --all
 kproxy account regen-machine-id <id|email>
 kproxy account rm <id|email> [<id|email> ...]
 
-kproxy config show --effective
+kproxy config list
+kproxy config show server
+kproxy config show pool --effective
+kproxy config edit pool          # 只编辑单个模块；不指定模块仍编辑完整文件
+kproxy config reset pool         # 只重置单个模块，其他模块保持不变
 kproxy config path
 kproxy config validate
 kproxy config reload
-kproxy config reset             # 确认后备份 config.toml、恢复默认设置并重载
+kproxy config reset              # 重置全部通用配置，保留 API key 和代理服务
 
 kproxy pool --watch --explain
 kproxy diagnose endpoints

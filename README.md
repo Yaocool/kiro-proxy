@@ -387,11 +387,15 @@ kproxy account probe --all
 kproxy account regen-machine-id <id|email>
 kproxy account rm <id|email> [<id|email> ...]
 
-kproxy config show --effective
+kproxy config list
+kproxy config show server
+kproxy config show pool --effective
+kproxy config edit pool          # edits only one module; bare edit still opens the full file
+kproxy config reset pool         # resets only one module and preserves every other module
 kproxy config path
 kproxy config validate
 kproxy config reload
-kproxy config reset             # confirms, backs up config.toml, restores defaults, and reloads
+kproxy config reset              # resets all general settings, preserves API keys/services
 
 kproxy pool --watch --explain
 kproxy diagnose endpoints
