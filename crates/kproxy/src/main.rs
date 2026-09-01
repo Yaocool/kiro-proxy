@@ -1218,6 +1218,32 @@ mod tests {
     }
 
     #[test]
+    fn apikey_add_accepts_a_restored_key_and_create_alias() {
+        for command in ["add", "create"] {
+            let cli = Cli::try_parse_from([
+                "kproxy",
+                "apikey",
+                command,
+                "--name",
+                "recovered",
+                "--key",
+                "sk-original-key",
+            ])
+            .expect("API key restore command");
+            let Some(Command::ApiKey(crate::commands::runtime::ApiKeyCommand::Add {
+                name,
+                key,
+                ..
+            })) = cli.command
+            else {
+                panic!("expected API key add command");
+            };
+            assert_eq!(name, "recovered");
+            assert_eq!(key.as_deref(), Some("sk-original-key"));
+        }
+    }
+
+    #[test]
     fn alert_command_replaces_the_webhook_entrypoint() {
         let cli = Cli::try_parse_from(["kproxy", "alert", "config"]).expect("alert command");
         let Some(Command::Alert(crate::commands::runtime::AlertCommand::Config)) = cli.command

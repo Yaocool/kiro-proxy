@@ -31,9 +31,10 @@ pub async fn run_apikey(
         ApiKeyCommand::Add {
             name,
             format,
+            key,
             credits_limit,
         } => {
-            let key = generate_key(&format)?;
+            let key = resolve_api_key_value(&format, key.as_deref())?;
             let id = key_id(&key);
             mutate_config_array(client, "api_key", |array| {
                 let mut table = toml::map::Map::new();
@@ -96,6 +97,28 @@ pub async fn run_apikey(
             report_apikey_change(client, &id, "已更新额度上限", json).await
         }
     }
+}
+
+fn resolve_api_key_value(format: &str, provided: Option<&str>) -> Result<String> {
+    match format {
+        "sk" | "token" | "simple" => {}
+        other => return Err(anyhow!("unsupported format: {other}")),
+    }
+    let Some(key) = provided else {
+        return generate_key(format);
+    };
+    if key.is_empty() {
+        return Err(anyhow!("--key must not be empty"));
+    }
+    if key.trim() != key {
+        return Err(anyhow!(
+            "--key must not contain leading or trailing whitespace"
+        ));
+    }
+    if key.chars().any(char::is_control) {
+        return Err(anyhow!("--key must not contain control characters"));
+    }
+    Ok(key.to_owned())
 }
 
 async fn report_apikey_change(
@@ -296,4 +319,26 @@ pub(super) fn apikey_list_json(
 
 pub(super) fn format_credits(value: f64) -> String {
     format!("{value:.2}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provided_api_key_is_preserved_and_keeps_its_stable_id() {
+        let original = "sk-restored-secret";
+        let restored = resolve_api_key_value("sk", Some(original)).expect("restore key");
+
+        assert_eq!(restored, original);
+        assert_eq!(key_id(&restored), key_id(original));
+    }
+
+    #[test]
+    fn provided_api_key_rejects_ambiguous_or_invalid_values() {
+        assert!(resolve_api_key_value("sk", Some("")).is_err());
+        assert!(resolve_api_key_value("sk", Some(" sk-secret")).is_err());
+        assert!(resolve_api_key_value("sk", Some("sk-secret\n")).is_err());
+        assert!(resolve_api_key_value("unknown", Some("secret")).is_err());
+    }
 }

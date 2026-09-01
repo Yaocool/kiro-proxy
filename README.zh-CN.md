@@ -346,6 +346,8 @@ kproxy model-map test claude-opus-4
 kproxy apikey list
 kproxy apikey list --detail
 kproxy apikey show ci
+kproxy apikey add --name ci
+kproxy apikey add --name recovered --key 'sk-original-key'  # 恢复误删密钥
 kproxy apikey limit ci --credits 100
 kproxy apikey limit ci --clear
 kproxy alert events
@@ -373,6 +375,9 @@ kproxy help
 读取、修改、原子写入、运行时重载和失败回滚的完整事务。并发发起的后续修改会等待前一项
 操作完成；`config edit` 打开编辑器期间同样持续持锁。直接使用第三方编辑器修改文件不会
 主动遵守这把建议锁，应优先使用 `kproxy config edit`。
+`kproxy apikey add` 默认随机生成密钥；传入 `--key` 时会原样保存用户指定的密钥，并据此
+生成与原密钥一致的稳定 ID，适用于恢复误删密钥而不改动调用方。`--key` 可能进入 shell
+历史和进程列表，执行后应按使用环境清理相关记录。
 账号剩余额度达到调度保护阈值时可订阅 `account-credit-protected`；同一目标短时间内产生的
 同类型多账号告警会合并成一条消息，每个账号仍独立保持“恢复前只告警一次”的去重语义。
 破坏性操作不提供 `--yes` 跳过选项，执行时必须交互输入 `y` 或 `yes` 二次确认。直接执行
