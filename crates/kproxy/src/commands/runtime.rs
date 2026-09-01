@@ -127,13 +127,17 @@ pub enum ApiKeyCommand {
     Show { id: String },
     /// 创建 API key；明文只在创建结果中显示一次。
     #[command(
-        after_help = "示例：\n  kproxy apikey add --name ci\n  kproxy apikey add --name team --credits-limit 100"
+        visible_alias = "create",
+        after_help = "默认随机生成密钥。使用 --key 可恢复误删的原密钥；注意命令行参数可能进入 shell 历史和进程列表。\n\n示例：\n  kproxy apikey add --name ci\n  kproxy apikey add --name team --credits-limit 100\n  kproxy apikey add --name recovered --key 'sk-original-key'"
     )]
     Add {
         #[arg(long)]
         name: String,
         #[arg(long, default_value = "sk")]
         format: String,
+        /// 使用指定的 API key 明文，而不是随机生成。
+        #[arg(long, value_name = "API_KEY")]
+        key: Option<String>,
         #[arg(long)]
         credits_limit: Option<f64>,
     },

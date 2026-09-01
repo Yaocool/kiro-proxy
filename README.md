@@ -411,6 +411,8 @@ kproxy model-map test claude-opus-4
 kproxy apikey list
 kproxy apikey list --detail
 kproxy apikey show ci
+kproxy apikey add --name ci
+kproxy apikey add --name recovered --key 'sk-original-key'  # restore a deleted key
 kproxy apikey limit ci --credits 100
 kproxy apikey limit ci --clear
 kproxy alert events
@@ -442,6 +444,11 @@ runtime reload, and rollback transaction. Later concurrent mutations wait,
 including while `kproxy config edit` has an editor open. Direct edits made by a
 third-party editor do not voluntarily honor this advisory lock, so prefer
 `kproxy config edit`.
+`kproxy apikey add` generates a random secret by default. With `--key`, it
+preserves the supplied secret verbatim and derives the same stable ID as the
+original key, allowing accidental deletion recovery without changing callers.
+The value may remain in shell history and process listings, so clean up those
+records as appropriate for the environment.
 Subscribe to `account-credit-protected` when accounts should alert after reaching
 the scheduler's remaining-credit protection threshold. Same-kind account events
 for one target are batched into one message while retaining per-account
