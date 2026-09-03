@@ -3,13 +3,13 @@ use super::{
     classified_stream_error, classify_stream_failure, claude_initial_events, client_visible_event,
     event_is_tool_search, event_is_web_search, event_kind, fill_missing_usage, finish_accounting,
     header, json, now_secs, prepend_pending_initial, record_account_scoped_stream_failure,
-    repair_json, restore_web_tool_name, should_buffer_tool_event, sse, stream_error, stream_event,
-    stream_finish, tool_search_continue_payload_batch, web_search_continue_payload_batch,
-    web_search_replay_failure, Body, Bytes, BytesMut, ClaudeToolSearchBudget, ClaudeWebSearchTrace,
-    DecodedResponse, Decoder, EventStreamDecoder, HashSet, HeaderValue, Infallible, KiroEvent,
-    KiroResponse, KiroToolUse, Response, StatusCode, StopSequenceFilter, StreamContext, StreamExt,
-    StreamFailureDiagnostics, StreamProtocol, ThinkingContentFilter, ToolLeakFilter,
-    UpstreamStreamMetrics, Value,
+    repair_json, restore_tool_event_name, restore_web_tool_name, should_buffer_tool_event, sse,
+    stream_error, stream_event, stream_finish, tool_search_continue_payload_batch,
+    web_search_continue_payload_batch, web_search_replay_failure, Body, Bytes, BytesMut,
+    ClaudeToolSearchBudget, ClaudeWebSearchTrace, DecodedResponse, Decoder, EventStreamDecoder,
+    HashSet, HeaderValue, Infallible, KiroEvent, KiroResponse, KiroToolUse, Response, StatusCode,
+    StopSequenceFilter, StreamContext, StreamExt, StreamFailureDiagnostics, StreamProtocol,
+    ThinkingContentFilter, ToolLeakFilter, UpstreamStreamMetrics, Value,
 };
 
 pub fn response(
@@ -120,6 +120,7 @@ pub fn response(
                 break 'rounds;
             }
             let mut leak_filter = ToolLeakFilter::new(context.enable_tool_leak_filter);
+            let mut upstream_tool_names = std::collections::HashMap::new();
             let mut thinking_filter = ThinkingContentFilter::new(context.thinking_enabled && effective_thinking)
                 .with_omitted_summary(payload.thinking_summary_omitted());
             loop {
@@ -155,6 +156,7 @@ pub fn response(
                                             .flat_map(|event| thinking_filter.push(event))
                                             .collect::<Vec<_>>();
                                         for mut event in events {
+                                            restore_tool_event_name(&mut event, &mut upstream_tool_names);
                                             let internal_search = event_is_tool_search(
                                                 &event,
                                                 context.tool_search.as_deref(),
@@ -298,6 +300,7 @@ pub fn response(
                 }
                 events.extend(thinking_filter.finish());
                 for mut event in events {
+                    restore_tool_event_name(&mut event, &mut upstream_tool_names);
                     let internal_search =
                         event_is_tool_search(&event, context.tool_search.as_deref());
                     let internal_web_search =
@@ -1649,7 +1652,12 @@ pub fn response(
             }
         }
         if failed.is_none() {
-            if buffer_tool_calls {
+            // Custom tools are buffered individually so their JSON wrapper
+            // can be removed. Flush them even when ordinary function calls
+            // stream immediately, using the same predicate as ingestion.
+            if buffer_tool_calls
+                || context.openai_tools.values().any(|identity| identity.kind == "custom")
+            {
                 if context.buffer_tool_calls
                     && context.tool_call_buffer_delay_ms > 0
                     && !decoded.tools.is_empty()
@@ -1666,6 +1674,9 @@ pub fn response(
                         input_delta: tool.input.clone(),
                         stop: true,
                     };
+                    if !should_buffer_tool_event(&event, buffer_tool_calls, &context.openai_tools) {
+                        continue;
+                    }
                     for data in stream_event(
                         &protocol,
                         &mut claude,

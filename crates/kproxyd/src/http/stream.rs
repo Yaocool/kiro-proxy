@@ -486,6 +486,25 @@ fn restore_web_tool_name(event: &mut KiroEvent, names: &std::collections::HashMa
     }
 }
 
+fn restore_tool_event_name(
+    event: &mut KiroEvent,
+    names: &mut std::collections::HashMap<String, String>,
+) {
+    // Kiro can send the name only in the initial fragment. Resolve later
+    // fragments by call id before deciding whether they must be buffered or
+    // handled as custom/server tools. Keep the upstream name here, before any
+    // client alias restoration, so a client alias cannot become a server tool.
+    if let KiroEvent::ToolUse { id, name, .. } = event {
+        if name.is_empty() {
+            if let Some(original) = names.get(id) {
+                name.clone_from(original);
+            }
+        } else {
+            names.entry(id.clone()).or_insert_with(|| name.clone());
+        }
+    }
+}
+
 fn should_buffer_tool_event(
     event: &KiroEvent,
     configured: bool,
