@@ -40,6 +40,15 @@ struct DeferredTool {
     load_bytes: usize,
 }
 
+impl DeferredTool {
+    fn kiro_name(&self) -> &str {
+        self.translated
+            .specification()
+            .map(|tool| tool.name.as_str())
+            .unwrap_or_default()
+    }
+}
+
 /// Remaining capacity for one Tool Search result. The caller-provided `limit`
 /// is only an upper bound; this budget keeps the selected definitions within
 /// the next Kiro request's actual capacity.
@@ -302,7 +311,7 @@ impl ClaudeToolSearchCatalog {
             .build()
         {
             for (index, tool) in self.deferred.iter().enumerate() {
-                if loaded_kiro_names.contains(&tool.translated.tool_specification.name) {
+                if loaded_kiro_names.contains(tool.kiro_name()) {
                     continue;
                 }
                 if expression.is_match(&tool.document) {
@@ -330,7 +339,7 @@ impl ClaudeToolSearchCatalog {
             })?;
         let started = std::time::Instant::now();
         for (index, tool) in self.deferred.iter().enumerate() {
-            if loaded_kiro_names.contains(&tool.translated.tool_specification.name) {
+            if loaded_kiro_names.contains(tool.kiro_name()) {
                 continue;
             }
             if started.elapsed().as_millis() > MAX_FANCY_REGEX_SEARCH_MILLIS {
@@ -383,7 +392,7 @@ impl ClaudeToolSearchCatalog {
             .iter()
             .enumerate()
             .filter_map(|(index, entry)| {
-                if loaded_kiro_names.contains(&entry.translated.tool_specification.name) {
+                if loaded_kiro_names.contains(entry.kiro_name()) {
                     return None;
                 }
                 let length = entry.document_length.max(1) as f64;
@@ -438,8 +447,9 @@ impl ClaudeToolSearchCatalog {
         budget: ClaudeToolSearchBudget,
         loaded_kiro_names: &HashSet<String>,
     ) -> ClaudeToolSearchOutcome {
-        debug_assert!(matches.iter().all(|index| !loaded_kiro_names
-            .contains(&self.deferred[*index].translated.tool_specification.name)));
+        debug_assert!(matches
+            .iter()
+            .all(|index| !loaded_kiro_names.contains(self.deferred[*index].kiro_name())));
         let match_count = matches.len();
         let mut references = Vec::with_capacity(match_count.min(budget.max_tools));
         let mut tools = Vec::with_capacity(match_count.min(budget.max_tools));

@@ -11,9 +11,10 @@ pub mod validate;
 
 pub use context::{
     apply_compaction_boundary, apply_context_management_edits, compact_trigger_tokens,
-    has_context_management_edits, is_compact_edit_type, normalize_compaction_boundary,
-    ClaudeCompactionNormalizationStats, ClaudeContextEditStats, CLEARED_TOOL_RESULT_TEXT,
-    DEFAULT_COMPACT_TRIGGER_TOKENS, DEFAULT_TOOL_USES_TO_KEEP, MIN_COMPACT_TRIGGER_TOKENS,
+    estimate_context_management_input_tokens, has_context_management_edits, is_compact_edit_type,
+    normalize_compaction_boundary, ClaudeCompactionNormalizationStats, ClaudeContextEditStats,
+    CLEARED_TOOL_RESULT_TEXT, DEFAULT_COMPACT_TRIGGER_TOKENS, DEFAULT_TOOL_CLEAR_TRIGGER_TOKENS,
+    DEFAULT_TOOL_USES_TO_KEEP, MIN_COMPACT_TRIGGER_TOKENS,
 };
 pub use error::{error_envelope, sanitize_error_message, ErrorFormat};
 pub use protocol::*;
@@ -33,6 +34,7 @@ pub use translate::{
     web_search_continue_payload_batch, ClaudeServerToolEmission, ClaudeToolSearchBudget,
     ClaudeToolSearchCatalog, ClaudeToolSearchError, ClaudeToolSearchOutcome, ClaudeToolSearchTrace,
     ClaudeWebSearchError, ClaudeWebSearchTrace, ToolNameRegistry, TranslationOptions,
-    WebSearchReplayCodec, WebSearchReplayError, SIGNATURE_PLACEHOLDER,
+    WebSearchReplayCodec, WebSearchReplayError,
 };
-pub use validate::{validate_claude, validate_openai, ValidationError};
+pub use validate::document_bytes_match_format;
+pub use validate::{validate_claude, validate_claude_generation, validate_openai, ValidationError};

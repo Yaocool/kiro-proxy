@@ -41,6 +41,7 @@ pub fn tool_search_continue_payload_batch(
             } else {
                 tail_chars(assistant_content, 48_000)
             },
+            cache_point: None,
             tool_uses: searches
                 .iter()
                 .map(|(tool_use, _)| tool_use.clone())
@@ -54,10 +55,13 @@ pub fn tool_search_continue_payload_batch(
         .unwrap_or_default();
     for (_, outcome) in searches {
         for found in &outcome.tools {
-            let name = &found.tool_specification.name;
+            let Some(name) = found.specification().map(|tool| &tool.name) else {
+                continue;
+            };
             if !tools
                 .iter()
-                .any(|existing| existing.tool_specification.name == *name)
+                .filter_map(crate::KiroTool::specification)
+                .any(|existing| existing.name == *name)
             {
                 tools.push(found.clone());
             }
@@ -81,6 +85,9 @@ pub fn tool_search_continue_payload_batch(
         )
     };
     current.images.clear();
+    current.documents.clear();
+    current.cache_point = None;
+    current.client_cache_config = None;
     current.user_input_message_context = Some(KiroMessageContext {
         tool_results,
         tools,
@@ -104,10 +111,14 @@ pub fn resume_tool_search_payload(
         .user_input_message_context
         .get_or_insert_with(KiroMessageContext::default);
     for found in &outcome.tools {
+        let Some(found_name) = found.specification().map(|tool| &tool.name) else {
+            continue;
+        };
         if !context
             .tools
             .iter()
-            .any(|existing| existing.tool_specification.name == found.tool_specification.name)
+            .filter_map(crate::KiroTool::specification)
+            .any(|existing| existing.name == *found_name)
         {
             context.tools.push(found.clone());
         }
@@ -174,6 +185,7 @@ pub fn auto_continue_payload(
             } else {
                 tail_chars(assistant_content, 48_000)
             },
+            cache_point: None,
             tool_uses: tool_uses.clone(),
         }),
     });
@@ -194,6 +206,9 @@ pub fn auto_continue_payload(
     let current = &mut next.conversation_state.current_message.user_input_message;
     current.content = "Continue with the next step.".into();
     current.images.clear();
+    current.documents.clear();
+    current.cache_point = None;
+    current.client_cache_config = None;
     current.user_input_message_context = Some(KiroMessageContext {
         tool_results: results,
         tools,
@@ -215,8 +230,8 @@ mod tests {
     use super::*;
     use crate::{
         claude_to_kiro, ClaudeRequest, ClaudeToolSearchTrace, KiroConversationState,
-        KiroCurrentMessage, KiroInputSchema, KiroTool, KiroToolSpecification, KiroUserInputMessage,
-        TranslationOptions,
+        KiroCurrentMessage, KiroDocument, KiroDocumentSource, KiroInputSchema, KiroTool,
+        KiroToolSpecification, KiroUserInputMessage, TranslationOptions,
     };
     use serde_json::json;
 
@@ -224,6 +239,8 @@ mod tests {
     fn preserves_conversation_and_adds_tool_results() {
         let payload = KiroPayload {
             conversation_state: KiroConversationState {
+                agent_continuation_id: None,
+                agent_task_type: None,
                 chat_trigger_type: "MANUAL".into(),
                 conversation_id: "conversation".into(),
                 current_message: KiroCurrentMessage {
@@ -232,6 +249,16 @@ mod tests {
                         model_id: "model".into(),
                         origin: "CLI".into(),
                         images: vec![],
+                        documents: vec![KiroDocument {
+                            format: "pdf".into(),
+                            name: "guide.pdf".into(),
+                            source: KiroDocumentSource {
+                                bytes: "aGVsbG8=".into(),
+                            },
+                            citations: None,
+                        }],
+                        cache_point: None,
+                        client_cache_config: None,
                         user_input_message_context: None,
                     },
                 },
@@ -239,6 +266,8 @@ mod tests {
             },
             profile_arn: None,
             inference_config: None,
+            additional_model_request_fields: None,
+            model_request_intent: None,
             protected_history_messages: 0,
         };
         let next = auto_continue_payload(
@@ -252,13 +281,45 @@ mod tests {
         );
         assert_eq!(next.conversation_state.conversation_id, "conversation");
         assert_eq!(next.conversation_state.history.len(), 2);
+        assert_eq!(
+            next.conversation_state.history[0]
+                .user_input_message
+                .as_ref()
+                .expect("history user")
+                .documents
+                .len(),
+            1
+        );
+        assert!(next
+            .conversation_state
+            .current_message
+            .user_input_message
+            .documents
+            .is_empty());
         let context = next
             .conversation_state
             .current_message
             .user_input_message
             .user_input_message_context
+            .as_ref()
             .expect("context");
         assert_eq!(context.tool_results[0].tool_use_id, "tool_1");
+
+        let continued = auto_continue_payload(&next, "still working", Vec::new());
+        let document_count = continued
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| message.user_input_message.as_ref())
+            .map(|message| message.documents.len())
+            .sum::<usize>()
+            + continued
+                .conversation_state
+                .current_message
+                .user_input_message
+                .documents
+                .len();
+        assert_eq!(document_count, 1);
     }
 
     #[test]
@@ -343,6 +404,8 @@ mod tests {
     fn tool_search_continuation_loads_only_matched_definitions() {
         let mut payload = KiroPayload {
             conversation_state: KiroConversationState {
+                agent_continuation_id: None,
+                agent_task_type: None,
                 chat_trigger_type: "MANUAL".into(),
                 conversation_id: "conversation".into(),
                 current_message: KiroCurrentMessage {
@@ -351,6 +414,16 @@ mod tests {
                         model_id: "model".into(),
                         origin: "CLI".into(),
                         images: vec![],
+                        documents: vec![KiroDocument {
+                            format: "md".into(),
+                            name: "notes.md".into(),
+                            source: KiroDocumentSource {
+                                bytes: "IyBOb3Rlcw==".into(),
+                            },
+                            citations: None,
+                        }],
+                        cache_point: None,
+                        client_cache_config: None,
                         user_input_message_context: None,
                     },
                 },
@@ -358,6 +431,8 @@ mod tests {
             },
             profile_arn: None,
             inference_config: None,
+            additional_model_request_fields: None,
+            model_request_intent: None,
             protected_history_messages: 0,
         };
         payload
@@ -365,7 +440,7 @@ mod tests {
             .current_message
             .user_input_message
             .user_input_message_context = Some(KiroMessageContext {
-            tools: vec![KiroTool {
+            tools: vec![KiroTool::Specification {
                 tool_specification: KiroToolSpecification {
                     name: "tool_search_tool_regex".into(),
                     description: "search".into(),
@@ -393,7 +468,7 @@ mod tests {
                 budget_truncated: false,
                 emission: crate::ClaudeServerToolEmission::Complete,
             },
-            tools: vec![KiroTool {
+            tools: vec![KiroTool::Specification {
                 tool_specification: KiroToolSpecification {
                     name: "mcp__github__list_issues".into(),
                     description: "List issues".into(),
@@ -406,6 +481,21 @@ mod tests {
             truncated: false,
         };
         let next = tool_search_continue_payload(&payload, "searching", search_use, &outcome);
+        assert_eq!(
+            next.conversation_state.history[0]
+                .user_input_message
+                .as_ref()
+                .expect("history user")
+                .documents
+                .len(),
+            1
+        );
+        assert!(next
+            .conversation_state
+            .current_message
+            .user_input_message
+            .documents
+            .is_empty());
         assert!(next.conversation_state.history[0]
             .user_input_message
             .as_ref()

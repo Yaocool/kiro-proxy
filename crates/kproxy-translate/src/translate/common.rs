@@ -1,14 +1,14 @@
 use base64::Engine;
-use serde_json::{Map, Value};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeSet, HashMap};
 
 use crate::{
-    KiroImage, KiroImageSource, KiroInferenceConfig, KiroMessageContext, KiroText, KiroTool,
-    KiroToolResult, KiroToolSpecification, KiroUserInputMessage,
+    KiroCachePoint, KiroCitationsConfig, KiroDocument, KiroDocumentSource, KiroImage,
+    KiroImageSource, KiroInferenceConfig, KiroMessageContext, KiroText, KiroTool, KiroToolResult,
+    KiroToolSpecification, KiroUserInputMessage,
 };
 
-pub const SIGNATURE_PLACEHOLDER: &str = "kiro-proxy-placeholder-signature";
 const MAX_KIRO_TOOL_NAME: usize = 64;
 const MAX_KIRO_DESCRIPTION: usize = 1024;
 
@@ -111,7 +111,8 @@ pub fn content_text(content: &Value) -> String {
                     .get("text")
                     .or_else(|| block.get("thinking"))
                     .or_else(|| block.get("content"))
-                    .and_then(Value::as_str),
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -124,6 +125,279 @@ pub fn extract_images(content: &Value) -> Vec<KiroImage> {
     let mut images = Vec::new();
     collect_claude_images(content, &mut images);
     images
+}
+
+pub fn kiro_cache_point(control: Option<&Value>) -> Option<KiroCachePoint> {
+    let control = control?;
+    // Kiro's request contract only defines `type: default`. Claude's TTL is
+    // still available to proxy-local accounting, but is never sent upstream.
+    (control.get("type").and_then(Value::as_str) == Some("ephemeral")).then(KiroCachePoint::new)
+}
+
+/// Preserve client document context as message text from the first request;
+/// it is not a native Kiro document field and must not require a 400 retry.
+pub fn document_context_text(content: &Value) -> String {
+    fn collect(content: &Value, contexts: &mut Vec<Value>) {
+        for block in content.as_array().into_iter().flatten() {
+            match block.get("type").and_then(Value::as_str) {
+                Some("document") => {
+                    if let Some(context) = block
+                        .get("context")
+                        .and_then(Value::as_str)
+                        .filter(|context| !context.trim().is_empty())
+                    {
+                        contexts.push(serde_json::json!({
+                            "document_name":neutral_document_name(
+                                claude_document_label(block),
+                                claude_document_format(block).unwrap_or("txt")
+                            ),
+                            "context":context
+                        }));
+                    }
+                }
+                Some("tool_result") => {
+                    if let Some(content) = block.get("content") {
+                        collect(content, contexts);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut contexts = Vec::new();
+    collect(content, &mut contexts);
+    if contexts.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Client-provided document context (JSON; separate from document contents):\n{}",
+        serde_json::to_string(&contexts).expect("document context is JSON-serializable")
+    )
+}
+
+/// Kiro exposes one cache marker per conversation message. Claude can place
+/// it on an individual block, so retain the last marker in that message—the
+/// one that covers the longest prefix.
+pub fn content_cache_point(content: &Value) -> Option<KiroCachePoint> {
+    match content {
+        Value::Array(blocks) => blocks.iter().filter_map(block_cache_point).next_back(),
+        Value::Object(_) => kiro_cache_point(content.get("cache_control")),
+        _ => None,
+    }
+}
+
+fn block_cache_point(block: &Value) -> Option<KiroCachePoint> {
+    let nested = match block.get("type").and_then(Value::as_str) {
+        Some("tool_result") => block.get("content").and_then(content_cache_point),
+        Some("document")
+            if block.pointer("/source/type").and_then(Value::as_str) == Some("content") =>
+        {
+            block
+                .pointer("/source/content")
+                .and_then(content_cache_point)
+        }
+        _ => None,
+    };
+    merged_cache_point(nested, kiro_cache_point(block.get("cache_control")))
+}
+
+pub fn merged_cache_point(
+    first: Option<KiroCachePoint>,
+    second: Option<KiroCachePoint>,
+) -> Option<KiroCachePoint> {
+    second.or(first)
+}
+
+pub fn extract_documents(content: &Value) -> Vec<KiroDocument> {
+    let mut documents = Vec::new();
+    let mut image_index = 0;
+    collect_claude_documents(content, &mut documents, &mut image_index);
+    documents
+}
+
+fn collect_claude_documents(
+    content: &Value,
+    documents: &mut Vec<KiroDocument>,
+    image_index: &mut usize,
+) {
+    let Some(blocks) = content.as_array() else {
+        return;
+    };
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("image") => *image_index = image_index.saturating_add(1),
+            Some("document") => {
+                if let Some(document) = claude_document(block, image_index) {
+                    documents.push(document);
+                }
+            }
+            Some("tool_result") => {
+                if let Some(content) = block.get("content") {
+                    collect_claude_documents(content, documents, image_index);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn claude_document(block: &Value, image_index: &mut usize) -> Option<KiroDocument> {
+    let source = block.get("source")?;
+    let source_type = source.get("type")?.as_str()?;
+    let bytes = match source_type {
+        "base64" => {
+            let data = source.get("data")?.as_str()?;
+            base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .ok()?;
+            data.to_owned()
+        }
+        "text" => base64::engine::general_purpose::STANDARD
+            .encode(source.get("data")?.as_str()?.as_bytes()),
+        "content" => base64::engine::general_purpose::STANDARD
+            .encode(custom_document_text(source.get("content")?, image_index).as_bytes()),
+        _ => return None,
+    };
+    let format = claude_document_format(block)?;
+    let name = neutral_document_name(claude_document_label(block), format);
+    Some(KiroDocument {
+        format: format.into(),
+        name,
+        source: KiroDocumentSource { bytes },
+        citations: block
+            .pointer("/citations/enabled")
+            .and_then(Value::as_bool)
+            .map(|enabled| KiroCitationsConfig { enabled }),
+    })
+}
+
+fn custom_document_text(content: &Value, image_index: &mut usize) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block.get("type").and_then(Value::as_str) {
+                Some("text") => block.get("text").and_then(Value::as_str).map(str::to_owned),
+                Some("image") => {
+                    *image_index = image_index.saturating_add(1);
+                    Some(format!("[Message image {image_index}]"))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        _ => String::new(),
+    }
+}
+
+/// Bedrock treats document names as prompt-bearing input and accepts only a
+/// small neutral character set. Keep a recognizable stem while removing file
+/// extensions, control characters, repeated whitespace, and instruction-like
+/// punctuation before the name reaches Kiro.
+fn neutral_document_name(label: Option<&str>, format: &str) -> String {
+    let label = label
+        .and_then(|label| {
+            let trimmed = label.trim();
+            let suffix = format!(".{format}");
+            trimmed
+                .to_ascii_lowercase()
+                .ends_with(&suffix)
+                .then(|| &trimmed[..trimmed.len().saturating_sub(suffix.len())])
+                .or(Some(trimmed))
+        })
+        .unwrap_or("document");
+    let mut output = String::new();
+    let mut previous_space = false;
+    for character in label.chars() {
+        if output.chars().count() >= 200 {
+            break;
+        }
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '(' | ')' | '[' | ']') {
+            output.push(character);
+            previous_space = false;
+        } else if character.is_whitespace() {
+            if !previous_space && !output.is_empty() {
+                output.push(' ');
+                previous_space = true;
+            }
+        } else if !output.ends_with('-') && !output.is_empty() {
+            output.push('-');
+            previous_space = false;
+        }
+    }
+    let output = output.trim_matches([' ', '-']).to_owned();
+    if output.is_empty() {
+        "document".into()
+    } else {
+        output
+    }
+}
+
+pub(crate) fn claude_document_format(block: &Value) -> Option<&'static str> {
+    let source = block.get("source")?;
+    if source.get("type").and_then(Value::as_str) == Some("content") {
+        return Some("txt");
+    }
+    source
+        .get("media_type")
+        .and_then(Value::as_str)
+        .and_then(document_format_from_media_type)
+        .or_else(|| {
+            ["name", "title"]
+                .into_iter()
+                .filter_map(|name| block.get(name).and_then(Value::as_str))
+                .find_map(document_format_from_name)
+        })
+}
+
+fn claude_document_label(block: &Value) -> Option<&str> {
+    ["name", "title"]
+        .into_iter()
+        .filter_map(|name| block.get(name).and_then(Value::as_str))
+        .map(str::trim)
+        .find(|name| !name.is_empty())
+}
+
+fn document_format_from_media_type(media_type: &str) -> Option<&'static str> {
+    let media_type = media_type
+        .split(';')
+        .next()
+        .unwrap_or(media_type)
+        .trim()
+        .to_ascii_lowercase();
+    match media_type.as_str() {
+        "application/pdf" => Some("pdf"),
+        "text/csv" | "application/csv" => Some("csv"),
+        "text/markdown" | "text/x-markdown" => Some("md"),
+        "text/html" => Some("html"),
+        "application/msword" => Some("doc"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => Some("docx"),
+        "application/vnd.ms-excel" => Some("xls"),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => Some("xlsx"),
+        media_type if media_type.starts_with("text/") => Some("txt"),
+        _ => None,
+    }
+}
+
+fn document_format_from_name(name: &str) -> Option<&'static str> {
+    match name
+        .rsplit_once('.')?
+        .1
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "pdf" => Some("pdf"),
+        "csv" => Some("csv"),
+        "md" | "markdown" => Some("md"),
+        "html" | "htm" => Some("html"),
+        "txt" => Some("txt"),
+        "doc" => Some("doc"),
+        "docx" => Some("docx"),
+        "xls" => Some("xls"),
+        "xlsx" => Some("xlsx"),
+        _ => None,
+    }
 }
 
 fn collect_claude_images(content: &Value, images: &mut Vec<KiroImage>) {
@@ -139,6 +413,13 @@ fn collect_claude_images(content: &Value, images: &mut Vec<KiroImage>) {
             }
             Some("tool_result") => {
                 if let Some(content) = block.get("content") {
+                    collect_claude_images(content, images);
+                }
+            }
+            Some("document")
+                if block.pointer("/source/type").and_then(Value::as_str) == Some("content") =>
+            {
+                if let Some(content) = block.pointer("/source/content") {
                     collect_claude_images(content, images);
                 }
             }
@@ -179,7 +460,7 @@ pub fn extract_openai_images(content: &Value) -> Vec<KiroImage> {
             let decoded = base64::engine::general_purpose::STANDARD
                 .decode(bytes)
                 .ok()?;
-            if decoded.len() > 10 * 1024 * 1024 {
+            if decoded.len() > 5 * 1024 * 1024 {
                 return None;
             }
             Some(KiroImage {
@@ -213,19 +494,24 @@ pub fn extract_tool_results(content: &Value) -> Vec<KiroToolResult> {
             let result = block.get("content").map(content_text).unwrap_or_default();
             let has_images = block
                 .get("content")
-                .and_then(Value::as_array)
-                .is_some_and(|blocks| {
-                    blocks
-                        .iter()
-                        .any(|block| block.get("type").and_then(Value::as_str) == Some("image"))
-                });
+                .is_some_and(content_contains_claude_image);
+            let has_documents =
+                block
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| {
+                        blocks.iter().any(|block| {
+                            block.get("type").and_then(Value::as_str) == Some("document")
+                        })
+                    });
             Some(KiroToolResult {
                 content: vec![KiroText {
                     text: if result.is_empty() {
-                        if has_images {
-                            "(image result attached)"
-                        } else {
-                            "(empty result)"
+                        match (has_images, has_documents) {
+                            (true, true) => "(image and document results attached)",
+                            (true, false) => "(image result attached)",
+                            (false, true) => "(document result attached)",
+                            (false, false) => "(empty result)",
                         }
                         .into()
                     } else {
@@ -242,6 +528,27 @@ pub fn extract_tool_results(content: &Value) -> Vec<KiroToolResult> {
             })
         })
         .collect()
+}
+
+fn content_contains_claude_image(content: &Value) -> bool {
+    content.as_array().is_some_and(|blocks| {
+        blocks
+            .iter()
+            .any(|block| match block.get("type").and_then(Value::as_str) {
+                Some("image") => true,
+                Some("tool_result") => block
+                    .get("content")
+                    .is_some_and(content_contains_claude_image),
+                Some("document")
+                    if block.pointer("/source/type").and_then(Value::as_str) == Some("content") =>
+                {
+                    block
+                        .pointer("/source/content")
+                        .is_some_and(content_contains_claude_image)
+                }
+                _ => false,
+            })
+    })
 }
 
 pub fn tool_name(name: &str) -> String {
@@ -318,37 +625,21 @@ pub fn kiro_tool_named(
         (description.to_string(), None)
     };
     (
-        KiroTool {
+        KiroTool::Specification {
             tool_specification: KiroToolSpecification {
                 name: kiro_name.to_owned(),
                 description,
                 input_schema: crate::KiroInputSchema {
-                    json: sanitize_schema(schema),
+                    // Kiro carries a JSON Schema document. Preserve semantic
+                    // keywords such as `additionalProperties: false` and
+                    // `$schema`; deleting them silently weakens the client's
+                    // tool contract.
+                    json: schema.clone(),
                 },
             },
         },
         documentation,
     )
-}
-
-fn sanitize_schema(value: &Value) -> Value {
-    match value {
-        Value::Array(values) => Value::Array(values.iter().map(sanitize_schema).collect()),
-        Value::Object(values) => {
-            let mut output = Map::new();
-            for (key, child) in values {
-                if matches!(key.as_str(), "additionalProperties" | "$schema" | "strict") {
-                    continue;
-                }
-                if key == "required" && child.as_array().is_some_and(Vec::is_empty) {
-                    continue;
-                }
-                output.insert(key.clone(), sanitize_schema(child));
-            }
-            Value::Object(output)
-        }
-        other => other.clone(),
-    }
 }
 
 pub fn context(
@@ -366,16 +657,19 @@ pub fn inference(
     _has_tools: bool,
     temperature: Option<f64>,
     top_p: Option<f64>,
-) -> KiroInferenceConfig {
-    let maximum = requested.unwrap_or(8192).clamp(1, 64_000);
-    KiroInferenceConfig {
-        // The client limit applies to the whole assistant turn, including
-        // internal server-tool continuations. Inflating tool requests to 4096
-        // lets the first upstream round violate that contract.
-        max_tokens: maximum,
+) -> Option<KiroInferenceConfig> {
+    // Match buildKiroPayload in chaogei/Kiro-account-manager: omission leaves
+    // the default to Kiro. Zero sampling values remain meaningful; maxTokens
+    // is emitted only when positive (generation validation rejects zero).
+    let max_tokens = requested.filter(|maximum| *maximum > 0);
+    if max_tokens.is_none() && temperature.is_none() && top_p.is_none() {
+        return None;
+    }
+    Some(KiroInferenceConfig {
+        max_tokens,
         temperature,
         top_p,
-    }
+    })
 }
 
 /// A legacy prompt hint for exact editor tool names, not a classification of
