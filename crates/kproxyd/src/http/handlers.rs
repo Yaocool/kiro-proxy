@@ -561,6 +561,7 @@ pub async fn models(State(service): State<ServiceHttpState>, headers: HeaderMap)
             &headers,
             ErrorFormat::OpenAi,
         )?;
+        enforce_codex_user_agent(&state, &headers)?;
         let config = state.config.current();
         if !config.models.dynamic_discovery {
             let created = now_secs();
@@ -724,6 +725,18 @@ fn authenticate(
 }
 
 fn enforce_claude_user_agent(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(), ApiError> {
+    enforce_client_user_agent(state, headers, ErrorFormat::Claude)
+}
+
+fn enforce_codex_user_agent(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(), ApiError> {
+    enforce_client_user_agent(state, headers, ErrorFormat::OpenAi)
+}
+
+fn enforce_client_user_agent(
+    state: &Arc<AppState>,
+    headers: &HeaderMap,
+    format: ErrorFormat,
+) -> Result<(), ApiError> {
     if !state.config.current().server.enforce_user_agent_check {
         return Ok(());
     }
@@ -731,19 +744,58 @@ fn enforce_claude_user_agent(state: &Arc<AppState>, headers: &HeaderMap) -> Resu
         .get(header::USER_AGENT)
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
-    let valid =
-        value.starts_with("claude-cli/") && value.contains(" (external,") && value.ends_with(')');
+    let (valid, client) = match format {
+        ErrorFormat::Claude => (
+            value.starts_with("claude-cli/")
+                && value.contains(" (external,")
+                && value.ends_with(')'),
+            "Claude Code",
+        ),
+        ErrorFormat::OpenAi => (is_codex_user_agent(value), "Codex"),
+    };
     if valid {
         Ok(())
     } else {
         let mut error = ApiError::new(
             StatusCode::BAD_REQUEST,
-            "Access denied. 本服务仅限 Claude Code 客户端使用，禁止通过其他方式接入。",
-            ErrorFormat::Claude,
+            format!("Access denied. 本协议仅限 {client} 客户端使用，禁止通过其他方式接入。"),
+            format,
         );
         error.suppress_model_stats = true;
         Err(error)
     }
+}
+
+fn is_codex_user_agent(value: &str) -> bool {
+    // Match the product token, never a substring or the optional originator
+    // header alone. Codex CLI, exec, editor and desktop use different products.
+    let Some((product, rest)) = value.split_once('/') else {
+        return false;
+    };
+    let branded_codex = product
+        .strip_prefix("Codex ")
+        .is_some_and(|suffix| !suffix.trim().is_empty());
+    if !branded_codex
+        && !matches!(
+            product,
+            "codex_cli_rs"
+                | "codex_exec"
+                | "codex_vscode"
+                | "codex-tui"
+                | "codex_cli"
+                | "codex"
+                | "Codex"
+                | "codex_desktop"
+                | "codex_app"
+        )
+    {
+        return false;
+    }
+    let version = rest.split_whitespace().next().unwrap_or_default();
+    version.as_bytes().first().is_some_and(u8::is_ascii_digit)
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_'))
 }
 
 fn enforce_context(

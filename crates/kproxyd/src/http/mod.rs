@@ -979,7 +979,12 @@ mod tests {
         let (_directory, state) = test_state(Config::default()).await;
         for path in ["/v1/models", "/models"] {
             let response = router(Arc::clone(&state))
-                .oneshot(Request::get(path).body(Body::empty()).expect("request"))
+                .oneshot(
+                    Request::get(path)
+                        .header(header::USER_AGENT, "codex_cli_rs/0.147.0 (test)")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
                 .await
                 .expect("response");
             assert_eq!(response.status(), StatusCode::OK);
@@ -1007,41 +1012,115 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_user_agent_check_does_not_apply_to_openai_routes() {
-        let (_directory, state) = test_state(Config::default()).await;
-        let claude = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/v1/messages/count_tokens")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"messages":[]}"#))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(claude.status(), StatusCode::BAD_REQUEST);
-        assert!(body_json(claude).await["error"]["message"]
-            .as_str()
-            .expect("message")
-            .contains("Claude Code"));
+    async fn client_allowlist_follows_protocol_for_every_alias_and_can_be_disabled() {
+        for enforced in [true, false] {
+            let mut config = Config::default();
+            config.server.enforce_user_agent_check = enforced;
+            let (_directory, state) = test_state(config).await;
+            for path in [
+                "/v1/messages",
+                "/messages",
+                "/anthropic/v1/messages",
+                "/v1/messages/count_tokens",
+                "/messages/count_tokens",
+                "/anthropic/v1/messages/count_tokens",
+                "/v1/chat/completions",
+                "/chat/completions",
+                "/v1/models",
+                "/models",
+            ] {
+                let claude = path.contains("messages");
+                let models = path.ends_with("models");
+                for (client, agent) in [
+                    ("claude", Some("claude-cli/2.1.235 (external, test)")),
+                    ("codex", Some("codex_cli_rs/0.147.0 (test)")),
+                    ("other", Some("curl/8.0 codex_cli_rs/0.147.0")),
+                    ("missing", None),
+                ] {
+                    let mut request = Request::builder()
+                        .method(if models { Method::GET } else { Method::POST })
+                        .uri(path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header("originator", "codex_cli_rs");
+                    if let Some(agent) = agent {
+                        request = request.header(header::USER_AGENT, agent);
+                    }
+                    let body = serde_json::json!({"model":"test","messages":[{"role":"user","content":"hello"}],"max_tokens":1});
+                    let response = router(Arc::clone(&state))
+                        .oneshot(request.body(Body::from(body.to_string())).unwrap())
+                        .await
+                        .unwrap();
+                    let allowed = !enforced
+                        || (claude && client == "claude")
+                        || (!claude && client == "codex");
+                    let expected = if !allowed {
+                        StatusCode::BAD_REQUEST
+                    } else if models || path.ends_with("count_tokens") {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    };
+                    assert_eq!(
+                        response.status(),
+                        expected,
+                        "path={path}, client={client}, enforced={enforced}"
+                    );
+                    assert!(response.headers().contains_key("request-id"));
+                    let body = body_json(response).await;
+                    if !allowed {
+                        assert_eq!(body["error"]["type"], "invalid_request_error");
+                        assert_eq!(body.get("type").is_some(), claude);
+                        assert!(body["error"]["message"]
+                            .as_str()
+                            .unwrap()
+                            .contains(if claude { "Claude Code" } else { "Codex" }));
+                    }
+                }
+            }
+        }
+    }
 
-        let openai = router(state)
-            .oneshot(
-                Request::post("/v1/chat/completions")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        r#"{"model":"test","messages":[{"role":"user","content":"hello"}],"max_tokens":1}"#,
-                    ))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(openai.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let body = body_json(openai).await;
-        assert!(body.get("type").is_none());
-        assert!(!body["error"]["message"]
-            .as_str()
-            .expect("message")
-            .contains("Claude Code"));
+    #[tokio::test]
+    async fn codex_products_are_recognized_without_accepting_substring_matches() {
+        let (_directory, state) = test_state(Config::default()).await;
+        for agent in [
+            "codex_cli_rs/0.147.0 (Mac OS 26.0; arm64) Terminal/1.0",
+            "codex_exec/0.147.0",
+            "codex_vscode/0.147.0",
+            "codex-tui/0.147.0",
+            "Codex/1.2026.901",
+            "Codex Desktop/1.2026.901",
+            "Codex App/1.2026.901",
+        ] {
+            let response = router(Arc::clone(&state))
+                .oneshot(
+                    Request::get("/v1/models")
+                        .header(header::USER_AGENT, agent)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{agent}");
+        }
+        for agent in [
+            "not-codex/1.0",
+            "codex_cli_rs/",
+            "codex_cli_rs/invalid",
+            "Mozilla/5.0 (Codex)",
+            "codex_cli_rs-impersonator/1.0",
+        ] {
+            let response = router(Arc::clone(&state))
+                .oneshot(
+                    Request::get("/v1/models")
+                        .header(header::USER_AGENT, agent)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{agent}");
+        }
     }
 
     #[tokio::test]
@@ -1070,6 +1149,7 @@ mod tests {
         let response = router(state)
             .oneshot(
                 Request::post("/v1/chat/completions")
+                    .header(header::USER_AGENT, "codex_cli_rs/0.147.0 (test)")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({
@@ -1150,6 +1230,7 @@ mod tests {
         let unauthorized = router(Arc::clone(&state))
             .oneshot(
                 Request::post("/v1/chat/completions")
+                    .header(header::USER_AGENT, "codex_cli_rs/0.147.0 (test)")
                     .header(header::CONTENT_TYPE, "application/json")
                     .body(Body::from(
                         serde_json::json!({"model": attacker_model, "messages": []}).to_string(),
@@ -1189,6 +1270,7 @@ mod tests {
         let invalid = router(Arc::clone(&state))
             .oneshot(
                 Request::post("/v1/chat/completions")
+                    .header(header::USER_AGENT, "codex_cli_rs/0.147.0 (test)")
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::AUTHORIZATION, "Bearer sk-secret")
                     .body(Body::from(

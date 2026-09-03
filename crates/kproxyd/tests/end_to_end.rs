@@ -611,6 +611,7 @@ async fn compact_model_alias_runs_through_translation_pool_and_mock_upstream() {
 
     let response = reqwest::Client::new()
         .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .header("user-agent", "codex_cli_rs/0.147.0 (e2e)")
         .bearer_auth(daemon.api_key.as_deref().expect("service API key"))
         .json(&serde_json::json!({
             "model": "opus5",
@@ -783,6 +784,7 @@ async fn openai_model_controls_follow_reference_omission_rules_through_http() {
             .extend(controls.as_object().unwrap().clone());
         let response = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .header("user-agent", "codex_cli_rs/0.147.0 (e2e)")
             .header("x-api-key", daemon.api_key.as_deref().unwrap())
             .json(&request)
             .send()
@@ -853,6 +855,7 @@ async fn openai_omitted_output_limits_do_not_report_false_truncation() {
                 .extend(controls.as_object().unwrap().clone());
             let response = reqwest::Client::new()
                 .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+                .header("user-agent", "codex_cli_rs/0.147.0 (e2e)")
                 .header("x-api-key", daemon.api_key.as_deref().unwrap())
                 .json(&request)
                 .send()
@@ -968,6 +971,7 @@ async fn openai_internal_continuations_only_apply_explicit_output_limits() {
             }
             let response = reqwest::Client::new()
                 .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+                .header("user-agent", "codex_cli_rs/0.147.0 (e2e)")
                 .header("x-api-key", daemon.api_key.as_deref().unwrap())
                 .json(&request)
                 .send()
@@ -1066,11 +1070,16 @@ priority = 10
     .await;
     let content = "input ".repeat(2000).trim_end().to_owned();
     for endpoint in ["/v1/messages", "/v1/chat/completions"] {
+        let user_agent = if endpoint == "/v1/messages" {
+            "claude-cli/2.1.235 (external, e2e)"
+        } else {
+            "codex_cli_rs/0.147.0 (e2e)"
+        };
         let response = reqwest::Client::new()
             .post(format!("http://127.0.0.1:{port}{endpoint}"))
             .header("x-api-key", daemon.api_key.as_deref().unwrap())
             .header("anthropic-version", "2023-06-01")
-            .header("user-agent", "claude-cli/2.1.235 (external, e2e)")
+            .header("user-agent", user_agent)
             .json(&serde_json::json!({
                 "model":"source-large", "max_tokens":64,
                 "messages":[{"role":"user","content":content}]
@@ -1349,7 +1358,14 @@ async fn mcp_tool_inputs_are_consistent_across_http_protocols_and_buffering_mode
                         .header("x-api-key", daemon.api_key.as_deref().unwrap())
                         .bearer_auth(daemon.api_key.as_deref().unwrap())
                         .header("anthropic-version", "2023-06-01")
-                        .header("user-agent", "claude-cli/2.1.235 (external, e2e)")
+                        .header(
+                            "user-agent",
+                            if claude {
+                                "claude-cli/2.1.235 (external, e2e)"
+                            } else {
+                                "codex_cli_rs/0.147.0 (e2e)"
+                            },
+                        )
                         .json(&request)
                         .send()
                         .await

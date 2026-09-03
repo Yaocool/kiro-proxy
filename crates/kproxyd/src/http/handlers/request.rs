@@ -851,6 +851,7 @@ pub(super) async fn handle_openai(
         &headers,
         ErrorFormat::OpenAi,
     )?;
+    super::enforce_codex_user_agent(&state, &headers)?;
     tracing::debug!(
         event = "proxy.authentication.completed",
         trace_id = %trace_id,
