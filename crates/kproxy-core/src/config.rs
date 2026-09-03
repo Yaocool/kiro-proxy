@@ -364,9 +364,9 @@ pub struct FeaturesConfig {
     pub tool_call_buffer_delay_ms: u64,
     /// thinking 输出格式。
     pub thinking_output_format: ThinkingOutputFormat,
-    /// 是否启用自适应 thinking。
+    /// 旧配置兼容字段；现在逐轮按客户端请求转换 thinking，不再启用轮次启停启发式。
     pub adaptive_thinking: bool,
-    /// thinking budget 兜底上限。
+    /// 旧配置兼容字段。原生 adaptive/effort 模式不提供独立的 thinking token 硬上限。
     pub max_thinking_budget_tokens: u32,
     /// 是否转换 web 工具。
     pub enable_web_tools: bool,
@@ -391,7 +391,7 @@ impl Default for FeaturesConfig {
             buffer_tool_calls: true,
             tool_call_buffer_delay_ms: 500,
             thinking_output_format: ThinkingOutputFormat::Claude,
-            adaptive_thinking: true,
+            adaptive_thinking: false,
             max_thinking_budget_tokens: 8192,
             enable_web_tools: true,
             enable_tool_leak_filter: true,
@@ -1479,9 +1479,9 @@ buffer_tool_calls = true
 tool_call_buffer_delay_ms = 500
 # 思考内容输出格式；"claude" 输出 thinking block，"openai" 输出 reasoning_content。
 thinking_output_format = "claude"
-# 是否根据请求和模型能力自动启用或调整 thinking。
-adaptive_thinking = true
-# 上游未给出有效预算时使用的 thinking token 上限。
+# 仅为兼容旧配置保留；逐轮按客户端请求转换 thinking，不再自动跳过工具结果/控制轮次。
+adaptive_thinking = false
+# 仅为兼容旧配置保留；原生 adaptive/effort 模式不使用独立 thinking token 硬上限。
 max_thinking_budget_tokens = 8192
 # 是否转换 Claude/OpenAI 的 Web Search 工具并交给 Kiro MCP 执行。
 enable_web_tools = true

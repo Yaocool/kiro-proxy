@@ -21,7 +21,11 @@ use kproxy_store::accounts::AccountStore;
 use kproxy_store::atomic::{lock_file_exclusive, ExclusiveFileLock};
 use kproxy_store::config_loader::ConfigHandle;
 use kproxy_translate::{
-    model::resolve_dynamic_model, KiroPayload, TokenCountCache, WebSearchReplayCodec,
+    model::{
+        apply_adaptive_thinking, resolve_dynamic_model, thinking_enabled_for_model,
+        ThinkingDecision,
+    },
+    KiroPayload, TokenCountCache, WebSearchReplayCodec,
 };
 use rand::RngCore;
 use sha2::{Digest, Sha256};
@@ -489,6 +493,30 @@ impl AppState {
         read_lock(&self.kiro).clone()
     }
 
+    /// Rebuild model controls for the actual target, including continuations
+    /// and stream-time fallbacks that do not pass through initial dispatch.
+    pub fn prepare_model_request(&self, payload: &mut KiroPayload) -> ThinkingDecision {
+        let config = self.config.current();
+        let model = &payload
+            .conversation_state
+            .current_message
+            .user_input_message
+            .model_id;
+        let requested_model = payload
+            .model_request_intent
+            .as_ref()
+            .map_or(model.as_str(), |intent| intent.requested_model.as_str());
+        let enabled = thinking_enabled_for_model(model, &config.model_thinking_mode)
+            && thinking_enabled_for_model(requested_model, &config.model_thinking_mode);
+        let schema = self
+            .resolved_model_info(model)
+            // Alias/family resolution is useful for routing, but another
+            // version's metadata is not the selected model's wire contract.
+            .filter(|info| info.model_id.eq_ignore_ascii_case(model))
+            .and_then(|info| info.additional_model_request_fields_schema);
+        apply_adaptive_thinking(payload, schema.as_ref(), enabled)
+    }
+
     /// Dispatches one generation request and records only proxy-side queueing
     /// and explicit upstream overload feedback for adaptive admission.
     pub async fn generate(
@@ -496,7 +524,11 @@ impl AppState {
         account: &Account,
         payload: &KiroPayload,
     ) -> Result<KiroResponse, KiroError> {
-        let result = self.kiro().generate(account, payload, None).await;
+        // Work on an attempt-local copy so routing to another model cannot
+        // permanently erase the original request's effort or thinking controls.
+        let mut prepared = payload.clone();
+        self.prepare_model_request(&mut prepared);
+        let result = self.kiro().generate(account, &prepared, None).await;
         match &result {
             Ok(response) => self
                 .adaptive_feedback

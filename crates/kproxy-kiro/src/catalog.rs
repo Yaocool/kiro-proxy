@@ -65,6 +65,7 @@ pub fn static_models() -> Vec<ModelInfo> {
             description: model.description.into(),
             rate_multiplier: Some(model.rate_multiplier),
             token_limits: None,
+            additional_model_request_fields_schema: None,
         })
         .collect()
 }

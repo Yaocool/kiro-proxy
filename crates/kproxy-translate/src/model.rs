@@ -394,38 +394,15 @@ fn glob(pattern: &str, value: &str) -> bool {
 pub enum ThinkingReason {
     ClientDisabled,
     ModelDisabled,
-    ToolResultFollowup,
-    ControlTurn,
-    ShortToolTurn,
-    ToolTurn,
     Standard,
 }
 
-pub fn should_enable_thinking(
-    client_enabled: bool,
-    model_enabled: bool,
-    has_tool_result: bool,
-    is_control_turn: bool,
-    has_tools: bool,
-    input_tokens: usize,
-) -> (bool, ThinkingReason) {
+pub fn should_enable_thinking(client_enabled: bool, model_enabled: bool) -> (bool, ThinkingReason) {
     if !client_enabled {
         return (false, ThinkingReason::ClientDisabled);
     }
     if !model_enabled {
         return (false, ThinkingReason::ModelDisabled);
-    }
-    if has_tool_result {
-        return (false, ThinkingReason::ToolResultFollowup);
-    }
-    if is_control_turn {
-        return (false, ThinkingReason::ControlTurn);
-    }
-    if has_tools && input_tokens < 300 {
-        return (true, ThinkingReason::ShortToolTurn);
-    }
-    if has_tools {
-        return (true, ThinkingReason::ToolTurn);
     }
     (true, ThinkingReason::Standard)
 }
@@ -434,7 +411,7 @@ pub fn should_enable_thinking(
 pub struct ThinkingDecision {
     pub enabled: bool,
     pub reason: ThinkingReason,
-    pub budget_tokens: Option<u32>,
+    pub effort: Option<String>,
 }
 
 pub fn thinking_enabled_for_model(
@@ -455,102 +432,120 @@ pub fn thinking_enabled_for_model(
 
 pub fn apply_adaptive_thinking(
     payload: &mut crate::KiroPayload,
-    thinking: Option<&crate::ThinkingConfig>,
+    additional_fields_schema: Option<&serde_json::Value>,
     model_enabled: bool,
-    adaptive: bool,
-    configured_cap: u32,
 ) -> ThinkingDecision {
-    let client_enabled = thinking.is_some_and(|thinking| {
-        matches!(
-            thinking.r#type.to_ascii_lowercase().as_str(),
-            "enabled" | "adaptive"
-        )
-    });
-    let current = &payload
-        .conversation_state
-        .current_message
-        .user_input_message;
-    let tool_results = current
-        .user_input_message_context
-        .as_ref()
-        .map_or(0, |context| context.tool_results.len());
-    let tools = current
-        .user_input_message_context
-        .as_ref()
-        .map_or(0, |context| context.tools.len());
-    let normalized = current.content.trim().to_ascii_lowercase();
-    let control = !payload.conversation_state.history.is_empty()
-        && matches!(
-            normalized.as_str(),
-            "continue"
-                | "continue."
-                | "tool results provided."
-                | "tool results provided"
-                | "done. continue with the next step."
-                | "done. continue with the next step"
-        );
-    let (enabled, reason) = should_enable_thinking(
-        client_enabled,
-        model_enabled,
-        adaptive && tool_results > 0,
-        adaptive && control,
-        tools > 0,
-        current.content.chars().count() / 4,
-    );
+    // Rebuild from immutable client intent, never from a previous model's
+    // transformed fields (which may have a different path or effort enum).
+    let intent = payload.model_request_intent.clone().unwrap_or_default();
+    let thinking = intent.thinking.as_ref();
+    let explicit_effort = intent.effort.as_deref();
+    let explicitly_disabled =
+        thinking.is_some_and(|thinking| thinking.r#type.eq_ignore_ascii_case("disabled"));
+    let client_enabled = !explicitly_disabled
+        && (explicit_effort.is_some()
+            || thinking.is_some_and(|thinking| {
+                matches!(
+                    thinking.r#type.to_ascii_lowercase().as_str(),
+                    "enabled" | "adaptive"
+                )
+            }));
+    // The reference never switches thinking off just because this is a tool
+    // result or control turn. Keep only the explicit operator-level deny rule.
+    let (enabled, reason) = should_enable_thinking(client_enabled, model_enabled);
     if !enabled {
+        // Match the reference gateway's omission policy. In particular, do not
+        // invent a reasoning.effort=none or thinking:disabled Kiro extension.
+        // Response filtering also suppresses unsolicited default reasoning.
+        payload.additional_model_request_fields = None;
         return ThinkingDecision {
             enabled,
             reason,
-            budget_tokens: None,
+            effort: None,
         };
     }
 
-    let current_max = payload
-        .inference_config
-        .as_ref()
-        .map(|inference| inference.max_tokens)
-        .unwrap_or(16_384)
-        .min(32_768);
-    let fallback = match reason {
-        ThinkingReason::ShortToolTurn => 1_024,
-        ThinkingReason::ToolTurn => 4_096,
-        _ => current_max / 4,
-    };
-    let reason_cap = match reason {
-        ThinkingReason::ShortToolTurn => 1_024,
-        ThinkingReason::ToolTurn => 4_096,
-        _ => u32::MAX,
-    };
-    let budget = thinking
-        .and_then(|thinking| thinking.budget_tokens)
-        .unwrap_or(fallback)
-        .max(1)
-        .min(current_max / 2)
-        .min(configured_cap.max(1))
-        .min(8_192)
-        .min(reason_cap);
-    let instruction = "[CRITICAL - Thinking Mode] Use the same language as the user for BOTH your thinking process and your response. If the user writes in Chinese, think and respond in Chinese; if in English, think and respond in English.";
-    let current = &mut payload
-        .conversation_state
-        .current_message
-        .user_input_message;
-    if !current
-        .content
-        .trim_start()
-        .starts_with("<thinking_mode>enabled</thinking_mode>")
-    {
-        current.content = format!(
-            "<thinking_mode>enabled</thinking_mode>\n<max_thinking_length>{budget}</max_thinking_length>\n\n{instruction}\n\n{}",
-            current.content
-        );
-    }
-    if let Some(inference) = &mut payload.inference_config {
-        inference.max_tokens = current_max.saturating_add(budget).min(32_768);
-    }
+    let (fields, effort) =
+        native_thinking_fields(thinking, explicit_effort, additional_fields_schema);
+    payload.additional_model_request_fields = Some(fields);
     ThinkingDecision {
         enabled: true,
         reason,
-        budget_tokens: Some(budget),
+        effort,
+    }
+}
+
+fn native_thinking_fields(
+    thinking: Option<&crate::ThinkingConfig>,
+    explicit_effort: Option<&str>,
+    schema: Option<&serde_json::Value>,
+) -> (serde_json::Value, Option<String>) {
+    // Like chaogei/Kiro-account-manager, metadata chooses a known thinking
+    // dialect only when it actually advertises effort values. It is not a
+    // complete JSON Schema allowlist (output_config also requires thinking).
+    for path in ["output_config", "reasoning"] {
+        let field_schema = schema.and_then(|schema| schema.get("properties")?.get(path));
+        let allowed = effort_values(field_schema);
+        if allowed.is_empty() {
+            continue;
+        }
+        let requested = explicit_effort
+            .map(str::to_ascii_lowercase)
+            .or_else(|| {
+                thinking
+                    .filter(|thinking| thinking.r#type == "enabled")
+                    .and_then(|thinking| thinking.budget_tokens)
+                    .map(|budget| budget_to_effort(budget).to_owned())
+            })
+            // getThinkingConfig in the reference does not read JSON Schema's
+            // default, so an otherwise unspecified effort is always high.
+            .unwrap_or_else(|| "high".into());
+        let effort = select_effort(&requested, &allowed).to_owned();
+        let fields = if path == "output_config" {
+            serde_json::json!({
+                "thinking": {"type":"adaptive", "display":"summarized"},
+                "output_config": {"effort":effort}
+            })
+        } else {
+            serde_json::json!({"reasoning":{"effort":effort}})
+        };
+        return (fields, Some(effort));
+    }
+
+    // Missing/incomplete metadata uses the reference's adaptive fallback;
+    // never forward legacy type:enabled + budget_tokens speculatively.
+    (serde_json::json!({"thinking":{"type":"adaptive"}}), None)
+}
+
+fn effort_values(schema: Option<&serde_json::Value>) -> Vec<&str> {
+    schema
+        .and_then(|schema| schema.pointer("/properties/effort/enum"))
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect()
+}
+
+fn select_effort<'a>(requested: &'a str, allowed: &'a [&'a str]) -> &'a str {
+    if allowed.contains(&requested) {
+        return requested;
+    }
+    // Preserve the advertised ordering, exactly as the reference does. Its
+    // implementation selects the final entry, not the nearest numeric rank.
+    allowed
+        .last()
+        .copied()
+        .filter(|effort| !effort.is_empty())
+        .unwrap_or("high")
+}
+
+fn budget_to_effort(budget: u32) -> &'static str {
+    match budget {
+        0..=4_000 => "low",
+        4_001..=16_000 => "medium",
+        16_001..=64_000 => "high",
+        _ => "xhigh",
     }
 }
 
@@ -565,18 +560,18 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_disables_adaptive_thinking() {
+    fn explicit_client_disable_takes_precedence() {
         assert_eq!(
-            should_enable_thinking(true, true, true, false, true, 1000),
-            (false, ThinkingReason::ToolResultFollowup)
+            should_enable_thinking(false, true),
+            (false, ThinkingReason::ClientDisabled)
         );
     }
 
     #[test]
-    fn short_tool_turn_keeps_thinking_with_a_small_budget() {
+    fn explicit_operator_disable_takes_precedence() {
         assert_eq!(
-            should_enable_thinking(true, true, false, false, true, 100),
-            (true, ThinkingReason::ShortToolTurn)
+            should_enable_thinking(true, false),
+            (false, ThinkingReason::ModelDisabled)
         );
     }
 
@@ -597,13 +592,7 @@ mod tests {
             &disabled,
             &crate::TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR"),
         );
-        let disabled_decision = apply_adaptive_thinking(
-            &mut disabled_payload,
-            disabled.thinking.as_ref(),
-            true,
-            true,
-            8_192,
-        );
+        let disabled_decision = apply_adaptive_thinking(&mut disabled_payload, None, true);
         assert_eq!(disabled_decision.reason, ThinkingReason::ClientDisabled);
         assert!(!disabled_decision.enabled);
         assert!(!disabled_payload
@@ -618,20 +607,352 @@ mod tests {
             &adaptive,
             &crate::TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR"),
         );
-        let adaptive_decision = apply_adaptive_thinking(
-            &mut adaptive_payload,
-            adaptive.thinking.as_ref(),
-            true,
-            true,
-            8_192,
-        );
+        let adaptive_decision = apply_adaptive_thinking(&mut adaptive_payload, None, true);
         assert!(adaptive_decision.enabled);
-        assert!(adaptive_payload
-            .conversation_state
-            .current_message
-            .user_input_message
-            .content
-            .starts_with("<thinking_mode>enabled</thinking_mode>"));
+        assert_eq!(
+            adaptive_payload
+                .additional_model_request_fields
+                .as_ref()
+                .and_then(|fields| fields.pointer("/thinking/type"))
+                .and_then(serde_json::Value::as_str),
+            Some("adaptive")
+        );
+    }
+
+    #[test]
+    fn native_thinking_respects_model_schema_and_explicit_disable() {
+        let build = |kind: &str| {
+            serde_json::from_value::<crate::ClaudeRequest>(serde_json::json!({
+                "model":"claude-sonnet-4.6",
+                "messages":[{"role":"user","content":"explain this carefully"}],
+                "max_tokens":8192,
+                "top_k":0,
+                "thinking":{"type":kind},
+                "output_config":{"effort":"high"}
+            }))
+            .expect("Claude request")
+        };
+        let schema = serde_json::json!({
+            "properties":{
+                "top_k":{"type":"integer"},
+                "output_config":{"properties":{
+                    "effort":{"enum":["low","medium"]}
+                }}
+            }
+        });
+
+        let adaptive = build("adaptive");
+        let mut payload = crate::claude_to_kiro(
+            &adaptive,
+            &crate::TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR"),
+        );
+        let decision = apply_adaptive_thinking(&mut payload, Some(&schema), true);
+        assert!(decision.enabled);
+        let fields = payload
+            .additional_model_request_fields
+            .as_ref()
+            .expect("additional fields");
+        assert!(fields.get("top_k").is_none());
+        assert_eq!(
+            fields
+                .pointer("/output_config/effort")
+                .and_then(serde_json::Value::as_str),
+            Some("medium")
+        );
+        assert_eq!(
+            fields["thinking"],
+            serde_json::json!({"type":"adaptive","display":"summarized"})
+        );
+
+        let disabled = build("disabled");
+        let mut payload = crate::claude_to_kiro(
+            &disabled,
+            &crate::TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR"),
+        );
+        let decision = apply_adaptive_thinking(&mut payload, Some(&schema), true);
+        assert!(!decision.enabled);
+        assert_eq!(decision.reason, ThinkingReason::ClientDisabled);
+        assert!(payload.additional_model_request_fields.is_none());
+    }
+
+    #[test]
+    fn top_k_is_omitted_even_when_present_in_model_metadata() {
+        for kind in ["adaptive", "disabled"] {
+            for schema in [
+                None,
+                Some(serde_json::json!({"properties":{}})),
+                Some(serde_json::json!({"properties":{"thinking":{"type":"object"}}})),
+                Some(
+                    serde_json::json!({"properties":{"thinking":{"type":"object"},"top_k":{"type":"integer"}}}),
+                ),
+            ] {
+                let request: crate::ClaudeRequest = serde_json::from_value(serde_json::json!({
+                    "model":"claude-sonnet-4.6", "max_tokens":4096, "top_k":42,
+                    "thinking":{"type":kind}, "messages":[{"role":"user","content":"explain"}]
+                }))
+                .expect("request");
+                let mut payload = crate::claude_to_kiro(
+                    &request,
+                    &crate::TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR"),
+                );
+                apply_adaptive_thinking(&mut payload, schema.as_ref(), true);
+                let top_k = payload
+                    .additional_model_request_fields
+                    .as_ref()
+                    .and_then(|fields| fields.get("top_k"));
+                assert!(top_k.is_none(), "kind={kind} schema={schema:?}");
+                if kind == "disabled" {
+                    assert!(payload.additional_model_request_fields.is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fallback_rebuilds_thinking_from_original_effort_without_leaking_unknown_fields() {
+        let request: crate::ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-sonnet-4.6", "max_tokens":100000, "top_k":42,
+            "thinking":{"type":"enabled","budget_tokens":64001},
+            "output_config":{"effort":"xhigh"},
+            "messages":[{"role":"user","content":"explain"}]
+        }))
+        .expect("request");
+        let mut payload = crate::claude_to_kiro(
+            &request,
+            &crate::TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR"),
+        );
+        payload.additional_model_request_fields =
+            Some(serde_json::json!({"top_k":42,"future_field":true}));
+        apply_adaptive_thinking(&mut payload, None, true);
+        assert_eq!(
+            payload.additional_model_request_fields,
+            Some(serde_json::json!({"thinking":{"type":"adaptive"}}))
+        );
+        let output_schema = serde_json::json!({"properties":{"output_config":{"properties":{"effort":{"enum":["low","medium"]}}}}});
+        apply_adaptive_thinking(&mut payload, Some(&output_schema), true);
+        assert_eq!(
+            payload.additional_model_request_fields.as_ref().unwrap()["output_config"]["effort"],
+            "medium"
+        );
+        let reasoning_schema = serde_json::json!({"properties":{"reasoning":{"properties":{"effort":{"enum":["low","medium","high","xhigh"]}}}}});
+        apply_adaptive_thinking(&mut payload, Some(&reasoning_schema), true);
+        assert_eq!(
+            payload.additional_model_request_fields,
+            Some(serde_json::json!({"reasoning":{"effort":"xhigh"}}))
+        );
+        apply_adaptive_thinking(&mut payload, None, true);
+        assert_eq!(
+            payload.additional_model_request_fields,
+            Some(serde_json::json!({"thinking":{"type":"adaptive"}}))
+        );
+    }
+
+    #[test]
+    fn native_thinking_supports_reasoning_effort_schema() {
+        let request = serde_json::from_value::<crate::OpenAiRequest>(serde_json::json!({
+            "model":"claude-sonnet-4.6",
+            "messages":[{"role":"user","content":"reason"}],
+            "max_tokens":8192,
+            "reasoning_effort":"high"
+        }))
+        .expect("OpenAI request");
+        let schema = serde_json::json!({
+            "properties":{"reasoning":{"properties":{
+                "effort":{"enum":["low","high"]}
+            }}}
+        });
+        let mut payload = crate::openai_to_kiro(
+            &request,
+            &crate::TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR"),
+        );
+        let decision = apply_adaptive_thinking(&mut payload, Some(&schema), true);
+        assert!(decision.enabled);
+        assert_eq!(
+            payload
+                .additional_model_request_fields
+                .as_ref()
+                .and_then(|fields| fields.pointer("/reasoning/effort"))
+                .and_then(serde_json::Value::as_str),
+            Some("high")
+        );
+    }
+
+    #[test]
+    fn manual_thinking_budgets_map_directly_to_reference_effort_levels() {
+        let schema = serde_json::json!({"properties":{"output_config":{"properties":{
+            "effort":{"enum":["low","medium","high","xhigh"]}
+        }}}});
+        for (budget, expected) in [
+            (1024, "low"),
+            (4000, "low"),
+            (4001, "medium"),
+            (16000, "medium"),
+            (16001, "high"),
+            (32000, "high"),
+            (64000, "high"),
+            (64001, "xhigh"),
+        ] {
+            let request: crate::ClaudeRequest = serde_json::from_value(serde_json::json!({
+                "model":"claude-sonnet-4.6", "max_tokens":100000,
+                "thinking":{"type":"enabled","budget_tokens":budget},
+                "messages":[{"role":"user","content":"explain"}]
+            }))
+            .unwrap();
+            crate::validate_claude(&request).unwrap();
+            let mut options = crate::TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR");
+            options.additional_model_request_fields_schema = Some(schema.clone());
+            let payload = crate::claude_to_kiro(&request, &options);
+            let fields = payload.additional_model_request_fields.unwrap();
+            assert_eq!(
+                fields["output_config"]["effort"], expected,
+                "budget={budget}"
+            );
+            assert_eq!(fields["thinking"]["type"], "adaptive");
+            assert!(fields["thinking"].get("budget_tokens").is_none());
+        }
+    }
+
+    #[test]
+    fn claude_output_config_and_display_do_not_override_reference_mapping() {
+        let request: crate::ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-sonnet-4.6", "max_tokens":4096,
+            "thinking":{"type":"enabled","budget_tokens":1024,"display":"omitted"},
+            "output_config":{"effort":"high"},
+            "tools":[{"name":"read","input_schema":{"type":"object"}}],
+            "messages":[{"role":"user","content":"explain"}]
+        }))
+        .unwrap();
+        let schema = serde_json::json!({"properties":{"output_config":{"properties":{
+            "effort":{"enum":["low","medium","high"]}
+        }}}});
+        let mut payload = crate::claude_to_kiro(
+            &request,
+            &crate::TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR"),
+        );
+        let decision = apply_adaptive_thinking(&mut payload, Some(&schema), true);
+        assert_eq!(decision.reason, ThinkingReason::Standard);
+        assert_eq!(decision.effort.as_deref(), Some("low"));
+        assert_eq!(
+            payload.additional_model_request_fields,
+            Some(serde_json::json!({
+                "thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"low"}
+            }))
+        );
+    }
+
+    #[test]
+    fn thinking_metadata_defaults_and_incomplete_schema_fallbacks() {
+        let request: crate::ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-sonnet-4.6", "max_tokens":4096,
+            "thinking":{"type":"adaptive","display":"omitted"},
+            "messages":[{"role":"user","content":"explain"}]
+        }))
+        .unwrap();
+        let mut payload = crate::claude_to_kiro(
+            &request,
+            &crate::TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR"),
+        );
+        assert!(
+            payload.additional_model_request_fields.as_ref().unwrap()["thinking"]
+                .get("display")
+                .is_none()
+        );
+        for (schema, path, effort) in [
+            (
+                serde_json::json!({"properties":{"output_config":{"properties":{"effort":{"enum":["low","medium","high"]}}}}}),
+                "output_config",
+                "high",
+            ),
+            (
+                serde_json::json!({"properties":{"output_config":{"properties":{"effort":{"enum":["low","medium","high"],"default":"medium"}}}}}),
+                "output_config",
+                "high",
+            ),
+            (
+                serde_json::json!({"properties":{"output_config":{},"reasoning":{"properties":{"effort":{"enum":["low","high"]}}}}}),
+                "reasoning",
+                "high",
+            ),
+        ] {
+            apply_adaptive_thinking(&mut payload, Some(&schema), true);
+            assert_eq!(
+                payload.additional_model_request_fields.as_ref().unwrap()[path]["effort"],
+                effort
+            );
+        }
+        for schema in [
+            None,
+            Some(
+                serde_json::json!({"properties":{"output_config":{"properties":{"effort":{"enum":[]}}}}}),
+            ),
+        ] {
+            apply_adaptive_thinking(&mut payload, schema.as_ref(), true);
+            assert_eq!(
+                payload.additional_model_request_fields,
+                Some(serde_json::json!({"thinking":{"type":"adaptive"}}))
+            );
+        }
+    }
+
+    #[test]
+    fn request_intent_is_local_and_preserves_openai_effort_across_model_changes() {
+        let request: crate::OpenAiRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-sonnet-4.6", "max_completion_tokens":4096,
+            "temperature":0, "top_p":0, "reasoning_effort":"minimal",
+            "messages":[{"role":"user","content":"explain"}]
+        }))
+        .unwrap();
+        crate::validate_openai(&request).unwrap();
+        let mut payload = crate::openai_to_kiro(
+            &request,
+            &crate::TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR"),
+        );
+        let schema = serde_json::json!({"properties":{"reasoning":{"properties":{
+            "effort":{"enum":["low","medium","high"]}
+        }}}});
+        apply_adaptive_thinking(&mut payload, Some(&schema), true);
+        assert_eq!(
+            payload.additional_model_request_fields,
+            Some(serde_json::json!({"reasoning":{"effort":"high"}}))
+        );
+        let mut wire = serde_json::to_value(&payload).unwrap();
+        assert_eq!(
+            wire["inferenceConfig"],
+            serde_json::json!({"temperature":0.0,"topP":0.0})
+        );
+        assert!(wire.get("modelRequestIntent").is_none());
+        wire["modelRequestIntent"] = serde_json::json!({"effort":"max"});
+        let parsed: crate::KiroPayload = serde_json::from_value(wire).unwrap();
+        assert!(
+            parsed.model_request_intent.is_none(),
+            "intent cannot be forged through JSON"
+        );
+        let schema = serde_json::json!({"properties":{"output_config":{"properties":{"effort":{"enum":["minimal","low","high"]}}}}});
+        apply_adaptive_thinking(&mut payload, Some(&schema), true);
+        assert_eq!(
+            payload.additional_model_request_fields.as_ref().unwrap()["output_config"]["effort"],
+            "minimal"
+        );
+    }
+
+    #[test]
+    fn inference_wire_contract_preserves_zero_values_and_omits_local_stop_controls() {
+        let request: crate::ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-sonnet-4.6", "max_tokens":1,
+            "temperature":0, "top_p":0, "top_k":42, "stop_sequences":["STOP"],
+            "messages":[{"role":"user","content":"explain"}]
+        }))
+        .unwrap();
+        let payload = crate::claude_to_kiro(
+            &request,
+            &crate::TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR"),
+        );
+        let wire = serde_json::to_value(payload).unwrap();
+        assert_eq!(
+            wire["inferenceConfig"],
+            serde_json::json!({"maxTokens":1,"temperature":0.0,"topP":0.0})
+        );
+        assert!(wire.get("additionalModelRequestFields").is_none());
     }
 
     #[test]
