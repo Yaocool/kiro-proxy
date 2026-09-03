@@ -346,8 +346,18 @@ fi
 
 wait_for_health() {
   elapsed=0
-  while ! compose_base exec --no-tty kproxyd /usr/local/bin/kproxy health >/dev/null 2>&1; do
-    [ "$elapsed" -lt "$health_timeout" ] || return 1
+  while :; do
+    # Compose supports -T; --no-tty fails before kproxy health can even run.
+    if health_output="$(compose_base exec -T kproxyd /usr/local/bin/kproxy health 2>&1)"; then
+      return 0
+    else
+      health_status=$?
+    fi
+    if [ "$elapsed" -ge "$health_timeout" ]; then
+      printf '==> Health check failed after %ss (exit %s):\n%s\n' \
+        "$health_timeout" "$health_status" "$health_output" >&2
+      return 1
+    fi
     sleep 1
     elapsed=$((elapsed + 1))
   done
