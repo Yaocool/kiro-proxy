@@ -15,6 +15,31 @@ fn streamed_values(output: &[String]) -> Vec<Value> {
 }
 
 #[test]
+fn unnamed_tool_fragments_keep_upstream_identity_before_client_aliases() {
+    let mut names = std::collections::HashMap::new();
+    let aliases = std::collections::HashMap::from([("client_search".into(), "web_search".into())]);
+    let tool_event = |id: &str, name: &str| KiroEvent::ToolUse {
+        id: id.into(),
+        name: name.into(),
+        input_delta: String::new(),
+        stop: false,
+    };
+    let mut client = tool_event("client", "client_search");
+    restore_tool_event_name(&mut client, &mut names);
+    restore_web_tool_name(&mut client, &aliases);
+    let mut server = tool_event("server", "web_search");
+    restore_tool_event_name(&mut server, &mut names);
+
+    let mut client_fragment = tool_event("client", "");
+    restore_tool_event_name(&mut client_fragment, &mut names);
+    assert!(!event_is_web_search(&client_fragment, 1));
+    assert!(matches!(client_fragment, KiroEvent::ToolUse { name, .. } if name == "client_search"));
+    let mut server_fragment = tool_event("server", "");
+    restore_tool_event_name(&mut server_fragment, &mut names);
+    assert!(event_is_web_search(&server_fragment, 1));
+}
+
+#[test]
 fn stream_failure_diagnostics_preserve_error_sources_and_metrics() {
     let error = std::io::Error::new(
         std::io::ErrorKind::InvalidData,
