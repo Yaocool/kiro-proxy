@@ -195,6 +195,14 @@ GET  /health
 Claude aliases `/messages` and `/anthropic/v1/messages` are also available.
 OpenAI aliases `/chat/completions` and `/models` are supported as well.
 
+### Tool call arguments
+
+Native upstream tool calls, including MCP calls, share the same JSON validation
+rules in Claude/OpenAI, streaming/non-streaming, and buffered/unbuffered responses.
+Tool names are not used to infer read or write operations. Empty arguments become
+`{}`; valid JSON is accepted even when the upstream omits the tool stop event.
+Non-empty malformed JSON fails explicitly instead of guessing missing arguments.
+
 ### Claude Code MCP Tool Search
 
 Claude Code loads every MCP schema up front when `ANTHROPIC_BASE_URL` points to

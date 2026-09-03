@@ -378,14 +378,23 @@ pub fn inference(
     }
 }
 
-pub fn enhance_system(mut system: String, has_write: bool) -> String {
+/// A legacy prompt hint for exact editor tool names, not a classification of
+/// side effects. In particular, do not inspect or strip MCP namespaces here.
+pub(super) fn needs_chunked_write_hint(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "write" | "edit" | "multiedit" | "notebookedit"
+    )
+}
+
+pub fn enhance_system(mut system: String, chunked_write_hint: bool) -> String {
     let rich = system.to_ascii_lowercase().contains("claude code");
     if !rich {
         system.push_str(
             "\n\nExecute the user's request directly and use provided tools when needed.",
         );
     }
-    if has_write && !system.contains("Write/create/edit tool arguments must stay small") {
+    if chunked_write_hint && !system.contains("Write/create/edit tool arguments must stay small") {
         system.push_str(
             "\n\nWrite/create/edit tool arguments must stay small; split large writes into chunks.",
         );
@@ -396,6 +405,47 @@ pub fn enhance_system(mut system: String, has_write: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn chunked_write_prompt_hint_does_not_classify_mcp_tools() {
+        let options = crate::TranslationOptions::new("model", "AI_EDITOR");
+        for (name, expected_hint) in [
+            ("Write", true),
+            ("EDIT", true),
+            ("MultiEdit", true),
+            ("NotebookEdit", true),
+            ("write_file", false),
+            ("mcp__files__Write", false),
+            ("mcp__files__edit", false),
+            ("mcp__relayer__memory_list_editable_atoms", false),
+        ] {
+            assert_eq!(needs_chunked_write_hint(name), expected_hint, "{name}");
+            let claude: crate::ClaudeRequest = serde_json::from_value(serde_json::json!({
+                "model":"model","max_tokens":256,
+                "messages":[{"role":"user","content":"Use the provided tool."}],
+                "tools":[{"name":name,"description":"Test tool","input_schema":{"type":"object"}}]
+            }))
+            .unwrap();
+            let openai: crate::OpenAiRequest = serde_json::from_value(serde_json::json!({
+                "model":"model",
+                "messages":[{"role":"user","content":"Use the provided tool."}],
+                "tools":[{"type":"function","function":{"name":name,"description":"Test tool","parameters":{"type":"object"}}}]
+            }))
+            .unwrap();
+            for payload in [
+                crate::claude_to_kiro(&claude, &options),
+                crate::openai_to_kiro(&openai, &options),
+            ] {
+                assert_eq!(
+                    serde_json::to_string(&payload)
+                        .unwrap()
+                        .contains("Write/create/edit tool arguments must stay small"),
+                    expected_hint,
+                    "{name}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn request_registry_resolves_normalization_collisions_reversibly() {

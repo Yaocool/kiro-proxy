@@ -8,7 +8,7 @@ use crate::{
 
 use super::common::{
     content_text, context, enhance_system, extract_images, extract_tool_results, inference,
-    kiro_tool, kiro_tool_named, system_text, ToolNameRegistry,
+    kiro_tool, kiro_tool_named, needs_chunked_write_hint, system_text, ToolNameRegistry,
 };
 use super::tool_search::is_tool_search_tool;
 use super::{TranslationOptions, SYSTEM_PROMPT_ACKNOWLEDGEMENT};
@@ -80,8 +80,10 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
         system = join_nonempty(&system, &content_text(&message.content));
     }
     if options.enhance_system_prompt {
-        let has_write = selected_tools.iter().any(|tool| is_write_tool(&tool.name));
-        system = enhance_system(system, has_write);
+        let chunked_write_hint = selected_tools
+            .iter()
+            .any(|tool| needs_chunked_write_hint(&tool.name));
+        system = enhance_system(system, chunked_write_hint);
     }
     if !documentation.is_empty() {
         system = join_nonempty(&system, &documentation.join("\n\n"));
@@ -667,13 +669,6 @@ fn join_nonempty(left: &str, right: &str) -> String {
         (_, true) => left.trim().into(),
         _ => format!("{}\n\n{}", left.trim(), right.trim()),
     }
-}
-
-fn is_write_tool(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "write" | "edit" | "multiedit" | "notebookedit"
-    )
 }
 
 fn random_id() -> String {

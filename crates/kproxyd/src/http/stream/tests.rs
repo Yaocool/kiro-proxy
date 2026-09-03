@@ -656,6 +656,162 @@ fn web_search_stream_separates_pending_and_resumed_protocol_phases() {
 }
 
 #[test]
+fn finalized_mcp_tool_inputs_match_streaming_and_nonstreaming_output() {
+    let name = "mcp__relayer__memory_list_editable_atoms";
+    for protocol in [StreamProtocol::Claude, StreamProtocol::OpenAi] {
+        for buffered in [false, true] {
+            for stop in [false, true] {
+                for input in [
+                    "",
+                    " \n\t",
+                    "{}",
+                    r#" {"raw":"preserve me","items":[1,2],"spaces":"  ","unicode":"空白"} "#,
+                ] {
+                    let mut decoded = DecodedResponse::default();
+                    let mut state =
+                        ClaudeState::new("request".into(), "model".into(), 0, replay_codec());
+                    let identities = std::collections::HashMap::new();
+                    let mut output = Vec::new();
+                    let mut events = vec![KiroEvent::ToolUse {
+                        id: "call".into(),
+                        name: name.into(),
+                        input_delta: String::new(),
+                        stop: false,
+                    }];
+                    // Include whitespace-only fragments both before the JSON
+                    // and inside a string, where they must not be discarded.
+                    for fragment in input.chars().map(|ch| ch.to_string()) {
+                        events.push(KiroEvent::ToolUse {
+                            id: "call".into(),
+                            name: name.into(),
+                            input_delta: fragment,
+                            stop: false,
+                        });
+                    }
+                    if stop {
+                        events.push(KiroEvent::ToolUse {
+                            id: "call".into(),
+                            name: name.into(),
+                            input_delta: String::new(),
+                            stop: true,
+                        });
+                    }
+                    for event in events {
+                        if !buffered {
+                            output.extend(stream_event(
+                                &protocol,
+                                &mut state,
+                                &event,
+                                1,
+                                "model",
+                                ThinkingOutputFormat::Openai,
+                                &identities,
+                            ));
+                        }
+                        decoded.push(event).unwrap();
+                    }
+                    decoded.finalize_tool_inputs().unwrap();
+                    if buffered {
+                        let tool = &decoded.tools["call"];
+                        output.extend(stream_event(
+                            &protocol,
+                            &mut state,
+                            &KiroEvent::ToolUse {
+                                id: tool.id.clone(),
+                                name: tool.name.clone(),
+                                input_delta: tool.input.clone(),
+                                stop: true,
+                            },
+                            1,
+                            "model",
+                            ThinkingOutputFormat::Openai,
+                            &identities,
+                        ));
+                    }
+                    output.extend(stream_finish(
+                        &protocol,
+                        &mut state,
+                        &decoded,
+                        1,
+                        "model",
+                        256,
+                        0,
+                        ThinkingOutputFormat::Openai,
+                        true,
+                    ));
+                    let values = streamed_values(&output);
+                    let (arguments, nonstream_input) = match &protocol {
+                        StreamProtocol::Claude => {
+                            let arguments = values
+                                .iter()
+                                .filter_map(|event| {
+                                    event.pointer("/delta/partial_json").and_then(Value::as_str)
+                                })
+                                .collect::<String>();
+                            let response = decoded.claude_json(
+                                "request",
+                                "model",
+                                256,
+                                0,
+                                None,
+                                &replay_codec(),
+                            );
+                            (arguments, response["content"][0]["input"].clone())
+                        }
+                        StreamProtocol::OpenAi => {
+                            let arguments = values
+                                .iter()
+                                .filter_map(|event| {
+                                    event
+                                        .pointer("/choices/0/delta/tool_calls")
+                                        .and_then(Value::as_array)
+                                })
+                                .flatten()
+                                .filter_map(|tool| {
+                                    tool.pointer("/function/arguments").and_then(Value::as_str)
+                                })
+                                .collect::<String>();
+                            let response = decoded.openai_json(
+                                "request",
+                                "model",
+                                1,
+                                256,
+                                0,
+                                ThinkingOutputFormat::Openai,
+                                &identities,
+                            );
+                            let input = serde_json::from_str(
+                                response["choices"][0]["message"]["tool_calls"][0]["function"]
+                                    ["arguments"]
+                                    .as_str()
+                                    .unwrap(),
+                            )
+                            .unwrap();
+                            (arguments, input)
+                        }
+                    };
+                    let streamed_input: Value = if matches!(protocol, StreamProtocol::Claude)
+                        && arguments.is_empty()
+                    {
+                        // Anthropic initializes the tool block with input: {}.
+                        json!({})
+                    } else {
+                        serde_json::from_str(&arguments).unwrap_or_else(|error| panic!("buffered={buffered}, stop={stop}, input={input:?}, arguments={arguments:?}: {error}"))
+                    };
+                    let expected: Value =
+                        serde_json::from_str(&decoded.tools["call"].input).unwrap();
+                    assert_eq!(
+                        streamed_input, expected,
+                        "buffered={buffered}, stop={stop}, input={input:?}"
+                    );
+                    assert_eq!(nonstream_input, expected);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn openai_tool_chunks_keep_request_id_and_stable_per_tool_indices() {
     let mut state = ClaudeState::new(
         "chatcmpl-request".into(),

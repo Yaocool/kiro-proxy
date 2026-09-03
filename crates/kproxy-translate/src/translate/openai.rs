@@ -7,7 +7,7 @@ use crate::{
 
 use super::common::{
     content_text, context, enhance_system, extract_openai_images, inference, kiro_tool_named,
-    ToolNameRegistry,
+    needs_chunked_write_hint, ToolNameRegistry,
 };
 use super::TranslationOptions;
 
@@ -57,13 +57,10 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
         .collect::<Vec<_>>()
         .join("\n");
     if options.enhance_system_prompt {
-        let has_write = tools.iter().any(|tool| {
-            matches!(
-                tool.tool_specification.name.to_ascii_lowercase().as_str(),
-                "write" | "edit" | "multiedit" | "notebookedit"
-            )
-        });
-        system = enhance_system(system, has_write);
+        let chunked_write_hint = tools
+            .iter()
+            .any(|tool| needs_chunked_write_hint(&tool.tool_specification.name));
+        system = enhance_system(system, chunked_write_hint);
     }
     if !documentation.is_empty() {
         system = join(&system, &documentation.join("\n\n"));

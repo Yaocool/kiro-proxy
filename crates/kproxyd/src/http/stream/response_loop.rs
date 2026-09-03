@@ -360,11 +360,11 @@ pub fn response(
                 }
             }
             // Buffered tool calls have not produced client-visible data yet.
-            // Validate them before committing the pending message/compaction
+            // Finalize them before committing the pending message/compaction
             // prelude so malformed tool JSON can still use the pre-data retry
             // path and cannot publish a failed compaction boundary.
             if failed.is_none() && stop_filter.matched().is_none() {
-                if let Err(error) = decoded.validate_tool_inputs() {
+                if let Err(error) = decoded.finalize_tool_inputs() {
                     failed = Some(error);
                 }
             }

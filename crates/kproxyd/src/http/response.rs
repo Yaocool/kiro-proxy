@@ -667,17 +667,20 @@ impl DecodedResponse {
         Ok(())
     }
 
-    pub fn validate_tool_inputs(&self) -> Result<(), String> {
+    /// Finalize every tool by its JSON input, never by its name or presumed
+    /// side effects. A missing stop event is harmless when the input is valid.
+    /// Do not repair non-empty inputs here: unbuffered streams may already have
+    /// sent those bytes, and guessing missing values can change a tool call.
+    pub fn finalize_tool_inputs(&mut self) -> Result<(), String> {
         for tool in self.tools.values() {
-            let parsed = serde_json::from_str::<Value>(tool.input.trim());
-            if parsed.is_err() && (!tool.complete && is_write_tool(&tool.name)) {
-                return Err(format!(
-                    "upstream ended before write tool {} produced complete JSON input",
-                    tool.name
-                ));
-            }
-            if parsed.is_err() && repair_json(&tool.input).get("raw").is_some() {
+            if !tool.input.trim().is_empty() && serde_json::from_str::<Value>(&tool.input).is_err()
+            {
                 return Err(format!("tool {} produced invalid JSON input", tool.name));
+            }
+        }
+        for tool in self.tools.values_mut() {
+            if tool.input.trim().is_empty() {
+                tool.input = "{}".into();
             }
         }
         Ok(())
@@ -1222,16 +1225,6 @@ fn normalize_partial_json(input: &str) -> String {
         output.push(character);
     }
     output
-}
-
-fn is_write_tool(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    [
-        "write", "create", "delete", "remove", "edit", "patch", "update", "move", "rename",
-        "execute", "command", "shell", "terminal",
-    ]
-    .iter()
-    .any(|marker| name.contains(marker))
 }
 
 fn sanitize_text(text: &str) -> String {
@@ -1793,7 +1786,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_truncated_write_tools_and_cumulative_tool_overflow() {
+    fn rejects_invalid_tool_inputs_and_cumulative_tool_overflow() {
         assert_eq!(repair_json("{\"ok\":true,}"), json!({"ok":true}));
         assert_eq!(
             repair_json("{\"line\":\"one\ntwo\"}"),
@@ -1808,7 +1801,7 @@ mod tests {
                 stop: false,
             })
             .expect("buffer");
-        assert!(truncated.validate_tool_inputs().is_err());
+        assert!(truncated.finalize_tool_inputs().is_err());
 
         let mut oversized = DecodedResponse::default();
         assert!(oversized
@@ -1819,6 +1812,79 @@ mod tests {
                 stop: false,
             })
             .is_err());
+    }
+
+    #[test]
+    fn finalizes_tool_inputs_without_inferring_side_effects() {
+        for name in [
+            "read",
+            "Write",
+            "write_file",
+            "execute_command",
+            "mcp__files__edit",
+            "mcp__relayer__memory_list_editable_atoms",
+        ] {
+            for stop in [false, true] {
+                for input in [
+                    "",
+                    " \n\t",
+                    "{}",
+                    r#" {"raw":"preserve me","items":[1,2]} "#,
+                ] {
+                    let mut decoded = DecodedResponse::default();
+                    decoded
+                        .push(KiroEvent::ToolUse {
+                            id: "call".into(),
+                            name: name.into(),
+                            input_delta: input.into(),
+                            stop,
+                        })
+                        .expect("buffer");
+                    decoded.finalize_tool_inputs().expect("valid tool input");
+                    assert_eq!(
+                        decoded.tools["call"].input,
+                        if input.trim().is_empty() { "{}" } else { input },
+                        "name={name}, stop={stop}, input={input:?}"
+                    );
+                    assert_eq!(decoded.tools["call"].complete, stop);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_tool_inputs_uniformly_instead_of_guessing_missing_json() {
+        for name in [
+            "read",
+            "write_file",
+            "mcp__relayer__memory_list_editable_atoms",
+        ] {
+            for stop in [false, true] {
+                for input in [
+                    r#"{"path":"/tmp/a""#,
+                    r#"{"path":"/tmp/a"#,
+                    r#"{"ok":true,}"#,
+                    "{\"line\":\"one\ntwo\"}",
+                    "not JSON",
+                ] {
+                    let mut decoded = DecodedResponse::default();
+                    decoded
+                        .push(KiroEvent::ToolUse {
+                            id: "call".into(),
+                            name: name.into(),
+                            input_delta: input.into(),
+                            stop,
+                        })
+                        .expect("buffer");
+                    assert_eq!(
+                        decoded.finalize_tool_inputs().unwrap_err(),
+                        format!("tool {name} produced invalid JSON input"),
+                        "stop={stop}, input={input:?}"
+                    );
+                    assert_eq!(decoded.tools["call"].input, input);
+                }
+            }
+        }
     }
 
     #[test]

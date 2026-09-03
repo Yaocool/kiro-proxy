@@ -533,6 +533,8 @@ fn openai_event(
             let identity = tool_identities.get(name);
             let original_name = identity.map_or(name.as_str(), |identity| identity.name.as_str());
             if identity.is_some_and(|identity| identity.kind == "custom") {
+                // Custom input is free-form; never add a JSON function delta.
+                state.tools_with_input.insert(id.clone());
                 let input = if *stop {
                     repair_json(input_delta)
                         .get("input")
@@ -547,9 +549,22 @@ fn openai_event(
                     "custom":{"name":original_name,"input":input}
                 }]})
             } else {
+                let arguments =
+                    if input_delta.trim().is_empty() && !state.tools_with_input.contains(id) {
+                        if *stop {
+                            "{}"
+                        } else {
+                            ""
+                        }
+                    } else {
+                        input_delta.as_str()
+                    };
+                if !arguments.trim().is_empty() {
+                    state.tools_with_input.insert(id.clone());
+                }
                 json!({"tool_calls":[{
                     "index":index,"id":id,"type":"function",
-                    "function":{"name":original_name,"arguments":input_delta}
+                    "function":{"name":original_name,"arguments":arguments}
                 }]})
             }
         }
@@ -575,6 +590,7 @@ struct ClaudeState {
     block: Option<(usize, &'static str)>,
     next_index: usize,
     tool_indices: std::collections::HashMap<String, usize>,
+    tools_with_input: HashSet<String>,
     openai_thinking_open: bool,
     openai_include_usage: bool,
     cache_creation_input_tokens: u64,
@@ -599,6 +615,7 @@ impl ClaudeState {
             block: None,
             next_index: 0,
             tool_indices: std::collections::HashMap::new(),
+            tools_with_input: HashSet::new(),
             openai_thinking_open: false,
             openai_include_usage: false,
             cache_creation_input_tokens: 0,
@@ -703,7 +720,13 @@ impl ClaudeState {
                     self.tool_indices.insert(id.clone(), index);
                     index
                 };
-                if !input_delta.is_empty() {
+                // Until JSON starts, whitespace-only fragments still mean no
+                // arguments. Afterwards preserve every byte, including spaces
+                // inside strings. An empty call keeps its initial input: {}.
+                if !input_delta.trim().is_empty() {
+                    self.tools_with_input.insert(id.clone());
+                }
+                if !input_delta.is_empty() && self.tools_with_input.contains(id) {
                     output.push(sse(&json!({
                         "type":"content_block_delta","index":index,
                         "delta":{"type":"input_json_delta","partial_json":input_delta}
@@ -975,6 +998,31 @@ fn stream_finish(
         }
         StreamProtocol::OpenAi => {
             let mut output = Vec::new();
+            // An unbuffered no-argument call can reach EOF without a stop
+            // event. Complete its JSON before publishing a successful finish.
+            let empty_calls = decoded
+                .tools
+                .values()
+                .filter_map(|tool| {
+                    if tool.input != "{}" || claude.tools_with_input.contains(&tool.id) {
+                        return None;
+                    }
+                    let index = claude.tool_indices.get(&tool.id).copied()?;
+                    claude.tools_with_input.insert(tool.id.clone());
+                    Some(json!({"index":index,"function":{"arguments":"{}"}}))
+                })
+                .collect::<Vec<_>>();
+            if !empty_calls.is_empty() {
+                let mut chunk = json!({
+                    "id":claude.request_id,"object":"chat.completion.chunk",
+                    "created":created,"model":model,
+                    "choices":[{"index":0,"delta":{"tool_calls":empty_calls},"finish_reason":Value::Null}]
+                });
+                if include_usage_chunk {
+                    chunk["usage"] = Value::Null;
+                }
+                output.push(format!("data: {chunk}\n\n"));
+            }
             if thinking_format == ThinkingOutputFormat::Claude && claude.openai_thinking_open {
                 claude.openai_thinking_open = false;
                 let mut chunk = json!({
