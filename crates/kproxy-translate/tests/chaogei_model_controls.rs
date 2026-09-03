@@ -2,6 +2,9 @@
 //! buildThinkingFields, extractThinkingSchema, and inferenceConfig builder at
 //! chaogei/Kiro-account-manager commit 447adcdb468157312621b1f09448278bd9bca748.
 //! Only those inspected pure helpers ran; no upstream requests were made.
+//! The two missing-metadata cases intentionally diverge: live Kiro Haiku 4.5
+//! rejects the entire additionalModelRequestFields field, even an empty object.
+//! Keep the original fixture intact to document rather than hide that difference.
 
 use kproxy_translate::{
     claude_to_kiro, openai_to_kiro, validate_claude, validate_openai, ClaudeRequest, OpenAiRequest,
@@ -26,7 +29,7 @@ fn canonical(value: &Value) -> Value {
 }
 
 #[test]
-fn outbound_model_controls_match_pinned_chaogei_reference() {
+fn outbound_model_controls_match_reference_except_unsupported_metadata_fallback() {
     let fixture: Value = serde_json::from_str(include_str!("fixtures/chaogei_model_controls.json"))
         .expect("reference fixture");
     assert_eq!(
@@ -59,11 +62,28 @@ fn outbound_model_controls_match_pinned_chaogei_reference() {
             canonical(&case["expectedInference"]),
             "{name}: inferenceConfig"
         );
+        let expected_additional = match name {
+            "missing_metadata_omits_display" | "openai_effort_without_metadata" => {
+                assert!(case["schema"].is_null());
+                assert_eq!(
+                    case["expectedAdditional"],
+                    json!({"thinking":{"type":"adaptive"}})
+                );
+                Value::Null
+            }
+            _ => case["expectedAdditional"].clone(),
+        };
         assert_eq!(
             canonical(&wire["additionalModelRequestFields"]),
-            canonical(&case["expectedAdditional"]),
+            canonical(&expected_additional),
             "{name}: additionalModelRequestFields"
         );
+        if expected_additional.is_null() {
+            assert!(
+                wire.get("additionalModelRequestFields").is_none(),
+                "{name}: field must be absent, not null or empty"
+            );
+        }
         assert!(
             wire.get("modelRequestIntent").is_none(),
             "{name}: local intent leaked"

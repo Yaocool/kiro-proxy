@@ -18,6 +18,9 @@ static HTTP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(()
 #[path = "end_to_end/responses.rs"]
 mod responses;
 
+#[path = "end_to_end/thinking_controls.rs"]
+mod thinking_controls;
+
 struct Daemon {
     child: Child,
     socket: PathBuf,
@@ -426,6 +429,9 @@ async fn mount_context_alignment_models(mock: &MockServer) {
             "models":[
                 {
                     "modelId":"source-large",
+                    "additionalModelRequestFieldsSchema":{"properties":{"output_config":{"properties":{
+                        "effort":{"enum":["low","medium","high"]}
+                    }}}},
                     "tokenLimits":{"maxInputTokens":1000000,"maxOutputTokens":16384}
                 },
                 {
