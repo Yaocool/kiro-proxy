@@ -266,6 +266,7 @@ pub fn web_search_continue_payload_batch(
             } else {
                 tail_chars(assistant_content, 48_000)
             },
+            cache_point: None,
             tool_uses: searches
                 .iter()
                 .map(|(tool_use, _)| tool_use.clone())
@@ -290,6 +291,9 @@ pub fn web_search_continue_payload_batch(
             .into()
     };
     current.images.clear();
+    current.documents.clear();
+    current.cache_point = None;
+    current.client_cache_config = None;
     current.user_input_message_context = Some(KiroMessageContext {
         tool_results,
         tools,
@@ -389,12 +393,17 @@ fn tail_chars(value: &str, maximum: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{KiroConversationState, KiroCurrentMessage, KiroUserInputMessage};
+    use crate::{
+        KiroConversationState, KiroCurrentMessage, KiroDocument, KiroDocumentSource,
+        KiroUserInputMessage,
+    };
 
     #[test]
     fn continuation_pairs_real_results_and_escapes_untrusted_markup() {
         let payload = KiroPayload {
             conversation_state: KiroConversationState {
+                agent_continuation_id: None,
+                agent_task_type: None,
                 chat_trigger_type: "MANUAL".into(),
                 conversation_id: "conversation".into(),
                 current_message: KiroCurrentMessage {
@@ -403,6 +412,16 @@ mod tests {
                         model_id: "model".into(),
                         origin: "CLI".into(),
                         images: vec![],
+                        documents: vec![KiroDocument {
+                            format: "pdf".into(),
+                            name: "news.pdf".into(),
+                            source: KiroDocumentSource {
+                                bytes: "aGVsbG8=".into(),
+                            },
+                            citations: None,
+                        }],
+                        cache_point: None,
+                        client_cache_config: None,
                         user_input_message_context: None,
                     },
                 },
@@ -410,6 +429,8 @@ mod tests {
             },
             profile_arn: None,
             inference_config: None,
+            additional_model_request_fields: None,
+            model_request_intent: None,
             protected_history_messages: 0,
         };
         let use_ = KiroToolUse {
@@ -432,6 +453,21 @@ mod tests {
             },
         );
         let next = web_search_continue_payload(&payload, "searching", use_, &trace);
+        assert_eq!(
+            next.conversation_state.history[0]
+                .user_input_message
+                .as_ref()
+                .expect("history user")
+                .documents
+                .len(),
+            1
+        );
+        assert!(next
+            .conversation_state
+            .current_message
+            .user_input_message
+            .documents
+            .is_empty());
         let context = next
             .conversation_state
             .current_message
@@ -490,6 +526,9 @@ mod tests {
                     model_id: "model".into(),
                     origin: "CLI".into(),
                     images: vec![],
+                    documents: vec![],
+                    cache_point: None,
+                    client_cache_config: None,
                     user_input_message_context: None,
                 }),
                 assistant_response_message: None,
@@ -498,6 +537,7 @@ mod tests {
                 user_input_message: None,
                 assistant_response_message: Some(KiroAssistantMessage {
                     content: super::super::SYSTEM_PROMPT_ACKNOWLEDGEMENT.into(),
+                    cache_point: None,
                     tool_uses: vec![],
                 }),
             },
@@ -509,6 +549,9 @@ mod tests {
                     model_id: "model".into(),
                     origin: "CLI".into(),
                     images: vec![],
+                    documents: vec![],
+                    cache_point: None,
+                    client_cache_config: None,
                     user_input_message_context: None,
                 }),
                 assistant_response_message: None,
@@ -517,12 +560,15 @@ mod tests {
                 user_input_message: None,
                 assistant_response_message: Some(KiroAssistantMessage {
                     content: format!("assistant {index}"),
+                    cache_point: None,
                     tool_uses: vec![],
                 }),
             });
         }
         let payload = KiroPayload {
             conversation_state: KiroConversationState {
+                agent_continuation_id: None,
+                agent_task_type: None,
                 chat_trigger_type: "MANUAL".into(),
                 conversation_id: "conversation".into(),
                 current_message: KiroCurrentMessage {
@@ -531,6 +577,9 @@ mod tests {
                         model_id: "model".into(),
                         origin: "CLI".into(),
                         images: vec![],
+                        documents: vec![],
+                        cache_point: None,
+                        client_cache_config: None,
                         user_input_message_context: None,
                     },
                 },
@@ -538,6 +587,8 @@ mod tests {
             },
             profile_arn: None,
             inference_config: None,
+            additional_model_request_fields: None,
+            model_request_intent: None,
             protected_history_messages: 2,
         };
         let use_ = KiroToolUse {

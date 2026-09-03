@@ -3,12 +3,15 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{
     matches_type_family, ClaudeRequest, KiroAssistantMessage, KiroConversationState,
-    KiroCurrentMessage, KiroHistoryMessage, KiroPayload, KiroToolUse, KiroUserInputMessage,
+    KiroCurrentMessage, KiroHistoryMessage, KiroPayload, KiroTool, KiroToolUse,
+    KiroUserInputMessage,
 };
 
 use super::common::{
-    content_text, context, enhance_system, extract_images, extract_tool_results, inference,
-    kiro_tool, kiro_tool_named, needs_chunked_write_hint, system_text, ToolNameRegistry,
+    content_cache_point, content_text, context, document_context_text, enhance_system,
+    extract_documents, extract_images, extract_tool_results, inference, kiro_cache_point,
+    kiro_tool, kiro_tool_named, merged_cache_point, needs_chunked_write_hint, system_text,
+    ToolNameRegistry,
 };
 use super::tool_search::is_tool_search_tool;
 use super::{TranslationOptions, SYSTEM_PROMPT_ACKNOWLEDGEMENT};
@@ -21,7 +24,11 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
     let mut documentation = Vec::new();
     let tools = selected_tools
         .iter()
-        .map(|tool| {
+        .flat_map(|tool| {
+            let searched = super::tool_search::tool_search_kiro_tool_named(
+                tool,
+                &tool_names.kiro_name(&tool.name),
+            );
             let (name, description, schema) = match tool.r#type.as_deref() {
                     Some(kind) if matches_type_family(kind, "web_search") => (
                         "web_search",
@@ -41,21 +48,15 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
                             "required":["url"]
                         }),
                     ),
-                    _ => {
-                        if let Some(tool) = super::tool_search::tool_search_kiro_tool_named(
-                            tool,
-                            &tool_names.kiro_name(&tool.name),
-                        ) {
-                            return tool;
-                        }
-                        (
+                    _ => (
                             tool.name.as_str(),
                             tool_description(tool),
                             tool.input_schema.clone(),
-                        )
-                    }
+                        ),
                 };
-            let (tool, docs) = if tool.r#type.as_deref().is_some_and(|kind| {
+            let (translated, docs) = if let Some(searched) = searched {
+                (searched, None)
+            } else if tool.r#type.as_deref().is_some_and(|kind| {
                 matches_type_family(kind, "web_search") || matches_type_family(kind, "web_fetch")
             }) {
                 kiro_tool(name, &description, &schema)
@@ -68,16 +69,35 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
                 )
             };
             documentation.extend(docs);
-            tool
+            let mut translated = vec![translated];
+            if options.enable_prompt_cache {
+                if let Some(cache_point) = kiro_cache_point(tool.cache_control.as_ref()) {
+                    translated.push(KiroTool::CachePoint { cache_point });
+                }
+            }
+            translated
         })
         .collect::<Vec<_>>();
     let mut system = system_text(request.system.as_ref());
+    let mut system_cache_point = options
+        .enable_prompt_cache
+        .then(|| request.system.as_ref().and_then(content_cache_point))
+        .flatten();
     for message in request
         .messages
         .iter()
         .filter(|message| message.role == "system")
     {
         system = join_nonempty(&system, &content_text(&message.content));
+        if options.enable_prompt_cache {
+            system_cache_point = merged_cache_point(
+                system_cache_point,
+                merged_cache_point(
+                    kiro_cache_point(message.cache_control.as_ref()),
+                    content_cache_point(&message.content),
+                ),
+            );
+        }
     }
     if options.enhance_system_prompt {
         let chunked_write_hint = selected_tools
@@ -101,17 +121,19 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
         &tool_choice_directive(request, &tools, &tool_names),
     );
 
-    let non_system = request
-        .messages
-        .iter()
-        .filter(|message| message.role != "system")
-        .collect::<Vec<_>>();
+    // Anthropic combines adjacent messages with the same role into one turn.
+    // Normalize that contract before projecting onto Kiro's strict alternating
+    // history instead of inventing model-authored filler turns.
+    let non_system = normalized_non_system_messages(&request.messages);
     let mut history = Vec::new();
     let mut current = KiroUserInputMessage {
         content: "Continue".into(),
         model_id: options.model_id.clone(),
         origin: options.origin.clone(),
         images: Vec::new(),
+        documents: Vec::new(),
+        cache_point: None,
+        client_cache_config: None,
         user_input_message_context: None,
     };
 
@@ -119,15 +141,25 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
         let last = index + 1 == non_system.len();
         match message.role.as_str() {
             "user" => {
-                let text = content_text(&message.content);
+                let text = join_nonempty(
+                    &content_text(&message.content),
+                    &document_context_text(&message.content),
+                );
                 let images = extract_images(&message.content);
+                let documents = extract_documents(&message.content);
                 let results = extract_tool_results(&message.content);
+                let cache_point = message_cache_point(message, options.enable_prompt_cache);
                 if last {
                     current.content = nonempty(text, !results.is_empty());
                     current.images = images;
+                    current.documents = documents;
+                    current.cache_point = cache_point;
                     current.user_input_message_context = context(tools.clone(), results);
                 } else {
-                    push_user(&mut history, user_message(text, images, results, options));
+                    push_user(
+                        &mut history,
+                        user_message(text, images, documents, results, cache_point, options),
+                    );
                 }
             }
             "assistant" => {
@@ -146,6 +178,7 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
                         } else {
                             text
                         },
+                        cache_point: message_cache_point(message, options.enable_prompt_cache),
                         tool_uses: uses,
                     },
                 );
@@ -157,27 +190,70 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
     if current.user_input_message_context.is_none() {
         current.user_input_message_context = context(tools.clone(), Vec::new());
     }
+    if options.enable_prompt_cache {
+        current.cache_point = merged_cache_point(
+            current.cache_point,
+            kiro_cache_point(request.cache_control.as_ref()),
+        );
+    }
     sanitize_history(&mut history, options);
-    let protected_history_messages = inject_system(&mut history, &system, options);
+    let protected_history_messages =
+        inject_system(&mut history, &system, system_cache_point, options);
 
-    KiroPayload {
+    let inference_config = inference(
+        Some(request.max_tokens),
+        !tools.is_empty(),
+        request.temperature,
+        request.top_p,
+    );
+    if request.top_k.is_some() {
+        tracing::debug!(
+            field = "top_k",
+            "omitting client sampling field outside the Kiro gateway compatibility contract"
+        );
+    }
+    if request
+        .output_config
+        .as_ref()
+        .and_then(|config| config.effort.as_ref())
+        .is_some()
+    {
+        tracing::debug!(
+            field = "output_config.effort",
+            "ignoring Claude effort to match the reference Kiro adapter"
+        );
+    }
+    // stop_sequences is enforced by the proxy's streaming/non-streaming
+    // response filter, not an unverified Kiro inferenceConfig extension.
+    let mut payload = KiroPayload {
         conversation_state: KiroConversationState {
+            agent_continuation_id: Some(random_id()),
+            agent_task_type: Some("vibe".into()),
             chat_trigger_type: "MANUAL".into(),
-            conversation_id: random_id(),
+            conversation_id: options.conversation_id.clone().unwrap_or_else(random_id),
             current_message: KiroCurrentMessage {
                 user_input_message: current,
             },
             history,
         },
         profile_arn: options.profile_arn.clone(),
-        inference_config: Some(inference(
-            Some(request.max_tokens),
-            !tools.is_empty(),
-            request.temperature,
-            request.top_p,
-        )),
+        inference_config,
+        additional_model_request_fields: None,
+        model_request_intent: Some(crate::ModelRequestIntent {
+            requested_model: request.model.clone(),
+            thinking: request.thinking.clone(),
+            // The reference Claude adapter does not consume output_config;
+            // only the OpenAI adapter supplies an explicit reasoning effort.
+            effort: None,
+        }),
         protected_history_messages,
-    }
+    };
+    crate::model::apply_adaptive_thinking(
+        &mut payload,
+        options.additional_model_request_fields_schema.as_ref(),
+        true,
+    );
+    payload
 }
 
 pub fn claude_tool_name_map(request: &ClaudeRequest) -> std::collections::HashMap<String, String> {
@@ -283,11 +359,10 @@ fn assistant_parts(
     tool_names: &ToolNameRegistry,
     official_web_tools: OfficialWebTools,
 ) -> (String, Vec<KiroToolUse>) {
-    // Claude Code returns prior thinking blocks verbatim on later turns. Kiro
-    // has no compatible signed-thinking history type, so flattening those
-    // blocks into assistant text leaks hidden reasoning and can make a later
-    // `thinking.type = "disabled"` turn imitate it. Preserve only visible
-    // assistant text and proxy compaction checkpoints.
+    // Claude Code returns signed thinking blocks verbatim on later turns.
+    // Kiro accepts reasoningContent in responses, not request history. Omit
+    // these blocks without exposing them as visible text; current-generation
+    // thinking remains controlled by additionalModelRequestFields.
     let mut text = match content {
         Value::String(text) => text.clone(),
         Value::Array(blocks) => blocks
@@ -385,6 +460,52 @@ fn assistant_parts(
         })
         .collect();
     (text, uses)
+}
+
+fn message_cache_point(
+    message: &crate::ClaudeMessage,
+    enabled: bool,
+) -> Option<crate::KiroCachePoint> {
+    enabled
+        .then(|| {
+            merged_cache_point(
+                kiro_cache_point(message.cache_control.as_ref()),
+                content_cache_point(&message.content),
+            )
+        })
+        .flatten()
+}
+
+fn normalized_non_system_messages(messages: &[crate::ClaudeMessage]) -> Vec<crate::ClaudeMessage> {
+    let mut normalized: Vec<crate::ClaudeMessage> = Vec::new();
+    for message in messages.iter().filter(|message| message.role != "system") {
+        if let Some(previous) = normalized
+            .last_mut()
+            .filter(|previous| previous.role == message.role)
+        {
+            merge_claude_content(&mut previous.content, &message.content);
+            if message.cache_control.is_some() {
+                previous.cache_control.clone_from(&message.cache_control);
+            }
+            continue;
+        }
+        normalized.push(message.clone());
+    }
+    normalized
+}
+
+fn merge_claude_content(current: &mut Value, addition: &Value) {
+    let mut blocks = content_as_blocks(std::mem::take(current));
+    blocks.extend(content_as_blocks(addition.clone()));
+    *current = Value::Array(blocks);
+}
+
+fn content_as_blocks(content: Value) -> Vec<Value> {
+    match content {
+        Value::String(text) => vec![serde_json::json!({"type":"text","text":text})],
+        Value::Array(blocks) => blocks,
+        other => vec![other],
+    }
 }
 
 fn escape_history_markup(value: &str) -> String {
@@ -526,7 +647,9 @@ fn normalize_history_tool_name(
 fn user_message(
     text: String,
     images: Vec<crate::KiroImage>,
+    documents: Vec<crate::KiroDocument>,
     results: Vec<crate::KiroToolResult>,
+    cache_point: Option<crate::KiroCachePoint>,
     options: &TranslationOptions,
 ) -> KiroUserInputMessage {
     KiroUserInputMessage {
@@ -534,23 +657,14 @@ fn user_message(
         model_id: options.model_id.clone(),
         origin: options.origin.clone(),
         images,
+        documents,
+        cache_point,
+        client_cache_config: None,
         user_input_message_context: context(Vec::new(), results),
     }
 }
 
 fn push_user(history: &mut Vec<KiroHistoryMessage>, message: KiroUserInputMessage) {
-    if history
-        .last()
-        .is_some_and(|item| item.user_input_message.is_some())
-    {
-        push_assistant(
-            history,
-            KiroAssistantMessage {
-                content: "Continue.".into(),
-                tool_uses: Vec::new(),
-            },
-        );
-    }
     history.push(KiroHistoryMessage {
         user_input_message: Some(message),
         assistant_response_message: None,
@@ -576,6 +690,8 @@ fn sanitize_history(history: &mut Vec<KiroHistoryMessage>, options: &Translation
                     "Begin conversation".into(),
                     vec![],
                     vec![],
+                    vec![],
+                    None,
                     options,
                 )),
                 assistant_response_message: None,
@@ -587,6 +703,7 @@ fn sanitize_history(history: &mut Vec<KiroHistoryMessage>, options: &Translation
 fn inject_system(
     history: &mut Vec<KiroHistoryMessage>,
     system: &str,
+    cache_point: Option<crate::KiroCachePoint>,
     options: &TranslationOptions,
 ) -> usize {
     if system.trim().is_empty() {
@@ -606,6 +723,8 @@ fn inject_system(
                     system.trim().to_owned(),
                     Vec::new(),
                     Vec::new(),
+                    Vec::new(),
+                    cache_point,
                     options,
                 )),
                 assistant_response_message: None,
@@ -614,6 +733,7 @@ fn inject_system(
                 user_input_message: None,
                 assistant_response_message: Some(KiroAssistantMessage {
                     content: SYSTEM_PROMPT_ACKNOWLEDGEMENT.into(),
+                    cache_point: None,
                     tool_uses: Vec::new(),
                 }),
             },
@@ -672,20 +792,62 @@ fn join_nonempty(left: &str, right: &str) -> String {
 }
 
 fn random_id() -> String {
-    use std::fmt::Write as _;
-
-    use rand::RngCore;
-    let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    bytes.iter().fold(String::new(), |mut output, byte| {
-        let _ = write!(output, "{byte:02x}");
-        output
-    })
+    uuid::Uuid::new_v4().to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+
+    #[test]
+    fn adjacent_same_role_messages_are_merged_without_fabricated_turns() {
+        let request: ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-sonnet-4",
+            "max_tokens":256,
+            "messages":[
+                {"role":"user","content":"first"},
+                {"role":"user","content":[{"type":"text","text":"second"}]},
+                {"role":"assistant","content":"answer one"},
+                {"role":"assistant","content":"answer two"},
+                {"role":"user","content":"current"}
+            ]
+        }))
+        .expect("request");
+
+        let mut options = TranslationOptions::new("dynamic-sonnet", "AI_EDITOR");
+        options.enhance_system_prompt = false;
+        let payload = claude_to_kiro(&request, &options);
+        let history = &payload.conversation_state.history;
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history[0]
+                .user_input_message
+                .as_ref()
+                .expect("merged user turn")
+                .content,
+            "first\nsecond"
+        );
+        assert_eq!(
+            history[1]
+                .assistant_response_message
+                .as_ref()
+                .expect("merged assistant turn")
+                .content,
+            "answer one\nanswer two"
+        );
+        assert_eq!(
+            payload
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "current"
+        );
+        assert!(!serde_json::to_string(history)
+            .expect("history JSON")
+            .contains("Continue."));
+    }
 
     #[test]
     fn versioned_server_web_search_uses_kiro_canonical_contract() {
@@ -711,9 +873,12 @@ mod tests {
             .user_input_message
             .user_input_message_context
             .expect("context");
-        assert_eq!(context.tools[0].tool_specification.name, "web_search");
+        let web_search = context.tools[0]
+            .specification()
+            .expect("tool specification");
+        assert_eq!(web_search.name, "web_search");
         assert_eq!(
-            context.tools[0].tool_specification.input_schema.json["required"],
+            web_search.input_schema.json["required"],
             serde_json::json!(["query"])
         );
         let history_tool = &payload.conversation_state.history[3]
@@ -885,7 +1050,7 @@ mod tests {
         assert!(context
             .tools
             .iter()
-            .any(|tool| tool.tool_specification.name == mapped));
+            .any(|tool| tool.specification().is_some_and(|tool| tool.name == mapped)));
         let history_name = &payload.conversation_state.history[3]
             .assistant_response_message
             .as_ref()
@@ -1027,6 +1192,43 @@ mod tests {
             .expect("assistant history");
         assert_eq!(assistant.content, "visible prior answer");
         assert!(!assistant.content.contains("private prior reasoning"));
+        let wire = serde_json::to_string(&payload).expect("wire payload");
+        assert!(!wire.contains("reasoningContent"));
+        assert!(!wire.contains("private prior reasoning"));
+        assert!(!wire.contains("placeholder"));
+    }
+
+    #[test]
+    fn mixed_reasoning_history_is_not_serialized_as_an_invalid_union() {
+        let request: ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-sonnet-4.6",
+            "max_tokens":4096,
+            "messages":[
+                {"role":"user","content":"first turn"},
+                {"role":"assistant","content":[
+                    {"type":"thinking","thinking":"visible reasoning","signature":"sig"},
+                    {"type":"redacted_thinking","data":"opaque"},
+                    {"type":"text","text":"visible answer"}
+                ]},
+                {"role":"user","content":"continue"}
+            ]
+        }))
+        .expect("request");
+        let payload = claude_to_kiro(
+            &request,
+            &TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR"),
+        );
+        let assistant = payload
+            .conversation_state
+            .history
+            .iter()
+            .skip(payload.protected_history_len())
+            .find_map(|message| message.assistant_response_message.as_ref())
+            .expect("assistant history");
+        assert_eq!(assistant.content, "visible answer");
+        let wire = serde_json::to_string(assistant).expect("wire history");
+        assert!(!wire.contains("reasoningContent"));
+        assert!(!wire.contains("opaque"));
     }
 
     #[test]
@@ -1077,7 +1279,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_result_images_are_forwarded_with_a_textual_pairing_marker() {
+    fn tool_result_media_are_forwarded_with_a_textual_pairing_marker() {
         let request: ClaudeRequest = serde_json::from_value(serde_json::json!({
             "model":"claude-sonnet-4",
             "max_tokens":256,
@@ -1089,6 +1291,10 @@ mod tests {
                     "type":"tool_result","tool_use_id":"tool_1","content":[{
                         "type":"image","source":{
                             "type":"base64","media_type":"image/png","data":"aGVsbG8="
+                        }
+                    },{
+                        "type":"document","title":"result.pdf","source":{
+                            "type":"base64","media_type":"application/pdf","data":"aGVsbG8="
                         }
                     }]
                 }]}
@@ -1104,11 +1310,138 @@ mod tests {
             .current_message
             .user_input_message;
         assert_eq!(current.images.len(), 1);
+        assert_eq!(current.documents.len(), 1);
         let result = &current
             .user_input_message_context
             .expect("context")
             .tool_results[0];
-        assert_eq!(result.content[0].text, "(image result attached)");
+        assert_eq!(
+            result.content[0].text,
+            "(image and document results attached)"
+        );
+    }
+
+    #[test]
+    fn documents_are_forwarded_in_history_and_current_messages() {
+        let request: ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-sonnet-5",
+            "max_tokens":256,
+            "messages":[
+                {"role":"user","content":[{
+                    "type":"document","source":{
+                        "type":"base64","media_type":"application/pdf","data":"aGVsbG8="
+                    },
+                    "context":"Requirements approved by the architecture group.",
+                    "citations":{"enabled":false}
+                }]},
+                {"role":"assistant","content":"I read the PDF."},
+                {"role":"user","content":[{
+                    "type":"document","title":"notes.md","source":{
+                        "type":"text","media_type":"text/markdown; charset=utf-8","data":"# Notes"
+                    }
+                },{"type":"text","text":"Summarize both documents."}]}
+            ]
+        }))
+        .expect("request");
+        let payload = claude_to_kiro(
+            &request,
+            &TranslationOptions::new("claude-sonnet-5", "AI_EDITOR"),
+        );
+
+        let historical = payload
+            .conversation_state
+            .history
+            .iter()
+            .filter_map(|message| message.user_input_message.as_ref())
+            .find(|message| !message.documents.is_empty())
+            .expect("historical document message");
+        assert_eq!(historical.documents.len(), 1);
+        assert_eq!(historical.documents[0].format, "pdf");
+        assert_eq!(historical.documents[0].name, "document");
+        assert_eq!(historical.documents[0].source.bytes, "aGVsbG8=");
+        assert!(serde_json::to_value(&historical.documents[0])
+            .expect("document JSON")
+            .get("context")
+            .is_none());
+        assert_eq!(
+            historical.documents[0]
+                .citations
+                .as_ref()
+                .map(|citations| citations.enabled),
+            Some(false)
+        );
+        assert!(historical
+            .content
+            .contains("Requirements approved by the architecture group."));
+
+        let current = &payload
+            .conversation_state
+            .current_message
+            .user_input_message;
+        assert_eq!(current.content, "Summarize both documents.");
+        assert_eq!(current.documents.len(), 1);
+        assert_eq!(current.documents[0].format, "md");
+        assert_eq!(current.documents[0].name, "notes");
+        assert_eq!(current.documents[0].source.bytes, "IyBOb3Rlcw==");
+
+        let wire = serde_json::to_value(payload).expect("serialized payload");
+        assert_eq!(
+            wire.pointer(
+                "/conversationState/currentMessage/userInputMessage/documents/0/source/bytes"
+            ),
+            Some(&serde_json::json!("IyBOb3Rlcw=="))
+        );
+    }
+
+    #[test]
+    fn custom_content_documents_preserve_text_order_and_hoist_images() {
+        let request: ClaudeRequest = serde_json::from_value(serde_json::json!({
+            "model":"claude-sonnet-5",
+            "max_tokens":256,
+            "messages":[{"role":"user","content":[{
+                "type":"image","source":{
+                    "type":"base64","media_type":"image/png","data":"iVBORw0KGgpyZXN0"
+                }
+            },{
+                "type":"document",
+                "title":"interleaved source",
+                "source":{"type":"content","content":[
+                    {"type":"text","text":"First chunk"},
+                    {"type":"image","source":{
+                        "type":"base64","media_type":"image/png","data":"iVBORw0KGgpyZXN0"
+                    }},
+                    {"type":"text","text":"Second chunk"}
+                ]},
+                "citations":{"enabled":true}
+            },{"type":"text","text":"Summarize it."}]}]
+        }))
+        .expect("request");
+        let payload = claude_to_kiro(
+            &request,
+            &TranslationOptions::new("claude-sonnet-5", "AI_EDITOR"),
+        );
+        let current = payload
+            .conversation_state
+            .current_message
+            .user_input_message;
+        assert_eq!(current.images.len(), 2);
+        assert_eq!(current.documents.len(), 1);
+        assert_eq!(current.documents[0].format, "txt");
+        assert_eq!(current.documents[0].name, "interleaved source");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&current.documents[0].source.bytes)
+            .expect("base64 document");
+        assert_eq!(
+            String::from_utf8(decoded).expect("UTF-8 document"),
+            "First chunk\n\n[Message image 2]\n\nSecond chunk"
+        );
+        assert_eq!(
+            current.documents[0]
+                .citations
+                .as_ref()
+                .map(|citations| citations.enabled),
+            Some(true)
+        );
     }
 
     #[test]
@@ -1134,12 +1467,12 @@ mod tests {
             .expect("context")
             .tools;
         assert_eq!(tools.len(), 2);
-        assert!(tools
-            .iter()
-            .any(|tool| { tool.tool_specification.name == "tool_search_tool_regex" }));
-        assert!(!tools
-            .iter()
-            .any(|tool| { tool.tool_specification.name == "mcp__github__list_issues" }));
+        assert!(tools.iter().any(|tool| tool
+            .specification()
+            .is_some_and(|tool| tool.name == "tool_search_tool_regex")));
+        assert!(!tools.iter().any(|tool| tool
+            .specification()
+            .is_some_and(|tool| tool.name == "mcp__github__list_issues")));
 
         request.messages.insert(
             0,
@@ -1155,6 +1488,8 @@ mod tests {
                         }]
                     }
                 }]),
+                cache_control: None,
+                extra: serde_json::Map::new(),
             },
         );
         let payload = claude_to_kiro(&request, &options);
@@ -1166,8 +1501,8 @@ mod tests {
             .expect("context")
             .tools;
         assert_eq!(tools.len(), 3);
-        assert!(tools
-            .iter()
-            .any(|tool| { tool.tool_specification.name == "mcp__github__list_issues" }));
+        assert!(tools.iter().any(|tool| tool
+            .specification()
+            .is_some_and(|tool| tool.name == "mcp__github__list_issues")));
     }
 }

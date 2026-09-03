@@ -2,7 +2,7 @@
 
 mod auto_continue;
 mod claude;
-mod common;
+pub(crate) mod common;
 mod openai;
 mod tool_search;
 mod web_search;
@@ -14,7 +14,7 @@ pub use auto_continue::{
 pub use claude::{
     claude_loaded_tools, claude_pending_server_tool_uses, claude_to_kiro, claude_tool_name_map,
 };
-pub use common::{tool_name, ToolNameRegistry, SIGNATURE_PLACEHOLDER};
+pub use common::{tool_name, ToolNameRegistry};
 pub use openai::openai_to_kiro;
 pub use tool_search::{
     is_tool_search_tool, is_tool_search_type, tool_search_kiro_tool, ClaudeToolSearchBudget,
@@ -41,6 +41,13 @@ pub struct TranslationOptions {
     /// represented by a protected history pair, independent of compaction.
     pub compact_mode: bool,
     pub web_search_replay: Option<WebSearchReplayCodec>,
+    /// Stable, caller-namespaced upstream conversation identifier.
+    pub conversation_id: Option<String>,
+    /// Emit native Kiro cachePoint blocks for validated Claude cache controls.
+    pub enable_prompt_cache: bool,
+    /// Model metadata used to select output_config/reasoning and valid effort
+    /// levels. This is not a generic pass-through allowlist for client fields.
+    pub additional_model_request_fields_schema: Option<serde_json::Value>,
 }
 
 impl TranslationOptions {
@@ -52,6 +59,9 @@ impl TranslationOptions {
             enhance_system_prompt: true,
             compact_mode: false,
             web_search_replay: None,
+            conversation_id: None,
+            enable_prompt_cache: false,
+            additional_model_request_fields_schema: None,
         }
     }
 }

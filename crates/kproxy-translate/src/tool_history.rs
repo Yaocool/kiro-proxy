@@ -161,7 +161,7 @@ pub fn validate_kiro_tool_history(payload: &KiroPayload) -> Result<(), String> {
             context
                 .tools
                 .iter()
-                .map(|tool| tool.tool_specification.name.as_str())
+                .filter_map(|tool| tool.specification().map(|tool| tool.name.as_str()))
                 .collect::<HashSet<_>>()
         })
         .unwrap_or_default();
@@ -171,7 +171,14 @@ pub fn validate_kiro_tool_history(payload: &KiroPayload) -> Result<(), String> {
     if current
         .user_input_message_context
         .as_ref()
-        .is_some_and(|context| context.tools.len() != active_names.len())
+        .is_some_and(|context| {
+            context
+                .tools
+                .iter()
+                .filter(|tool| tool.specification().is_some())
+                .count()
+                != active_names.len()
+        })
     {
         return Err("current tool definitions contain duplicate names".into());
     }
@@ -255,13 +262,16 @@ fn sanitize_current_tool_definitions(
     let mut names = HashSet::new();
     if let Some(context) = context {
         context.tools.retain_mut(|tool| {
-            let name = tool.tool_specification.name.trim();
+            let Some(specification) = tool.specification_mut() else {
+                return true;
+            };
+            let name = specification.name.trim();
             let keep = !name.is_empty() && names.insert(name.to_owned());
             if !keep {
                 stats.removed_duplicate_tool_definitions =
                     stats.removed_duplicate_tool_definitions.saturating_add(1);
-            } else if name != tool.tool_specification.name {
-                tool.tool_specification.name = name.to_owned();
+            } else if name != specification.name {
+                specification.name = name.to_owned();
             }
             keep
         });
@@ -426,6 +436,9 @@ fn normalize_roles(
         model_id: String::new(),
         origin: String::new(),
         images: Vec::new(),
+        documents: Vec::new(),
+        cache_point: None,
+        client_cache_config: None,
         user_input_message_context: None,
     });
     let mut output = Vec::with_capacity(messages.len().saturating_add(2));
@@ -621,6 +634,9 @@ fn synthetic_user(
         model_id: template.model_id.clone(),
         origin: template.origin.clone(),
         images: Vec::new(),
+        documents: Vec::new(),
+        cache_point: None,
+        client_cache_config: None,
         user_input_message_context: (!results.is_empty()).then_some(KiroMessageContext {
             tool_results: results,
             tools: Vec::new(),
@@ -631,6 +647,7 @@ fn synthetic_user(
 fn synthetic_assistant() -> KiroAssistantMessage {
     KiroAssistantMessage {
         content: "Continue.".into(),
+        cache_point: None,
         tool_uses: Vec::new(),
     }
 }
@@ -682,6 +699,9 @@ mod tests {
             model_id: "model".into(),
             origin: "AI_EDITOR".into(),
             images: Vec::new(),
+            documents: Vec::new(),
+            cache_point: None,
+            client_cache_config: None,
             user_input_message_context: (!results.is_empty() || !tools.is_empty()).then_some(
                 KiroMessageContext {
                     tool_results: results,
@@ -692,7 +712,7 @@ mod tests {
     }
 
     fn tool(name: &str) -> KiroTool {
-        KiroTool {
+        KiroTool::Specification {
             tool_specification: KiroToolSpecification {
                 name: name.into(),
                 description: String::new(),
@@ -722,6 +742,8 @@ mod tests {
     fn payload(history: Vec<KiroHistoryMessage>, current: KiroUserInputMessage) -> KiroPayload {
         KiroPayload {
             conversation_state: KiroConversationState {
+                agent_continuation_id: None,
+                agent_task_type: None,
                 chat_trigger_type: "MANUAL".into(),
                 conversation_id: "conversation".into(),
                 current_message: KiroCurrentMessage {
@@ -731,6 +753,8 @@ mod tests {
             },
             profile_arn: None,
             inference_config: None,
+            additional_model_request_fields: None,
+            model_request_intent: None,
             protected_history_messages: 0,
         }
     }
@@ -740,6 +764,7 @@ mod tests {
             user_input_message: None,
             assistant_response_message: Some(KiroAssistantMessage {
                 content: "calling".into(),
+                cache_point: None,
                 tool_uses: uses,
             }),
         }
@@ -809,7 +834,13 @@ mod tests {
             .user_input_message_context
             .as_ref()
             .expect("current context");
-        assert_eq!(current_context.tools[0].tool_specification.name, "lookup");
+        assert_eq!(
+            current_context.tools[0]
+                .specification()
+                .expect("tool specification")
+                .name,
+            "lookup"
+        );
         assert_eq!(current_context.tool_results[0].tool_use_id, "call_1");
     }
 

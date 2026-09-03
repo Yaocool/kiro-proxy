@@ -7,17 +7,26 @@ fn request() -> ClaudeRequest {
         messages: vec![ClaudeMessage {
             role: "user".into(),
             content: Value::String("hi".into()),
+            cache_control: None,
+            extra: Default::default(),
         }],
         max_tokens: 100,
         temperature: None,
         top_p: None,
+        top_k: None,
         stop_sequences: vec![],
         stream: false,
         system: None,
         tools: vec![],
         tool_choice: None,
         thinking: None,
+        output_config: None,
+        cache_control: None,
+        service_tier: None,
+        metadata: None,
+        conversation_id: None,
         context_management: None,
+        extra: Default::default(),
     }
 }
 
@@ -81,6 +90,44 @@ fn claude_stop_sequences_are_bounded() {
         validate_claude(&input),
         Err(ValidationError::InvalidField { field, .. }) if field == "stop_sequences"
     ));
+}
+
+#[test]
+fn claude_top_k_zero_and_thinking_variants_follow_the_messages_contract() {
+    let mut input = request();
+    input.max_tokens = 4_096;
+    input.top_k = Some(0);
+    validate_claude(&input).expect("top_k=0 is an allowed sampling value");
+
+    input.thinking = Some(crate::ThinkingConfig {
+        r#type: "adaptive".into(),
+        budget_tokens: Some(1_024),
+        display: Some("summarized".into()),
+    });
+    assert!(validate_claude(&input)
+        .expect_err("adaptive thinking has no fixed budget")
+        .to_string()
+        .contains("only valid for enabled"));
+
+    input.thinking = Some(crate::ThinkingConfig {
+        r#type: "enabled".into(),
+        budget_tokens: Some(1_024),
+        display: Some("omitted".into()),
+    });
+    validate_claude(&input).expect("enabled thinking accepts a bounded budget and display");
+}
+
+#[test]
+fn cache_control_accepts_bedrock_ttl_values() {
+    let mut input = request();
+    input.cache_control = Some(serde_json::json!({"type":"ephemeral","ttl":"1h"}));
+    validate_claude(&input).expect("one-hour cache TTL");
+
+    input.cache_control = Some(serde_json::json!({"type":"ephemeral","ttl":"30m"}));
+    assert!(validate_claude(&input)
+        .expect_err("unsupported TTL")
+        .to_string()
+        .contains("expected 5m or 1h"));
 }
 
 #[test]
@@ -164,6 +211,16 @@ fn rejects_strict_claude_tools_and_invalid_input_examples() {
         .expect_err("strict")
         .to_string()
         .contains("strict"));
+
+    let mut server_tool = tool(1);
+    server_tool.r#type = Some("web_search_20250305".into());
+    server_tool.name = "web_search".into();
+    server_tool.strict = Some(true);
+    input.tools = vec![server_tool];
+    assert!(validate_claude(&input)
+        .expect_err("strict server tool")
+        .to_string()
+        .contains("strict"));
 }
 
 #[test]
@@ -192,6 +249,23 @@ fn validates_supported_compaction_configuration() {
         "keep":"all"
     }]}));
     validate_claude(&input).expect("Claude Code clear-thinking edit");
+
+    input.context_management = Some(serde_json::json!({"edits":[{
+        "type":"clear_thinking_20251015",
+        "keep":{"type":"all"}
+    },{
+        "type":"clear_tool_uses_20250919",
+        "clear_at_least":null,
+        "clear_tool_inputs":["Read","Bash"],
+        "exclude_tools":null
+    }]}));
+    validate_claude(&input).expect("current context-editing union variants");
+
+    input.context_management = Some(serde_json::json!({}));
+    validate_claude(&input).expect("empty context management configuration");
+
+    input.context_management = Some(serde_json::json!({"edits":[]}));
+    validate_claude(&input).expect("empty context edit list");
 
     input.context_management = Some(serde_json::json!({"edits":[{
         "type":"compaction_latest"
@@ -236,30 +310,212 @@ fn validates_assistant_compaction_content_contract() {
 }
 
 #[test]
-fn validates_nested_tool_result_images_and_rejects_unsupported_blocks() {
+fn validates_nested_media_and_rejects_unsupported_blocks() {
     let mut input = request();
     input.messages[0].content = serde_json::json!([{
         "type":"tool_result","tool_use_id":"tool_1","content":[{
             "type":"image","source":{
-                "type":"base64","media_type":"image/png","data":"aGVsbG8="
+                "type":"base64","media_type":"image/png","data":"iVBORw0KGgpyZXN0"
+            }
+        },{
+            "type":"document","title":"result.pdf","source":{
+                "type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQKJSVFT0YK"
             }
         }]
     }]);
-    validate_claude(&input).expect("nested image");
+    validate_claude(&input).expect("nested image and document");
 
     input.messages[0].content = serde_json::json!([{
-        "type":"document","source":{"type":"base64","data":"aGVsbG8="}
+        "type":"document","source":{
+            "type":"url","url":"https://example.com/report.pdf"
+        }
+    }]);
+    validate_claude(&input).expect("HTTP(S) URL document");
+
+    input.messages[0].content = serde_json::json!([{
+        "type":"document","source":{
+            "type":"url","url":"file:///tmp/report.pdf"
+        }
     }]);
     assert!(validate_claude(&input)
-        .expect_err("document")
+        .expect_err("non-HTTP URL document")
         .to_string()
-        .contains("not supported"));
+        .contains("expected an HTTP(S) URL"));
 
     input.messages[0].content = serde_json::json!([{"type":"future_block"}]);
     assert!(validate_claude(&input)
         .expect_err("unknown block")
         .to_string()
         .contains("unsupported Claude content block"));
+}
+
+#[test]
+fn image_transformations_accept_only_noop_objects() {
+    for nested in [false, true] {
+        for transformations in [serde_json::json!({}), Value::Null] {
+            let mut input = request();
+            let image = serde_json::json!({
+                "type":"image",
+                "source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgpyZXN0"},
+                "transformations":transformations
+            });
+            input.messages[0].content = if nested {
+                serde_json::json!([{"type":"document","source":{"type":"content","content":[image]}}])
+            } else {
+                serde_json::json!([image])
+            };
+            validate_claude(&input).expect("no-op image transformations");
+
+            let pointer = if nested {
+                "/0/source/content/0/transformations"
+            } else {
+                "/0/transformations"
+            };
+            for unsupported in [serde_json::json!([]), serde_json::json!({"crop":{}})] {
+                *input.messages[0]
+                    .content
+                    .pointer_mut(pointer)
+                    .expect("transformations") = unsupported;
+                assert!(validate_claude(&input)
+                    .expect_err("unsupported image transformations")
+                    .to_string()
+                    .contains("transformations"));
+            }
+        }
+    }
+}
+
+#[test]
+fn custom_document_images_share_the_request_image_limit() {
+    let mut input = request();
+    let image = serde_json::json!({
+        "type":"image",
+        "source":{"type":"base64","media_type":"image/png","data":"iVBORw0KGgpyZXN0"}
+    });
+    input.messages[0].content = serde_json::json!([{
+        "type":"document",
+        "source":{"type":"content","content":vec![image.clone(); MAX_IMAGES_PER_REQUEST]}
+    }]);
+    validate_claude(&input).expect("custom document at image limit");
+    input.messages[0]
+        .content
+        .as_array_mut()
+        .expect("blocks")
+        .push(image);
+    assert!(validate_claude(&input)
+        .expect_err("custom document images must count toward the request limit")
+        .to_string()
+        .contains("at most 20 image blocks"));
+}
+
+#[test]
+fn validates_document_sources_formats_and_per_message_limit() {
+    let mut input = request();
+    input.messages[0].content = serde_json::json!([
+        {
+            "type":"document",
+            "title":"report.pdf",
+            "source":{
+                "type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQKJSVFT0YK"
+            }
+        },
+        {
+            "type":"document",
+            "name":null,
+            "title":"notes.md",
+            "source":{"type":"text","media_type":"text/markdown","data":"# Notes"},
+            "context":"Architecture notes for this request.",
+            "citations":{"enabled":false}
+        }
+    ]);
+    validate_claude(&input).expect("supported document sources");
+
+    input.messages[0].content = serde_json::json!([{
+        "type":"document",
+        "title":"custom chunks",
+        "source":{"type":"content","content":[
+            {"type":"text","text":"First chunk","cache_control":{"type":"ephemeral"}},
+            {"type":"image","source":{
+                "type":"base64","media_type":"image/png","data":"iVBORw0KGgpyZXN0"
+            }},
+            {"type":"text","text":"Second chunk"}
+        ]},
+        "citations":{"enabled":true}
+    }]);
+    validate_claude(&input).expect("custom content document source");
+
+    input.messages[0].content = serde_json::json!([{
+        "type":"document","source":{"type":"content","content":[
+            {"type":"tool_use","id":"tool_1","name":"read","input":{}}
+        ]}
+    }]);
+    assert!(validate_claude(&input)
+        .expect_err("unsupported custom document block")
+        .to_string()
+        .contains("unsupported content document block"));
+
+    input.messages[0].content = serde_json::json!([{
+        "type":"document","source":{"type":"content","content":[]}
+    }]);
+    assert!(validate_claude(&input)
+        .expect_err("empty custom document")
+        .to_string()
+        .contains("must not be empty"));
+
+    input.messages[0].content = serde_json::json!([{
+        "type":"document","title":"report.pdf","source":{
+            "type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQKJSVFT0YK"
+        },
+        "citations":{"enabled":true}
+    }]);
+    validate_claude(&input).expect("supported document citations");
+
+    input.messages[0].content = serde_json::json!([{
+        "type":"document","title":"report.pdf","source":{
+            "type":"base64","media_type":"application/pdf","data":"JVBERi0xLjQKJSVFT0YK"
+        },
+        "citations":{"enabled":"yes"}
+    }]);
+    assert!(validate_claude(&input)
+        .expect_err("invalid document citations")
+        .to_string()
+        .contains("expected a boolean"));
+
+    input.messages[0].content = serde_json::json!([{
+        "type":"document","title":"report.pdf","source":{
+            "type":"base64","media_type":"application/pdf","data":"not-base64"
+        }
+    }]);
+    assert!(validate_claude(&input)
+        .expect_err("invalid base64")
+        .to_string()
+        .contains("invalid base64 document data"));
+
+    input.messages[0].content = serde_json::json!([{
+        "type":"document","title":"report.pdf","source":{
+            "type":"base64","media_type":"application/pdf","data":"aGVsbG8="
+        }
+    }]);
+    assert!(validate_claude(&input)
+        .expect_err("mismatched document signature")
+        .to_string()
+        .contains("document bytes do not match the declared media_type"));
+
+    input.messages[0].content = Value::Array(
+        (0..=MAX_DOCUMENTS_PER_MESSAGE)
+            .map(|index| {
+                serde_json::json!({
+                    "type":"document",
+                    "title":format!("document-{index}.txt"),
+                    "source":{"type":"text","media_type":"text/plain","data":"text"}
+                })
+            })
+            .collect(),
+    );
+    assert!(validate_claude(&input)
+        .expect_err("too many documents")
+        .to_string()
+        .contains("at most 5 document blocks"));
 }
 
 #[test]
@@ -299,10 +555,14 @@ fn validates_anthropic_tool_search_contract() {
                     "tool_references":[{"type":"tool_reference","tool_name":"tool_1"}]
                 }}
             ]),
+            cache_control: None,
+            extra: Default::default(),
         },
         ClaudeMessage {
             role: "user".into(),
             content: Value::String("continue".into()),
+            cache_control: None,
+            extra: Default::default(),
         },
     ];
     validate_claude(&input).expect("official Tool Search request");
@@ -428,10 +688,14 @@ fn accepts_official_web_search_history_blocks() {
                     "encrypted_content":"opaque","page_age":null
                 }]}
             ]),
+            cache_control: None,
+            extra: Default::default(),
         },
         ClaudeMessage {
             role: "user".into(),
             content: Value::String("continue".into()),
+            cache_control: None,
+            extra: Default::default(),
         },
     ];
     validate_claude(&input).expect("web search history");
@@ -582,11 +846,72 @@ fn openai_business_fields_and_tool_call_json_are_validated() {
         content: Some(Value::String("hi".into())),
         tool_calls: Vec::new(),
         tool_call_id: None,
+        reasoning_content: None,
+        name: None,
+        cache_control: None,
     }];
     input.max_tokens = Some(1);
     input.max_completion_tokens = Some(1);
-    assert!(validate_openai(&input)
-        .expect_err("exclusive limits")
+    validate_openai(&input)
+        .expect("ignored max_completion_tokens does not conflict with max_tokens");
+}
+
+#[test]
+fn openai_images_are_validated_and_bounded_before_translation() {
+    let build = |url: &str| {
+        serde_json::from_value::<OpenAiRequest>(serde_json::json!({
+            "model":"claude-sonnet-4",
+            "messages":[{"role":"user","content":[{
+                "type":"image_url","image_url":{"url":url}
+            }]}]
+        }))
+        .expect("OpenAI request")
+    };
+
+    validate_openai(&build("data:image/png;base64,iVBORw0KGgpyZXN0"))
+        .expect("supported inline image");
+    assert!(validate_openai(&build("data:image/bmp;base64,AQID"))
+        .expect_err("unsupported format")
         .to_string()
-        .contains("either"));
+        .contains("JPEG, PNG, GIF, or WebP"));
+    assert!(
+        validate_openai(&build("https://user:secret@example.com/image.png"))
+            .expect_err("URL credentials")
+            .to_string()
+            .contains("without credentials")
+    );
+
+    let parts = (0..=MAX_IMAGES_PER_REQUEST)
+        .map(|_| {
+            serde_json::json!({
+                "type":"image_url","image_url":{"url":"data:image/png;base64,iVBORw0KGgpyZXN0"}
+            })
+        })
+        .collect::<Vec<_>>();
+    let too_many: OpenAiRequest = serde_json::from_value(serde_json::json!({
+        "model":"claude-sonnet-4",
+        "messages":[{"role":"user","content":parts}]
+    }))
+    .expect("OpenAI request");
+    assert!(validate_openai(&too_many)
+        .expect_err("image limit")
+        .to_string()
+        .contains("at most 20"));
+}
+
+#[test]
+fn generation_rejects_assistant_prefill_without_rejecting_token_count_validation() {
+    let mut input = request();
+    input.messages.push(ClaudeMessage {
+        role: "assistant".into(),
+        content: Value::String("The answer begins".into()),
+        cache_control: None,
+        extra: Default::default(),
+    });
+
+    validate_claude(&input).expect("assistant-ended history is countable");
+    assert!(validate_claude_generation(&input)
+        .expect_err("Kiro cannot represent assistant prefill")
+        .to_string()
+        .contains("assistant prefill is not supported"));
 }

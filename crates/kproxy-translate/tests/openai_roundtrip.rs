@@ -66,17 +66,22 @@ proptest! {
         let payload = openai_to_kiro(&request, &options);
         let state = &payload.conversation_state;
 
-        prop_assert_eq!(state.history.len(), 3);
-        let first = state.history[0]
+        prop_assert_eq!(payload.protected_history_len(), 2);
+        prop_assert_eq!(state.history.len(), 5);
+        let protected_system = state.history[0]
+            .user_input_message
+            .as_ref()
+            .expect("protected system turn");
+        prop_assert_eq!(&protected_system.content, system.trim());
+        prop_assert!(state.history[1].assistant_response_message.is_some());
+
+        let first = state.history[2]
             .user_input_message
             .as_ref()
             .expect("first user turn");
-        prop_assert_eq!(
-            &first.content,
-            &format!("{}\n\n{}", system.trim(), first_user.trim())
-        );
+        prop_assert_eq!(&first.content, &first_user);
 
-        let translated_assistant = state.history[1]
+        let translated_assistant = state.history[3]
             .assistant_response_message
             .as_ref()
             .expect("assistant turn");
@@ -86,7 +91,7 @@ proptest! {
         prop_assert_eq!(&translated_assistant.tool_uses[0].name, &tool_name);
         prop_assert_eq!(&translated_assistant.tool_uses[0].input, &json!({"value": argument}));
 
-        let result_turn = state.history[2]
+        let result_turn = state.history[4]
             .user_input_message
             .as_ref()
             .expect("tool-result turn");
@@ -108,6 +113,9 @@ proptest! {
             .expect("tool context")
             .tools;
         prop_assert_eq!(tools.len(), 1);
-        prop_assert_eq!(&tools[0].tool_specification.name, &tool_name);
+        prop_assert_eq!(
+            &tools[0].specification().expect("tool specification").name,
+            &tool_name
+        );
     }
 }

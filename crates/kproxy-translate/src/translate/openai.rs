@@ -6,12 +6,19 @@ use crate::{
 };
 
 use super::common::{
-    content_text, context, enhance_system, extract_openai_images, inference, kiro_tool_named,
-    needs_chunked_write_hint, ToolNameRegistry,
+    content_cache_point, content_text, context, enhance_system, extract_openai_images, inference,
+    kiro_cache_point, kiro_tool_named, merged_cache_point, needs_chunked_write_hint,
+    ToolNameRegistry,
 };
-use super::TranslationOptions;
+use super::{TranslationOptions, SYSTEM_PROMPT_ACKNOWLEDGEMENT};
 
 pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> KiroPayload {
+    if request.max_completion_tokens.is_some() {
+        tracing::debug!(
+            field = "max_completion_tokens",
+            "ignoring OpenAI completion limit to match the reference Kiro adapter; only max_tokens is forwarded"
+        );
+    }
     let tool_names = ToolNameRegistry::new(request.tools.iter().filter_map(|tool| {
         tool.body
             .get(&tool.r#type)
@@ -22,7 +29,12 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
     let mut documentation = Vec::new();
     let tools = selected
         .iter()
-        .filter_map(|tool| {
+        .flat_map(|tool| {
+            let mut translated = Vec::new();
+            let cache_point = options
+                .enable_prompt_cache
+                .then(|| kiro_cache_point(tool.body.get("cache_control")))
+                .flatten();
             let definition = tool.body.get(&tool.r#type)?;
             let name = definition.get("name")?.as_str()?;
             let description = definition
@@ -37,15 +49,20 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
                     .cloned()
                     .unwrap_or_else(|| json!({"type":"object","properties":{}}))
             };
-            let (tool, docs) = kiro_tool_named(
+            let (translated_tool, docs) = kiro_tool_named(
                 name,
                 &tool_names.kiro_name(name),
                 description,
                 &schema,
             );
             documentation.extend(docs);
-            Some(tool)
+            translated.push(translated_tool);
+            if let Some(cache_point) = cache_point {
+                translated.push(crate::KiroTool::CachePoint { cache_point });
+            }
+            Some(translated)
         })
+        .flatten()
         .collect::<Vec<_>>();
 
     let mut system = request
@@ -56,10 +73,23 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
         .map(content_text)
         .collect::<Vec<_>>()
         .join("\n");
+    let system_cache_point = options
+        .enable_prompt_cache
+        .then(|| {
+            request
+                .messages
+                .iter()
+                .filter(|message| matches!(message.role.as_str(), "system" | "developer"))
+                .fold(None, |current, message| {
+                    merged_cache_point(current, openai_message_cache_point(message))
+                })
+        })
+        .flatten();
     if options.enhance_system_prompt {
-        let chunked_write_hint = tools
-            .iter()
-            .any(|tool| needs_chunked_write_hint(&tool.tool_specification.name));
+        let chunked_write_hint = tools.iter().any(|tool| {
+            tool.specification()
+                .is_some_and(|tool| needs_chunked_write_hint(&tool.name))
+        });
         system = enhance_system(system, chunked_write_hint);
     }
     if !documentation.is_empty() {
@@ -76,13 +106,14 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
     let mut current_text = String::new();
     let mut current_results = Vec::new();
     let mut current_images = Vec::new();
-    let mut system_merged = false;
+    let mut current_cache_point = None;
+    let mut current_result_cache_point = None;
 
     for (index, message) in non_system.iter().enumerate() {
         let last = index + 1 == non_system.len();
         match message.role.as_str() {
             "user" => {
-                let mut text = message
+                let text = message
                     .content
                     .as_ref()
                     .map(content_text)
@@ -92,19 +123,32 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
                     .as_ref()
                     .map(extract_openai_images)
                     .unwrap_or_default();
-                if !system_merged {
-                    text = join(&system, &text);
-                    system_merged = true;
-                }
+                current_cache_point = openai_message_cache_point(message);
                 if last {
                     current_text = text;
                     current_images = images;
                 } else {
-                    push_user(&mut history, make_user(text, images, Vec::new(), options));
+                    push_user(
+                        &mut history,
+                        make_user(
+                            text,
+                            images,
+                            Vec::new(),
+                            current_cache_point.take(),
+                            options,
+                        ),
+                    );
                 }
             }
-            "assistant" => push_assistant(&mut history, assistant_message(message, &tool_names)),
+            "assistant" => push_assistant(
+                &mut history,
+                assistant_message(message, &tool_names, options.enable_prompt_cache),
+            ),
             "tool" => {
+                current_result_cache_point = merged_cache_point(
+                    current_result_cache_point,
+                    openai_message_cache_point(message),
+                );
                 if let Some(id) = &message.tool_call_id {
                     let text = message
                         .content
@@ -127,6 +171,7 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
                             "Tool results provided.".into(),
                             Vec::new(),
                             current_results.split_off(0),
+                            current_result_cache_point.take(),
                             options,
                         ),
                     );
@@ -135,9 +180,7 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
             _ => {}
         }
     }
-    if !system_merged {
-        current_text = join(&system, &current_text);
-    }
+    current_cache_point = merged_cache_point(current_cache_point, current_result_cache_point);
     if current_text.trim().is_empty() {
         current_text = if current_results.is_empty() {
             "Continue.".into()
@@ -150,27 +193,74 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
         model_id: options.model_id.clone(),
         origin: options.origin.clone(),
         images: current_images,
+        documents: Vec::new(),
+        cache_point: current_cache_point,
+        client_cache_config: None,
         user_input_message_context: context(tools.clone(), current_results),
     };
+    let protected_history_messages = if system.trim().is_empty() {
+        0
+    } else {
+        history.splice(
+            0..0,
+            [
+                KiroHistoryMessage {
+                    user_input_message: Some(make_user(
+                        system.trim().to_owned(),
+                        Vec::new(),
+                        Vec::new(),
+                        system_cache_point,
+                        options,
+                    )),
+                    assistant_response_message: None,
+                },
+                KiroHistoryMessage {
+                    user_input_message: None,
+                    assistant_response_message: Some(KiroAssistantMessage {
+                        content: SYSTEM_PROMPT_ACKNOWLEDGEMENT.into(),
+                        cache_point: None,
+                        tool_uses: Vec::new(),
+                    }),
+                },
+            ],
+        );
+        2
+    };
 
-    KiroPayload {
+    let mut payload = KiroPayload {
         conversation_state: KiroConversationState {
+            agent_continuation_id: Some(random_id()),
+            agent_task_type: Some("vibe".into()),
             chat_trigger_type: "MANUAL".into(),
-            conversation_id: random_id(),
+            conversation_id: options.conversation_id.clone().unwrap_or_else(random_id),
             current_message: KiroCurrentMessage {
                 user_input_message: current,
             },
             history,
         },
         profile_arn: options.profile_arn.clone(),
-        inference_config: Some(inference(
-            request.max_completion_tokens.or(request.max_tokens),
+        // The reference uses max_tokens only; max_completion_tokens is not
+        // translated and no proxy default is inserted into the wire payload.
+        inference_config: inference(
+            request.max_tokens,
             !tools.is_empty(),
             request.temperature,
             request.top_p,
-        )),
-        protected_history_messages: 0,
-    }
+        ),
+        additional_model_request_fields: None,
+        model_request_intent: Some(crate::ModelRequestIntent {
+            requested_model: request.model.clone(),
+            thinking: request.thinking.clone(),
+            effort: request.reasoning_effort.clone(),
+        }),
+        protected_history_messages,
+    };
+    crate::model::apply_adaptive_thinking(
+        &mut payload,
+        options.additional_model_request_fields_schema.as_ref(),
+        true,
+    );
+    payload
 }
 
 fn selected_tools(request: &OpenAiRequest) -> Vec<&crate::OpenAiTool> {
@@ -232,6 +322,7 @@ fn selected_tools(request: &OpenAiRequest) -> Vec<&crate::OpenAiTool> {
 fn assistant_message(
     message: &crate::OpenAiMessage,
     tool_names: &ToolNameRegistry,
+    prompt_cache_enabled: bool,
 ) -> KiroAssistantMessage {
     let mut content = message
         .content
@@ -271,13 +362,20 @@ fn assistant_message(
         }
         .into();
     }
-    KiroAssistantMessage { content, tool_uses }
+    KiroAssistantMessage {
+        content,
+        cache_point: prompt_cache_enabled
+            .then(|| openai_message_cache_point(message))
+            .flatten(),
+        tool_uses,
+    }
 }
 
 fn make_user(
     text: String,
     images: Vec<crate::KiroImage>,
     results: Vec<KiroToolResult>,
+    cache_point: Option<crate::KiroCachePoint>,
     options: &TranslationOptions,
 ) -> KiroUserInputMessage {
     KiroUserInputMessage {
@@ -289,8 +387,18 @@ fn make_user(
         model_id: options.model_id.clone(),
         origin: options.origin.clone(),
         images,
+        documents: Vec::new(),
+        cache_point,
+        client_cache_config: None,
         user_input_message_context: context(Vec::new(), results),
     }
+}
+
+fn openai_message_cache_point(message: &crate::OpenAiMessage) -> Option<crate::KiroCachePoint> {
+    merged_cache_point(
+        kiro_cache_point(message.cache_control.as_ref()),
+        message.content.as_ref().and_then(content_cache_point),
+    )
 }
 
 fn push_user(history: &mut Vec<KiroHistoryMessage>, message: KiroUserInputMessage) {
@@ -340,20 +448,55 @@ fn join(left: &str, right: &str) -> String {
 }
 
 fn random_id() -> String {
-    use std::fmt::Write as _;
-
-    use rand::RngCore;
-    let mut bytes = [0u8; 16];
-    rand::thread_rng().fill_bytes(&mut bytes);
-    bytes.iter().fold(String::new(), |mut output, byte| {
-        let _ = write!(output, "{byte:02x}");
-        output
-    })
+    uuid::Uuid::new_v4().to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_messages_use_a_protected_kiro_history_pair() {
+        let request: OpenAiRequest = serde_json::from_value(json!({
+            "model":"claude-sonnet",
+            "messages":[
+                {"role":"system","content":"Follow the project rules."},
+                {"role":"user","content":"hello"}
+            ],
+            "max_tokens":128
+        }))
+        .expect("request");
+        let payload = openai_to_kiro(
+            &request,
+            &TranslationOptions::new("claude-sonnet", "AI_EDITOR"),
+        );
+        assert_eq!(payload.protected_history_len(), 2);
+        let protected_system = payload.conversation_state.history[0]
+            .user_input_message
+            .as_ref()
+            .expect("protected system message");
+        assert!(protected_system
+            .content
+            .starts_with("Follow the project rules."));
+        assert!(protected_system
+            .content
+            .contains("Execute the user's request directly"));
+        assert_eq!(
+            payload.conversation_state.history[1]
+                .assistant_response_message
+                .as_ref()
+                .map(|message| message.content.as_str()),
+            Some(SYSTEM_PROMPT_ACKNOWLEDGEMENT)
+        );
+        assert_eq!(
+            payload
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "hello"
+        );
+    }
 
     #[test]
     fn data_url_images_are_forwarded_for_history_and_current_turn() {
@@ -377,11 +520,15 @@ mod tests {
             &request,
             &TranslationOptions::new("claude-sonnet", "AI_EDITOR"),
         );
-        let history_image = &payload.conversation_state.history[0]
-            .user_input_message
-            .as_ref()
-            .expect("user")
-            .images[0];
+        let history_image = payload
+            .conversation_state
+            .history
+            .iter()
+            .skip(payload.protected_history_len())
+            .filter_map(|message| message.user_input_message.as_ref())
+            .flat_map(|message| message.images.iter())
+            .next()
+            .expect("history image");
         assert_eq!(history_image.format, "png");
         let current = &payload
             .conversation_state
@@ -418,7 +565,10 @@ mod tests {
             .expect("context")
             .tools;
         assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].tool_specification.name, "two");
+        assert_eq!(
+            tools[0].specification().expect("tool specification").name,
+            "two"
+        );
     }
 
     #[test]
@@ -455,12 +605,16 @@ mod tests {
         assert!(context
             .tools
             .iter()
-            .any(|tool| tool.tool_specification.name == mapped));
-        let history_name = &payload.conversation_state.history[1]
-            .assistant_response_message
-            .as_ref()
-            .expect("assistant")
-            .tool_uses[0]
+            .any(|tool| tool.specification().is_some_and(|tool| tool.name == mapped)));
+        let history_name = &payload
+            .conversation_state
+            .history
+            .iter()
+            .skip(payload.protected_history_len())
+            .filter_map(|message| message.assistant_response_message.as_ref())
+            .flat_map(|message| message.tool_uses.iter())
+            .next()
+            .expect("assistant tool use")
             .name;
         assert_eq!(history_name, &mapped);
     }
