@@ -19,7 +19,7 @@ local Kiro application configuration changes.
 ## Highlights
 
 - Claude-compatible `/v1/messages` and `/v1/messages/count_tokens` endpoints.
-- OpenAI-compatible `/v1/chat/completions` and `/v1/models` endpoints.
+- OpenAI-compatible `/v1/responses`, `/v1/chat/completions`, and `/v1/models` endpoints.
 - Weighted multi-account scheduling with per-account concurrency limits,
   cooldowns, quota tracking, and model compatibility checks.
 - Automatic enterprise IdC/SSO token refresh with per-account singleflight.
@@ -188,12 +188,24 @@ After creating `main` with the default settings, its business API binds to
 POST /v1/messages
 POST /v1/messages/count_tokens
 POST /v1/chat/completions
+POST /v1/responses
 GET  /v1/models
 GET  /health
 ```
 
 Claude aliases `/messages` and `/anthropic/v1/messages` are also available.
-OpenAI aliases `/chat/completions` and `/models` are supported as well.
+OpenAI aliases `/responses`, `/chat/completions`, and `/models` are supported as well.
+
+Client checks are enabled by default: Claude routes (including token counting)
+accept Claude Code; OpenAI routes (including models) accept Codex. The shared
+`server.enforce_user_agent_check = false` setting disables these User-Agent checks.
+API key authentication and each service's key allowlist still apply.
+
+Responses supports stateless Codex conversations, streaming, function/custom tools,
+namespaced tools, image inputs, and tool-result replay. Configure Codex with
+`wire_api = "responses"` and the service's `/v1` base URL. See
+[Responses compatibility and Codex setup](docs/openai-responses.md) for configuration,
+protocol coverage, and explicit unsupported controls.
 
 ### Tool call arguments
 
@@ -329,11 +341,12 @@ remaining remote attachments.
 Adjacent same-role messages are merged. Assistant prefill, `max_tokens=0` cache
 warming, strict structured outputs, and Anthropic Files API `file_id` sources
 are rejected explicitly because Kiro cannot provide equivalent behavior.
-OpenAI `/v1/responses` is not exposed. Protocol compatibility is resolved before
+Protocol compatibility is resolved before
 the first upstream call, without a time-based rejection cache or field-removal
 probes. Cache markers contain only `type: default`; Claude cache TTL preferences
-do not control Kiro's cache lifetime. Historical thinking is omitted from Kiro
-request history without disabling current-generation thinking. Document context
+do not control Kiro's cache lifetime. Claude historical thinking is omitted from Kiro
+request history without disabling current-generation thinking; Responses plaintext
+reasoning summaries are preserved in assistant history. Document context
 is preserved as separate JSON-labelled message text rather than a document field.
 Generation controls follow the explicit mapping in
 [chaogei/Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager/blob/447adcdb468157312621b1f09448278bd9bca748/src/main/proxy/translator.ts):

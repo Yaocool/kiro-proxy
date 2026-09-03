@@ -761,11 +761,13 @@ Remember that `KPROXY_ADMIN_SOCKET` changes the CLI target only. Set
 Run `kproxy config validate`, inspect warn/error logs, and check whether the changed
 field requires restart. Also check for a process-level `KPROXY_HTTP_PORT` override.
 
-### Claude routes return access denied
+### Protocol routes return access denied
 
-Claude routes validate the client User-Agent by default. Use a supported Claude
-Code-compatible User-Agent or explicitly change `server.enforce_user_agent_check`
-in a trusted deployment.
+Client User-Agent checks are enabled by default: use Claude Code for Claude
+routes and Codex for OpenAI Responses, Chat Completions, and model-list routes.
+To allow other clients, set `server.enforce_user_agent_check = false` and reload
+the configuration. API key authentication remains enabled. See
+[Codex setup and Responses support](openai-responses.md).
 
 ### Generation returns `503`
 

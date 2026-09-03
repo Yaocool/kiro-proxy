@@ -672,10 +672,12 @@ kproxy --socket /path/to/admin.sock status
 运行 `kproxy config validate`，检查 warn/error 日志，并确认修改字段是否需要重启。同时检查进程
 环境中是否存在 `KPROXY_HTTP_PORT` 覆盖。
 
-### Claude 路由返回访问拒绝
+### 协议路由返回访问拒绝
 
-Claude 路由默认校验客户端 User-Agent。请使用兼容 Claude Code 的 User-Agent，或仅在可信
-部署中显式修改 `server.enforce_user_agent_check`。
+默认按协议校验客户端 User-Agent：Claude 路由使用 Claude Code，OpenAI Responses、
+Chat Completions 和模型列表路由使用 Codex。需要其他客户端时，设置
+`server.enforce_user_agent_check = false` 并重载配置，API key 认证仍生效。
+接入方法见 [Responses 与 Codex 配置](openai-responses.md)。
 
 ### 生成接口返回 `503`
 
