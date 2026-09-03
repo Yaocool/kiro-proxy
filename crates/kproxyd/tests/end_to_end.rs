@@ -15,6 +15,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 static HTTP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
+#[path = "end_to_end/responses.rs"]
+mod responses;
+
 struct Daemon {
     child: Child,
     socket: PathBuf,

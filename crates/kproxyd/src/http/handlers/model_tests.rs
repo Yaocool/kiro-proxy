@@ -52,6 +52,24 @@ fn conversation_fallback_is_stable_uuid_and_isolated_by_client() {
         explicit, without_header,
         "explicit IDs take priority over headers"
     );
+    for header in ["session-id", "thread-id"] {
+        let mut headers = HeaderMap::new();
+        headers.insert(header, HeaderValue::from_static("codex-session"));
+        let id = stable_conversation_id(&headers, Some("key-a"), None, Some(&first_hint));
+        assert_eq!(
+            id,
+            stable_conversation_id(&headers, Some("key-a"), None, Some("different history"))
+        );
+        assert_ne!(
+            id,
+            stable_conversation_id(&headers, Some("key-b"), None, Some(&first_hint))
+        );
+        headers.insert(header, HeaderValue::from_static("another-codex-session"));
+        assert_ne!(
+            id,
+            stable_conversation_id(&headers, Some("key-a"), None, Some(&first_hint))
+        );
+    }
 }
 
 #[test]

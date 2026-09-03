@@ -68,6 +68,8 @@ fn stable_conversation_id(
         .or_else(|| {
             [
                 "x-claude-code-session-id",
+                "session-id",
+                "thread-id",
                 "x-opencode-session",
                 "x-session-affinity",
                 "x-conversation-id",

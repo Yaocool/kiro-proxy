@@ -1,23 +1,27 @@
 use super::{
     apply_context_management_edits, authenticate, claude_loaded_tools,
     claude_pending_server_tool_uses, claude_to_kiro, claude_validation_error,
-    claude_web_tool_names, compact_trigger_tokens, enforce_claude_user_agent, enforce_context,
-    enforce_payload_budget, estimate_context_management_input_tokens, estimated_credits,
-    execute_kiro_web_search, execute_upstream, initial_compaction_decision, loaded_tool_bytes,
-    loaded_tool_count, loaded_tool_names, map_model, matches_type_family, nonstream_claude,
-    nonstream_openai, normalize_compaction_boundary, openai_to_kiro, openai_tool_identities,
-    prepare_kiro_payload, prepare_upstream, prepend_attempt_logs, prepend_execute_error_attempts,
-    reapply_compaction, remaining_tool_search_budget, reserve_credits,
-    resolved_compaction_decision, resume_tool_search_payload, resume_web_search_payload,
-    run_compaction, sanitize_error_message, serialized_payload_bytes, stream, upstream_error,
-    upstream_overflow_compaction_decision, validate_claude, validate_claude_generation,
-    validate_openai, web_search_error_code, ApiError, AppState, Arc, Bytes, ClaudeRequest,
-    ClaudeServerEvent, ClaudeToolSearchCatalog, ClaudeWebSearchTrace, CompactionReason,
-    CompactionRequest, Duration, Engine, ErrorFormat, ExecuteError, HeaderMap, Instant, IpAddr,
-    OpenAiRequest, RequestDiagnostics, Response, ServiceHttpState, StatusCode, StreamContext,
-    StreamExt, StreamProtocol, TranslationOptions, UpstreamExecution, Url, Uuid, Value,
+    claude_web_tool_names, compact_trigger_tokens, enforce_claude_user_agent,
+    enforce_codex_user_agent, enforce_context, enforce_payload_budget,
+    estimate_context_management_input_tokens, estimated_credits, execute_kiro_web_search,
+    execute_upstream, initial_compaction_decision, loaded_tool_bytes, loaded_tool_count,
+    loaded_tool_names, map_model, matches_type_family, nonstream_claude, nonstream_openai,
+    normalize_compaction_boundary, openai_to_kiro, openai_tool_identities, prepare_kiro_payload,
+    prepare_upstream, prepend_attempt_logs, prepend_execute_error_attempts, reapply_compaction,
+    remaining_tool_search_budget, reserve_credits, resolved_compaction_decision,
+    resume_tool_search_payload, resume_web_search_payload, run_compaction, sanitize_error_message,
+    serialized_payload_bytes, stream, upstream_error, upstream_overflow_compaction_decision,
+    validate_claude, validate_claude_generation, validate_openai, web_search_error_code, ApiError,
+    AppState, Arc, Bytes, ClaudeRequest, ClaudeServerEvent, ClaudeToolSearchCatalog,
+    ClaudeWebSearchTrace, CompactionReason, CompactionRequest, Duration, Engine, ErrorFormat,
+    ExecuteError, HeaderMap, Instant, IpAddr, OpenAiRequest, RequestDiagnostics, Response,
+    ServiceHttpState, StatusCode, StreamContext, StreamExt, StreamProtocol, TranslationOptions,
+    UpstreamExecution, Url, Uuid, Value,
 };
 use futures::TryStreamExt;
+use kproxy_translate::{responses_to_openai, ResponsesRequest};
+
+use super::super::responses::{is_responses_path, stream_response, ResponsesOptions};
 
 pub(super) async fn handle_claude(
     service: ServiceHttpState,
@@ -851,7 +855,7 @@ pub(super) async fn handle_openai(
         &headers,
         ErrorFormat::OpenAi,
     )?;
-    super::enforce_codex_user_agent(&state, &headers)?;
+    enforce_codex_user_agent(&state, &headers)?;
     tracing::debug!(
         event = "proxy.authentication.completed",
         trace_id = %trace_id,
@@ -859,20 +863,40 @@ pub(super) async fn handle_openai(
         api_key_id = key_id.as_deref().unwrap_or("anonymous"),
         "client authentication completed"
     );
-    let mut request: OpenAiRequest = serde_json::from_slice(&body).map_err(|_| {
-        ApiError::new(
-            StatusCode::BAD_REQUEST,
-            "Invalid JSON in request body",
-            ErrorFormat::OpenAi,
-        )
-    })?;
-    validate_openai(&request).map_err(|error| {
-        ApiError::new(
-            StatusCode::BAD_REQUEST,
-            error.to_string(),
-            ErrorFormat::OpenAi,
-        )
-    })?;
+    let (mut request, responses_options) = if is_responses_path(&path) {
+        let responses: ResponsesRequest = serde_json::from_slice(&body).map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                format!("Invalid Responses request: {error}"),
+                ErrorFormat::OpenAi,
+            )
+        })?;
+        let translated = responses_to_openai(&responses).map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
+                ErrorFormat::OpenAi,
+            )
+        })?;
+        let options = ResponsesOptions::new(&responses, translated.tool_names);
+        (translated.request, Some(options))
+    } else {
+        let request: OpenAiRequest = serde_json::from_slice(&body).map_err(|_| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "Invalid JSON in request body",
+                ErrorFormat::OpenAi,
+            )
+        })?;
+        validate_openai(&request).map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
+                ErrorFormat::OpenAi,
+            )
+        })?;
+        (request, None)
+    };
     tracing::info!(
         event = "proxy.request.validated",
         trace_id = %trace_id,
@@ -1015,7 +1039,10 @@ pub(super) async fn handle_openai(
         .and_then(|options| options.get("include_usage"))
         .and_then(Value::as_bool)
         == Some(true);
-    let request_id = format!("chatcmpl-{}", Uuid::new_v4().simple());
+    let request_id = responses_options
+        .as_ref()
+        .map(|options| options.id().to_owned())
+        .unwrap_or_else(|| format!("chatcmpl-{}", Uuid::new_v4().simple()));
     let UpstreamExecution {
         lease,
         response: upstream,
@@ -1042,7 +1069,12 @@ pub(super) async fn handle_openai(
     .await
     .map_err(|error| upstream_error(error, ErrorFormat::OpenAi))?;
     if request.stream {
-        return Ok(stream::response(
+        let thinking_output_format = if responses_options.is_some() {
+            kproxy_core::config::ThinkingOutputFormat::Openai
+        } else {
+            config.features.thinking_output_format
+        };
+        let response = stream::response(
             upstream,
             StreamProtocol::OpenAi,
             StreamContext {
@@ -1078,7 +1110,7 @@ pub(super) async fn handle_openai(
                 tool_call_buffer_delay_ms: config.features.tool_call_buffer_delay_ms,
                 enable_tool_leak_filter: config.features.enable_tool_leak_filter,
                 thinking_enabled: decision.enabled,
-                thinking_output_format: config.features.thinking_output_format,
+                thinking_output_format,
                 include_usage_chunk,
                 web_tool_names: std::collections::HashMap::new(),
                 tool_search: None,
@@ -1095,7 +1127,11 @@ pub(super) async fn handle_openai(
                 _connection_guard: connection_guard,
                 _admission_guard: admission_guard,
             },
-        ));
+        );
+        return Ok(match responses_options {
+            Some(options) => stream_response(response, options),
+            None => response,
+        });
     }
     nonstream_openai(
         state,
@@ -1119,6 +1155,7 @@ pub(super) async fn handle_openai(
         prompt_cache,
         diagnostics,
         openai_tools,
+        responses_options,
     )
     .await
 }
