@@ -145,6 +145,11 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
                 assistant_message(message, &tool_names, options.enable_prompt_cache),
             ),
             "tool" => {
+                // Responses tool outputs may contain images (for example a
+                // Codex view_image result). Keep them with the tool-result turn.
+                if let Some(content) = &message.content {
+                    current_images.extend(extract_openai_images(content));
+                }
                 current_result_cache_point = merged_cache_point(
                     current_result_cache_point,
                     openai_message_cache_point(message),
@@ -169,7 +174,7 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
                         &mut history,
                         make_user(
                             "Tool results provided.".into(),
-                            Vec::new(),
+                            std::mem::take(&mut current_images),
                             current_results.split_off(0),
                             current_result_cache_point.take(),
                             options,
