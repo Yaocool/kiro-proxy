@@ -1336,6 +1336,7 @@ pub(super) async fn nonstream_openai(
     prompt_cache: Option<PromptCacheProfile>,
     diagnostics: RequestDiagnostics,
     openai_tools: std::collections::HashMap<String, OpenAiToolIdentity>,
+    responses_options: Option<super::super::responses::ResponsesOptions>,
 ) -> Result<Response, ApiError> {
     let (mut decoded, endpoint, current_round_output_tokens) = collect_nonstream_rounds(
         &state,
@@ -1416,8 +1417,12 @@ pub(super) async fn nonstream_openai(
         duration_ms = started.elapsed().as_millis() as u64,
         "client non-stream response completed"
     );
-    let thinking_format = state.config.current().features.thinking_output_format;
-    Ok(Json(decoded.openai_json(
+    let thinking_format = if responses_options.is_some() {
+        kproxy_core::config::ThinkingOutputFormat::Openai
+    } else {
+        state.config.current().features.thinking_output_format
+    };
+    let chat = decoded.openai_json(
         &request_id,
         &request.model,
         now_secs(),
@@ -1425,8 +1430,12 @@ pub(super) async fn nonstream_openai(
         current_round_output_tokens,
         thinking_format,
         &openai_tools,
-    ))
-    .into_response())
+    );
+    let response = match responses_options {
+        Some(options) => super::super::responses::json_response(chat, options),
+        None => chat,
+    };
+    Ok(Json(response).into_response())
 }
 
 pub(super) fn openai_tool_identities(

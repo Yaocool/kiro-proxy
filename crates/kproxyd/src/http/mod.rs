@@ -4,6 +4,7 @@ mod handlers;
 pub(crate) use handlers::fallback_models;
 pub(crate) mod prompt_cache;
 mod response;
+mod responses;
 pub(crate) mod stream;
 mod usage;
 
@@ -118,6 +119,14 @@ fn router_for_service(
         )
         .route(
             "/chat/completions",
+            post(handlers::openai_chat).fallback(handlers::openai_method_not_allowed),
+        )
+        .route(
+            "/v1/responses",
+            post(handlers::openai_chat).fallback(handlers::openai_method_not_allowed),
+        )
+        .route(
+            "/responses",
             post(handlers::openai_chat).fallback(handlers::openai_method_not_allowed),
         )
         .route(
@@ -1026,6 +1035,8 @@ mod tests {
                 "/anthropic/v1/messages/count_tokens",
                 "/v1/chat/completions",
                 "/chat/completions",
+                "/v1/responses",
+                "/responses",
                 "/v1/models",
                 "/models",
             ] {
@@ -1045,7 +1056,11 @@ mod tests {
                     if let Some(agent) = agent {
                         request = request.header(header::USER_AGENT, agent);
                     }
-                    let body = serde_json::json!({"model":"test","messages":[{"role":"user","content":"hello"}],"max_tokens":1});
+                    let body = if path.contains("responses") {
+                        serde_json::json!({"model":"test","input":"hello"})
+                    } else {
+                        serde_json::json!({"model":"test","messages":[{"role":"user","content":"hello"}],"max_tokens":1})
+                    };
                     let response = router(Arc::clone(&state))
                         .oneshot(request.body(Body::from(body.to_string())).unwrap())
                         .await
@@ -1124,19 +1139,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn openai_responses_api_is_not_exposed() {
+    async fn responses_methods_and_validation_use_openai_errors() {
         let (_directory, state) = test_state(Config::default()).await;
-        let response = router(state)
-            .oneshot(
-                Request::post("/v1/responses")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(r#"{"model":"test","input":"hello"}"#))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        for path in ["/v1/responses", "/responses"] {
+            let response = router(Arc::clone(&state))
+                .oneshot(Request::get(path).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+            assert_eq!(response.headers()[header::ALLOW], "POST");
+            assert!(body_json(response).await.get("type").is_none());
+            let response = router(Arc::clone(&state)).oneshot(Request::post(path)
+                .header(header::USER_AGENT, "codex_cli_rs/0.147.0")
+                .body(Body::from(r#"{"model":"test","input":"hello","previous_response_id":"resp_unknown"}"#)).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert!(body_json(response).await["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("previous_response_id"));
+        }
     }
 
     #[tokio::test]
