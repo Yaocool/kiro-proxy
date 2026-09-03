@@ -133,7 +133,7 @@ pub struct ServerConfig {
     pub host: String,
     /// 新建代理服务的默认监听端口。
     pub port: u16,
-    /// 是否校验 Claude 客户端 User-Agent。
+    /// 按协议校验客户端 User-Agent：Claude 仅限 Claude Code，OpenAI 仅限 Codex。
     pub enforce_user_agent_check: bool,
     /// 全局准入上限。
     pub max_concurrent_requests: usize,
@@ -1325,7 +1325,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# =====================================
 host = "0.0.0.0"
 # 新建 API 代理服务的默认端口；允许范围 1024-65535。
 port = 5580
-# 是否校验 Claude 路由的客户端 User-Agent；不影响 OpenAI Chat Completions。
+# 按协议校验客户端 User-Agent：Claude 路由仅限 Claude Code，OpenAI 路由仅限 Codex。
 enforce_user_agent_check = true
 # 所有代理服务共享的请求准入上限；超出时返回 503 和 Retry-After。
 max_concurrent_requests = 500
