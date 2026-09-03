@@ -741,6 +741,204 @@ async fn temporarily_unavailable_model_falls_back_to_lower_same_family_model() {
 }
 
 #[tokio::test]
+async fn mcp_tool_inputs_are_consistent_across_http_protocols_and_buffering_modes() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    let config_path = daemon.home().join("config.toml");
+    let mut config: kproxy_core::config::Config =
+        toml::from_str(&tokio::fs::read_to_string(&config_path).await.unwrap()).unwrap();
+    config.upstream.max_retries = 0;
+    config.features.enable_model_fallback = false;
+    config.features.tool_call_buffer_delay_ms = 0;
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()
+        .unwrap();
+    let name = "mcp__relayer__memory_list_editable_atoms";
+
+    for buffered in [false, true] {
+        config.features.buffer_tool_calls = buffered;
+        tokio::fs::write(&config_path, toml::to_string(&config).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(
+            expect_ok(daemon.call("config.reload", serde_json::json!({})).await)["applied"],
+            true
+        );
+        for (input, stop, expected) in [
+            ("", false, Some(serde_json::json!({}))),
+            (" \n\t", false, Some(serde_json::json!({}))),
+            (" \n\t", true, Some(serde_json::json!({}))),
+            (
+                r#" {"query":"editable","raw":"keep"} "#,
+                false,
+                Some(serde_json::json!({"query":"editable","raw":"keep"})),
+            ),
+            (r#"{"query":"unfinished"#, false, None),
+            (r#"{"query":"editable",}"#, true, None),
+        ] {
+            // Emit a real frame sequence with fragmented arguments, including
+            // clean EOF without tool stop (the reported production failure).
+            let mut upstream_body = event_stream_frame(
+                "toolUseEvent",
+                serde_json::json!({
+                    "toolUseId":"call", "name":name, "input":"", "stop":false
+                }),
+            );
+            let (first, second) = input.split_at(input.len() / 2);
+            for fragment in [first, second] {
+                upstream_body.extend(event_stream_frame(
+                    "toolUseEvent",
+                    serde_json::json!({
+                        "toolUseId":"call", "name":name, "input":fragment, "stop":false
+                    }),
+                ));
+            }
+            if stop {
+                upstream_body.extend(event_stream_frame(
+                    "toolUseEvent",
+                    serde_json::json!({
+                        "toolUseId":"call", "name":name, "stop":true
+                    }),
+                ));
+            }
+            let _fixture = Mock::given(method("POST"))
+                .and(path("/generateAssistantResponse"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/vnd.amazon.eventstream")
+                        .set_body_bytes(upstream_body),
+                )
+                .mount_as_scoped(&mock)
+                .await;
+
+            for claude in [false, true] {
+                for stream in [false, true] {
+                    let route = if claude {
+                        "messages"
+                    } else {
+                        "chat/completions"
+                    };
+                    let mut request = serde_json::json!({
+                        "model":"source-large", "max_tokens":256, "stream":stream,
+                        "messages":[{"role":"user","content":"Use the provided tool."}]
+                    });
+                    request["tools"] = if claude {
+                        serde_json::json!([{"name":name,"description":"List editable atoms","input_schema":{"type":"object"}}])
+                    } else {
+                        serde_json::json!([{"type":"function","function":{"name":name,"description":"List editable atoms","parameters":{"type":"object"}}}])
+                    };
+                    let response = client
+                        .post(format!("http://127.0.0.1:{port}/v1/{route}"))
+                        .header("x-api-key", daemon.api_key.as_deref().unwrap())
+                        .bearer_auth(daemon.api_key.as_deref().unwrap())
+                        .header("anthropic-version", "2023-06-01")
+                        .header("user-agent", "claude-cli/2.1.235 (external, e2e)")
+                        .json(&request)
+                        .send()
+                        .await
+                        .unwrap();
+                    let status = response.status();
+                    let body = response.text().await.unwrap();
+                    let context = format!("claude={claude}, stream={stream}, buffered={buffered}, input={input:?}, stop={stop}: {body}");
+                    assert!(!body.contains("before write tool"), "{context}");
+                    let Some(expected) = expected.as_ref() else {
+                        assert!(body.contains("produced invalid JSON input"), "{context}");
+                        if stream {
+                            assert!(!body.contains("data: [DONE]"), "{context}");
+                            assert!(!body.contains("\"type\":\"message_stop\""), "{context}");
+                        } else {
+                            assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY, "{context}");
+                        }
+                        continue;
+                    };
+                    assert_eq!(status, reqwest::StatusCode::OK, "{context}");
+                    assert!(!body.contains("\"error\""), "{context}");
+                    let actual: serde_json::Value = if stream {
+                        let events = body
+                            .lines()
+                            .filter_map(|line| line.strip_prefix("data: "))
+                            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                            .collect::<Vec<_>>();
+                        let arguments = if claude {
+                            let tool = events
+                                .iter()
+                                .find_map(|event| {
+                                    event
+                                        .get("content_block")
+                                        .filter(|block| block["type"] == "tool_use")
+                                })
+                                .expect("tool block");
+                            assert_eq!(tool["name"], name, "{context}");
+                            events
+                                .iter()
+                                .filter_map(|event| {
+                                    event
+                                        .pointer("/delta/partial_json")
+                                        .and_then(serde_json::Value::as_str)
+                                })
+                                .collect::<String>()
+                        } else {
+                            let tools = events
+                                .iter()
+                                .filter_map(|event| {
+                                    event
+                                        .pointer("/choices/0/delta/tool_calls")
+                                        .and_then(serde_json::Value::as_array)
+                                })
+                                .flatten()
+                                .collect::<Vec<_>>();
+                            assert!(
+                                tools.iter().any(|tool| tool["function"]["name"] == name),
+                                "{context}"
+                            );
+                            tools
+                                .iter()
+                                .filter_map(|tool| {
+                                    tool.pointer("/function/arguments")
+                                        .and_then(serde_json::Value::as_str)
+                                })
+                                .collect::<String>()
+                        };
+                        if claude && arguments.is_empty() {
+                            serde_json::json!({})
+                        } else {
+                            serde_json::from_str(&arguments).unwrap_or_else(|error| {
+                                panic!("{context}; invalid arguments {arguments:?}: {error}")
+                            })
+                        }
+                    } else {
+                        let response: serde_json::Value = serde_json::from_str(&body).unwrap();
+                        if claude {
+                            let tool = response["content"]
+                                .as_array()
+                                .unwrap()
+                                .iter()
+                                .find(|block| block["type"] == "tool_use")
+                                .expect("tool block");
+                            assert_eq!(tool["name"], name, "{context}");
+                            tool["input"].clone()
+                        } else {
+                            let tool = &response["choices"][0]["message"]["tool_calls"][0];
+                            assert_eq!(tool["function"]["name"], name, "{context}");
+                            serde_json::from_str(tool["function"]["arguments"].as_str().unwrap())
+                                .unwrap()
+                        }
+                    };
+                    assert_eq!(&actual, expected, "{context}");
+                }
+            }
+        }
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn claude_stream_stops_before_later_frames_in_the_same_upstream_chunk() {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;

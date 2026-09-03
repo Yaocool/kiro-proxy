@@ -293,7 +293,7 @@ pub(super) async fn collect_nonstream_rounds(
             let _trailing = stop_filter.finish();
         }
         if decoded.stop_sequence.is_none() {
-            decoded.validate_tool_inputs().map_err(|message| {
+            decoded.finalize_tool_inputs().map_err(|message| {
                 ExecuteError::Upstream(KiroError {
                     status: None,
                     endpoint: endpoint.clone(),

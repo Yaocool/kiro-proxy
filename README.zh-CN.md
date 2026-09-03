@@ -170,6 +170,13 @@ GET  /health
 同时支持 Claude 别名 `/messages`、`/anthropic/v1/messages`，以及 OpenAI 别名
 `/chat/completions`、`/models`。
 
+### 工具调用参数
+
+上游原生工具调用（包括 MCP 工具）在 Claude/OpenAI、流式/非流式、开启/关闭缓冲时，
+使用同一套 JSON 校验规则，不根据工具名称推断读写操作。空参数统一为 `{}`；参数是合法
+JSON 时，即使上游未发送工具 stop 事件也可正常返回。非空但损坏的 JSON 会明确报错，
+不会通过猜测缺失参数来补全调用。
+
 ### Claude Code MCP Tool Search
 
 当 `ANTHROPIC_BASE_URL` 指向第三方代理时，Claude Code 默认会关闭 Tool Search，并在请求中
