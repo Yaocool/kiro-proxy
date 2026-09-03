@@ -4,6 +4,7 @@ pub mod context;
 pub mod error;
 pub mod model;
 pub mod protocol;
+pub mod responses;
 pub mod tokenizer;
 pub mod tool_history;
 pub mod translate;
@@ -18,6 +19,9 @@ pub use context::{
 };
 pub use error::{error_envelope, sanitize_error_message, ErrorFormat};
 pub use protocol::*;
+pub use responses::{
+    responses_to_openai, ResponsesRequest, ResponsesToolName, ResponsesTranslation,
+};
 pub use tokenizer::{
     compaction_summary_payload, ContextCompactionStats, KiroCompactionPlan, TokenCountCache,
     TokenCountStats,
