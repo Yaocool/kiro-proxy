@@ -2,8 +2,45 @@ use super::{
     attempt_diagnostics, build_model_path, check_context_limit, dispatch_error,
     find_model_fallback, map_model, now_secs, push_model_path, resolve_static_model,
     retry_attempt_count, sanitize_error_message, set_payload_model, upstream_attempt_log, AppState,
-    Arc, ExecuteError, HashSet, KiroError, PoolError, Rng, UpstreamAttemptLog, UpstreamExecution,
+    Arc, ExecuteError, HashSet, KiroError, PoolError, PreparedUpstream, Rng, UpstreamAttemptLog,
+    UpstreamExecution,
 };
+
+enum DispatchOutcome {
+    Prepared(Box<PreparedUpstream>),
+    Generated(Box<UpstreamExecution>),
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::http::handlers) async fn prepare_upstream(
+    state: &Arc<AppState>,
+    trace_id: &str,
+    model: &str,
+    requested_model: &str,
+    key_id: Option<&str>,
+    default_model: &str,
+    payload: &kproxy_translate::KiroPayload,
+) -> Result<PreparedUpstream, ExecuteError> {
+    match dispatch_upstream(
+        state,
+        trace_id,
+        model,
+        requested_model,
+        key_id,
+        default_model,
+        0.0,
+        0,
+        false,
+        payload,
+        None,
+        true,
+    )
+    .await?
+    {
+        DispatchOutcome::Prepared(prepared) => Ok(*prepared),
+        DispatchOutcome::Generated(_) => unreachable!("preflight must not generate"),
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub(in crate::http::handlers) async fn execute_upstream(
@@ -17,21 +54,87 @@ pub(in crate::http::handlers) async fn execute_upstream(
     input_tokens: u64,
     compact: bool,
     payload: &kproxy_translate::KiroPayload,
+    prepared: Option<PreparedUpstream>,
 ) -> Result<UpstreamExecution, ExecuteError> {
+    match dispatch_upstream(
+        state,
+        trace_id,
+        model,
+        requested_model,
+        key_id,
+        default_model,
+        estimate,
+        input_tokens,
+        compact,
+        payload,
+        prepared,
+        false,
+    )
+    .await?
+    {
+        DispatchOutcome::Generated(execution) => Ok(*execution),
+        DispatchOutcome::Prepared(_) => unreachable!("generation must not stop at preflight"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn dispatch_upstream(
+    state: &Arc<AppState>,
+    trace_id: &str,
+    model: &str,
+    requested_model: &str,
+    key_id: Option<&str>,
+    default_model: &str,
+    estimate: f64,
+    input_tokens: u64,
+    compact: bool,
+    payload: &kproxy_translate::KiroPayload,
+    prepared: Option<PreparedUpstream>,
+    preflight_only: bool,
+) -> Result<DispatchOutcome, ExecuteError> {
     let config = state.config.current();
     let pool = state.pool();
     let account_count = pool.snapshot().await.len() as u32;
     let attempts = retry_attempt_count(config.upstream.max_retries, account_count);
     let mut last_error = None;
-    let mut actual_model = model.to_string();
-    let mut mapped_model = model.to_string();
-    let mut request_payload = payload.clone();
+    // Reuse the prepared state without cloning the full conversation again or
+    // drawing another weighted mapping choice. Preserve preflight exclusions
+    // and attempt numbers when generation subsequently needs a retry.
+    let (
+        mut actual_model,
+        mut mapped_model,
+        mut request_payload,
+        mut model_mapping_rule,
+        mut model_path,
+        mut attempt_logs,
+        mut prepared_lease,
+    ) = if let Some(selected) = prepared {
+        (
+            selected.kiro_model,
+            selected.mapped_model,
+            selected.payload,
+            selected.model_mapping_rule,
+            selected.model_path,
+            selected.attempts,
+            Some(selected.lease),
+        )
+    } else {
+        (
+            model.to_owned(),
+            model.to_owned(),
+            payload.clone(),
+            map_model(requested_model, &config.model_mapping, key_id, None, "").rule,
+            build_model_path(requested_model, model, ""),
+            Vec::new(),
+            None,
+        )
+    };
     let mut fallback_model = None::<String>;
-    let mut attempted_accounts = HashSet::new();
-    let initial_route = map_model(requested_model, &config.model_mapping, key_id, None, "");
-    let mut model_mapping_rule = initial_route.rule;
-    let mut model_path = build_model_path(requested_model, model, "");
-    let mut attempt_logs = Vec::new();
+    let mut attempted_accounts = attempt_logs
+        .iter()
+        .map(|attempt| attempt.account_id.clone())
+        .collect::<HashSet<_>>();
+    let preflight_attempts = attempt_logs.len() as u32;
     tracing::info!(
         event = "upstream.dispatch.started",
         trace_id,
@@ -39,157 +142,177 @@ pub(in crate::http::handlers) async fn execute_upstream(
         initial_model = model,
         max_attempts = attempts,
         account_count,
+        preflight_only,
         "upstream dispatch started"
     );
-    for attempt in 0..attempts {
-        let lease = match pool
-            .acquire_excluding(&actual_model, estimate, &attempted_accounts)
-            .await
-        {
-            Ok(lease) => lease,
-            Err(PoolError::NoAvailableAccount(_)) if last_error.is_some() => break,
-            Err(PoolError::NoAvailableAccount(_))
-                if pool.all_matching_credit_exhausted(&actual_model).await =>
-            {
-                crate::alerts::sync_service_quota(state).await;
-                return Err(ExecuteError::Pool(PoolError::CreditsExhausted));
-            }
-            Err(PoolError::NoAvailableAccount(_))
-                if !default_model.trim().is_empty() && actual_model != default_model =>
-            {
-                actual_model = default_model.to_string();
-                set_payload_model(&mut request_payload, &actual_model);
-                match pool
-                    .acquire_excluding(&actual_model, estimate, &attempted_accounts)
-                    .await
-                {
-                    Ok(lease) => lease,
-                    Err(PoolError::NoAvailableAccount(_)) if last_error.is_some() => break,
-                    Err(PoolError::NoAvailableAccount(_))
-                        if pool.all_matching_credit_exhausted(&actual_model).await =>
-                    {
-                        crate::alerts::sync_service_quota(state).await;
-                        return Err(ExecuteError::Pool(PoolError::CreditsExhausted));
-                    }
-                    Err(error) => return Err(ExecuteError::Pool(error)),
-                }
-            }
-            Err(PoolError::NoAvailableAccount(_)) => match pool
-                .acquire_excluding("", estimate, &attempted_accounts)
+    for attempt in preflight_attempts..attempts {
+        let lease = if let Some(lease) = prepared_lease.take() {
+            lease
+        } else {
+            let lease = match pool
+                .acquire_excluding(&actual_model, estimate, &attempted_accounts)
                 .await
             {
                 Ok(lease) => lease,
                 Err(PoolError::NoAvailableAccount(_)) if last_error.is_some() => break,
                 Err(PoolError::NoAvailableAccount(_))
-                    if pool.all_matching_credit_exhausted("").await =>
+                    if pool.all_matching_credit_exhausted(&actual_model).await =>
                 {
                     crate::alerts::sync_service_quota(state).await;
                     return Err(ExecuteError::Pool(PoolError::CreditsExhausted));
                 }
+                Err(PoolError::NoAvailableAccount(_))
+                    if !default_model.trim().is_empty() && actual_model != default_model =>
+                {
+                    actual_model = default_model.to_string();
+                    set_payload_model(&mut request_payload, &actual_model);
+                    match pool
+                        .acquire_excluding(&actual_model, estimate, &attempted_accounts)
+                        .await
+                    {
+                        Ok(lease) => lease,
+                        Err(PoolError::NoAvailableAccount(_)) if last_error.is_some() => break,
+                        Err(PoolError::NoAvailableAccount(_))
+                            if pool.all_matching_credit_exhausted(&actual_model).await =>
+                        {
+                            crate::alerts::sync_service_quota(state).await;
+                            return Err(ExecuteError::Pool(PoolError::CreditsExhausted));
+                        }
+                        Err(error) => return Err(ExecuteError::Pool(error)),
+                    }
+                }
+                Err(PoolError::NoAvailableAccount(_)) => match pool
+                    .acquire_excluding("", estimate, &attempted_accounts)
+                    .await
+                {
+                    Ok(lease) => lease,
+                    Err(PoolError::NoAvailableAccount(_)) if last_error.is_some() => break,
+                    Err(PoolError::NoAvailableAccount(_))
+                        if pool.all_matching_credit_exhausted("").await =>
+                    {
+                        crate::alerts::sync_service_quota(state).await;
+                        return Err(ExecuteError::Pool(PoolError::CreditsExhausted));
+                    }
+                    Err(error) => return Err(ExecuteError::Pool(error)),
+                },
                 Err(error) => return Err(ExecuteError::Pool(error)),
-            },
-            Err(error) => return Err(ExecuteError::Pool(error)),
-        };
-        let account = lease.account().await;
-        let account_name = account.display_name().to_owned();
-        tracing::debug!(
-            event = "upstream.account.selected",
-            trace_id,
-            attempt = attempt + 1,
-            max_attempts = attempts,
-            account_id = %account.id,
-            account_name,
-            candidate_model = %actual_model,
-            "upstream account selected"
-        );
-        let mut account_model_incompatible = false;
-        let mut available_models = Vec::new();
-        if let Some(runtime) = pool.get(&account.id).await {
-            let remaining = account
-                .usage
-                .as_ref()
-                .filter(|usage| usage.limit > 0.0)
-                .map(|usage| {
-                    ((usage.limit - usage.current) / usage.limit * 100.0).clamp(0.0, 100.0)
-                });
-            if let Some(fallback) = fallback_model.clone() {
-                mapped_model = fallback;
-            } else {
-                let route = map_model(
-                    requested_model,
-                    &config.model_mapping,
-                    key_id,
-                    remaining,
-                    "",
-                );
-                mapped_model = route.mapped;
-                model_mapping_rule = route.rule;
-            }
-            model_path = build_model_path(requested_model, &mapped_model, "");
-            actual_model.clone_from(&mapped_model);
-            if let Some(resolved) = runtime.resolve_model(&actual_model).await {
-                actual_model = resolved;
-                push_model_path(&mut model_path, &actual_model);
-                set_payload_model(&mut request_payload, &actual_model);
-            } else if runtime.has_model_cache().await {
-                if !default_model.trim().is_empty() {
-                    if let Some(resolved) = runtime.resolve_model(default_model).await {
-                        actual_model = resolved;
-                        push_model_path(&mut model_path, default_model);
-                        push_model_path(&mut model_path, &actual_model);
-                        set_payload_model(&mut request_payload, &actual_model);
+            };
+            let account = lease.account().await;
+            let account_name = account.display_name().to_owned();
+            tracing::debug!(
+                event = "upstream.account.selected",
+                trace_id,
+                attempt = attempt + 1,
+                max_attempts = attempts,
+                account_id = %account.id,
+                account_name,
+                candidate_model = %actual_model,
+                "upstream account selected"
+            );
+            let mut account_model_incompatible = false;
+            let mut available_models = Vec::new();
+            if let Some(runtime) = pool.get(&account.id).await {
+                let remaining = account
+                    .usage
+                    .as_ref()
+                    .filter(|usage| usage.limit > 0.0)
+                    .map(|usage| {
+                        ((usage.limit - usage.current) / usage.limit * 100.0).clamp(0.0, 100.0)
+                    });
+                if let Some(fallback) = fallback_model.clone() {
+                    mapped_model = fallback;
+                } else {
+                    let route = map_model(
+                        requested_model,
+                        &config.model_mapping,
+                        key_id,
+                        remaining,
+                        "",
+                    );
+                    mapped_model = route.mapped;
+                    model_mapping_rule = route.rule;
+                }
+                model_path = build_model_path(requested_model, &mapped_model, "");
+                actual_model.clone_from(&mapped_model);
+                if let Some(resolved) = runtime.resolve_model(&actual_model).await {
+                    actual_model = resolved;
+                    push_model_path(&mut model_path, &actual_model);
+                    set_payload_model(&mut request_payload, &actual_model);
+                } else if runtime.has_model_cache().await {
+                    if !default_model.trim().is_empty() {
+                        if let Some(resolved) = runtime.resolve_model(default_model).await {
+                            actual_model = resolved;
+                            push_model_path(&mut model_path, default_model);
+                            push_model_path(&mut model_path, &actual_model);
+                            set_payload_model(&mut request_payload, &actual_model);
+                        } else {
+                            account_model_incompatible = true;
+                            available_models = runtime.supported_models().await;
+                        }
                     } else {
                         account_model_incompatible = true;
                         available_models = runtime.supported_models().await;
                     }
                 } else {
-                    account_model_incompatible = true;
-                    available_models = runtime.supported_models().await;
+                    if let Some(resolved) = resolve_static_model(&account, &actual_model) {
+                        actual_model = resolved;
+                        push_model_path(&mut model_path, &actual_model);
+                    }
+                    set_payload_model(&mut request_payload, &actual_model);
                 }
-            } else {
-                if let Some(resolved) = resolve_static_model(&account, &actual_model) {
-                    actual_model = resolved;
-                    push_model_path(&mut model_path, &actual_model);
-                }
-                set_payload_model(&mut request_payload, &actual_model);
             }
-        }
-        if account_model_incompatible {
-            let reason = if default_model.trim().is_empty() {
-                format!(
+            if account_model_incompatible {
+                let reason = if default_model.trim().is_empty() {
+                    format!(
                     "model '{}' is not present in this account's model cache and no default model is configured",
                     actual_model
                 )
-            } else {
-                format!(
+                } else {
+                    format!(
                     "model '{}' and default model '{}' are not present in this account's model cache",
                     actual_model, default_model
                 )
-            };
-            attempt_logs.push(UpstreamAttemptLog {
-                attempt: attempt + 1,
-                account_id: account.id.clone(),
-                account_name: account_name.clone(),
-                model: actual_model.clone(),
-                available_models: available_models.clone(),
-                endpoint: "model-resolution".into(),
-                status: None,
-                error: reason.clone(),
-            });
-            tracing::warn!(
-                trace_id,
-                attempt = attempt + 1,
-                account_id = %account.id,
-                account_name,
-                model = %actual_model,
-                model_path = %model_path.join(" -> "),
-                available_models = %available_models.join(","),
-                reason,
-                "account cannot serve resolved model"
-            );
-            attempted_accounts.insert(account.id);
-            drop(lease);
-            continue;
+                };
+                attempt_logs.push(UpstreamAttemptLog {
+                    attempt: attempt + 1,
+                    account_id: account.id.clone(),
+                    account_name: account_name.clone(),
+                    model: actual_model.clone(),
+                    available_models: available_models.clone(),
+                    endpoint: "model-resolution".into(),
+                    status: None,
+                    error: reason.clone(),
+                });
+                tracing::warn!(
+                    trace_id,
+                    attempt = attempt + 1,
+                    account_id = %account.id,
+                    account_name,
+                    model = %actual_model,
+                    model_path = %model_path.join(" -> "),
+                    available_models = %available_models.join(","),
+                    reason,
+                    "account cannot serve resolved model"
+                );
+                attempted_accounts.insert(account.id);
+                drop(lease);
+                continue;
+            }
+            lease
+        };
+        let account = lease.account().await;
+        let account_name = account.display_name().to_owned();
+        state.prepare_model_request(&mut request_payload);
+        if preflight_only {
+            return Ok(DispatchOutcome::Prepared(Box::new(PreparedUpstream {
+                lease,
+                mapped_model,
+                kiro_model: actual_model,
+                model_path,
+                model_mapping_rule,
+                attempts: attempt_logs,
+                payload: request_payload,
+            })));
         }
         if let Err(limit) = check_context_limit(state, input_tokens, compact, &actual_model) {
             return Err(ExecuteError::ContextLimit(limit));
@@ -230,7 +353,7 @@ pub(in crate::http::handlers) async fn execute_upstream(
                     "upstream response accepted"
                 );
                 pool.record_success(&account.id).await;
-                return Ok(UpstreamExecution {
+                return Ok(DispatchOutcome::Generated(Box::new(UpstreamExecution {
                     lease,
                     response,
                     upstream_access_token: account.credentials.access_token.clone(),
@@ -240,7 +363,7 @@ pub(in crate::http::handlers) async fn execute_upstream(
                     model_mapping_rule,
                     attempts: attempt_logs,
                     payload: request_payload,
-                });
+                })));
             }
             Err(error) if error.is_auth() => {
                 attempt_logs.push(upstream_attempt_log(
@@ -287,7 +410,7 @@ pub(in crate::http::handlers) async fn execute_upstream(
                                 "upstream authentication retry succeeded"
                             );
                             pool.record_success(&refreshed.id).await;
-                            return Ok(UpstreamExecution {
+                            return Ok(DispatchOutcome::Generated(Box::new(UpstreamExecution {
                                 lease,
                                 upstream_access_token: refreshed.credentials.access_token.clone(),
                                 mapped_model,
@@ -297,7 +420,7 @@ pub(in crate::http::handlers) async fn execute_upstream(
                                 attempts: attempt_logs,
                                 payload: request_payload,
                                 response,
-                            });
+                            })));
                         }
                         Err(retry_error) => {
                             attempt_logs.push(upstream_attempt_log(
@@ -438,6 +561,7 @@ pub(in crate::http::handlers) async fn execute_upstream(
                                 push_model_path(&mut model_path, &mapped_model);
                                 push_model_path(&mut model_path, &actual_model);
                                 set_payload_model(&mut request_payload, &actual_model);
+                                state.prepare_model_request(&mut request_payload);
                                 match state.generate(&account, &request_payload).await {
                                     Ok(response) => {
                                         tracing::info!(
@@ -452,20 +576,22 @@ pub(in crate::http::handlers) async fn execute_upstream(
                                             "upstream model fallback succeeded"
                                         );
                                         pool.record_success(&account.id).await;
-                                        return Ok(UpstreamExecution {
-                                            lease,
-                                            upstream_access_token: account
-                                                .credentials
-                                                .access_token
-                                                .clone(),
-                                            mapped_model,
-                                            kiro_model: actual_model,
-                                            model_path,
-                                            model_mapping_rule,
-                                            attempts: attempt_logs,
-                                            payload: request_payload,
-                                            response,
-                                        });
+                                        return Ok(DispatchOutcome::Generated(Box::new(
+                                            UpstreamExecution {
+                                                lease,
+                                                upstream_access_token: account
+                                                    .credentials
+                                                    .access_token
+                                                    .clone(),
+                                                mapped_model,
+                                                kiro_model: actual_model,
+                                                model_path,
+                                                model_mapping_rule,
+                                                attempts: attempt_logs,
+                                                payload: request_payload,
+                                                response,
+                                            },
+                                        )));
                                     }
                                     Err(fallback_error) => {
                                         attempt_logs.push(upstream_attempt_log(

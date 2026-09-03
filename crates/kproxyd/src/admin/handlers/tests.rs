@@ -831,6 +831,7 @@ async fn administrative_lists_use_stable_name_order() {
         description: String::new(),
         rate_multiplier: None,
         token_limits: None,
+        additional_model_request_fields_schema: None,
     });
     sort_models_for_display(&mut models);
     assert_eq!(

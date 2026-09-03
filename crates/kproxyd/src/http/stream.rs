@@ -14,9 +14,9 @@ use kproxy_kiro::{EventStreamDecoder, KiroEvent, KiroResponse};
 use kproxy_pool::AccountLease;
 use kproxy_translate::{
     auto_continue_payload, tool_search_continue_payload_batch, web_search_continue_payload_batch,
-    ClaudeServerToolEmission, ClaudeToolSearchBudget, ClaudeToolSearchCatalog,
-    ClaudeToolSearchTrace, ClaudeWebSearchTrace, KiroPayload, KiroToolUse, WebSearchReplayCodec,
-    WebSearchReplayError,
+    ClaudeContextEditStats, ClaudeServerToolEmission, ClaudeToolSearchBudget,
+    ClaudeToolSearchCatalog, ClaudeToolSearchTrace, ClaudeWebSearchTrace, KiroPayload, KiroToolUse,
+    WebSearchReplayCodec, WebSearchReplayError,
 };
 use serde_json::{json, Value};
 use tokio::sync::broadcast;
@@ -28,8 +28,9 @@ use crate::stats::{RequestDiagnostics, RequestLog, UpstreamAttemptLog};
 
 use super::prompt_cache::{PromptCachePlan, PromptCacheProfile};
 use super::response::{
-    repair_json, web_search_citations, CompactionIterationUsage, DecodedResponse,
-    OpenAiToolIdentity, StopSequenceFilter, ThinkingContentFilter, ToolLeakFilter,
+    kiro_citation_key, kiro_visible_references, repair_json, web_search_citations,
+    CompactionIterationUsage, DecodedResponse, OpenAiToolIdentity, StopSequenceFilter,
+    ThinkingContentFilter, ToolLeakFilter,
 };
 use super::usage::{fallback_credits, fill_missing_usage, produced_output};
 
@@ -97,8 +98,10 @@ pub struct StreamContext {
     pub compaction_iteration: Option<CompactionIterationUsage>,
     /// Effective input size before proxy-triggered model-mapping compaction.
     pub auto_compaction_original_input_tokens: Option<u64>,
+    /// Client-requested context edits that were actually applied locally.
+    pub context_edit_stats: ClaudeContextEditStats,
     pub estimated_credits: f64,
-    pub max_tokens: u32,
+    pub max_tokens: Option<u32>,
     pub stop_sequences: Vec<String>,
     pub started: Instant,
     pub prompt_cache: Option<PromptCacheProfile>,
@@ -130,6 +133,9 @@ pub struct StreamContext {
     pub diagnostics: RequestDiagnostics,
     /// Kiro-normalized tool name -> original OpenAI tool type and name.
     pub openai_tools: std::collections::HashMap<String, OpenAiToolIdentity>,
+    /// Keeps decoded remote attachments charged to the global body budget for
+    /// the full lifetime of streaming continuations.
+    pub _attachment_guards: Vec<crate::state::BodyGuard>,
     pub _connection_guard: crate::state::AdmissionGuard,
     pub _admission_guard: crate::state::AdmissionGuard,
 }
@@ -181,6 +187,9 @@ fn build_claude_state(context: &StreamContext, prompt_cache: &PromptCachePlan) -
     claude.openai_include_usage = context.include_usage_chunk;
     claude.auto_compaction_original_input_tokens = context.auto_compaction_original_input_tokens;
     claude.compaction_iteration = context.compaction_iteration;
+    claude
+        .context_edit_stats
+        .clone_from(&context.context_edit_stats);
     claude.set_prompt_cache_plan(prompt_cache);
     claude
 }
@@ -450,6 +459,7 @@ fn event_kind(event: &KiroEvent) -> &'static str {
         KiroEvent::AssistantResponse { .. } => "assistant_response",
         KiroEvent::ToolUse { .. } => "tool_use",
         KiroEvent::Reasoning { .. } => "reasoning",
+        KiroEvent::Citations { .. } => "citations",
         KiroEvent::MessageMetadata { .. } => "message_metadata",
         KiroEvent::Usage { .. } => "usage",
         KiroEvent::Error { .. } => "error",
@@ -502,6 +512,7 @@ fn openai_event(
 ) -> Vec<String> {
     let delta = match event {
         KiroEvent::AssistantResponse { content } => {
+            state.visible_text.push_str(content);
             let prefix = if state.openai_thinking_open {
                 state.openai_thinking_open = false;
                 "</thinking>"
@@ -510,8 +521,18 @@ fn openai_event(
             };
             json!({"content":format!("{prefix}{content}")})
         }
-        KiroEvent::Reasoning { content } => match thinking_format {
-            ThinkingOutputFormat::Openai => json!({"reasoning_content":content}),
+        KiroEvent::Reasoning {
+            content,
+            signature: _,
+            redacted_content: _,
+        } => match thinking_format {
+            ThinkingOutputFormat::Openai => {
+                let mut delta = json!({});
+                if !content.is_empty() {
+                    delta["reasoning_content"] = json!(content);
+                }
+                delta
+            }
             ThinkingOutputFormat::Claude => {
                 let prefix = if state.openai_thinking_open {
                     ""
@@ -522,6 +543,31 @@ fn openai_event(
                 json!({"content":format!("{prefix}{content}")})
             }
         },
+        // Chat Completions has no citation event shape, so preserve the source
+        // information as ordinary visible text instead of dropping it.
+        KiroEvent::Citations { citations } => {
+            let fresh = citations
+                .iter()
+                .filter(|citation| {
+                    state
+                        .emitted_citation_links
+                        .insert(kiro_citation_key(citation))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            let references = kiro_visible_references(&fresh);
+            if references.is_empty() {
+                return Vec::new();
+            }
+            state.visible_text.push_str(&references);
+            let prefix = if state.openai_thinking_open {
+                state.openai_thinking_open = false;
+                "</thinking>"
+            } else {
+                ""
+            };
+            json!({"content":format!("{prefix}{references}")})
+        }
         KiroEvent::ToolUse {
             id,
             name,
@@ -586,6 +632,7 @@ struct ClaudeState {
     input_tokens: u64,
     auto_compaction_original_input_tokens: Option<u64>,
     compaction_iteration: Option<CompactionIterationUsage>,
+    context_edit_stats: ClaudeContextEditStats,
     message_started: bool,
     block: Option<(usize, &'static str)>,
     next_index: usize,
@@ -595,6 +642,8 @@ struct ClaudeState {
     openai_include_usage: bool,
     cache_creation_input_tokens: u64,
     cache_read_input_tokens: u64,
+    visible_text: String,
+    emitted_citation_links: HashSet<String>,
     web_search_replay: WebSearchReplayCodec,
 }
 
@@ -611,6 +660,7 @@ impl ClaudeState {
             input_tokens,
             auto_compaction_original_input_tokens: None,
             compaction_iteration: None,
+            context_edit_stats: ClaudeContextEditStats::default(),
             message_started: false,
             block: None,
             next_index: 0,
@@ -620,13 +670,17 @@ impl ClaudeState {
             openai_include_usage: false,
             cache_creation_input_tokens: 0,
             cache_read_input_tokens: 0,
+            visible_text: String::new(),
+            emitted_citation_links: HashSet::new(),
             web_search_replay,
         }
     }
 
-    fn set_prompt_cache_plan(&mut self, plan: &PromptCachePlan) {
-        self.cache_creation_input_tokens = plan.cache_write_tokens();
-        self.cache_read_input_tokens = plan.cache_read_tokens();
+    fn set_prompt_cache_plan(&mut self, _plan: &PromptCachePlan) {
+        // Streaming starts before Kiro reports usage. Do not publish the local
+        // cache estimate as fact; the final message_delta carries real counters.
+        self.cache_creation_input_tokens = 0;
+        self.cache_read_input_tokens = 0;
     }
 
     fn ensure_message(&mut self, output: &mut Vec<String>) {
@@ -662,12 +716,6 @@ impl ClaudeState {
             if current == kind && kind != "tool_use" {
                 return index;
             }
-            if current == "thinking" {
-                output.push(sse(&json!({
-                    "type":"content_block_delta","index":index,
-                    "delta":{"type":"signature_delta","signature":kproxy_translate::SIGNATURE_PLACEHOLDER}
-                })));
-            }
             output.push(sse(&json!({"type":"content_block_stop","index":index})));
         }
         let index = self.next_index;
@@ -683,6 +731,7 @@ impl ClaudeState {
         let mut output = Vec::new();
         match event {
             KiroEvent::AssistantResponse { content } => {
+                self.visible_text.push_str(content);
                 let index =
                     self.switch_block(&mut output, "text", json!({"type":"text","text":""}));
                 output.push(sse(&json!({
@@ -690,16 +739,59 @@ impl ClaudeState {
                     "delta":{"type":"text_delta","text":content}
                 })));
             }
-            KiroEvent::Reasoning { content } => {
-                let index = self.switch_block(
-                    &mut output,
-                    "thinking",
-                    json!({"type":"thinking","thinking":"","signature":""}),
-                );
-                output.push(sse(&json!({
-                    "type":"content_block_delta","index":index,
-                    "delta":{"type":"thinking_delta","thinking":content}
-                })));
+            KiroEvent::Reasoning {
+                content,
+                signature,
+                redacted_content,
+            } => {
+                if !content.is_empty() || signature.is_some() {
+                    let index = self.switch_block(
+                        &mut output,
+                        "thinking",
+                        json!({"type":"thinking","thinking":"","signature":""}),
+                    );
+                    if !content.is_empty() {
+                        output.push(sse(&json!({
+                            "type":"content_block_delta","index":index,
+                            "delta":{"type":"thinking_delta","thinking":content}
+                        })));
+                    }
+                    if let Some(signature) = signature {
+                        output.push(sse(&json!({
+                            "type":"content_block_delta","index":index,
+                            "delta":{"type":"signature_delta","signature":signature}
+                        })));
+                    }
+                }
+                if let Some(data) = redacted_content {
+                    let index = self.switch_block(
+                        &mut output,
+                        "redacted_thinking",
+                        json!({"type":"redacted_thinking","data":data}),
+                    );
+                    output.push(sse(&json!({"type":"content_block_stop","index":index})));
+                    self.block = None;
+                }
+            }
+            KiroEvent::Citations { citations } => {
+                let fresh = citations
+                    .iter()
+                    .filter(|citation| {
+                        self.emitted_citation_links
+                            .insert(kiro_citation_key(citation))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                let fallback = kiro_visible_references(&fresh);
+                if !fallback.is_empty() {
+                    self.visible_text.push_str(&fallback);
+                    let index =
+                        self.switch_block(&mut output, "text", json!({"type":"text","text":""}));
+                    output.push(sse(&json!({
+                        "type":"content_block_delta","index":index,
+                        "delta":{"type":"text_delta","text":fallback}
+                    })));
+                }
             }
             KiroEvent::ToolUse {
                 id,
@@ -916,7 +1008,7 @@ fn stream_finish(
     decoded: &DecodedResponse,
     created: i64,
     model: &str,
-    max_tokens: u32,
+    max_tokens: Option<u32>,
     current_round_output_tokens: u64,
     thinking_format: ThinkingOutputFormat,
     include_usage_chunk: bool,
@@ -925,20 +1017,16 @@ fn stream_finish(
         StreamProtocol::Claude => {
             let mut output = Vec::new();
             claude.ensure_message(&mut output);
-            if let Some((index, kind)) = claude.block.take() {
-                if kind == "thinking" {
-                    output.push(sse(&json!({
-                        "type":"content_block_delta","index":index,
-                        "delta":{"type":"signature_delta","signature":kproxy_translate::SIGNATURE_PLACEHOLDER}
-                    })));
-                }
+            if let Some((index, _kind)) = claude.block.take() {
                 output.push(sse(&json!({"type":"content_block_stop","index":index})));
             }
             let stop = if let Some(reason) = decoded.stop_reason.as_deref() {
                 reason
             } else if !decoded.tools.is_empty() {
                 "tool_use"
-            } else if current_round_output_tokens >= u64::from(max_tokens) {
+            } else if max_tokens
+                .is_some_and(|maximum| current_round_output_tokens >= u64::from(maximum))
+            {
                 "max_tokens"
             } else {
                 "end_turn"
@@ -982,15 +1070,17 @@ fn stream_finish(
                 },
                 "usage":usage
             });
+            let mut applied_edits = claude.context_edit_stats.applied_edits();
             if let Some(original_input_tokens) = claude.auto_compaction_original_input_tokens {
-                event["context_management"] = json!({
-                    "applied_edits":[{
+                applied_edits.push(json!({
                         "type":"compact_20260112",
                         "reason":"model_mapping_overflow",
                         "original_input_tokens":original_input_tokens,
                         "compacted_input_tokens":claude.input_tokens
-                    }]
-                });
+                }));
+            }
+            if !applied_edits.is_empty() {
+                event["context_management"] = json!({"applied_edits":applied_edits});
             }
             output.push(sse(&event));
             output.push(sse(&json!({"type":"message_stop"})));
@@ -1038,7 +1128,8 @@ fn stream_finish(
             let finish_reason = if !decoded.tools.is_empty() {
                 "tool_calls"
             } else if decoded.stop_reason.as_deref() == Some("max_tokens")
-                || current_round_output_tokens >= u64::from(max_tokens)
+                || max_tokens
+                    .is_some_and(|maximum| current_round_output_tokens >= u64::from(maximum))
             {
                 "length"
             } else {

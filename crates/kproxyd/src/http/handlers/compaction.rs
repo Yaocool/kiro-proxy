@@ -142,10 +142,7 @@ async fn generate_compaction_summary_inner(
 ) -> Result<GeneratedCompactionSummary, CompactionSummaryFailure> {
     let started = Instant::now();
     let input_tokens = state.tokenizer.estimate_kiro_payload(&payload).await? as u64;
-    let max_output_tokens = payload
-        .inference_config
-        .as_ref()
-        .map_or(1, |inference| inference.max_tokens);
+    let max_output_tokens = payload.max_output_tokens().unwrap_or(1);
     let estimate = estimated_credits(
         input_tokens,
         max_output_tokens,
@@ -168,6 +165,7 @@ async fn generate_compaction_summary_inner(
             input_tokens,
             true,
             &payload,
+            None,
         ) => result.map_err(execute_error_message)?,
         _ = cancel.cancelled() => {
             return Err(CompactionSummaryFailure {
@@ -478,19 +476,42 @@ async fn extractive_compaction(
     source_payload: &KiroPayload,
     target_tokens: u64,
     preserve_recent_turns: usize,
+    context_limit: Option<&CompactionDecision>,
 ) -> Result<(KiroPayload, kproxy_translate::ContextCompactionStats), ApiError> {
     let mut payload = source_payload.clone();
-    let mut stats = state
+    let compacted = state
         .tokenizer
         .compact_kiro_payload(&mut payload, target_tokens as usize, preserve_recent_turns)
-        .await
-        .map_err(|error| {
-            ApiError::new(
+        .await;
+    let mut stats = match compacted {
+        Ok(stats) => stats,
+        Err(error)
+            if error.contains("local compaction did not reach target")
+                && context_limit.is_some() =>
+        {
+            let decision = context_limit.expect("checked above");
+            let actual = state
+                .tokenizer
+                .estimate_kiro_payload(&payload)
+                .await
+                .unwrap_or(decision.maximum_tokens as usize + 1) as u64;
+            return Err(upstream_error(
+                ExecuteError::ContextLimit(ContextLimitError {
+                    model: decision.model.clone(),
+                    input_tokens: actual.max(decision.maximum_tokens.saturating_add(1)),
+                    maximum: decision.maximum_tokens,
+                }),
+                ErrorFormat::Claude,
+            ));
+        }
+        Err(error) => {
+            return Err(ApiError::new(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 error,
                 ErrorFormat::Claude,
-            )
-        })?;
+            ));
+        }
+    };
     finalize_compaction_payload(state, &mut payload, &mut stats, "extractive compaction").await?;
     Ok((payload, stats))
 }
@@ -643,23 +664,46 @@ pub(super) async fn run_compaction(
         })? as u64;
     let (summary_source, summary_preprocessed) = if source_input_tokens > summary_preprocess_target
     {
-        let (payload, stats) = extractive_compaction(
+        match extractive_compaction(
             state,
             source_payload,
             summary_preprocess_target,
             preserve_recent_turns,
+            None,
         )
-        .await?;
-        tracing::info!(
-            trace_id,
-            summary_model,
-            original_input_tokens = source_input_tokens,
-            preprocessed_input_tokens = stats.compacted_tokens,
-            preprocess_target_tokens = summary_preprocess_target,
-            removed_messages = stats.removed_messages,
-            "compaction summary input preprocessed locally"
-        );
-        (payload, true)
+        .await
+        {
+            Ok((payload, stats)) => {
+                tracing::info!(
+                    trace_id,
+                    summary_model,
+                    original_input_tokens = source_input_tokens,
+                    preprocessed_input_tokens = stats.compacted_tokens,
+                    preprocess_target_tokens = summary_preprocess_target,
+                    removed_messages = stats.removed_messages,
+                    "compaction summary input preprocessed locally"
+                );
+                (payload, true)
+            }
+            Err(error)
+                if error
+                    .message
+                    .contains("local compaction did not reach target") =>
+            {
+                // The summary model is an optimization, not the authority for
+                // the client's context limit. Let the capacity check skip the
+                // semantic round and have the main compaction path classify
+                // any irreducible request against the resolved model window.
+                tracing::warn!(
+                    trace_id,
+                    summary_model,
+                    reason = %sanitize_error_message(&error.message),
+                    "summary preprocessing could not reach its preferred target; skipping semantic summary"
+                );
+                (source_payload.clone(), false)
+            }
+            Err(error) => return Err(error),
+        }
     } else {
         (source_payload.clone(), false)
     };
@@ -774,6 +818,7 @@ pub(super) async fn run_compaction(
         source_payload,
         operation_target,
         preserve_recent_turns,
+        Some(decision),
     )
     .await?;
     if stats.compacted_tokens as u64 > decision.maximum_tokens {
@@ -912,6 +957,7 @@ pub(super) async fn reapply_compaction(
                 source_payload,
                 operation_target,
                 *preserve_recent_turns,
+                Some(decision),
             )
             .await?;
             (payload, stats, "extractive_fallback", *usage)

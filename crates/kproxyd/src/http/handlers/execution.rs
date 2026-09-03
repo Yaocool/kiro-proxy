@@ -4,18 +4,19 @@ use super::{
     remaining_tool_search_budget, resolve_dynamic_model, resume_web_search_payload,
     sanitize_error_message, sanitize_kiro_tool_history, tool_search_continue_payload_batch,
     upstream_error, validate_kiro_tool_history, web_search_continue_payload_batch, AccountLease,
-    ApiError, AppState, Arc, ClaudeRequest, ClaudeServerEvent, ClaudeToolSearchBudget,
-    ClaudeToolSearchCatalog, ClaudeWebSearchTrace, CompactionIterationUsage, CreditReservation,
-    DecodedResponse, DispatchFailure, ErrorFormat, ExecuteError, HashSet, Instant, IntoResponse,
-    Json, KiroError, KiroEvent, KiroResponse, OpenAiRequest, OpenAiToolIdentity, PoolError,
-    PromptCacheProfile, RequestDiagnostics, RequestLog, RequestLogContext, Response, Rng,
-    StopSequenceFilter, ThinkingContentFilter, ToolLeakFilter, UpstreamAttemptLog,
-    UpstreamExecution, UsageRecord, Uuid, Value,
+    ApiError, AppState, Arc, ClaudeContextEditStats, ClaudeRequest, ClaudeServerEvent,
+    ClaudeToolSearchBudget, ClaudeToolSearchCatalog, ClaudeWebSearchTrace,
+    CompactionIterationUsage, CreditReservation, DecodedResponse, DispatchFailure, ErrorFormat,
+    ExecuteError, HashSet, Instant, IntoResponse, Json, KiroError, KiroEvent, KiroResponse,
+    OpenAiRequest, OpenAiToolIdentity, PoolError, PreparedUpstream, PromptCacheProfile,
+    RequestDiagnostics, RequestLog, RequestLogContext, Response, Rng, StopSequenceFilter,
+    ThinkingContentFilter, ToolLeakFilter, UpstreamAttemptLog, UpstreamExecution, UsageRecord,
+    Uuid, Value,
 };
 
 mod dispatch;
 
-pub(super) use dispatch::execute_upstream;
+pub(super) use dispatch::{execute_upstream, prepare_upstream};
 
 pub(super) fn build_model_path(original: &str, mapped: &str, kiro: &str) -> Vec<String> {
     let mut path = Vec::new();
@@ -174,7 +175,7 @@ pub(super) fn push_nonstream_event(
 ) -> Result<bool, String> {
     if matches!(
         event,
-        KiroEvent::Reasoning { .. } | KiroEvent::ToolUse { .. }
+        KiroEvent::Reasoning { .. } | KiroEvent::Citations { .. } | KiroEvent::ToolUse { .. }
     ) {
         visible_text.push_str(&stop_filter.finish());
     }
@@ -198,7 +199,7 @@ pub(super) async fn collect_nonstream_rounds(
     mut upstream: KiroResponse,
     mut payload: kproxy_translate::KiroPayload,
     compact: bool,
-    max_output_tokens: u32,
+    max_output_tokens: Option<u32>,
     stop_sequences: &[String],
     thinking_enabled: bool,
     tool_search: Option<&Arc<ClaudeToolSearchCatalog>>,
@@ -233,6 +234,7 @@ pub(super) async fn collect_nonstream_rounds(
         .filter(|search| search.executed)
         .count() as u32;
     loop {
+        let effective_thinking = thinking_enabled && upstream.thinking_enabled();
         let (endpoint_definition, response, _upstream_permit) = upstream.into_parts();
         let endpoint = endpoint_definition.name.to_string();
         let events = state
@@ -242,7 +244,8 @@ pub(super) async fn collect_nonstream_rounds(
             .map_err(ExecuteError::Upstream)?;
         let event_count = events.len();
         let mut leak_filter = ToolLeakFilter::new(config.features.enable_tool_leak_filter);
-        let mut thinking_filter = ThinkingContentFilter::new(thinking_enabled);
+        let mut thinking_filter = ThinkingContentFilter::new(effective_thinking)
+            .with_omitted_summary(payload.thinking_summary_omitted());
         let mut stop_filter = StopSequenceFilter::new(stop_sequences);
         let mut visible_text = String::new();
         let mut stop_matched = false;
@@ -314,10 +317,12 @@ pub(super) async fn collect_nonstream_rounds(
             let total_output_tokens = decoded.usage.output_tokens;
             return Ok((decoded, endpoint, total_output_tokens));
         }
-        let output_exhausted = accumulated_usage
-            .output_tokens
-            .saturating_add(decoded.usage.output_tokens)
-            >= u64::from(max_output_tokens);
+        let output_exhausted = max_output_tokens.is_some_and(|maximum| {
+            accumulated_usage
+                .output_tokens
+                .saturating_add(decoded.usage.output_tokens)
+                >= u64::from(maximum)
+        });
 
         let search_uses = tool_search
             .map(|catalog| decoded.take_tool_uses_where(|tool| catalog.is_search_tool(&tool.name)))
@@ -457,7 +462,7 @@ pub(super) async fn collect_nonstream_rounds(
                     outcome
                         .tools
                         .iter()
-                        .map(|tool| tool.tool_specification.name.clone()),
+                        .filter_map(|tool| tool.specification().map(|tool| tool.name.clone())),
                 );
                 accumulated_server_events.push(ClaudeServerEvent::ToolSearch {
                     index: accumulated_searches.len(),
@@ -657,9 +662,9 @@ pub(super) async fn collect_nonstream_rounds(
             let continuation_estimate = estimated_credits(
                 next_input_tokens,
                 payload
-                    .inference_config
-                    .as_ref()
-                    .map_or(max_output_tokens, |inference| inference.max_tokens),
+                    .max_output_tokens()
+                    .or(max_output_tokens)
+                    .unwrap_or(super::DEFAULT_OUTPUT_TOKEN_ESTIMATE),
                 &config.pool,
             );
             if let Err(error) = reservation.extend(continuation_estimate) {
@@ -797,9 +802,9 @@ pub(super) async fn collect_nonstream_rounds(
             let continuation_estimate = estimated_credits(
                 next_input_tokens,
                 payload
-                    .inference_config
-                    .as_ref()
-                    .map_or(max_output_tokens, |inference| inference.max_tokens),
+                    .max_output_tokens()
+                    .or(max_output_tokens)
+                    .unwrap_or(super::DEFAULT_OUTPUT_TOKEN_ESTIMATE),
                 &config.pool,
             );
             if let Err(error) = reservation.extend(continuation_estimate) {
@@ -887,9 +892,9 @@ pub(super) async fn collect_nonstream_rounds(
         let continuation_estimate = estimated_credits(
             next_input_tokens,
             payload
-                .inference_config
-                .as_ref()
-                .map_or(max_output_tokens, |inference| inference.max_tokens),
+                .max_output_tokens()
+                .or(max_output_tokens)
+                .unwrap_or(super::DEFAULT_OUTPUT_TOKEN_ESTIMATE),
             &config.pool,
         );
         if let Err(error) = reservation.extend(continuation_estimate) {
@@ -918,16 +923,20 @@ pub(in crate::http) fn web_search_error_code(error: &KiroError) -> &'static str 
 /// continuation. Returns false when no model output may be generated.
 pub(in crate::http) fn apply_remaining_output_budget(
     payload: &mut kproxy_translate::KiroPayload,
-    maximum: u32,
+    maximum: Option<u32>,
     used: u64,
 ) -> bool {
+    let Some(maximum) = maximum else {
+        return true;
+    };
     let remaining = u64::from(maximum).saturating_sub(used);
     if remaining == 0 {
         return false;
     }
-    if let Some(inference) = payload.inference_config.as_mut() {
-        inference.max_tokens = remaining.min(u64::from(u32::MAX)) as u32;
-    }
+    let inference = payload
+        .inference_config
+        .get_or_insert_with(Default::default);
+    inference.max_tokens = Some(remaining.min(u64::from(u32::MAX)) as u32);
     true
 }
 
@@ -1182,6 +1191,7 @@ pub(super) async fn nonstream_claude(
     compaction_summary: Option<String>,
     compaction_iteration: Option<CompactionIterationUsage>,
     auto_compaction_original_input_tokens: Option<u64>,
+    context_edit_stats: ClaudeContextEditStats,
     tool_search: Option<Arc<ClaudeToolSearchCatalog>>,
     max_tool_search_operations: u32,
     tool_search_operations: u32,
@@ -1201,7 +1211,7 @@ pub(super) async fn nonstream_claude(
         upstream,
         payload,
         compact,
-        request.max_tokens,
+        Some(request.max_tokens),
         &request.stop_sequences,
         thinking_enabled,
         tool_search.as_ref(),
@@ -1249,6 +1259,7 @@ pub(super) async fn nonstream_claude(
             compaction_iteration,
             auto_compaction_original_input_tokens,
             input_tokens,
+            &context_edit_stats,
             &state.web_search_replay,
         )
         .map_err(|error| {
@@ -1320,7 +1331,7 @@ pub(super) async fn nonstream_openai(
     model_mapping_rule: Option<String>,
     attempts: Vec<UpstreamAttemptLog>,
     _input_tokens: u64,
-    max_tokens: u32,
+    max_tokens: Option<u32>,
     started: Instant,
     prompt_cache: Option<PromptCacheProfile>,
     diagnostics: RequestDiagnostics,

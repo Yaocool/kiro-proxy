@@ -204,6 +204,8 @@ fn thinking_signature_stays_on_the_same_block_and_message_starts_once() {
     let mut state = ClaudeState::new("msg_test".into(), "model".into(), 10, replay_codec());
     let mut output = state.event(&KiroEvent::Reasoning {
         content: "think".into(),
+        signature: Some("real-signature".into()),
+        redacted_content: None,
     });
     output.extend(state.event(&KiroEvent::AssistantResponse {
         content: "answer".into(),
@@ -218,7 +220,7 @@ fn thinking_signature_stays_on_the_same_block_and_message_starts_once() {
 }
 
 #[test]
-fn tagged_thinking_streams_as_native_claude_blocks() {
+fn unsigned_tagged_thinking_streams_as_literal_text() {
     let mut filter = ThinkingContentFilter::new(true);
     let mut state = ClaudeState::new("msg_test".into(), "model".into(), 10, replay_codec());
     let mut output = Vec::new();
@@ -235,15 +237,16 @@ fn tagged_thinking_streams_as_native_claude_blocks() {
     let joined = output.join("");
     let values = streamed_values(&output);
 
-    assert!(!joined.contains("<thinking>"));
-    assert!(!joined.contains("</thinking>"));
+    assert!(joined.contains("<thinking>hidden</thinking>"));
+    assert!(!joined.contains("thinking_delta"));
+    assert!(!joined.contains("signature_delta"));
     assert!(values.iter().any(|value| {
-        value["delta"]["type"] == "thinking_delta" && value["delta"]["thinking"] == "hidden"
+        value["delta"]["type"] == "text_delta"
+            && value["delta"]["text"] == "<thinking>hidden</thinking>"
     }));
     assert!(values.iter().any(|value| {
         value["delta"]["type"] == "text_delta" && value["delta"]["text"] == "Hello"
     }));
-    assert_eq!(joined.matches("signature_delta").count(), 1);
 }
 
 #[test]
@@ -255,6 +258,8 @@ fn disabled_thinking_streams_only_visible_text() {
     });
     events.extend(filter.push(KiroEvent::Reasoning {
         content: "native secret".into(),
+        signature: None,
+        redacted_content: None,
     }));
     events.extend(filter.finish());
     let output = events
@@ -273,10 +278,12 @@ fn disabled_thinking_streams_only_visible_text() {
 }
 
 #[test]
-fn finish_adds_signature_without_opening_a_second_thinking_block() {
+fn finish_does_not_fabricate_a_thinking_signature() {
     let mut state = ClaudeState::new("msg_test".into(), "model".into(), 10, replay_codec());
     let started = state.event(&KiroEvent::Reasoning {
         content: "think".into(),
+        signature: None,
+        redacted_content: None,
     });
     let decoded = DecodedResponse {
         reasoning: "think".into(),
@@ -288,7 +295,7 @@ fn finish_adds_signature_without_opening_a_second_thinking_block() {
         &decoded,
         0,
         "model",
-        100,
+        Some(100),
         10,
         ThinkingOutputFormat::Claude,
         false,
@@ -296,8 +303,7 @@ fn finish_adds_signature_without_opening_a_second_thinking_block() {
     let joined = [started, finished].concat().join("");
     assert_eq!(joined.matches("event: message_start").count(), 1);
     assert_eq!(joined.matches("\"type\":\"thinking\"").count(), 1);
-    assert_eq!(joined.matches("signature_delta").count(), 1);
-    assert!(joined.contains(kproxy_translate::SIGNATURE_PLACEHOLDER));
+    assert_eq!(joined.matches("signature_delta").count(), 0);
 }
 
 #[test]
@@ -386,7 +392,7 @@ fn automatic_compaction_stats_are_emitted_in_the_final_message_delta() {
         &decoded,
         0,
         "model",
-        100,
+        Some(100),
         0,
         ThinkingOutputFormat::Claude,
         false,
@@ -469,6 +475,58 @@ fn web_search_stream_uses_native_server_result_blocks() {
 }
 
 #[test]
+fn targetless_citations_are_visible_in_claude_and_openai_streams() {
+    let event = KiroEvent::Citations {
+        citations: vec![kproxy_kiro::KiroCitation {
+            text: Some("Example source".into()),
+            link: "https://example.com/source".into(),
+            target: json!({}),
+            kind: "web".into(),
+        }],
+    };
+
+    let mut claude = ClaudeState::new("msg_test".into(), "model".into(), 10, replay_codec());
+    let claude_output = claude.event(&event).join("");
+    assert!(claude_output.contains("text_delta"));
+    assert!(claude_output.contains("Example source"));
+    assert!(claude_output.contains("https://example.com/source"));
+
+    let mut openai = ClaudeState::new("chat_test".into(), "model".into(), 10, replay_codec());
+    let openai_output = openai_event(
+        &event,
+        &mut openai,
+        1,
+        "model",
+        ThinkingOutputFormat::Openai,
+        &std::collections::HashMap::new(),
+    )
+    .join("");
+    assert!(openai_output.contains("Example source"));
+    assert!(openai_output.contains("https://example.com/source"));
+}
+
+#[test]
+fn kiro_citation_stream_preserves_sources_without_inventing_document_ranges() {
+    let mut state = ClaudeState::new("msg_test".into(), "model".into(), 10, replay_codec());
+    state.event(&KiroEvent::AssistantResponse {
+        content: "answer".into(),
+    });
+    let output = state
+        .event(&KiroEvent::Citations {
+            citations: vec![kproxy_kiro::KiroCitation {
+                text: Some("answer".into()),
+                link: "https://example.com/source".into(),
+                target: json!({"range":{"start":0,"end":6}}),
+                kind: "document".into(),
+            }],
+        })
+        .join("");
+    assert!(output.contains("https://example.com/source"));
+    assert!(!output.contains("citations_delta"));
+    assert!(!output.contains("char_location"));
+}
+
+#[test]
 fn stream_finish_honors_pause_turn_override() {
     let mut state = ClaudeState::new("msg_pause".into(), "model".into(), 10, replay_codec());
     let decoded = DecodedResponse {
@@ -481,7 +539,7 @@ fn stream_finish_honors_pause_turn_override() {
         &decoded,
         0,
         "model",
-        100,
+        Some(100),
         0,
         ThinkingOutputFormat::Claude,
         false,
@@ -535,7 +593,7 @@ fn claude_stream_reports_stop_sequences_and_cache_usage() {
         &decoded,
         123,
         "model",
-        100,
+        Some(100),
         10,
         ThinkingOutputFormat::Claude,
         false,
@@ -606,7 +664,7 @@ fn openai_stream_reports_length_and_detailed_usage() {
         &decoded,
         123,
         "model",
-        50,
+        Some(50),
         50,
         ThinkingOutputFormat::Claude,
         true,
@@ -734,7 +792,7 @@ fn finalized_mcp_tool_inputs_match_streaming_and_nonstreaming_output() {
                         &decoded,
                         1,
                         "model",
-                        256,
+                        Some(256),
                         0,
                         ThinkingOutputFormat::Openai,
                         true,
@@ -775,7 +833,7 @@ fn finalized_mcp_tool_inputs_match_streaming_and_nonstreaming_output() {
                                 "request",
                                 "model",
                                 1,
-                                256,
+                                Some(256),
                                 0,
                                 ThinkingOutputFormat::Openai,
                                 &identities,
@@ -868,7 +926,7 @@ fn openai_tool_chunks_keep_request_id_and_stable_per_tool_indices() {
         &DecodedResponse::default(),
         123,
         "model",
-        100,
+        Some(100),
         1,
         ThinkingOutputFormat::Openai,
         false,
@@ -882,7 +940,7 @@ fn openai_tool_chunks_keep_request_id_and_stable_per_tool_indices() {
         &DecodedResponse::default(),
         123,
         "model",
-        100,
+        Some(100),
         1,
         ThinkingOutputFormat::Openai,
         true,

@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
 
-use kproxy_kiro::{KiroEvent, UsageInfo};
+use kproxy_kiro::{KiroCitation, KiroEvent, UsageInfo};
 use kproxy_translate::{
-    ClaudeServerToolEmission, ClaudeToolSearchTrace, ClaudeWebSearchTrace, KiroToolUse,
-    WebSearchReplayCodec, WebSearchReplayError,
+    ClaudeContextEditStats, ClaudeServerToolEmission, ClaudeToolSearchTrace, ClaudeWebSearchTrace,
+    KiroToolUse, WebSearchReplayCodec, WebSearchReplayError,
 };
 use serde_json::{json, Value};
 
@@ -23,6 +23,9 @@ pub struct CompactionIterationUsage {
 pub struct DecodedResponse {
     pub text: String,
     pub reasoning: String,
+    pub reasoning_signature: Option<String>,
+    pub redacted_thinking: String,
+    pub citations: Vec<KiroCitation>,
     pub tools: BTreeMap<String, ToolBuffer>,
     pub tool_searches: Vec<ClaudeToolSearchTrace>,
     pub web_searches: Vec<ClaudeWebSearchTrace>,
@@ -82,6 +85,7 @@ const THINKING_END_TAG: &str = "</thinking>";
 #[derive(Debug)]
 pub struct ThinkingContentFilter {
     enabled: bool,
+    omit_summary: bool,
     pending: String,
     in_tagged_thinking: bool,
 }
@@ -90,9 +94,15 @@ impl ThinkingContentFilter {
     pub fn new(enabled: bool) -> Self {
         Self {
             enabled,
+            omit_summary: false,
             pending: String::new(),
             in_tagged_thinking: false,
         }
+    }
+
+    pub fn with_omitted_summary(mut self, omit_summary: bool) -> Self {
+        self.omit_summary = omit_summary;
+        self
     }
 
     pub fn push(&mut self, event: KiroEvent) -> Vec<KiroEvent> {
@@ -101,10 +111,25 @@ impl ThinkingContentFilter {
                 self.pending.push_str(&content);
                 self.drain(false)
             }
-            KiroEvent::Reasoning { content } => {
+            KiroEvent::Reasoning {
+                mut content,
+                signature,
+                redacted_content,
+            } => {
                 let mut output = self.drain(true);
-                if self.enabled && !content.is_empty() {
-                    output.push(KiroEvent::Reasoning { content });
+                if self.omit_summary {
+                    // Claude display:omitted hides text, not the native
+                    // signature needed to preserve multi-turn continuity.
+                    content.clear();
+                }
+                if self.enabled
+                    && (!content.is_empty() || signature.is_some() || redacted_content.is_some())
+                {
+                    output.push(KiroEvent::Reasoning {
+                        content,
+                        signature,
+                        redacted_content,
+                    });
                 }
                 output
             }
@@ -127,20 +152,13 @@ impl ThinkingContentFilter {
                 if let Some(end) = self.pending.find(THINKING_END_TAG) {
                     let content = take_prefix(&mut self.pending, end);
                     self.pending.drain(..THINKING_END_TAG.len());
-                    self.push_reasoning(&mut output, content);
+                    self.push_tagged_reasoning(&mut output, content, true);
                     self.in_tagged_thinking = false;
                     continue;
                 }
-                let split = if finish {
-                    self.pending.len()
-                } else {
-                    safe_prefix_len(&self.pending, THINKING_END_TAG)
-                };
-                if split > 0 {
-                    let content = take_prefix(&mut self.pending, split);
-                    self.push_reasoning(&mut output, content);
-                }
                 if finish {
+                    let content = std::mem::take(&mut self.pending);
+                    self.push_tagged_reasoning(&mut output, content, false);
                     self.in_tagged_thinking = false;
                 }
                 break;
@@ -167,9 +185,15 @@ impl ThinkingContentFilter {
         output
     }
 
-    fn push_reasoning(&self, output: &mut Vec<KiroEvent>, content: String) {
-        if self.enabled && !content.is_empty() {
-            output.push(KiroEvent::Reasoning { content });
+    fn push_tagged_reasoning(&self, output: &mut Vec<KiroEvent>, content: String, closed: bool) {
+        if self.enabled && !self.omit_summary && !content.is_empty() {
+            output.push(KiroEvent::AssistantResponse {
+                content: if closed {
+                    format!("{THINKING_START_TAG}{content}{THINKING_END_TAG}")
+                } else {
+                    format!("{THINKING_START_TAG}{content}")
+                },
+            });
         }
     }
 }
@@ -630,7 +654,22 @@ impl DecodedResponse {
             KiroEvent::AssistantResponse { content } => {
                 self.text.push_str(&sanitize_text(&content))
             }
-            KiroEvent::Reasoning { content } => self.reasoning.push_str(&content),
+            KiroEvent::Reasoning {
+                content,
+                signature,
+                redacted_content,
+            } => {
+                self.reasoning.push_str(&content);
+                if let Some(signature) = signature {
+                    self.reasoning_signature
+                        .get_or_insert_with(String::new)
+                        .push_str(&signature);
+                }
+                if let Some(redacted) = redacted_content {
+                    self.redacted_thinking.push_str(&redacted);
+                }
+            }
+            KiroEvent::Citations { citations } => self.citations.extend(citations),
             KiroEvent::ToolUse {
                 id,
                 name,
@@ -705,6 +744,7 @@ impl DecodedResponse {
             None,
             None,
             self.usage.input_tokens,
+            &ClaudeContextEditStats::default(),
             web_search_replay,
         )
         .expect("test response replay encryption")
@@ -721,17 +761,35 @@ impl DecodedResponse {
         compaction_iteration: Option<CompactionIterationUsage>,
         auto_compaction_original_input_tokens: Option<u64>,
         effective_input_tokens: u64,
+        context_edit_stats: &ClaudeContextEditStats,
         web_search_replay: &WebSearchReplayCodec,
     ) -> Result<Value, WebSearchReplayError> {
         let mut content = Vec::new();
         if let Some(summary) = compaction_summary {
             content.push(json!({"type":"compaction","content":summary}));
         }
-        if !self.reasoning.is_empty() {
+        if !self.reasoning.is_empty() || self.reasoning_signature.is_some() {
+            if let Some(signature) = &self.reasoning_signature {
+                content.push(json!({
+                    "type":"thinking",
+                    "thinking":self.reasoning,
+                    "signature":signature
+                }));
+            } else if !self.reasoning.is_empty() {
+                // Tagged fallback reasoning has no upstream-verifiable
+                // signature. Return it as ordinary visible text so a client
+                // cannot mistake a locally fabricated token for a valid
+                // round-trippable Claude thinking block.
+                content.push(json!({
+                    "type":"text",
+                    "text":format!("<thinking>{}</thinking>", self.reasoning)
+                }));
+            }
+        }
+        if !self.redacted_thinking.is_empty() {
             content.push(json!({
-                "type":"thinking",
-                "thinking":self.reasoning,
-                "signature":kproxy_translate::SIGNATURE_PLACEHOLDER
+                "type":"redacted_thinking",
+                "data":self.redacted_thinking
             }));
         }
         if self.claude_server_events.is_empty() {
@@ -770,13 +828,15 @@ impl DecodedResponse {
             }
         }
         let citations = web_search_citations(&self.web_searches, &self.text, web_search_replay)?;
-        if !self.text.is_empty() {
+        let mut answer_text = self.text.clone();
+        answer_text.push_str(&kiro_visible_references(&self.citations));
+        if !answer_text.is_empty() {
             if citations.is_empty() {
-                content.push(json!({"type":"text","text":self.text}));
+                content.push(json!({"type":"text","text":answer_text}));
             } else {
                 content.push(json!({
                     "type":"text",
-                    "text":self.text,
+                    "text":answer_text,
                     "citations":citations
                 }));
             }
@@ -834,15 +894,17 @@ impl DecodedResponse {
                 }
             ]);
         }
+        let mut applied_edits = context_edit_stats.applied_edits();
         if let Some(original_input_tokens) = auto_compaction_original_input_tokens {
-            response["context_management"] = json!({
-                "applied_edits":[{
+            applied_edits.push(json!({
                     "type":"compact_20260112",
                     "reason":"model_mapping_overflow",
                     "original_input_tokens":original_input_tokens,
                     "compacted_input_tokens":effective_input_tokens
-                }]
-            });
+            }));
+        }
+        if !applied_edits.is_empty() {
+            response["context_management"] = json!({"applied_edits":applied_edits});
         }
         Ok(response)
     }
@@ -853,7 +915,7 @@ impl DecodedResponse {
         id: &str,
         model: &str,
         created: i64,
-        max_tokens: u32,
+        max_tokens: Option<u32>,
         current_round_output_tokens: u64,
         thinking_format: kproxy_core::config::ThinkingOutputFormat,
         tool_identities: &std::collections::HashMap<String, OpenAiToolIdentity>,
@@ -882,19 +944,23 @@ impl DecodedResponse {
             .collect::<Vec<_>>();
         let finish = if !tools.is_empty() {
             "tool_calls"
-        } else if current_round_output_tokens >= u64::from(max_tokens) {
+        } else if self.stop_reason.as_deref() == Some("max_tokens")
+            || max_tokens.is_some_and(|maximum| current_round_output_tokens >= u64::from(maximum))
+        {
             "length"
         } else {
             "stop"
         };
+        let mut answer_text = self.text.clone();
+        answer_text.push_str(&kiro_visible_references(&self.citations));
         let content = match thinking_format {
             kproxy_core::config::ThinkingOutputFormat::Claude if !self.reasoning.is_empty() => {
                 let mut tagged = format!("<thinking>{}</thinking>", self.reasoning);
-                tagged.push_str(&self.text);
+                tagged.push_str(&answer_text);
                 json!(tagged)
             }
-            _ if self.text.is_empty() => Value::Null,
-            _ => json!(self.text),
+            _ if answer_text.is_empty() => Value::Null,
+            _ => json!(answer_text),
         };
         let mut message = json!({
             "role":"assistant",
@@ -1034,6 +1100,63 @@ pub(crate) fn web_search_citations(
             }))
         })
         .collect()
+}
+
+/// Kiro's target ranges identify positions in the generated answer, whereas
+/// Claude's char/page/block locations address the original source document.
+/// Without source coordinates and a trustworthy document-index mapping, a
+/// native Claude citation would fabricate attribution. Keep these references
+/// visible in both public protocols instead.
+pub(crate) fn kiro_visible_references(citations: &[KiroCitation]) -> String {
+    let mut seen = std::collections::HashSet::new();
+    let citations = citations
+        .iter()
+        .filter(|citation| seen.insert(kiro_citation_key(citation)))
+        .take(20)
+        .collect::<Vec<_>>();
+    format_visible_references(&citations)
+}
+
+pub(crate) fn kiro_citation_key(citation: &KiroCitation) -> String {
+    format!(
+        "{}\0{}\0{}",
+        citation.kind,
+        citation.link,
+        citation.text.as_deref().unwrap_or_default()
+    )
+}
+
+fn format_visible_references(citations: &[&KiroCitation]) -> String {
+    if citations.is_empty() {
+        return String::new();
+    }
+    let mut output = String::from("\n\nReferences:\n");
+    for citation in citations {
+        let default_label = match citation.kind.as_str() {
+            "web" => "Web source",
+            "code" => "Code reference",
+            "document" => "Document source",
+            _ => "Source",
+        };
+        let label = citation.text.as_deref().unwrap_or(default_label);
+        let label = label.replace(['\r', '\n'], " ");
+        let link = citation.link.replace(['\r', '\n'], "");
+        output.push_str("- ");
+        let label = label.trim();
+        let link = link.trim();
+        if !label.is_empty() {
+            output.push_str(label);
+        }
+        if !label.is_empty() && !link.is_empty() {
+            output.push_str(": ");
+        }
+        if !link.is_empty() {
+            output.push_str(link);
+        }
+        output.push('\n');
+    }
+    output.pop();
+    output
 }
 
 fn merge_usage(output: &mut UsageInfo, value: &Value) {
@@ -1261,8 +1384,8 @@ mod tests {
                 KiroEvent::AssistantResponse {
                     content: "before ".into()
                 },
-                KiroEvent::Reasoning {
-                    content: "hidden".into()
+                KiroEvent::AssistantResponse {
+                    content: "<thinking>hidden</thinking>".into()
                 },
                 KiroEvent::AssistantResponse {
                     content: "after".into()
@@ -1279,6 +1402,8 @@ mod tests {
         });
         events.extend(filter.push(KiroEvent::Reasoning {
             content: "also hidden".into(),
+            signature: None,
+            redacted_content: None,
         }));
         events.extend(filter.finish());
 
@@ -1291,6 +1416,38 @@ mod tests {
                 KiroEvent::AssistantResponse {
                     content: "after".into()
                 }
+            ]
+        );
+    }
+
+    #[test]
+    fn omitted_thinking_hides_text_but_preserves_native_signatures() {
+        let mut filter = ThinkingContentFilter::new(true).with_omitted_summary(true);
+        let mut events = filter.push(KiroEvent::AssistantResponse {
+            content: "<thinking>hidden tags</thinking>answer".into(),
+        });
+        events.extend(filter.push(KiroEvent::Reasoning {
+            content: "hidden summary".into(),
+            signature: Some("native-signature".into()),
+            redacted_content: None,
+        }));
+        events.extend(filter.push(KiroEvent::Reasoning {
+            content: "unsigned hidden summary".into(),
+            signature: None,
+            redacted_content: None,
+        }));
+        events.extend(filter.finish());
+        assert_eq!(
+            events,
+            vec![
+                KiroEvent::AssistantResponse {
+                    content: "answer".into()
+                },
+                KiroEvent::Reasoning {
+                    content: String::new(),
+                    signature: Some("native-signature".into()),
+                    redacted_content: None
+                },
             ]
         );
     }
@@ -1435,7 +1592,7 @@ mod tests {
             "chat",
             "model",
             1,
-            50,
+            Some(50),
             10,
             kproxy_core::config::ThinkingOutputFormat::Claude,
             &std::collections::HashMap::new(),
@@ -1451,7 +1608,7 @@ mod tests {
             "chat",
             "model",
             1,
-            50,
+            Some(50),
             10,
             kproxy_core::config::ThinkingOutputFormat::Openai,
             &std::collections::HashMap::new(),
@@ -1550,6 +1707,68 @@ mod tests {
         };
         let response = decoded.claude_json("msg", "model", 100, 1, None, &replay_codec());
         assert!(response["content"][2].get("citations").is_none());
+    }
+
+    #[test]
+    fn targetless_kiro_citations_remain_visible_in_both_protocols() {
+        let decoded = DecodedResponse {
+            text: "Answer".into(),
+            citations: vec![KiroCitation {
+                text: Some("Example source".into()),
+                link: "https://example.com/source".into(),
+                target: json!({}),
+                kind: "web".into(),
+            }],
+            ..DecodedResponse::default()
+        };
+
+        let claude = decoded.claude_json("msg", "model", 100, 1, None, &replay_codec());
+        assert!(claude["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("Example source: https://example.com/source")));
+        assert!(claude["content"][0].get("citations").is_none());
+
+        let openai = decoded.openai_json(
+            "chat",
+            "model",
+            1,
+            Some(100),
+            1,
+            kproxy_core::config::ThinkingOutputFormat::Openai,
+            &std::collections::HashMap::new(),
+        );
+        assert!(openai["choices"][0]["message"]["content"]
+            .as_str()
+            .is_some_and(|text| text.contains("Example source: https://example.com/source")));
+    }
+
+    #[test]
+    fn kiro_answer_ranges_never_become_fabricated_source_coordinates() {
+        let citations = [
+            KiroCitation {
+                text: Some("same".into()),
+                link: "https://example.com/source".into(),
+                target: json!({"range":{"start":0,"end":4}}),
+                kind: "document".into(),
+            },
+            KiroCitation {
+                text: Some("same".into()),
+                link: "https://example.com/source".into(),
+                target: json!({"range":{"start":5,"end":9}}),
+                kind: "document".into(),
+            },
+        ];
+        let decoded = DecodedResponse {
+            text: "same same".into(),
+            citations: citations.to_vec(),
+            ..DecodedResponse::default()
+        };
+        let response = decoded.claude_json("msg", "model", 100, 1, None, &replay_codec());
+        let text = response["content"][0]["text"]
+            .as_str()
+            .expect("answer text");
+        assert_eq!(text.matches("https://example.com/source").count(), 1);
+        assert!(response["content"][0].get("citations").is_none());
     }
 
     #[test]
@@ -1737,6 +1956,7 @@ mod tests {
                 }),
                 Some(180_000),
                 23_000,
+                &ClaudeContextEditStats::default(),
                 &replay_codec(),
             )
             .expect("encrypt replay data");
@@ -1774,7 +1994,7 @@ mod tests {
             "chat",
             "model",
             1,
-            10,
+            Some(10),
             1,
             kproxy_core::config::ThinkingOutputFormat::Openai,
             &registry,

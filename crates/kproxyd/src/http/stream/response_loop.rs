@@ -17,6 +17,7 @@ pub fn response(
     protocol: StreamProtocol,
     mut context: StreamContext,
 ) -> Response {
+    let mut effective_thinking = upstream.thinking_enabled();
     let (initial_endpoint, initial_response, mut upstream_permit) = upstream.into_parts();
     let mut source = initial_response.bytes_stream();
     let mut endpoint = initial_endpoint.name.to_string();
@@ -119,7 +120,8 @@ pub fn response(
                 break 'rounds;
             }
             let mut leak_filter = ToolLeakFilter::new(context.enable_tool_leak_filter);
-            let mut thinking_filter = ThinkingContentFilter::new(context.thinking_enabled);
+            let mut thinking_filter = ThinkingContentFilter::new(context.thinking_enabled && effective_thinking)
+                .with_omitted_summary(payload.thinking_summary_omitted());
             loop {
                 tokio::select! {
                     chunk = source.next() => match chunk {
@@ -164,7 +166,7 @@ pub fn response(
                                             if !internal_search && !internal_web_search {
                                                 restore_web_tool_name(&mut event, &context.web_tool_names);
                                             }
-                                            if matches!(&event, KiroEvent::Reasoning { .. } | KiroEvent::ToolUse { .. }) {
+                                            if matches!(&event, KiroEvent::Reasoning { .. } | KiroEvent::Citations { .. } | KiroEvent::ToolUse { .. }) {
                                                 let pending = stop_filter.finish();
                                                 if !pending.is_empty() {
                                                     let output = stream_event(
@@ -305,7 +307,9 @@ pub fn response(
                     }
                     if matches!(
                         &event,
-                        KiroEvent::Reasoning { .. } | KiroEvent::ToolUse { .. }
+                        KiroEvent::Reasoning { .. }
+                            | KiroEvent::Citations { .. }
+                            | KiroEvent::ToolUse { .. }
                     ) {
                         let pending = stop_filter.finish();
                         if !pending.is_empty() {
@@ -457,6 +461,7 @@ pub fn response(
                         match context.state.generate(&account, &payload).await {
                             Ok(retry) => {
                                 upstream_access_token = account.credentials.access_token.clone();
+                                effective_thinking = retry.thinking_enabled();
                                 let (next_endpoint, next_response, next_permit) = retry.into_parts();
                                 endpoint = next_endpoint.name.to_string();
                                 source = next_response.bytes_stream();
@@ -541,6 +546,7 @@ pub fn response(
                             match context.state.generate(&account, &payload).await {
                                 Ok(retry) => {
                                     upstream_access_token = account.credentials.access_token.clone();
+                                    effective_thinking = retry.thinking_enabled();
                                     let (next_endpoint, next_response, next_permit) =
                                         retry.into_parts();
                                     endpoint = next_endpoint.name.to_string();
@@ -759,6 +765,7 @@ pub fn response(
                     match context.state.generate(&account, &payload).await {
                         Ok(retry) => {
                             upstream_access_token = account.credentials.access_token.clone();
+                            effective_thinking = retry.thinking_enabled();
                             let (next_endpoint, next_response, next_permit) = retry.into_parts();
                             endpoint = next_endpoint.name.to_string();
                             source = next_response.bytes_stream();
@@ -809,10 +816,12 @@ pub fn response(
             if stop_filter.matched().is_some() {
                 break 'rounds;
             }
-            let output_exhausted = accumulated_usage
-                .output_tokens
-                .saturating_add(decoded.usage.output_tokens)
-                >= u64::from(context.max_tokens);
+            let output_exhausted = context.max_tokens.is_some_and(|maximum| {
+                accumulated_usage
+                    .output_tokens
+                    .saturating_add(decoded.usage.output_tokens)
+                    >= u64::from(maximum)
+            });
             let search_uses = context
                 .tool_search
                 .as_ref()
@@ -985,8 +994,9 @@ pub fn response(
                         max_tools: budget.max_tools.saturating_sub(outcome.tools.len()),
                         max_bytes: budget.max_bytes.saturating_sub(consumed_bytes),
                     };
-                    loaded_names.extend(outcome.tools.iter()
-                        .map(|tool| tool.tool_specification.name.clone()));
+                    loaded_names.extend(outcome.tools.iter().filter_map(|tool| {
+                        tool.specification().map(|tool| tool.name.clone())
+                    }));
                     if matches!(protocol, StreamProtocol::Claude) {
                         for data in claude.tool_search(&outcome.trace) {
                             data_started = true;
@@ -1220,10 +1230,7 @@ pub fn response(
                 context.input_tokens = next_input_tokens;
                 let continuation_estimate = super::super::handlers::estimated_credits(
                     next_input_tokens,
-                    payload.inference_config.as_ref().map_or(
-                        context.max_tokens,
-                        |inference| inference.max_tokens,
-                    ),
+                    payload.max_output_tokens().or(context.max_tokens).unwrap_or(super::super::handlers::DEFAULT_OUTPUT_TOKEN_ESTIMATE),
                     &config.pool,
                 );
                 if let Err(error) = context.reservation.extend(continuation_estimate) {
@@ -1239,6 +1246,7 @@ pub fn response(
                 match context.state.generate(&account, &payload).await {
                     Ok(next) => {
                         upstream_access_token = account.credentials.access_token.clone();
+                        effective_thinking = next.thinking_enabled();
                         let (next_endpoint, next_response, next_permit) = next.into_parts();
                         endpoint = next_endpoint.name.to_string();
                         source = next_response.bytes_stream();
@@ -1428,10 +1436,7 @@ pub fn response(
                 let config = context.state.config.current();
                 let continuation_estimate = super::super::handlers::estimated_credits(
                     context.input_tokens,
-                    payload.inference_config.as_ref().map_or(
-                        context.max_tokens,
-                        |inference| inference.max_tokens,
-                    ),
+                    payload.max_output_tokens().or(context.max_tokens).unwrap_or(super::super::handlers::DEFAULT_OUTPUT_TOKEN_ESTIMATE),
                     &config.pool,
                 );
                 if let Err(error) = context.reservation.extend(continuation_estimate) {
@@ -1447,6 +1452,7 @@ pub fn response(
                 match context.state.generate(&account, &payload).await {
                     Ok(next) => {
                         upstream_access_token = account.credentials.access_token.clone();
+                        effective_thinking = next.thinking_enabled();
                         let (next_endpoint, next_response, next_permit) = next.into_parts();
                         endpoint = next_endpoint.name.to_string();
                         source = next_response.bytes_stream();
@@ -1539,10 +1545,7 @@ pub fn response(
             let config = context.state.config.current();
             let continuation_estimate = super::super::handlers::estimated_credits(
                 context.input_tokens,
-                payload
-                    .inference_config
-                    .as_ref()
-                    .map_or(context.max_tokens, |inference| inference.max_tokens),
+                payload.max_output_tokens().or(context.max_tokens).unwrap_or(super::super::handlers::DEFAULT_OUTPUT_TOKEN_ESTIMATE),
                 &config.pool,
             );
             if let Err(error) = context.reservation.extend(continuation_estimate) {
@@ -1558,6 +1561,7 @@ pub fn response(
             match context.state.generate(&account, &payload).await {
                 Ok(next) => {
                     upstream_access_token = account.credentials.access_token.clone();
+                    effective_thinking = next.thinking_enabled();
                     let (next_endpoint, next_response, next_permit) = next.into_parts();
                     endpoint = next_endpoint.name.to_string();
                     source = next_response.bytes_stream();

@@ -1,22 +1,23 @@
 use super::{
-    apply_adaptive_thinking, apply_context_management_edits, authenticate, claude_loaded_tools,
+    apply_context_management_edits, authenticate, claude_loaded_tools,
     claude_pending_server_tool_uses, claude_to_kiro, claude_validation_error,
     claude_web_tool_names, compact_trigger_tokens, enforce_claude_user_agent, enforce_context,
-    enforce_payload_budget, estimated_credits, execute_kiro_web_search, execute_upstream,
-    initial_compaction_decision, loaded_tool_bytes, loaded_tool_count, loaded_tool_names,
-    map_model, matches_type_family, model_token_limit, nonstream_claude, nonstream_openai,
-    normalize_compaction_boundary, openai_to_kiro, openai_tool_identities, prepare_kiro_payload,
-    prepend_attempt_logs, prepend_execute_error_attempts, reapply_compaction,
-    remaining_tool_search_budget, reserve_credits, resolved_compaction_decision,
-    resume_tool_search_payload, resume_web_search_payload, run_compaction, sanitize_error_message,
-    serialized_payload_bytes, stream, thinking_enabled_for_model, upstream_error,
-    upstream_overflow_compaction_decision, validate_claude, validate_openai, web_search_error_code,
-    ApiError, AppState, Arc, Bytes, ClaudeRequest, ClaudeServerEvent, ClaudeToolSearchCatalog,
-    ClaudeWebSearchTrace, CompactionReason, CompactionRequest, Duration, Engine, ErrorFormat,
-    ExecuteError, HeaderMap, Instant, IpAddr, OpenAiRequest, RequestDiagnostics, Response,
-    ServiceHttpState, StatusCode, StreamContext, StreamExt, StreamProtocol, TranslationOptions,
-    UpstreamExecution, Url, Uuid, Value,
+    enforce_payload_budget, estimate_context_management_input_tokens, estimated_credits,
+    execute_kiro_web_search, execute_upstream, initial_compaction_decision, loaded_tool_bytes,
+    loaded_tool_count, loaded_tool_names, map_model, matches_type_family, nonstream_claude,
+    nonstream_openai, normalize_compaction_boundary, openai_to_kiro, openai_tool_identities,
+    prepare_kiro_payload, prepare_upstream, prepend_attempt_logs, prepend_execute_error_attempts,
+    reapply_compaction, remaining_tool_search_budget, reserve_credits,
+    resolved_compaction_decision, resume_tool_search_payload, resume_web_search_payload,
+    run_compaction, sanitize_error_message, serialized_payload_bytes, stream, upstream_error,
+    upstream_overflow_compaction_decision, validate_claude, validate_claude_generation,
+    validate_openai, web_search_error_code, ApiError, AppState, Arc, Bytes, ClaudeRequest,
+    ClaudeServerEvent, ClaudeToolSearchCatalog, ClaudeWebSearchTrace, CompactionReason,
+    CompactionRequest, Duration, Engine, ErrorFormat, ExecuteError, HeaderMap, Instant, IpAddr,
+    OpenAiRequest, RequestDiagnostics, Response, ServiceHttpState, StatusCode, StreamContext,
+    StreamExt, StreamProtocol, TranslationOptions, UpstreamExecution, Url, Uuid, Value,
 };
+use futures::TryStreamExt;
 
 pub(super) async fn handle_claude(
     service: ServiceHttpState,
@@ -57,12 +58,21 @@ pub(super) async fn handle_claude(
     let compaction_normalization = normalize_compaction_boundary(&mut request);
     let compact_boundary_applied = compaction_normalization.boundary_applied;
     validate_claude(&request).map_err(claude_validation_error)?;
-    let context_edit_stats = apply_context_management_edits(&mut request);
+    validate_claude_generation(&request).map_err(claude_validation_error)?;
+    let context_input_estimate = estimate_context_management_input_tokens(&request);
+    let context_edit_stats = apply_context_management_edits(&mut request, context_input_estimate);
+    let attachment_guards = hydrate_claude_attachments(&state, &mut request).await?;
+    // Hydration rewrites URL sources into base64 sources and can infer a
+    // document title. Validate the effective wire input again so a remote
+    // response can never bypass the same media and size rules as inline data.
+    validate_claude(&request).map_err(claude_validation_error)?;
     if context_edit_stats.changed() {
         tracing::info!(
             trace_id = %trace_id,
             cleared_tool_results = context_edit_stats.cleared_tool_results,
             cleared_tool_inputs = context_edit_stats.cleared_tool_inputs,
+            cleared_thinking_turns = context_edit_stats.cleared_thinking_turns,
+            cleared_input_tokens = context_edit_stats.cleared_input_tokens(),
             "Claude context edits applied locally"
         );
     }
@@ -143,6 +153,18 @@ pub(super) async fn handle_claude(
     let mut options = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
     options.enhance_system_prompt = config.features.enhance_system_prompt;
     options.web_search_replay = Some(state.web_search_replay.clone());
+    options.enable_prompt_cache = config.features.enable_prompt_cache;
+    let conversation_fingerprint = super::conversation_fingerprint(&request.messages);
+    options.conversation_id = super::stable_conversation_id(
+        &headers,
+        key_id.as_deref(),
+        request.conversation_id.as_deref(),
+        super::metadata_conversation_hint(request.metadata.as_ref())
+            .or(conversation_fingerprint.as_deref()),
+    );
+    options.additional_model_request_fields_schema = state
+        .resolved_model_info(&route.mapped)
+        .and_then(|model| model.additional_model_request_fields_schema);
     let mut payload = claude_to_kiro(&request, &options);
     let original_tool_count = request.tools.len();
     let catalog_bytes = request
@@ -267,7 +289,7 @@ pub(super) async fn handle_claude(
             outcome
                 .tools
                 .iter()
-                .map(|tool| tool.tool_specification.name.clone()),
+                .filter_map(|tool| tool.specification().map(|tool| tool.name.clone())),
         );
         resume_tool_search_payload(&mut payload, &tool_use, &outcome);
         resumed_server_events.push(ClaudeServerEvent::ToolSearch {
@@ -358,24 +380,6 @@ pub(super) async fn handle_claude(
             resumed_web_searches.push(trace);
         }
     }
-    let thinking_limit = model_token_limit(&state, &route.mapped, false)
-        .unwrap_or(config.features.max_thinking_budget_tokens)
-        .min(config.features.max_thinking_budget_tokens);
-    let decision = apply_adaptive_thinking(
-        &mut payload,
-        request.thinking.as_ref(),
-        thinking_enabled_for_model(&request.model, &config.model_thinking_mode),
-        config.features.adaptive_thinking,
-        thinking_limit,
-    );
-    tracing::debug!(
-        event = "proxy.adaptive_thinking.decided",
-        trace_id = %trace_id,
-        enabled = decision.enabled,
-        reason = ?decision.reason,
-        budget_tokens = decision.budget_tokens,
-        "adaptive thinking decision"
-    );
     prepare_kiro_payload(
         &mut payload,
         "request-preparation",
@@ -388,6 +392,32 @@ pub(super) async fn handle_claude(
             ErrorFormat::Claude,
         )
     })?;
+    // Account-dependent rules, weighted choices, aliases, and default-model
+    // resolution must finish before irreversible context edits or rejection.
+    let selected = prepare_upstream(
+        &state,
+        &trace_id,
+        &route.mapped,
+        &request.model,
+        key_id.as_deref(),
+        &config.features.default_model_id,
+        &payload,
+    )
+    .await
+    .map_err(|error| upstream_error(error, ErrorFormat::Claude))?;
+    let resolved_model = selected.kiro_model.clone();
+    payload = selected.payload.clone();
+    let mut prepared = Some(selected);
+    let decision = state.prepare_model_request(&mut payload);
+    tracing::debug!(
+        event = "proxy.adaptive_thinking.decided",
+        trace_id = %trace_id,
+        model = %resolved_model,
+        enabled = decision.enabled,
+        reason = ?decision.reason,
+        effort = decision.effort.as_deref(),
+        "adaptive thinking decision"
+    );
     let mut input_tokens = state
         .tokenizer
         .estimate_kiro_payload(&payload)
@@ -407,13 +437,16 @@ pub(super) async fn handle_claude(
     let mut compaction_iteration = None;
     if let Some(decision) = initial_compaction_decision(
         &state,
-        &route.mapped,
+        &resolved_model,
         input_tokens,
         compact_trigger,
         config.context.auto_compact_on_overflow,
     ) {
+        // The summary may use this same single-concurrency account. Release
+        // its slot first; dispatch rechecks any new target after compaction.
+        drop(prepared.take());
         let summary_model = if config.context.compaction_summary_model.trim().is_empty() {
-            route.mapped.as_str()
+            resolved_model.as_str()
         } else {
             config.context.compaction_summary_model.trim()
         };
@@ -509,7 +542,7 @@ pub(super) async fn handle_claude(
         &state,
         input_tokens,
         compacted,
-        &route.mapped,
+        &resolved_model,
         ErrorFormat::Claude,
     )?;
     let mut estimate = estimated_credits(input_tokens, request.max_tokens, &config.pool);
@@ -544,6 +577,7 @@ pub(super) async fn handle_claude(
         input_tokens,
         compacted,
         &payload,
+        prepared,
     )
     .await;
     let (execution, reservation) = match first_execution {
@@ -666,6 +700,7 @@ pub(super) async fn handle_claude(
                 input_tokens,
                 true,
                 &payload,
+                None,
             )
             .await;
             let execution = match retry_execution {
@@ -730,8 +765,9 @@ pub(super) async fn handle_claude(
                 compaction_summary,
                 compaction_iteration,
                 auto_compaction_original_input_tokens,
+                context_edit_stats,
                 estimated_credits: estimate,
-                max_tokens: request.max_tokens,
+                max_tokens: Some(request.max_tokens),
                 stop_sequences: request.stop_sequences.clone(),
                 started,
                 prompt_cache,
@@ -754,6 +790,7 @@ pub(super) async fn handle_claude(
                 resumed_server_events,
                 diagnostics,
                 openai_tools: std::collections::HashMap::new(),
+                _attachment_guards: attachment_guards,
                 _connection_guard: connection_guard,
                 _admission_guard: admission_guard,
             },
@@ -782,6 +819,7 @@ pub(super) async fn handle_claude(
         compaction_summary,
         compaction_iteration,
         auto_compaction_original_input_tokens,
+        context_edit_stats,
         tool_search,
         max_tool_search_operations,
         tool_search_operations,
@@ -853,10 +891,9 @@ pub(super) async fn handle_openai(
     }
     let openai_tools = openai_tool_identities(&request);
     let image_guards = hydrate_openai_images(&state, &mut request).await?;
-    let max_tokens = request
-        .max_completion_tokens
-        .or(request.max_tokens)
-        .unwrap_or(8192);
+    // Omission must survive through response formatting and continuations,
+    // not just the initial Kiro payload. Only credit estimates use a default.
+    let max_tokens = request.max_tokens;
     let route = map_model(
         &request.model,
         &config.model_mapping,
@@ -866,23 +903,26 @@ pub(super) async fn handle_openai(
     );
     let mut options = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
     options.enhance_system_prompt = config.features.enhance_system_prompt;
-    let mut payload = openai_to_kiro(&request, &options);
-    let thinking_limit = model_token_limit(&state, &route.mapped, false)
-        .unwrap_or(config.features.max_thinking_budget_tokens)
-        .min(config.features.max_thinking_budget_tokens);
-    let decision = apply_adaptive_thinking(
-        &mut payload,
-        request.thinking.as_ref(),
-        thinking_enabled_for_model(&request.model, &config.model_thinking_mode),
-        config.features.adaptive_thinking,
-        thinking_limit,
+    options.enable_prompt_cache = config.features.enable_prompt_cache;
+    let conversation_fingerprint = super::conversation_fingerprint(&request.messages);
+    options.conversation_id = super::stable_conversation_id(
+        &headers,
+        key_id.as_deref(),
+        request.conversation_id.as_deref(),
+        super::metadata_conversation_hint(request.metadata.as_ref())
+            .or(conversation_fingerprint.as_deref()),
     );
+    options.additional_model_request_fields_schema = state
+        .resolved_model_info(&route.mapped)
+        .and_then(|model| model.additional_model_request_fields_schema);
+    let mut payload = openai_to_kiro(&request, &options);
+    let decision = state.prepare_model_request(&mut payload);
     tracing::debug!(
         event = "proxy.adaptive_thinking.decided",
         trace_id = %trace_id,
         enabled = decision.enabled,
         reason = ?decision.reason,
-        budget_tokens = decision.budget_tokens,
+        effort = decision.effort.as_deref(),
         "adaptive thinking decision"
     );
     prepare_kiro_payload(
@@ -943,14 +983,13 @@ pub(super) async fn handle_openai(
         false,
         ErrorFormat::OpenAi,
     )?;
-    enforce_context(
-        &state,
+    // The dispatcher validates against the account's actual model. Checking
+    // the provisional mapping here can reject input that its final target fits.
+    let estimate = estimated_credits(
         input_tokens,
-        false,
-        &route.mapped,
-        ErrorFormat::OpenAi,
-    )?;
-    let estimate = estimated_credits(input_tokens, max_tokens, &config.pool);
+        max_tokens.unwrap_or(super::DEFAULT_OUTPUT_TOKEN_ESTIMATE),
+        &config.pool,
+    );
     let reservation = reserve_credits(&state, key_id.as_deref(), estimate, ErrorFormat::OpenAi)?;
     tracing::info!(
         event = "proxy.request.prepared",
@@ -964,12 +1003,11 @@ pub(super) async fn handle_openai(
         payload_bytes,
         loaded_tool_count = loaded_tool_count(&payload),
         loaded_tool_bytes = diagnostics.loaded_tool_bytes,
-        max_tokens,
+        max_tokens = ?max_tokens,
         estimated_credits = estimate,
         "upstream request prepared"
     );
     drop(body);
-    drop(image_guards);
     let include_usage_chunk = request
         .stream_options
         .as_ref()
@@ -998,6 +1036,7 @@ pub(super) async fn handle_openai(
         input_tokens,
         false,
         &payload,
+        None,
     )
     .await
     .map_err(|error| upstream_error(error, ErrorFormat::OpenAi))?;
@@ -1026,6 +1065,7 @@ pub(super) async fn handle_openai(
                 compaction_summary: None,
                 compaction_iteration: None,
                 auto_compaction_original_input_tokens: None,
+                context_edit_stats: Default::default(),
                 estimated_credits: estimate,
                 max_tokens,
                 stop_sequences: Vec::new(),
@@ -1050,6 +1090,7 @@ pub(super) async fn handle_openai(
                 resumed_server_events: Vec::new(),
                 diagnostics,
                 openai_tools,
+                _attachment_guards: image_guards,
                 _connection_guard: connection_guard,
                 _admission_guard: admission_guard,
             },
@@ -1081,111 +1122,432 @@ pub(super) async fn handle_openai(
     .await
 }
 
-async fn hydrate_openai_images(
+const REMOTE_IMAGE_MAX_BYTES: usize = 5 * 1024 * 1024;
+const REMOTE_DOCUMENT_MAX_BYTES: usize = 4_500_000;
+const REMOTE_ATTACHMENT_MAX_REDIRECTS: usize = 3;
+const REMOTE_ATTACHMENT_CONCURRENCY: usize = 4;
+
+#[derive(Debug, Clone, Copy)]
+pub(super) enum RemoteAttachmentKind {
+    Image,
+    Document,
+}
+
+#[derive(Debug)]
+struct RemoteAttachment {
+    bytes: Vec<u8>,
+    media_type: String,
+    final_url: Url,
+}
+
+#[derive(Debug)]
+struct ClaudeRemoteAttachment {
+    message_index: usize,
+    block_pointer: String,
+    kind: RemoteAttachmentKind,
+    url: String,
+}
+
+pub(super) async fn hydrate_claude_attachments(
     state: &Arc<AppState>,
-    request: &mut OpenAiRequest,
+    request: &mut ClaudeRequest,
 ) -> Result<Vec<crate::state::BodyGuard>, ApiError> {
-    let mut guards = Vec::new();
-    for message in &mut request.messages {
-        let Some(parts) = message.content.as_mut().and_then(Value::as_array_mut) else {
-            continue;
-        };
-        let mut output = Vec::with_capacity(parts.len());
-        for mut part in parts.drain(..) {
-            let remote = part
-                .pointer("/image_url/url")
-                .and_then(Value::as_str)
-                .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
-                .map(str::to_string);
-            let Some(url) = remote else {
-                output.push(part);
-                continue;
+    let mut targets = Vec::new();
+    for (message_index, message) in request.messages.iter().enumerate() {
+        collect_claude_remote_attachments(&message.content, message_index, "", &mut targets);
+    }
+
+    let guarded_targets = targets
+        .into_iter()
+        .map(|target| {
+            let maximum = match target.kind {
+                RemoteAttachmentKind::Image => REMOTE_IMAGE_MAX_BYTES,
+                RemoteAttachmentKind::Document => REMOTE_DOCUMENT_MAX_BYTES,
             };
-            let guard = state.body_budget.reserve(10 * 1024 * 1024).ok_or_else(|| {
+            reserve_remote_attachment(state, maximum, ErrorFormat::Claude)
+                .map(|guard| (target, maximum, guard))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let fetched = futures::stream::iter(guarded_targets)
+        .map(|(target, maximum, guard)| async move {
+            let attachment = fetch_remote_attachment(&target.url, target.kind, maximum)
+                .await
+                .map_err(|message| {
+                    ApiError::new(
+                        StatusCode::BAD_GATEWAY,
+                        format!("unable to fetch remote attachment: {message}"),
+                        ErrorFormat::Claude,
+                    )
+                })?;
+            Ok::<_, ApiError>((target, attachment, guard))
+        })
+        .buffer_unordered(REMOTE_ATTACHMENT_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    let mut guards = Vec::with_capacity(fetched.len());
+    for (target, fetched, guard) in fetched {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(&fetched.bytes);
+        let block = request.messages[target.message_index]
+            .content
+            .pointer_mut(&target.block_pointer)
+            .ok_or_else(|| {
                 ApiError::new(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "remote image memory budget exceeded",
-                    ErrorFormat::OpenAi,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote attachment changed while preparing the request",
+                    ErrorFormat::Claude,
                 )
             })?;
-            let data_url = fetch_image_as_data_url(&url).await.ok_or_else(|| {
-                ApiError::new(
-                    StatusCode::BAD_GATEWAY,
-                    "unable to fetch remote image",
-                    ErrorFormat::OpenAi,
-                )
-            })?;
-            if let Some(value) = part.pointer_mut("/image_url/url") {
-                *value = Value::String(data_url);
-            }
-            output.push(part);
-            guards.push(guard);
+        block["source"] = serde_json::json!({
+            "type":"base64",
+            "media_type":fetched.media_type,
+            "data":encoded
+        });
+        if matches!(target.kind, RemoteAttachmentKind::Document)
+            && block.get("title").is_none()
+            && block.get("name").is_none()
+        {
+            let title = fetched
+                .final_url
+                .path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .filter(|segment| !segment.is_empty())
+                .unwrap_or("document");
+            block["title"] = Value::String(title.to_owned());
         }
-        *parts = output;
+        guards.push(guard);
     }
     Ok(guards)
 }
 
-async fn fetch_image_as_data_url(url: &str) -> Option<String> {
-    let url = Url::parse(url).ok()?;
-    let host = url.host_str()?;
-    let port = url.port_or_known_default()?;
-    let addresses = tokio::net::lookup_host((host, port))
-        .await
-        .ok()?
-        .collect::<Vec<_>>();
-    if addresses.is_empty()
-        || addresses
-            .iter()
-            .any(|address| !is_public_address(address.ip()))
-    {
-        return None;
-    }
-    // Pin the validated DNS answers and prohibit redirects so a resolver race or
-    // redirect cannot turn this image helper into an internal-network proxy.
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(15))
-        .redirect(reqwest::redirect::Policy::none())
-        .resolve_to_addrs(host, &addresses)
-        .build()
-        .ok()?;
-    let response = client.get(url).send().await.ok()?;
-    if !response.status().is_success() {
-        return None;
-    }
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)?
-        .to_str()
-        .ok()?
-        .split(';')
-        .next()?
-        .trim()
-        .to_ascii_lowercase();
-    let format = match content_type.as_str() {
-        "image/jpeg" | "image/jpg" => "jpeg",
-        "image/png" => "png",
-        "image/gif" => "gif",
-        "image/webp" => "webp",
-        _ => return None,
+fn collect_claude_remote_attachments(
+    content: &Value,
+    message_index: usize,
+    pointer: &str,
+    output: &mut Vec<ClaudeRemoteAttachment>,
+) {
+    let Some(blocks) = content.as_array() else {
+        return;
     };
-    let mut stream = response.bytes_stream();
-    let mut bytes = Vec::new();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.ok()?;
-        if bytes.len().saturating_add(chunk.len()) > 10 * 1024 * 1024 {
-            return None;
+    for (index, block) in blocks.iter().enumerate() {
+        let block_pointer = format!("{pointer}/{index}");
+        match block.get("type").and_then(Value::as_str) {
+            Some("image" | "document")
+                if block.pointer("/source/type").and_then(Value::as_str) == Some("url") =>
+            {
+                if let Some(url) = block.pointer("/source/url").and_then(Value::as_str) {
+                    output.push(ClaudeRemoteAttachment {
+                        message_index,
+                        block_pointer,
+                        kind: if block.get("type").and_then(Value::as_str) == Some("image") {
+                            RemoteAttachmentKind::Image
+                        } else {
+                            RemoteAttachmentKind::Document
+                        },
+                        url: url.to_owned(),
+                    });
+                }
+            }
+            Some("tool_result") => {
+                if let Some(nested) = block.get("content") {
+                    collect_claude_remote_attachments(
+                        nested,
+                        message_index,
+                        &format!("{block_pointer}/content"),
+                        output,
+                    );
+                }
+            }
+            Some("document")
+                if block.pointer("/source/type").and_then(Value::as_str) == Some("content") =>
+            {
+                if let Some(nested) = block.pointer("/source/content") {
+                    collect_claude_remote_attachments(
+                        nested,
+                        message_index,
+                        &format!("{block_pointer}/source/content"),
+                        output,
+                    );
+                }
+            }
+            _ => {}
         }
-        bytes.extend_from_slice(&chunk);
     }
-    let encoded = base64::engine::general_purpose::STANDARD.encode(bytes);
-    Some(format!("data:image/{format};base64,{encoded}"))
+}
+
+async fn hydrate_openai_images(
+    state: &Arc<AppState>,
+    request: &mut OpenAiRequest,
+) -> Result<Vec<crate::state::BodyGuard>, ApiError> {
+    let mut targets = Vec::new();
+    for (message_index, message) in request.messages.iter().enumerate() {
+        let Some(parts) = message.content.as_ref().and_then(Value::as_array) else {
+            continue;
+        };
+        for (part_index, part) in parts.iter().enumerate() {
+            if let Some(url) = part
+                .pointer("/image_url/url")
+                .and_then(Value::as_str)
+                .filter(|url| {
+                    Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+                })
+            {
+                targets.push((message_index, part_index, url.to_owned()));
+            }
+        }
+    }
+
+    let guarded_targets = targets
+        .into_iter()
+        .map(|target| {
+            reserve_remote_attachment(state, REMOTE_IMAGE_MAX_BYTES, ErrorFormat::OpenAi)
+                .map(|guard| (target, guard))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let fetched = futures::stream::iter(guarded_targets)
+        .map(|((message_index, part_index, url), guard)| async move {
+            let image =
+                fetch_remote_attachment(&url, RemoteAttachmentKind::Image, REMOTE_IMAGE_MAX_BYTES)
+                    .await
+                    .map_err(|message| {
+                        ApiError::new(
+                            StatusCode::BAD_GATEWAY,
+                            format!("unable to fetch remote image: {message}"),
+                            ErrorFormat::OpenAi,
+                        )
+                    })?;
+            Ok::<_, ApiError>((message_index, part_index, image, guard))
+        })
+        .buffer_unordered(REMOTE_ATTACHMENT_CONCURRENCY)
+        .try_collect::<Vec<_>>()
+        .await?;
+
+    let mut guards = Vec::with_capacity(fetched.len());
+    for (message_index, part_index, fetched, guard) in fetched {
+        let encoded = base64::engine::general_purpose::STANDARD.encode(fetched.bytes);
+        let data_url = format!("data:{};base64,{encoded}", fetched.media_type);
+        let value = request.messages[message_index]
+            .content
+            .as_mut()
+            .and_then(Value::as_array_mut)
+            .and_then(|parts| parts.get_mut(part_index))
+            .and_then(|part| part.pointer_mut("/image_url/url"))
+            .ok_or_else(|| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "remote image changed while preparing the request",
+                    ErrorFormat::OpenAi,
+                )
+            })?;
+        *value = Value::String(data_url);
+        guards.push(guard);
+    }
+    Ok(guards)
+}
+
+fn reserve_remote_attachment(
+    state: &Arc<AppState>,
+    decoded_maximum: usize,
+    format: ErrorFormat,
+) -> Result<crate::state::BodyGuard, ApiError> {
+    let encoded_maximum = decoded_maximum
+        .saturating_add(2)
+        .saturating_div(3)
+        .saturating_mul(4)
+        .saturating_add(decoded_maximum)
+        .saturating_add(16 * 1024);
+    state.body_budget.reserve(encoded_maximum).ok_or_else(|| {
+        ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "remote attachment memory budget exceeded",
+            format,
+        )
+    })
+}
+
+async fn fetch_remote_attachment(
+    value: &str,
+    kind: RemoteAttachmentKind,
+    maximum: usize,
+) -> Result<RemoteAttachment, String> {
+    let mut url = Url::parse(value).map_err(|_| "invalid URL")?;
+    for redirect in 0..=REMOTE_ATTACHMENT_MAX_REDIRECTS {
+        if !matches!(url.scheme(), "http" | "https")
+            || !url.username().is_empty()
+            || url.password().is_some()
+        {
+            return Err("URL must be HTTP(S) and must not contain credentials".into());
+        }
+        let host = url.host_str().ok_or("URL has no host")?.to_owned();
+        let port = url
+            .port_or_known_default()
+            .ok_or("URL has no usable port")?;
+        let addresses = tokio::net::lookup_host((host.as_str(), port))
+            .await
+            .map_err(|_| "host resolution failed")?
+            .collect::<Vec<_>>();
+        if addresses.is_empty()
+            || addresses
+                .iter()
+                .any(|address| !is_public_address(address.ip()))
+        {
+            return Err("URL resolved to a non-public address".into());
+        }
+        // Pin every validated DNS answer, disable environment proxies, and
+        // process redirects ourselves so every hop is resolved and checked.
+        let client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(5))
+            .timeout(Duration::from_secs(15))
+            .redirect(reqwest::redirect::Policy::none())
+            .no_proxy()
+            .resolve_to_addrs(&host, &addresses)
+            .build()
+            .map_err(|_| "unable to initialize HTTP client")?;
+        let response = client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|_| "remote request failed")?;
+        if response.status().is_redirection() {
+            if redirect == REMOTE_ATTACHMENT_MAX_REDIRECTS {
+                return Err("too many redirects".into());
+            }
+            let location = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|value| value.to_str().ok())
+                .ok_or("redirect did not include a valid Location header")?;
+            url = url.join(location).map_err(|_| "invalid redirect URL")?;
+            continue;
+        }
+        if !response.status().is_success() {
+            return Err(format!("remote server returned HTTP {}", response.status()));
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > maximum as u64)
+        {
+            return Err(format!("attachment exceeds the {maximum}-byte limit"));
+        }
+        let declared_media_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_ascii_lowercase);
+        let mut stream = response.bytes_stream();
+        let mut bytes = Vec::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| "remote response body failed")?;
+            if bytes.len().saturating_add(chunk.len()) > maximum {
+                return Err(format!("attachment exceeds the {maximum}-byte limit"));
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        if bytes.is_empty() {
+            return Err("remote attachment was empty".into());
+        }
+        let media_type =
+            validate_remote_media_type(kind, declared_media_type.as_deref(), &url, &bytes)
+                .ok_or("remote attachment has an unsupported or mismatched media type")?;
+        return Ok(RemoteAttachment {
+            bytes,
+            media_type: media_type.into(),
+            final_url: url,
+        });
+    }
+    Err("too many redirects".into())
+}
+
+pub(super) fn validate_remote_media_type(
+    kind: RemoteAttachmentKind,
+    declared: Option<&str>,
+    url: &Url,
+    bytes: &[u8],
+) -> Option<&'static str> {
+    match kind {
+        RemoteAttachmentKind::Image => {
+            let detected = if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+                "image/jpeg"
+            } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+                "image/png"
+            } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+                "image/gif"
+            } else if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+                "image/webp"
+            } else {
+                return None;
+            };
+            let declared = match declared {
+                Some("image/jpg") => Some("image/jpeg"),
+                Some(value) => Some(value),
+                None => None,
+            };
+            declared
+                .is_none_or(|declared| declared == detected)
+                .then_some(detected)
+        }
+        RemoteAttachmentKind::Document => {
+            let extension = url
+                .path_segments()
+                .and_then(|mut segments| segments.next_back())
+                .and_then(|name| name.rsplit_once('.').map(|(_, extension)| extension))
+                .map(str::to_ascii_lowercase);
+            let candidate = match declared {
+                Some("application/pdf") => "application/pdf",
+                Some("text/csv" | "application/csv") => "text/csv",
+                Some("text/markdown" | "text/x-markdown") => "text/markdown",
+                Some("text/html") => "text/html",
+                Some("application/msword") => "application/msword",
+                Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document") => {
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                }
+                Some("application/vnd.ms-excel") => "application/vnd.ms-excel",
+                Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet") => {
+                    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                }
+                Some(value) if value.starts_with("text/") => "text/plain",
+                Some("application/octet-stream") | None => match extension.as_deref() {
+                    Some("pdf") => "application/pdf",
+                    Some("csv") => "text/csv",
+                    Some("md" | "markdown") => "text/markdown",
+                    Some("html" | "htm") => "text/html",
+                    Some("txt") => "text/plain",
+                    Some("doc") => "application/msword",
+                    Some("docx") => {
+                        "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                    }
+                    Some("xls") => "application/vnd.ms-excel",
+                    Some("xlsx") => {
+                        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    }
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            let format = match candidate {
+                "application/pdf" => "pdf",
+                "application/msword" => "doc",
+                "application/vnd.ms-excel" => "xls",
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => "docx",
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => "xlsx",
+                "text/csv" => "csv",
+                "text/markdown" => "md",
+                "text/html" => "html",
+                "text/plain" => "txt",
+                _ => return None,
+            };
+            kproxy_translate::document_bytes_match_format(format, bytes).then_some(candidate)
+        }
+    }
 }
 
 pub(super) fn is_public_address(address: IpAddr) -> bool {
     match address {
         IpAddr::V4(address) => {
+            let octets = address.octets();
             !address.is_private()
                 && !address.is_loopback()
                 && !address.is_link_local()
@@ -1193,12 +1555,15 @@ pub(super) fn is_public_address(address: IpAddr) -> bool {
                 && !address.is_broadcast()
                 && !address.is_multicast()
                 && !address.is_documentation()
-                && !address.octets()[0].eq(&0)
-                && !(address.octets()[0] == 100 && (64..=127).contains(&address.octets()[1]))
-                && !(address.octets()[0] == 198 && (18..=19).contains(&address.octets()[1]))
+                && octets[0] != 0
+                && octets[0] < 240
+                && !(octets[0] == 100 && (64..=127).contains(&octets[1]))
+                && !(octets[0] == 192 && octets[1] == 0 && octets[2] == 0)
+                && !(octets[0] == 192 && octets[1] == 88 && octets[2] == 99)
+                && !(octets[0] == 198 && (18..=19).contains(&octets[1]))
         }
         IpAddr::V6(address) => {
-            if let Some(mapped) = address.to_ipv4_mapped() {
+            if let Some(mapped) = address.to_ipv4() {
                 return is_public_address(IpAddr::V4(mapped));
             }
             let segments = address.segments();
@@ -1207,7 +1572,66 @@ pub(super) fn is_public_address(address: IpAddr) -> bool {
                 || address.is_multicast()
                 || (segments[0] & 0xfe00) == 0xfc00 // unique-local fc00::/7
                 || (segments[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || (segments[0] & 0xffc0) == 0xfec0 // deprecated site-local fec0::/10
+                || (segments[0] == 0x0064 && segments[1] == 0xff9b) // NAT64 well-known prefix
+                || (segments[0] == 0x2001 && segments[1] == 0x0000) // Teredo
+                || segments[0] == 0x2002 // 6to4
                 || (segments[0] == 0x2001 && segments[1] == 0x0db8)) // documentation
         }
+    }
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::*;
+
+    #[test]
+    fn remote_attachment_pointers_include_custom_document_images_and_tool_results() {
+        let mut content = serde_json::json!([
+            {"type":"image","source":{"type":"url","url":"https://example.com/first.png"}},
+            {"type":"document","source":{"type":"content","content":[
+                {"type":"text","text":"custom document"},
+                {"type":"image","source":{"type":"url","url":"https://example.com/second.png"}}
+            ]}},
+            {"type":"tool_result","tool_use_id":"tool_1","content":[
+                {"type":"document","source":{"type":"content","content":[
+                    {"type":"image","source":{"type":"url","url":"https://example.com/third.png"}}
+                ]}},
+                {"type":"document","source":{"type":"url","url":"https://example.com/report.pdf"}}
+            ]}
+        ]);
+        let mut targets = Vec::new();
+        collect_claude_remote_attachments(&content, 7, "", &mut targets);
+        assert_eq!(
+            targets
+                .iter()
+                .map(|target| target.block_pointer.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "/0",
+                "/1/source/content/1",
+                "/2/content/0/source/content/0",
+                "/2/content/1"
+            ]
+        );
+        assert!(targets.iter().all(|target| target.message_index == 7));
+        assert!(targets[..3]
+            .iter()
+            .all(|target| matches!(target.kind, RemoteAttachmentKind::Image)));
+        assert!(matches!(targets[3].kind, RemoteAttachmentKind::Document));
+        for target in targets {
+            let block = content
+                .pointer_mut(&target.block_pointer)
+                .expect("collected block");
+            assert_eq!(block["source"]["url"].as_str(), Some(target.url.as_str()));
+            block["source"] = serde_json::json!({"type":"base64","data":"hydrated"});
+        }
+        let mut remaining = Vec::new();
+        collect_claude_remote_attachments(&content, 7, "", &mut remaining);
+        assert!(remaining.is_empty());
+        assert_eq!(
+            content[1]["source"]["content"][0]["text"],
+            "custom document"
+        );
     }
 }
