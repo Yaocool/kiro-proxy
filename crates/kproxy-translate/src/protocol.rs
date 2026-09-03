@@ -23,6 +23,8 @@ pub struct ClaudeRequest {
     #[serde(default)]
     pub top_p: Option<f64>,
     #[serde(default)]
+    pub top_k: Option<u32>,
+    #[serde(default)]
     pub stop_sequences: Vec<String>,
     #[serde(default)]
     pub stream: bool,
@@ -35,13 +37,36 @@ pub struct ClaudeRequest {
     #[serde(default)]
     pub thinking: Option<ThinkingConfig>,
     #[serde(default)]
+    pub output_config: Option<ClaudeOutputConfig>,
+    /// Anthropic automatic prompt-caching control. Block-level controls remain
+    /// embedded in the untyped content values below.
+    #[serde(default)]
+    pub cache_control: Option<Value>,
+    #[serde(default)]
+    pub service_tier: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<Value>,
+    /// Optional Kiro-compatible extension used by clients that already own a
+    /// stable conversation identifier. The daemon hashes it with the
+    /// authenticated client namespace before putting it on the upstream wire.
+    #[serde(default, alias = "conversationId")]
+    pub conversation_id: Option<String>,
+    #[serde(default)]
     pub context_management: Option<Value>,
+    /// Unknown top-level controls must remain visible to validation. Silently
+    /// dropping a future execution or safety field can change request meaning.
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClaudeMessage {
     pub role: String,
     pub content: Value,
+    #[serde(default)]
+    pub cache_control: Option<Value>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,6 +131,16 @@ pub struct ThinkingConfig {
     pub r#type: String,
     #[serde(default)]
     pub budget_tokens: Option<u32>,
+    #[serde(default)]
+    pub display: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaudeOutputConfig {
+    #[serde(default)]
+    pub effort: Option<String>,
+    #[serde(flatten)]
+    pub extra: Map<String, Value>,
 }
 
 /// OpenAI Chat Completions request.
@@ -135,6 +170,12 @@ pub struct OpenAiRequest {
     #[serde(default)]
     pub thinking: Option<ThinkingConfig>,
     #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub conversation_id: Option<String>,
+    #[serde(default)]
+    pub metadata: Option<Value>,
+    #[serde(default)]
     pub response_format: Option<Value>,
 }
 
@@ -147,6 +188,12 @@ pub struct OpenAiMessage {
     pub tool_calls: Vec<Value>,
     #[serde(default)]
     pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub reasoning_content: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub cache_control: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -154,6 +201,17 @@ pub struct OpenAiTool {
     pub r#type: String,
     #[serde(flatten)]
     pub body: Value,
+}
+
+/// Original client controls, retained across account routing, model fallbacks,
+/// and internal continuation turns. Never part of Kiro's wire protocol.
+#[derive(Debug, Clone, Default)]
+pub struct ModelRequestIntent {
+    pub requested_model: String,
+    pub thinking: Option<ThinkingConfig>,
+    /// OpenAI reasoning_effort only. The reference Claude adapter ignores
+    /// output_config.effort when constructing upstream model controls.
+    pub effort: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -164,6 +222,11 @@ pub struct KiroPayload {
     pub profile_arn: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inference_config: Option<KiroInferenceConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub additional_model_request_fields: Option<Value>,
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub model_request_intent: Option<ModelRequestIntent>,
     /// Proxy-local metadata. This is deliberately excluded from the upstream
     /// wire payload so protected history cannot be forged through JSON or
     /// interpreted as part of the prompt by Kiro.
@@ -173,6 +236,35 @@ pub struct KiroPayload {
 }
 
 impl KiroPayload {
+    pub fn max_output_tokens(&self) -> Option<u32> {
+        self.inference_config
+            .as_ref()
+            .and_then(|inference| inference.max_tokens)
+    }
+
+    pub fn thinking_summary_omitted(&self) -> bool {
+        self.model_request_intent
+            .as_ref()
+            .and_then(|intent| intent.thinking.as_ref())
+            .and_then(|thinking| thinking.display.as_deref())
+            == Some("omitted")
+    }
+
+    /// Whether this particular upstream attempt requested visible reasoning.
+    /// Omission is not a guarantee that the upstream model itself cannot think.
+    pub fn thinking_enabled(&self) -> bool {
+        let Some(fields) = self.additional_model_request_fields.as_ref() else {
+            return false;
+        };
+        matches!(
+            fields.pointer("/thinking/type").and_then(Value::as_str),
+            Some("adaptive" | "enabled")
+        ) || fields
+            .pointer("/reasoning/effort")
+            .and_then(Value::as_str)
+            .is_some_and(|effort| effort != "none")
+    }
+
     pub fn protected_history_len(&self) -> usize {
         self.protected_history_messages
             .min(self.conversation_state.history.len())
@@ -205,6 +297,10 @@ impl KiroPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroConversationState {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_continuation_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_task_type: Option<String>,
     pub chat_trigger_type: String,
     pub conversation_id: String,
     pub current_message: KiroCurrentMessage,
@@ -226,6 +322,12 @@ pub struct KiroUserInputMessage {
     pub origin: String,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub images: Vec<KiroImage>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub documents: Vec<KiroDocument>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_point: Option<KiroCachePoint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_cache_config: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_input_message_context: Option<KiroMessageContext>,
 }
@@ -239,6 +341,44 @@ pub struct KiroImage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KiroImageSource {
     pub bytes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroDocument {
+    pub format: String,
+    pub name: String,
+    pub source: KiroDocumentSource,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub citations: Option<KiroCitationsConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroDocumentSource {
+    pub bytes: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroCitationsConfig {
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KiroCachePoint {
+    pub r#type: String,
+}
+
+impl KiroCachePoint {
+    pub fn new() -> Self {
+        Self {
+            r#type: "default".into(),
+        }
+    }
+}
+
+impl Default for KiroCachePoint {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -290,9 +430,39 @@ pub struct WebSearchResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct KiroTool {
-    pub tool_specification: KiroToolSpecification,
+#[serde(rename_all = "camelCase", untagged)]
+pub enum KiroTool {
+    Specification {
+        #[serde(rename = "toolSpecification")]
+        tool_specification: KiroToolSpecification,
+    },
+    CachePoint {
+        #[serde(rename = "cachePoint")]
+        cache_point: KiroCachePoint,
+    },
+}
+
+impl KiroTool {
+    pub fn specification(&self) -> Option<&KiroToolSpecification> {
+        match self {
+            Self::Specification { tool_specification } => Some(tool_specification),
+            Self::CachePoint { .. } => None,
+        }
+    }
+
+    pub fn specification_mut(&mut self) -> Option<&mut KiroToolSpecification> {
+        match self {
+            Self::Specification { tool_specification } => Some(tool_specification),
+            Self::CachePoint { .. } => None,
+        }
+    }
+
+    pub fn cache_point(&self) -> Option<&KiroCachePoint> {
+        match self {
+            Self::CachePoint { cache_point } => Some(cache_point),
+            Self::Specification { .. } => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,6 +491,8 @@ pub struct KiroHistoryMessage {
 #[serde(rename_all = "camelCase")]
 pub struct KiroAssistantMessage {
     pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_point: Option<KiroCachePoint>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub tool_uses: Vec<KiroToolUse>,
 }
@@ -333,10 +505,11 @@ pub struct KiroToolUse {
     pub input: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroInferenceConfig {
-    pub max_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -353,7 +526,11 @@ fn default_parallel() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::matches_type_family;
+    use serde_json::json;
+
+    use super::{
+        matches_type_family, KiroCachePoint, KiroInputSchema, KiroTool, KiroToolSpecification,
+    };
 
     #[test]
     fn protocol_type_families_do_not_assume_a_version_format() {
@@ -363,5 +540,42 @@ mod tests {
         assert!(matches_type_family("web_search_", "web_search"));
         assert!(!matches_type_family("web_searcher", "web_search"));
         assert!(!matches_type_family("other_web_search_next", "web_search"));
+    }
+
+    #[test]
+    fn kiro_tool_variants_match_the_wire_shape() {
+        let specification = KiroTool::Specification {
+            tool_specification: KiroToolSpecification {
+                name: "lookup".into(),
+                description: "Lookup a value".into(),
+                input_schema: KiroInputSchema {
+                    json: json!({"type":"object"}),
+                },
+            },
+        };
+        assert_eq!(
+            serde_json::to_value(&specification).expect("serialize specification"),
+            json!({"toolSpecification": {
+                "name": "lookup",
+                "description": "Lookup a value",
+                "inputSchema": {"json": {"type":"object"}}
+            }})
+        );
+
+        let cache_point = KiroTool::CachePoint {
+            cache_point: KiroCachePoint::new(),
+        };
+        let value = serde_json::to_value(&cache_point).expect("serialize cache point");
+        assert_eq!(value, json!({"cachePoint":{"type":"default"}}));
+        assert!(serde_json::from_value::<KiroTool>(value).is_ok());
+
+        let extended: KiroTool = serde_json::from_value(json!({
+            "cachePoint":{"type":"default","ttl":"1h"}
+        }))
+        .expect("read an older payload");
+        assert_eq!(
+            serde_json::to_value(&extended).expect("serialize only supported cache fields"),
+            json!({"cachePoint":{"type":"default"}})
+        );
     }
 }

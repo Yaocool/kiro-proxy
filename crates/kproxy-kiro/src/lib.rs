@@ -13,5 +13,5 @@ pub use client::{
     KiroClient, KiroError, KiroResponse, ModelInfo, UsageInfo, UsageLimits, UsageUserInfo,
 };
 pub use endpoint::{EndpointCache, EndpointDefinition, EndpointKey, EndpointPurpose};
-pub use event_stream::{EventStreamDecoder, KiroEvent};
+pub use event_stream::{EventStreamDecoder, KiroCitation, KiroEvent};
 pub use kproxy_translate::{WebSearchResult, WebSearchResults};

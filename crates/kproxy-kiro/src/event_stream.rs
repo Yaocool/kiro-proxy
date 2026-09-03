@@ -24,6 +24,11 @@ pub enum KiroEvent {
     },
     Reasoning {
         content: String,
+        signature: Option<String>,
+        redacted_content: Option<String>,
+    },
+    Citations {
+        citations: Vec<KiroCitation>,
     },
     MessageMetadata {
         usage: Value,
@@ -39,6 +44,14 @@ pub enum KiroEvent {
         event_type: String,
         payload: Value,
     },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct KiroCitation {
+    pub text: Option<String>,
+    pub link: String,
+    pub target: Value,
+    pub kind: String,
 }
 
 #[derive(Debug, Default)]
@@ -180,16 +193,17 @@ fn to_event(headers: BTreeMap<String, String>, value: Value) -> KiroEvent {
             kind: exception_type.unwrap_or_else(|| event_type.clone()),
             message: value
                 .get("message")
-                .or_else(|| value.get("Message"))
                 .and_then(Value::as_str)
+                .or_else(|| value.get("Message").and_then(Value::as_str))
                 .unwrap_or("Unknown stream error")
                 .into(),
         };
     }
     if let Some(kind) = value
         .get("__type")
-        .or_else(|| value.get("_type"))
         .and_then(Value::as_str)
+        .or_else(|| value.get("_type").and_then(Value::as_str))
+        .filter(|kind| !kind.is_empty())
     {
         return KiroEvent::Error {
             kind: kind.into(),
@@ -200,7 +214,7 @@ fn to_event(headers: BTreeMap<String, String>, value: Value) -> KiroEvent {
                 .into(),
         };
     }
-    if let Some(error) = value.get("error") {
+    if let Some(error) = value.get("error").filter(|error| !error.is_null()) {
         return KiroEvent::Error {
             kind: "upstream_error".into(),
             message: error
@@ -239,64 +253,61 @@ fn to_event(headers: BTreeMap<String, String>, value: Value) -> KiroEvent {
                 stop: body.get("stop").and_then(Value::as_bool).unwrap_or(false),
             }
         }
-        "reasoningContentEvent" => KiroEvent::Reasoning {
-            content: nested_str(&value, "reasoningContentEvent", "text")
-                .or_else(|| nested_str(&value, "reasoningContentEvent", "content"))
-                .or_else(|| value.get("text").and_then(Value::as_str))
-                .or_else(|| value.get("content").and_then(Value::as_str))
-                .unwrap_or_default()
-                .into(),
-        },
+        "reasoningContentEvent" => {
+            let body = value.get("reasoningContentEvent").unwrap_or(&value);
+            KiroEvent::Reasoning {
+                content: body
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| body.get("content").and_then(Value::as_str))
+                    .unwrap_or_default()
+                    .into(),
+                signature: body
+                    .get("signature")
+                    .and_then(Value::as_str)
+                    .filter(|signature| !signature.is_empty())
+                    .map(str::to_owned),
+                redacted_content: body
+                    .get("redactedContent")
+                    .and_then(Value::as_str)
+                    .or_else(|| body.get("redacted_content").and_then(Value::as_str))
+                    .filter(|content| !content.is_empty())
+                    .map(str::to_owned),
+            }
+        }
         "messageMetadataEvent" | "metadataEvent" => KiroEvent::MessageMetadata { usage: value },
         "usageEvent" | "usage" | "meteringEvent" => KiroEvent::Usage { usage: value },
-        "supplementaryWebLinksEvent" => visible_supplementary(
+        "supplementaryWebLinksEvent" => citation_event(
             &value,
             "supplementaryWebLinksEvent",
             "supplementaryWebLinks",
-            "Web References",
-            |item, _| {
-                let url = item.get("url")?.as_str()?;
-                let title = item.get("title").and_then(Value::as_str).unwrap_or(url);
-                Some(format!("- [{title}]({url})"))
-            },
+            "web",
         ),
-        "codeReferenceEvent" => visible_supplementary(
-            &value,
-            "codeReferenceEvent",
-            "references",
-            "Code References",
-            |item, _| {
-                let mut fields = Vec::new();
-                if let Some(license) = item.get("licenseName").and_then(Value::as_str) {
-                    fields.push(format!("License: {license}"));
-                }
-                if let Some(repository) = item.get("repository").and_then(Value::as_str) {
-                    fields.push(format!("Repo: {repository}"));
-                }
-                if let Some(url) = item.get("url").and_then(Value::as_str) {
-                    fields.push(format!("URL: {url}"));
-                }
-                (!fields.is_empty()).then(|| fields.join(", "))
-            },
-        ),
-        "citationEvent" => visible_supplementary(
-            &value,
-            "citationEvent",
-            "citations",
-            "Citations",
-            |item, index| {
-                let title = item.get("title").and_then(Value::as_str);
-                let url = item.get("url").and_then(Value::as_str);
-                (title.is_some() || url.is_some()).then(|| {
-                    format!(
-                        "[{}] {}{}",
-                        index + 1,
-                        title.unwrap_or_default(),
-                        url.map(|url| format!(" ({url})")).unwrap_or_default()
-                    )
+        "codeReferenceEvent" => citation_event(&value, "codeReferenceEvent", "references", "code"),
+        "citationEvent" => citation_event(&value, "citationEvent", "citations", "document"),
+        "invalidStateEvent" => {
+            let body = value.get("invalidStateEvent").unwrap_or(&value);
+            let reason = ["reason", "code", "state"]
+                .into_iter()
+                .find_map(|field| {
+                    body.get(field)
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
                 })
-            },
-        ),
+                .unwrap_or("INVALID_STATE");
+            let message = ["message", "detail"]
+                .into_iter()
+                .find_map(|field| {
+                    body.get(field)
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.is_empty())
+                })
+                .unwrap_or("Kiro reported an invalid conversation state");
+            KiroEvent::Error {
+                kind: reason.into(),
+                message: message.into(),
+            }
+        }
         "followupPromptEvent" => {
             let body = value.get("followupPromptEvent").unwrap_or(&value);
             let prompt = body.get("followupPrompt").unwrap_or(body);
@@ -340,38 +351,80 @@ fn detected_event_type(value: &Value) -> Option<&'static str> {
     ]
     .into_iter()
     .find(|key| value.get(key).is_some())
+    .or_else(|| {
+        value
+            .get("citationLink")
+            .is_some()
+            .then_some("citationEvent")
+    })
 }
 
-fn visible_supplementary(
-    value: &Value,
-    wrapper: &str,
-    list: &str,
-    heading: &str,
-    render: impl Fn(&Value, usize) -> Option<String>,
-) -> KiroEvent {
+fn nested_str<'a>(value: &'a Value, wrapper: &str, key: &str) -> Option<&'a str> {
+    value
+        .get(wrapper)
+        .unwrap_or(value)
+        .get(key)
+        .and_then(Value::as_str)
+}
+
+fn citation_event(value: &Value, wrapper: &str, list: &str, kind: &str) -> KiroEvent {
     let body = value.get(wrapper).unwrap_or(value);
-    let lines = body
+    let listed = body
         .get(list)
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .enumerate()
-        .filter_map(|(index, item)| render(item, index))
         .collect::<Vec<_>>();
-    if lines.is_empty() {
+    let items = if listed.is_empty() {
+        vec![body]
+    } else {
+        listed
+    };
+    let citations = items
+        .into_iter()
+        .filter_map(|item| {
+            let link = ["citationLink", "url", "repository"]
+                .into_iter()
+                .find_map(|field| {
+                    item.get(field)
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                })
+                .map(str::to_owned);
+            let text = ["citationText", "title", "licenseName", "snippet", "content"]
+                .into_iter()
+                .find_map(|field| {
+                    item.get(field)
+                        .and_then(Value::as_str)
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                })
+                .map(str::to_owned);
+            if link.is_none() && text.is_none() {
+                return None;
+            }
+            let target = item
+                .get("target")
+                .or_else(|| item.get("recommendationContentSpan"))
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            Some(KiroCitation {
+                text,
+                link: link.unwrap_or_default(),
+                target,
+                kind: kind.into(),
+            })
+        })
+        .collect::<Vec<_>>();
+    if citations.is_empty() {
         KiroEvent::Other {
             event_type: wrapper.into(),
             payload: value.clone(),
         }
     } else {
-        KiroEvent::AssistantResponse {
-            content: format!("\n\n**{heading}:**\n{}", lines.join("\n")),
-        }
+        KiroEvent::Citations { citations }
     }
-}
-
-fn nested_str<'a>(value: &'a Value, parent: &str, key: &str) -> Option<&'a str> {
-    value.get(parent)?.get(key)?.as_str()
 }
 
 fn value_text(value: &Value) -> String {
@@ -473,7 +526,9 @@ mod tests {
                 serde_json::json!({"reasoningContentEvent":{"text":"thinking"}}),
             ),
             KiroEvent::Reasoning {
-                content: "thinking".into()
+                content: "thinking".into(),
+                signature: None,
+                redacted_content: None,
             }
         );
         let links = to_event(
@@ -482,11 +537,51 @@ mod tests {
                 {"title":"Example","url":"https://example.com"}
             ]}}),
         );
-        assert!(matches!(
-            links,
-            KiroEvent::AssistantResponse { content }
-                if content.contains("[Example](https://example.com)")
-        ));
+        assert!(matches!(links, KiroEvent::Citations { citations }
+            if citations.len() == 1
+                && citations[0].text.as_deref() == Some("Example")
+                && citations[0].link == "https://example.com"));
+
+        let license = to_event(
+            BTreeMap::new(),
+            serde_json::json!({"codeReferenceEvent":{"references":[
+                {"licenseName":"MIT"}
+            ]}}),
+        );
+        assert!(matches!(license, KiroEvent::Citations { citations }
+            if citations.len() == 1
+                && citations[0].text.as_deref() == Some("MIT")
+                && citations[0].link.is_empty()));
+
+        let direct = to_event(
+            BTreeMap::new(),
+            serde_json::json!({
+                "error":null,
+                "citationLink":null,
+                "url":"https://example.com/source",
+                "citationText":null,
+                "title":"Fallback title",
+                "target":{"range":{"start":0,"end":6}}
+            }),
+        );
+        assert!(matches!(direct, KiroEvent::Citations { citations }
+            if citations.len() == 1
+                && citations[0].text.as_deref() == Some("Fallback title")
+                && citations[0].link == "https://example.com/source"));
+
+        assert_eq!(
+            to_event(
+                BTreeMap::new(),
+                serde_json::json!({"invalidStateEvent":{
+                    "reason":"STALE_CONVERSATION",
+                    "message":"Conversation state is no longer valid"
+                }}),
+            ),
+            KiroEvent::Error {
+                kind: "STALE_CONVERSATION".into(),
+                message: "Conversation state is no longer valid".into(),
+            }
+        );
     }
 
     #[test]
