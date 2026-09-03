@@ -49,6 +49,8 @@ fn kiro_ide_user_agents_match_the_current_desktop_client() {
 fn payload() -> KiroPayload {
     KiroPayload {
         conversation_state: KiroConversationState {
+            agent_continuation_id: None,
+            agent_task_type: None,
             chat_trigger_type: "MANUAL".into(),
             conversation_id: "conversation".into(),
             current_message: KiroCurrentMessage {
@@ -57,6 +59,9 @@ fn payload() -> KiroPayload {
                     model_id: "claude-sonnet-4".into(),
                     origin: "AI_EDITOR".into(),
                     images: Vec::new(),
+                    documents: Vec::new(),
+                    cache_point: None,
+                    client_cache_config: None,
                     user_input_message_context: None,
                 },
             },
@@ -64,6 +69,8 @@ fn payload() -> KiroPayload {
         },
         profile_arn: None,
         inference_config: None,
+        additional_model_request_fields: None,
+        model_request_intent: None,
         protected_history_messages: 0,
     }
 }
@@ -955,4 +962,131 @@ fn framed_error_text_is_classified_like_http_statuses() {
     assert!(ordinary_server_error.is_retriable());
     assert!(!ordinary_server_error.is_model_capacity_error());
     assert!(!ordinary_server_error.is_context_too_long());
+}
+
+#[tokio::test]
+async fn first_generation_uses_the_static_protocol_contract_for_every_account_and_endpoint() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(4)
+        .mount(&server)
+        .await;
+    let client = test_client(&server);
+    let request: kproxy_translate::ClaudeRequest = serde_json::from_value(serde_json::json!({
+        "model":"claude-sonnet-4", "max_tokens":4096, "top_k":42,
+        "thinking":{"type":"adaptive"}, "cache_control":{"type":"ephemeral","ttl":"1h"},
+        "tools":[{"name":"lookup","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral","ttl":"1h"}}],
+        "messages":[
+            {"role":"user","content":"start"},
+            {"role":"assistant","content":[
+                {"type":"thinking","thinking":"private prior reasoning","signature":"stale-signature"},
+                {"type":"text","text":"visible answer","cache_control":{"type":"ephemeral","ttl":"1h"}}
+            ]},
+            {"role":"user","content":[{"type":"document","source":{"type":"text","media_type":"text/plain","data":"Report"},
+                "title":"Report","context":"Use the totals on page two","citations":{"enabled":true}}]}
+        ]
+    })).expect("Claude request");
+    kproxy_translate::validate_claude(&request).expect("valid request");
+    let mut options = kproxy_translate::TranslationOptions::new("claude-sonnet-4", "AI_EDITOR");
+    options.enable_prompt_cache = true;
+    options.additional_model_request_fields_schema =
+        Some(serde_json::json!({"properties":{"thinking":{"type":"object"}}}));
+    let mut payload = kproxy_translate::claude_to_kiro(&request, &options);
+    kproxy_translate::model::apply_adaptive_thinking(
+        &mut payload,
+        options.additional_model_request_fields_schema.as_ref(),
+        true,
+    );
+    for index in 0..2 {
+        let mut account = power_account(AuthMethod::Idc);
+        account.id = format!("account-{index}");
+        for endpoint in [EndpointKey::Amazonq, EndpointKey::Codewhisperer] {
+            drop(
+                client
+                    .generate(&account, &payload, Some(endpoint))
+                    .await
+                    .expect("one successful request"),
+            );
+        }
+    }
+    let requests = server.received_requests().await.expect("requests");
+    assert_eq!(requests.len(), 4);
+    for request in requests {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).expect("request JSON");
+        assert!(body
+            .pointer("/additionalModelRequestFields/top_k")
+            .is_none());
+        assert_eq!(
+            body.pointer("/additionalModelRequestFields/thinking/type")
+                .and_then(serde_json::Value::as_str),
+            Some("adaptive")
+        );
+        let current = body
+            .pointer("/conversationState/currentMessage/userInputMessage")
+            .expect("current user");
+        assert_eq!(current["cachePoint"], serde_json::json!({"type":"default"}));
+        assert_eq!(
+            current["userInputMessageContext"]["tools"][1],
+            serde_json::json!({"cachePoint":{"type":"default"}})
+        );
+        assert!(current["documents"][0].get("context").is_none());
+        assert_eq!(current["documents"][0]["citations"]["enabled"], true);
+        assert!(current["content"]
+            .as_str()
+            .expect("text")
+            .contains("Use the totals on page two"));
+        let wire = body.to_string();
+        assert!(!wire.contains("\"ttl\""));
+        assert!(!wire.contains("reasoningContent"));
+        assert!(!wire.contains("private prior reasoning"));
+        assert!(!wire.contains("stale-signature"));
+    }
+}
+
+#[tokio::test]
+async fn request_validation_errors_never_trigger_field_probes_or_capability_learning() {
+    for message in [
+        "ValidationException: top_k is not allowed",
+        "ValidationException: top_k must be greater than zero",
+        "ValidationException: cachePoint is invalid",
+        "ValidationException: document context is not allowed",
+        "ValidationException: document citations are not allowed",
+        "ValidationException: improperly formed request",
+        "THINKING_SIGNATURE_INVALID",
+    ] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(400).set_body_json(serde_json::json!({"message":message})),
+            )
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = test_client(&server);
+        let mut request = payload();
+        // An already-prepared payload can still be rejected for a value or
+        // service-side error. A field name in that error is not a capability.
+        request.additional_model_request_fields = Some(serde_json::json!({"top_k":42}));
+        for index in 0..2 {
+            let mut account = power_account(AuthMethod::Idc);
+            account.id = format!("account-{index}");
+            let error = match client.generate(&account, &request, None).await {
+                Err(error) => error,
+                Ok(_) => panic!("the upstream rejection must be returned"),
+            };
+            assert_eq!(error.status, Some(400), "{message}");
+            assert!(error.message.contains(message), "{error}");
+        }
+        let requests = server.received_requests().await.expect("received requests");
+        assert_eq!(requests.len(), 2, "no hidden probe retries for {message}");
+        for request in requests {
+            let body: serde_json::Value =
+                serde_json::from_slice(&request.body).expect("request JSON");
+            assert_eq!(
+                body.pointer("/additionalModelRequestFields/top_k"),
+                Some(&serde_json::json!(42))
+            );
+        }
+    }
 }

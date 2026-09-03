@@ -168,9 +168,15 @@ pub struct KiroResponse {
     pub response: Response,
     permit: tokio::sync::OwnedSemaphorePermit,
     stream_slot_wait_ms: u64,
+    thinking_enabled: bool,
 }
 
 impl KiroResponse {
+    /// Thinking requested by this actual attempt, after model-specific preparation.
+    pub fn thinking_enabled(&self) -> bool {
+        self.thinking_enabled
+    }
+
     /// Time spent waiting for an upstream streaming connection slot.
     pub fn stream_slot_wait_ms(&self) -> u64 {
         self.stream_slot_wait_ms
@@ -199,6 +205,8 @@ pub struct ModelInfo {
     pub rate_multiplier: Option<f64>,
     #[serde(default)]
     pub token_limits: Option<TokenLimits>,
+    #[serde(default)]
+    pub additional_model_request_fields_schema: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -929,6 +937,9 @@ impl KiroClient {
         payload: &KiroPayload,
         endpoint: EndpointDefinition,
     ) -> Result<KiroResponse, KiroError> {
+        // Protocol capabilities are resolved before dispatch. A 400 describes
+        // this request, not temporary account health: do not probe by removing
+        // fields or learn time-limited capabilities from error message text.
         let mut payload = payload.clone();
         set_payload_origin(&mut payload, endpoint.origin);
         validate_kiro_tool_history(&payload).map_err(|message| KiroError {
@@ -972,6 +983,7 @@ impl KiroClient {
                 response,
                 permit,
                 stream_slot_wait_ms,
+                thinking_enabled: payload.thinking_enabled(),
             });
         }
         Err(response_error(response, &endpoint).await)
