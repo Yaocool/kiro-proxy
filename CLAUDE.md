@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目定位
 
-`kiro-proxy` 是无 GUI 的 Rust 常驻服务，把 Kiro 上游（CodeWhisperer / Amazon Q / Kiro MCP）包装成 Claude Messages 与 OpenAI Chat Completions 兼容 API。仅支持 Kiro **企业版 SSO（AWS IAM Identity Center / IdC）** 账号，不支持个人账号或社交登录；仓库刻意不含 GUI、MITM 与本地 Kiro 应用改写。
+`kiro-proxy` 是无 GUI 的 Rust 常驻服务，把 Kiro 上游（CodeWhisperer / Amazon Q / Kiro MCP）包装成 Claude Messages、OpenAI Chat Completions 与 Responses 兼容 API。仅支持 Kiro **企业版 SSO（AWS IAM Identity Center / IdC）** 账号，不支持个人账号或社交登录；仓库刻意不含 GUI、MITM 与本地 Kiro 应用改写。
 
 ## 常用命令
 
@@ -74,6 +74,8 @@ kproxyd / kproxy ← 二进制，聚合以上全部
 `AppState`（`kproxyd/src/state.rs`）是唯一共享状态，内部大量 `RwLock<...>` 字段（pool、kiro、notifier、refresher、tls_config、runtime_config）配合 `account_mutation` / `config_mutation` 两把 `Mutex` 串行化写操作。改动这些字段时优先复用 `apply_config_transaction`，不要新开锁顺序。
 
 ### 服务端工具的本地执行
+
+Responses 的入站转换位于 `kproxy-translate/src/responses.rs`，复用 OpenAI 请求执行链；出站 JSON/SSE 编码位于 `kproxyd/src/http/responses.rs`。该端点为无状态模式，客户端传完整历史，`store=true`、`previous_response_id` 等有状态控制明确拒绝。协议支持范围见 `docs/openai-responses.md`。默认客户端准入按协议分流：Claude 仅限 Claude Code，OpenAI（含 Responses、Chat Completions、模型列表）仅限 Codex，统一受 `server.enforce_user_agent_check` 控制。
 
 Kiro 没有原生 Tool Search / Web Search server tool，代理在本地补齐并**续接同一次模型回合**：
 

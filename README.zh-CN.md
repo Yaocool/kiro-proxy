@@ -15,7 +15,7 @@ API Key 限额、TLS、Webhook、统计和运维 CLI。
 ## 主要能力
 
 - 兼容 Claude 的 `/v1/messages` 和 `/v1/messages/count_tokens` 端点。
-- 兼容 OpenAI 的 `/v1/chat/completions` 和 `/v1/models` 端点。
+- 兼容 OpenAI 的 `/v1/responses`、`/v1/chat/completions` 和 `/v1/models` 端点。
 - 带单账号并发限制、冷却、额度追踪和模型兼容检查的多账号加权调度。
 - Kiro 企业账号的 IdC/SSO Token 自动刷新，并对同一账号做 singleflight 防并发刷新。
 - 根据账号选择 Amazon Q 或 CodeWhisperer，使用有界的进程内可用性缓存。
@@ -163,12 +163,21 @@ KPROXY_HTTP_PORT=5581 ./target/release/kproxyd
 POST /v1/messages
 POST /v1/messages/count_tokens
 POST /v1/chat/completions
+POST /v1/responses
 GET  /v1/models
 GET  /health
 ```
 
 同时支持 Claude 别名 `/messages`、`/anthropic/v1/messages`，以及 OpenAI 别名
-`/chat/completions`、`/models`。
+`/responses`、`/chat/completions`、`/models`。
+
+默认按协议检查客户端：Claude 路由（含 token 计数）仅允许 Claude Code；OpenAI 路由
+（含模型列表）仅允许 Codex。`server.enforce_user_agent_check = false` 可统一关闭
+User-Agent 检查，API key 认证和每个服务的 key 白名单仍生效。
+
+Responses 支持 Codex 无状态多轮对话、流式输出、function/custom 工具、命名空间工具、
+图片输入和工具结果回传。Codex 使用 `wire_api = "responses"`，base URL 指向服务的 `/v1`。
+具体配置、支持范围和不支持参数见 [Responses 协议与 Codex 接入](docs/openai-responses.md)。
 
 ### 工具调用参数
 
@@ -259,10 +268,11 @@ clear_tool_inputs；`clear_thinking` 支持保留指定轮次或全部 thinking�
 编辑前后输入估算。生成路径会先清理已无需保留的历史，再获取仍然需要的远程附件。
 
 相邻同角色消息会合并。Kiro 无法等价实现的 assistant prefill、`max_tokens=0` 缓存预热、严格
-结构化输出和 Anthropic Files API 的 `file_id` 来源会被明确拒绝；OpenAI `/v1/responses` 未暴露。
+结构化输出和 Anthropic Files API 的 `file_id` 来源会被明确拒绝。
 协议兼容在首次发送前确定，不再缓存字段拒绝结果、定时过期重探测或通过逐项删字段重试。
-缓存标记只发送 `type: default`，Claude 的缓存 TTL 不控制 Kiro 缓存有效期。历史 thinking 不回传
-到 Kiro 请求历史，但不关闭当前生成的 thinking；文档 context 则保留为独立、带 JSON 标识的消息文本。
+缓存标记只发送 `type: default`，Claude 的缓存 TTL 不控制 Kiro 缓存有效期。Claude 历史 thinking 不回传
+到 Kiro 请求历史，但不关闭当前生成的 thinking；Responses 的明文推理摘要保留在 assistant 历史中。
+文档 context 则保留为独立、带 JSON 标识的消息文本。
 模型控制参数采用 [chaogei/Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager/blob/447adcdb468157312621b1f09448278bd9bca748/src/main/proxy/translator.ts) 的显式映射方式：
 
 | 客户端参数 | Kiro / 代理处理 |
