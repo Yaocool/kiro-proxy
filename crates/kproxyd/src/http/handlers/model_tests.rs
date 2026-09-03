@@ -250,6 +250,9 @@ async fn final_model_controls_do_not_borrow_another_versions_schema_or_disabled_
     config
         .model_thinking_mode
         .insert("claude-opus-4.7".into(), false);
+    config
+        .model_thinking_mode
+        .insert("claude-haiku".into(), true);
     let state = AppState::new(
         paths,
         kproxy_store::config_loader::ConfigHandle::new(config),
@@ -261,7 +264,7 @@ async fn final_model_controls_do_not_borrow_another_versions_schema_or_disabled_
             "additionalModelRequestFieldsSchema":{"properties":{"output_config":{"properties":{
                 "effort":{"enum":["low","medium","high"]}
             }}}}
-        }]))
+        }, {"modelId":"claude-haiku-4.5", "additionalModelRequestFieldsSchema":null}]))
         .unwrap(),
     );
     let request: ClaudeRequest = serde_json::from_value(json!({
@@ -289,11 +292,20 @@ async fn final_model_controls_do_not_borrow_another_versions_schema_or_disabled_
     assert!(state.prepare_model_request(&mut payload).enabled);
 
     set_payload_model(&mut payload, "claude-opus-4.8");
-    state.prepare_model_request(&mut payload);
+    let decision = state.prepare_model_request(&mut payload);
     assert_eq!(
-        payload.additional_model_request_fields,
-        Some(json!({"thinking":{"type":"adaptive"}}))
+        decision.reason,
+        kproxy_translate::model::ThinkingReason::ModelControlsUnavailable
     );
+    assert!(payload.additional_model_request_fields.is_none());
+
+    // An operator allow rule cannot create a capability the actual model lacks.
+    set_payload_model(&mut payload, "claude-haiku-4.5");
+    assert!(!state.prepare_model_request(&mut payload).enabled);
+    assert!(serde_json::to_value(&payload)
+        .unwrap()
+        .get("additionalModelRequestFields")
+        .is_none());
 
     set_payload_model(&mut payload, "claude-opus-4.7");
     let decision = state.prepare_model_request(&mut payload);

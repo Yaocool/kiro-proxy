@@ -965,16 +965,16 @@ fn framed_error_text_is_classified_like_http_statuses() {
 }
 
 #[tokio::test]
-async fn first_generation_uses_the_static_protocol_contract_for_every_account_and_endpoint() {
+async fn first_generation_preserves_prepared_controls_for_every_account_and_endpoint() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .respond_with(ResponseTemplate::new(200))
-        .expect(4)
+        .expect(8)
         .mount(&server)
         .await;
     let client = test_client(&server);
     let request: kproxy_translate::ClaudeRequest = serde_json::from_value(serde_json::json!({
-        "model":"claude-sonnet-4", "max_tokens":4096, "top_k":42,
+        "model":"claude-sonnet-4.6", "max_tokens":4096, "top_k":42,
         "thinking":{"type":"adaptive"}, "cache_control":{"type":"ephemeral","ttl":"1h"},
         "tools":[{"name":"lookup","input_schema":{"type":"object"},"cache_control":{"type":"ephemeral","ttl":"1h"}}],
         "messages":[
@@ -988,40 +988,45 @@ async fn first_generation_uses_the_static_protocol_contract_for_every_account_an
         ]
     })).expect("Claude request");
     kproxy_translate::validate_claude(&request).expect("valid request");
-    let mut options = kproxy_translate::TranslationOptions::new("claude-sonnet-4", "AI_EDITOR");
+    let mut options = kproxy_translate::TranslationOptions::new("claude-sonnet-4.6", "AI_EDITOR");
     options.enable_prompt_cache = true;
-    options.additional_model_request_fields_schema =
-        Some(serde_json::json!({"properties":{"thinking":{"type":"object"}}}));
-    let mut payload = kproxy_translate::claude_to_kiro(&request, &options);
-    kproxy_translate::model::apply_adaptive_thinking(
-        &mut payload,
-        options.additional_model_request_fields_schema.as_ref(),
-        true,
-    );
-    for index in 0..2 {
-        let mut account = power_account(AuthMethod::Idc);
-        account.id = format!("account-{index}");
-        for endpoint in [EndpointKey::Amazonq, EndpointKey::Codewhisperer] {
-            drop(
-                client
-                    .generate(&account, &payload, Some(endpoint))
-                    .await
-                    .expect("one successful request"),
-            );
+    for schema in [
+        None,
+        Some(serde_json::json!({"properties":{
+            "thinking":{"properties":{"type":{"enum":["adaptive","disabled"]}}},
+            "output_config":{"properties":{"effort":{"enum":["low","high"]}}}
+        }})),
+    ] {
+        options.additional_model_request_fields_schema = schema;
+        let payload = kproxy_translate::claude_to_kiro(&request, &options);
+        for index in 0..2 {
+            let mut account = power_account(AuthMethod::Idc);
+            account.id = format!("account-{index}");
+            for endpoint in [EndpointKey::Amazonq, EndpointKey::Codewhisperer] {
+                drop(
+                    client
+                        .generate(&account, &payload, Some(endpoint))
+                        .await
+                        .expect("one successful request"),
+                );
+            }
         }
     }
     let requests = server.received_requests().await.expect("requests");
-    assert_eq!(requests.len(), 4);
-    for request in requests {
+    assert_eq!(requests.len(), 8);
+    for (index, request) in requests.into_iter().enumerate() {
         let body: serde_json::Value = serde_json::from_slice(&request.body).expect("request JSON");
         assert!(body
             .pointer("/additionalModelRequestFields/top_k")
             .is_none());
-        assert_eq!(
-            body.pointer("/additionalModelRequestFields/thinking/type")
-                .and_then(serde_json::Value::as_str),
-            Some("adaptive")
-        );
+        if index < 4 {
+            assert!(body.get("additionalModelRequestFields").is_none());
+        } else {
+            assert_eq!(
+                body["additionalModelRequestFields"]["thinking"]["type"],
+                "adaptive"
+            );
+        }
         let current = body
             .pointer("/conversationState/currentMessage/userInputMessage")
             .expect("current user");

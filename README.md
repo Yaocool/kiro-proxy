@@ -348,8 +348,8 @@ do not control Kiro's cache lifetime. Claude historical thinking is omitted from
 request history without disabling current-generation thinking; Responses plaintext
 reasoning summaries are preserved in assistant history. Document context
 is preserved as separate JSON-labelled message text rather than a document field.
-Generation controls follow the explicit mapping in
-[chaogei/Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager/blob/447adcdb468157312621b1f09448278bd9bca748/src/main/proxy/translator.ts):
+Generation controls use the explicit mapping in
+[chaogei/Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager/blob/447adcdb468157312621b1f09448278bd9bca748/Kiro-account-manager/src/main/proxy/translator.ts), except for its speculative missing-metadata thinking fallback:
 
 | Client control | Kiro/proxy handling |
 | --- | --- |
@@ -357,10 +357,10 @@ Generation controls follow the explicit mapping in
 | OpenAI `max_completion_tokens` | Accepted/validated but ignored, matching the reference; use `max_tokens` for an upstream limit. |
 | Claude `top_k` | Accepted but omitted with a debug diagnostic, regardless of model metadata. This is a gateway compatibility policy, not a claim that Kiro universally rejects it. |
 | Claude `stop_sequences` | Enforced locally in streaming and non-streaming responses; no native `stopSequences` is sent. This does not guarantee a server-side generation/cost limit. |
-| Thinking / effort | Metadata chooses `thinking: adaptive` + `output_config.effort`, or `reasoning.effort`; missing/incomplete effort metadata falls back to adaptive thinking only. |
+| Thinking / effort | Recognized effort metadata chooses `thinking: adaptive` + `output_config.effort`, or `reasoning.effort`. Missing, incomplete, or unrecognized metadata omits the entire `additionalModelRequestFields` field, never sending `{}`, `null`, or speculative adaptive thinking. |
 | Claude `output_config.effort` | Accepted/validated but ignored; it neither enables thinking nor overrides the budget-derived/default effort. |
 | OpenAI `reasoning_effort` | Takes precedence over `thinking.budget_tokens`; otherwise the default is high. Unsupported values select the last advertised effort, without sorting or nearest-rank matching. |
-| `thinking.display` | The output_config dialect always sends summarized; the reasoning and no-metadata paths omit display. Client display does not override these upstream shapes. |
+| `thinking.display` | The output_config dialect always sends summarized; the reasoning dialect omits display. Without recognized metadata, the entire extension is omitted. Client display does not override these upstream shapes. |
 | `thinking.budget_tokens` | Maps directly to low (≤4000), medium (≤16000), high (≤64000), or xhigh; it is not an exact native thinking-token cap. |
 | `thinking: disabled` | Omits thinking controls and suppresses returned reasoning; omission does not guarantee that a model with thinking enabled by default stops thinking internally. |
 
@@ -369,7 +369,14 @@ reference's runtime metadata extraction. Thinking is no longer automatically
 disabled on tool-result or control follow-ups. Both legacy `adaptive_thinking`
 and `max_thinking_budget_tokens` settings remain readable but no longer affect
 generation controls. An explicitly configured operator `model_thinking_mode`
-deny rule remains enforced.
+deny rule remains enforced; an allow rule cannot create upstream parameter support.
+
+Unsupported thinking controls degrade to the upstream model's default behavior;
+the request still runs, but its requested thinking mode/budget is not guaranteed.
+The debug decision reason is `ModelControlsUnavailable`. This concerns parameter
+support, not whether the underlying model can reason. In an AmazonQ Haiku 4.5
+probe, even an empty extension was rejected, while omission succeeded. No model-name
+blacklist, prompt-tag simulation, or field-removal retry is used for this fallback.
 
 Alignment covers outbound generation parameters. Request validation, local stop
 filtering, bounded internal continuations, and response protection remain:

@@ -273,7 +273,7 @@ clear_tool_inputs；`clear_thinking` 支持保留指定轮次或全部 thinking�
 缓存标记只发送 `type: default`，Claude 的缓存 TTL 不控制 Kiro 缓存有效期。Claude 历史 thinking 不回传
 到 Kiro 请求历史，但不关闭当前生成的 thinking；Responses 的明文推理摘要保留在 assistant 历史中。
 文档 context 则保留为独立、带 JSON 标识的消息文本。
-模型控制参数采用 [chaogei/Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager/blob/447adcdb468157312621b1f09448278bd9bca748/src/main/proxy/translator.ts) 的显式映射方式：
+模型控制参数采用 [chaogei/Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager/blob/447adcdb468157312621b1f09448278bd9bca748/Kiro-account-manager/src/main/proxy/translator.ts) 的显式映射方式，但不沿用其缺失元数据时猜测开启 thinking 的回退：
 
 | 客户端参数 | Kiro / 代理处理 |
 | --- | --- |
@@ -281,17 +281,22 @@ clear_tool_inputs；`clear_thinking` 支持保留指定轮次或全部 thinking�
 | OpenAI `max_completion_tokens` | 接收、校验但忽略，与参考项目一致；需要限制上游输出时使用 `max_tokens`。 |
 | Claude `top_k` | 接收但不发送，不因模型 schema 而开启；记录 debug 诊断。这是网关兼容策略，不代表断言 Kiro 全局不支持。 |
 | Claude `stop_sequences` | 在流式 / 非流式响应中本地执行，不发送原生 `stopSequences`；不保证上游生成量或费用也因此受限。 |
-| thinking / effort | 有有效 effort 元数据时使用 `thinking: adaptive` + `output_config.effort`，或 `reasoning.effort`；元数据缺失 / 不完整时只发送 adaptive thinking。 |
+| thinking / effort | 有可识别的 effort 元数据时使用 `thinking: adaptive` + `output_config.effort`，或 `reasoning.effort`；元数据缺失、不完整或不可识别时，完全省略 `additionalModelRequestFields`，不发送 `{}`、`null` 或猜测的 adaptive thinking。 |
 | Claude `output_config.effort` | 接收、校验但忽略；不单独启用 thinking，也不覆盖预算映射值或默认 effort。 |
 | OpenAI `reasoning_effort` | 优先于 `thinking.budget_tokens`；均未提供时默认 high。档位不支持时取模型枚举最后一项，不排序、不做最近档位匹配。 |
-| `thinking.display` | output_config 路径固定发送 summarized；reasoning 和缺少元数据的路径不发 display。客户端 display 不覆盖这些上游格式。 |
+| `thinking.display` | output_config 路径固定发送 summarized；reasoning 路径不发 display；没有可识别的元数据时省略整个扩展字段。客户端 display 不覆盖这些上游格式。 |
 | `thinking.budget_tokens` | 原始预算直接映射为 low（≤4000）、medium（≤16000）、high（≤64000）、xhigh，不是上游独立 thinking token 硬上限。 |
 | `thinking: disabled` | 不发送 thinking 控制字段，并过滤返回的思考内容；省略字段不保证默认开启思考的模型在内部停止思考。 |
 
 默认 effort 按参考项目的运行时提取方式固定为 `high`，不读取 JSON Schema 的 default。
 工具结果 / 控制续写轮次不再自动关闭 thinking。旧配置 `adaptive_thinking` 和
 `max_thinking_budget_tokens` 均仅保留读取兼容，不再影响生成参数；显式配置的操作员
-`model_thinking_mode` 禁用规则仍然生效。
+`model_thinking_mode` 禁用规则仍然生效；允许规则不能创造上游未提供的参数能力。
+
+无法应用的 thinking 控制降级为上游模型默认行为，请求仍正常执行，但不保证客户端要求的 thinking
+模式或预算生效。debug 决策原因为 `ModelControlsUnavailable`，它表示参数能力不可用，不代表
+底层模型无法推理。AmazonQ Haiku 4.5 实测连空扩展对象也会拒绝，省略整个字段则成功。
+该降级不依赖模型名称黑名单，不注入提示词模拟 thinking，也不通过删字段重试试探能力。
 
 对齐范围是出站生成参数；保留请求校验、本地停止词过滤、内部续写预算和响应保护。
 `display: omitted` 仍在本地隐藏返回的思考文本、保留原生签名，但不改变参考项目的上游 display 策略。
