@@ -13,21 +13,22 @@ use bytes::BytesMut;
 use futures::StreamExt;
 use kproxy_kiro::{EventStreamDecoder, KiroError, KiroEvent, KiroResponse};
 use kproxy_pool::{AccountLease, PoolError};
-use kproxy_translate::model::{
-    apply_adaptive_thinking, map_model, resolve_dynamic_model, thinking_enabled_for_model,
-};
+use kproxy_translate::model::{map_model, resolve_dynamic_model};
 use kproxy_translate::{
     apply_context_management_edits, claude_loaded_tools, claude_pending_server_tool_uses,
     claude_to_kiro, compact_trigger_tokens, compaction_summary_payload, error_envelope,
-    has_context_management_edits, matches_type_family, normalize_compaction_boundary,
-    openai_to_kiro, resume_tool_search_payload, resume_web_search_payload, sanitize_error_message,
-    sanitize_kiro_tool_history, tool_search_continue_payload_batch, validate_claude,
-    validate_kiro_tool_history, validate_openai, web_search_continue_payload_batch, ClaudeRequest,
-    ClaudeToolSearchBudget, ClaudeToolSearchCatalog, ClaudeWebSearchTrace, ErrorFormat,
-    KiroCompactionPlan, KiroPayload, OpenAiRequest, TranslationOptions, ValidationError,
+    estimate_context_management_input_tokens, has_context_management_edits, matches_type_family,
+    normalize_compaction_boundary, openai_to_kiro, resume_tool_search_payload,
+    resume_web_search_payload, sanitize_error_message, sanitize_kiro_tool_history,
+    tool_search_continue_payload_batch, validate_claude, validate_claude_generation,
+    validate_kiro_tool_history, validate_openai, web_search_continue_payload_batch,
+    ClaudeContextEditStats, ClaudeRequest, ClaudeToolSearchBudget, ClaudeToolSearchCatalog,
+    ClaudeWebSearchTrace, ErrorFormat, KiroCompactionPlan, KiroPayload, OpenAiRequest,
+    TranslationOptions, ValidationError,
 };
 use rand::Rng;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
@@ -49,9 +50,84 @@ use super::ServiceHttpState;
 const MAX_STATS_MODEL_CHARS: usize = 128;
 const MAX_ATTEMPT_LOG_SUMMARY_CHARS: usize = 4_096;
 const UNKNOWN_STATS_MODEL: &str = "unknown";
+/// Credit reservation fallback only; never an implicit generation limit.
+pub(super) const DEFAULT_OUTPUT_TOKEN_ESTIMATE: u32 = 8_192;
 const MIN_COMPACTION_BACKGROUND_GRACE: Duration = Duration::from_millis(250);
 const MAX_COMPACTION_BACKGROUND_GRACE: Duration = Duration::from_secs(5);
 const COMPACTION_CLEANUP_GRACE: Duration = Duration::from_secs(5);
+
+fn stable_conversation_id(
+    headers: &HeaderMap,
+    api_key_id: Option<&str>,
+    explicit: Option<&str>,
+    fallback: Option<&str>,
+) -> Option<String> {
+    let hint = explicit
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+        .or_else(|| {
+            [
+                "x-claude-code-session-id",
+                "x-opencode-session",
+                "x-session-affinity",
+                "x-conversation-id",
+            ]
+            .into_iter()
+            .find_map(|name| {
+                headers
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::trim)
+                    .filter(|hint| !hint.is_empty() && hint.len() <= 256)
+            })
+        })
+        .or_else(|| fallback.map(str::trim).filter(|hint| !hint.is_empty()))?;
+    let mut digest = Sha256::new();
+    digest.update(b"kiro-proxy-conversation-v1\0");
+    digest.update(api_key_id.unwrap_or("anonymous").as_bytes());
+    digest.update(b"\0");
+    digest.update(hint.as_bytes());
+    let digest = digest.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    // UUIDv8 reserves the payload bits for application-defined stable IDs.
+    // Keeping the standard variant/version layout matches Kiro IDE wire IDs
+    // while retaining deterministic, API-key-isolated session affinity.
+    bytes[6] = (bytes[6] & 0x0f) | 0x80;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Some(Uuid::from_bytes(bytes).to_string())
+}
+
+fn conversation_fingerprint<T: serde::Serialize>(messages: &[T]) -> Option<String> {
+    if messages.is_empty() {
+        return None;
+    }
+    // The first client message is immutable when later turns are appended.
+    // Hashing the first two made the fallback ID change between turn one and
+    // turn two because the first request contains only one message.
+    let encoded = serde_json::to_vec(&messages[..1]).ok()?;
+    let mut digest = Sha256::new();
+    digest.update(b"kiro-proxy-history-v1\0");
+    digest.update(encoded);
+    Some(
+        digest.finalize()[..16]
+            .iter()
+            .fold(String::new(), |mut output, byte| {
+                use std::fmt::Write as _;
+                let _ = write!(output, "{byte:02x}");
+                output
+            }),
+    )
+}
+
+fn metadata_conversation_hint(metadata: Option<&Value>) -> Option<&str> {
+    let metadata = metadata?.as_object()?;
+    ["session_id", "conversation_id", "thread_id"]
+        .into_iter()
+        .find_map(|name| metadata.get(name).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty() && hint.len() <= 256)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CompactionReason {
@@ -134,9 +210,9 @@ pub use entrypoints::{claude_messages, health, openai_chat, readiness, root};
 
 mod request;
 
-#[cfg(test)]
-use request::is_public_address;
 use request::{handle_claude, handle_openai};
+#[cfg(test)]
+use request::{is_public_address, validate_remote_media_type, RemoteAttachmentKind};
 
 const COMPACTION_USAGE_PATH: &str = "/internal/compact";
 
@@ -200,6 +276,18 @@ struct UpstreamExecution {
     payload: kproxy_translate::KiroPayload,
 }
 
+/// A selected account and its resolved wire model, before any generation.
+/// Keep the lease only on the no-compaction path; summaries need their own slot.
+struct PreparedUpstream {
+    lease: AccountLease,
+    mapped_model: String,
+    kiro_model: String,
+    model_path: Vec<String>,
+    model_mapping_rule: Option<String>,
+    attempts: Vec<UpstreamAttemptLog>,
+    payload: KiroPayload,
+}
+
 enum ExecuteError {
     Pool(PoolError),
     Upstream(KiroError),
@@ -227,7 +315,8 @@ use execution::{
 };
 use execution::{
     credits, execute_upstream, nonstream_claude, nonstream_openai, openai_tool_identities,
-    prepend_attempt_logs, prepend_execute_error_attempts, request_log, usage_record,
+    prepare_upstream, prepend_attempt_logs, prepend_execute_error_attempts, request_log,
+    usage_record,
 };
 
 pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Request) -> Response {
@@ -283,19 +372,33 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             )
         })?;
         object.entry("max_tokens").or_insert_with(|| json!(1));
-        let mut request: ClaudeRequest = serde_json::from_value(value).map_err(|error| {
-            ApiError::new(
-                StatusCode::BAD_REQUEST,
-                format!("Invalid request body: {error}"),
-                ErrorFormat::Claude,
-            )
-        })?;
-        let mut original_request = request.clone();
-        let has_context_edits = has_context_management_edits(request.context_management.as_ref());
+        let mut original_request: ClaudeRequest =
+            serde_json::from_value(value).map_err(|error| {
+                ApiError::new(
+                    StatusCode::BAD_REQUEST,
+                    format!("Invalid request body: {error}"),
+                    ErrorFormat::Claude,
+                )
+            })?;
+        let has_context_edits =
+            has_context_management_edits(original_request.context_management.as_ref());
+        // Validate the semantically effective history before touching remote
+        // media. A completed compaction boundary can make stale history
+        // irrelevant to protocol validation, while `original_input_tokens`
+        // still needs to count that pre-boundary history.
+        let mut request = original_request.clone();
         let compaction_normalization = normalize_compaction_boundary(&mut request);
         let boundary_applied = compaction_normalization.boundary_applied;
         validate_claude(&request).map_err(claude_validation_error)?;
-        let context_edit_stats = apply_context_management_edits(&mut request);
+        // Counting must include the real bytes of every attachment in the
+        // pre-edit request. Generation can avoid fetching history that will
+        // be cleared, but the count endpoint promises both original and
+        // effective token totals.
+        let _attachment_guards =
+            request::hydrate_claude_attachments(&state, &mut original_request).await?;
+        request.clone_from(&original_request);
+        normalize_compaction_boundary(&mut request);
+        validate_claude(&request).map_err(claude_validation_error)?;
         tracing::info!(
             trace_id = %trace_id,
             protocol = "claude_count_tokens",
@@ -348,17 +451,20 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         );
         let mut normal = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
         normal.enhance_system_prompt = config.features.enhance_system_prompt;
-        let mut original_payload = claude_to_kiro(&original_request, &normal);
-        let thinking_limit = model_token_limit(&state, &route.mapped, false)
-            .unwrap_or(config.features.max_thinking_budget_tokens)
-            .min(config.features.max_thinking_budget_tokens);
-        apply_adaptive_thinking(
-            &mut original_payload,
-            request.thinking.as_ref(),
-            thinking_enabled_for_model(&request.model, &config.model_thinking_mode),
-            config.features.adaptive_thinking,
-            thinking_limit,
+        normal.enable_prompt_cache = config.features.enable_prompt_cache;
+        let conversation_fingerprint = conversation_fingerprint(&request.messages);
+        normal.conversation_id = stable_conversation_id(
+            &headers,
+            key_id.as_deref(),
+            request.conversation_id.as_deref(),
+            metadata_conversation_hint(request.metadata.as_ref())
+                .or(conversation_fingerprint.as_deref()),
         );
+        normal.additional_model_request_fields_schema = state
+            .resolved_model_info(&route.mapped)
+            .and_then(|model| model.additional_model_request_fields_schema);
+        let mut original_payload = claude_to_kiro(&original_request, &normal);
+        state.prepare_model_request(&mut original_payload);
         let original_input_tokens = state
             .tokenizer
             .estimate_kiro_payload(&original_payload)
@@ -370,29 +476,24 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
                     ErrorFormat::Claude,
                 )
             })?;
-        let input_tokens = if compaction_normalization.changed() || context_edit_stats.changed() {
-            let mut effective_payload = claude_to_kiro(&request, &normal);
-            apply_adaptive_thinking(
-                &mut effective_payload,
-                request.thinking.as_ref(),
-                thinking_enabled_for_model(&request.model, &config.model_thinking_mode),
-                config.features.adaptive_thinking,
-                thinking_limit,
-            );
-            state
-                .tokenizer
-                .estimate_kiro_payload(&effective_payload)
-                .await
-                .map_err(|error| {
-                    ApiError::new(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        error,
-                        ErrorFormat::Claude,
-                    )
-                })?
-        } else {
-            original_input_tokens
-        };
+        let mut effective_request = request.clone();
+        let context_edit_stats = apply_context_management_edits(
+            &mut effective_request,
+            u64::try_from(original_input_tokens).unwrap_or(u64::MAX),
+        );
+        let mut effective_payload = claude_to_kiro(&effective_request, &normal);
+        state.prepare_model_request(&mut effective_payload);
+        let input_tokens = state
+            .tokenizer
+            .estimate_kiro_payload(&effective_payload)
+            .await
+            .map_err(|error| {
+                ApiError::new(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error,
+                    ErrorFormat::Claude,
+                )
+            })?;
         let mut response = json!({"input_tokens":input_tokens});
         if has_context_edits {
             response["context_management"] = json!({
@@ -568,6 +669,7 @@ fn configured_model_info(model_id: String) -> kproxy_kiro::ModelInfo {
         description: "Configured Kiro upstream model".into(),
         rate_multiplier: None,
         token_limits: None,
+        additional_model_request_fields_schema: None,
     }
 }
 
@@ -704,7 +806,13 @@ fn loaded_tool_count(payload: &kproxy_translate::KiroPayload) -> usize {
         .user_input_message
         .user_input_message_context
         .as_ref()
-        .map_or(0, |context| context.tools.len())
+        .map_or(0, |context| {
+            context
+                .tools
+                .iter()
+                .filter(|tool| tool.specification().is_some())
+                .count()
+        })
 }
 
 fn loaded_tool_bytes(payload: &kproxy_translate::KiroPayload) -> usize {
@@ -727,7 +835,7 @@ pub(super) fn loaded_tool_names(payload: &kproxy_translate::KiroPayload) -> Hash
         .as_ref()
         .into_iter()
         .flat_map(|context| context.tools.iter())
-        .map(|tool| tool.tool_specification.name.clone())
+        .filter_map(|tool| tool.specification().map(|tool| tool.name.clone()))
         .collect()
 }
 
@@ -835,7 +943,7 @@ fn enforce_payload_budget_limits(
         return Err(ApiError::new(
             budget_status,
             format!(
-                "translated upstream payload is too large: {payload_bytes} bytes > {}; reduce the conversation or loaded tool schemas",
+                "translated upstream payload is too large: {payload_bytes} bytes > {}; reduce the conversation, attached documents, or loaded tool schemas",
                 context.max_upstream_payload_bytes
             ),
             format,

@@ -663,6 +663,9 @@ pub(super) async fn probe_account_inner(
             )),
             tool_calls: vec![],
             tool_call_id: None,
+            reasoning_content: None,
+            name: None,
+            cache_control: None,
         }],
         temperature: Some(0.0),
         top_p: None,
@@ -674,6 +677,9 @@ pub(super) async fn probe_account_inner(
         tool_choice: None,
         parallel_tool_calls: true,
         thinking: None,
+        reasoning_effort: None,
+        conversation_id: None,
+        metadata: None,
         response_format: None,
     };
     let payload = kproxy_translate::openai_to_kiro(

@@ -377,7 +377,9 @@ impl wiremock::Respond for RetryingCompactionStreamResponder {
 }
 
 #[derive(Clone, Default)]
-struct ModelUnavailableFallbackResponder;
+struct ModelUnavailableFallbackResponder {
+    stream_failure: bool,
+}
 
 impl wiremock::Respond for ModelUnavailableFallbackResponder {
     fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
@@ -387,9 +389,24 @@ impl wiremock::Respond for ModelUnavailableFallbackResponder {
             .as_str()
             .unwrap_or_default();
         if model == "claude-opus-5" {
+            if self.stream_failure {
+                return ResponseTemplate::new(200)
+                    .insert_header("content-type", "application/vnd.amazon.eventstream")
+                    .set_body_bytes(event_stream_frame("error", serde_json::json!({
+                        "__type":"MODEL_TEMPORARILY_UNAVAILABLE",
+                        "message":"Encountered unexpectedly high load when processing the request, please try again."
+                    })));
+            }
             ResponseTemplate::new(500).set_body_json(serde_json::json!({
                 "message": "Encountered unexpectedly high load when processing the request, please try again.",
                 "reason": "MODEL_TEMPORARILY_UNAVAILABLE"
+            }))
+        } else if payload
+            .pointer("/additionalModelRequestFields/top_k")
+            .is_some()
+        {
+            ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "message":"top_k is not allowed by the fallback model"
             }))
         } else {
             ResponseTemplate::new(200)
@@ -636,7 +653,473 @@ async fn compact_model_alias_runs_through_translation_pool_and_mock_upstream() {
 }
 
 #[tokio::test]
+async fn claude_document_blocks_reach_the_native_kiro_wire_format() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(generation_body("document received")),
+        )
+        .mount(&mock)
+        .await;
+
+    let port = unused_tcp_port();
+    let upstream_url = format!("{}/generateAssistantResponse", mock.uri());
+    let daemon = Daemon::start_http(port, &upstream_url).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header(
+            "x-api-key",
+            daemon.api_key.as_deref().expect("service API key"),
+        )
+        .header("anthropic-version", "2023-06-01")
+        .header("user-agent", "claude-cli/2.1.0 (external, e2e)")
+        .json(&serde_json::json!({
+            "model":"source-large",
+            "max_tokens":64,
+            "top_k":42,
+            "stream":false,
+            "messages":[{"role":"user","content":[
+                {
+                    "type":"document",
+                    "title":"guide.pdf",
+                    "context":"Use the approved architecture requirements.",
+                    "citations":{"enabled":false},
+                    "source":{
+                        "type":"base64",
+                        "media_type":"application/pdf",
+                        "data":"JVBERi0xLjQKJSVFT0YK"
+                    }
+                },
+                {"type":"text","text":"Summarize the guide."}
+            ]}]
+        }))
+        .send()
+        .await
+        .expect("call Claude document path");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let response_body: serde_json::Value = response.json().await.expect("Claude response JSON");
+    assert_eq!(response_body["content"][0]["text"], "document received");
+
+    let received = mock.received_requests().await.expect("received requests");
+    assert_eq!(
+        received
+            .iter()
+            .filter(|request| request.url.path() == "/generateAssistantResponse")
+            .count(),
+        1
+    );
+    let payload = received
+        .iter()
+        .filter(|request| request.url.path() == "/generateAssistantResponse")
+        .find_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+        .expect("Kiro generation payload");
+    let current = &payload["conversationState"]["currentMessage"]["userInputMessage"];
+    assert_eq!(current["documents"][0]["format"], "pdf");
+    assert_eq!(current["documents"][0]["name"], "guide");
+    assert_eq!(
+        current["documents"][0]["source"]["bytes"],
+        "JVBERi0xLjQKJSVFT0YK"
+    );
+    assert!(current["documents"][0].get("context").is_none());
+    assert!(current["content"]
+        .as_str()
+        .expect("user text")
+        .contains("Use the approved architecture requirements."));
+    assert_eq!(current["documents"][0]["citations"]["enabled"], false);
+    assert!(payload
+        .pointer("/additionalModelRequestFields/top_k")
+        .is_none());
+
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn openai_model_controls_follow_reference_omission_rules_through_http() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(generation_body("reference controls accepted")),
+        )
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    let cases = [
+        (serde_json::json!({}), serde_json::Value::Null),
+        (
+            serde_json::json!({"max_completion_tokens":64}),
+            serde_json::Value::Null,
+        ),
+        (
+            serde_json::json!({"temperature":0,"top_p":0}),
+            serde_json::json!({"temperature":0.0,"topP":0.0}),
+        ),
+        (
+            serde_json::json!({"max_tokens":64,"max_completion_tokens":128}),
+            serde_json::json!({"maxTokens":64}),
+        ),
+    ];
+    for (controls, _) in &cases {
+        let mut request = serde_json::json!({
+            "model":"source-large", "messages":[{"role":"user","content":"explain"}]
+        });
+        request
+            .as_object_mut()
+            .unwrap()
+            .extend(controls.as_object().unwrap().clone());
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+            .header("x-api-key", daemon.api_key.as_deref().unwrap())
+            .json(&request)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(
+            body["choices"][0]["message"]["content"],
+            "reference controls accepted"
+        );
+    }
+    let payloads = mock
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/generateAssistantResponse")
+        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(payloads.len(), cases.len());
+    for (payload, (_, expected)) in payloads.iter().zip(&cases) {
+        assert_eq!(&payload["inferenceConfig"], expected);
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn openai_omitted_output_limits_do_not_report_false_truncation() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let mut body = event_stream_frame(
+        "assistantResponseEvent",
+        serde_json::json!({
+            "content":"token ".repeat(9000)
+        }),
+    );
+    body.extend(event_stream_frame("messageMetadataEvent", serde_json::json!({
+        "messageMetadataEvent":{"usage":{"inputTokens":100,"outputTokens":9000,"creditsConsumed":0.25}}
+    })));
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(body),
+        )
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    for stream in [false, true] {
+        for (controls, expected) in [
+            (serde_json::json!({}), "stop"),
+            (serde_json::json!({"max_completion_tokens":64}), "stop"),
+            (serde_json::json!({"max_tokens":8192}), "length"),
+        ] {
+            let mut request = serde_json::json!({
+                "model":"source-large", "stream":stream,
+                "messages":[{"role":"user","content":"explain"}]
+            });
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(controls.as_object().unwrap().clone());
+            let response = reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+                .header("x-api-key", daemon.api_key.as_deref().unwrap())
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let text = response.text().await.unwrap();
+            let finish = if stream {
+                text.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .filter_map(|event| {
+                        event["choices"][0]["finish_reason"]
+                            .as_str()
+                            .map(str::to_owned)
+                    })
+                    .next_back()
+                    .expect("finish reason")
+            } else {
+                serde_json::from_str::<serde_json::Value>(&text).unwrap()["choices"][0]
+                    ["finish_reason"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            };
+            assert_eq!(finish, expected, "stream={stream}, controls={controls}");
+        }
+    }
+    let requests = mock.received_requests().await.unwrap();
+    let payloads = requests
+        .iter()
+        .filter(|request| request.url.path() == "/generateAssistantResponse")
+        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(payloads.len(), 6);
+    for (index, payload) in payloads.iter().enumerate() {
+        let limit = payload
+            .pointer("/inferenceConfig/maxTokens")
+            .and_then(serde_json::Value::as_u64);
+        assert_eq!(limit, (index % 3 == 2).then_some(8192));
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn openai_internal_continuations_only_apply_explicit_output_limits() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(|request: &wiremock::Request| {
+            let payload: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            let continuation = payload["conversationState"]["currentMessage"]["userInputMessage"]
+                ["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("Continue with the next step."));
+            let mut body = event_stream_frame(
+                "assistantResponseEvent",
+                serde_json::json!({"content":if continuation {
+                    "continuation completed".to_owned()
+                } else {
+                    "token ".repeat(9000)
+                }}),
+            );
+            if !continuation {
+                body.extend(event_stream_frame(
+                    "toolUseEvent",
+                    serde_json::json!({
+                        "toolUseId":"internal-step", "name":"internal_step",
+                        "input":"{}", "stop":true
+                    }),
+                ));
+            }
+            body.extend(event_stream_frame(
+                "messageMetadataEvent",
+                serde_json::json!({
+                    "messageMetadataEvent":{"usage":{
+                        "inputTokens":100, "outputTokens":if continuation {100} else {9000},
+                        "creditsConsumed":0.25
+                    }}
+                }),
+            ));
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(body)
+        })
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    let config_path = daemon.home().join("config.toml");
+    let mut config: kproxy_core::config::Config =
+        toml::from_str(&tokio::fs::read_to_string(&config_path).await.unwrap()).unwrap();
+    config.features.auto_continue_rounds = 1;
+    tokio::fs::write(&config_path, toml::to_string(&config).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        expect_ok(daemon.call("config.reload", serde_json::json!({})).await)["applied"],
+        true
+    );
+    for stream in [false, true] {
+        for maximum in [None, Some(10_000)] {
+            let mut request = serde_json::json!({
+                "model":"source-large", "stream":stream,
+                "messages":[{"role":"user","content":"complete the task"}]
+            });
+            if let Some(maximum) = maximum {
+                request["max_tokens"] = serde_json::json!(maximum);
+            }
+            let response = reqwest::Client::new()
+                .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+                .header("x-api-key", daemon.api_key.as_deref().unwrap())
+                .json(&request)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+            let body = response.text().await.unwrap();
+            assert!(
+                body.contains("continuation completed"),
+                "continuation was skipped: stream={stream}, maximum={maximum:?}, response tail={:?}",
+                body.get(body.len().saturating_sub(500)..)
+            );
+            let finish = if stream {
+                body.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .filter_map(|event| {
+                        event["choices"][0]["finish_reason"]
+                            .as_str()
+                            .map(str::to_owned)
+                    })
+                    .next_back()
+                    .expect("finish reason")
+            } else {
+                serde_json::from_str::<serde_json::Value>(&body).unwrap()["choices"][0]
+                    ["finish_reason"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            };
+            assert_eq!(finish, "stop", "stream={stream}, maximum={maximum:?}");
+        }
+    }
+    let requests = mock.received_requests().await.unwrap();
+    let payloads = requests
+        .iter()
+        .filter(|request| request.url.path() == "/generateAssistantResponse")
+        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        payloads.len(),
+        8,
+        "each response requires two upstream rounds"
+    );
+    for (index, payload) in payloads.iter().enumerate() {
+        let expected = match index % 4 {
+            2 => Some(10_000),
+            3 => Some(1_000),
+            _ => None,
+        };
+        assert_eq!(
+            payload
+                .pointer("/inferenceConfig/maxTokens")
+                .and_then(serde_json::Value::as_u64),
+            expected,
+            "unexpected budget in generation {index}"
+        );
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn account_conditional_larger_window_is_selected_before_context_validation() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(CompactionResponder)
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 50.0).await;
+    configure_context_alignment(
+        &daemon,
+        "summary-large",
+        r#"
+[[model_mapping]]
+name = "account-large"
+type = "replace"
+source_models = ["source-large"]
+target_models = ["source-large"]
+max_remaining_credit_percent = 90.0
+priority = 5
+
+[[model_mapping]]
+name = "provisional-tiny"
+type = "replace"
+source_models = ["source-large"]
+target_models = ["resolved-tiny"]
+priority = 10
+"#,
+    )
+    .await;
+    let content = "input ".repeat(2000).trim_end().to_owned();
+    for endpoint in ["/v1/messages", "/v1/chat/completions"] {
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}{endpoint}"))
+            .header("x-api-key", daemon.api_key.as_deref().unwrap())
+            .header("anthropic-version", "2023-06-01")
+            .header("user-agent", "claude-cli/2.1.235 (external, e2e)")
+            .json(&serde_json::json!({
+                "model":"source-large", "max_tokens":64,
+                "messages":[{"role":"user","content":content}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(status, reqwest::StatusCode::OK, "{endpoint}: {body}");
+        assert!(body.get("context_management").is_none());
+        if endpoint == "/v1/messages" {
+            assert_eq!(body["content"][0]["type"], "text");
+        }
+    }
+    let requests = mock.received_requests().await.unwrap();
+    let payloads = requests
+        .iter()
+        .filter(|request| request.url.path() == "/generateAssistantResponse")
+        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(payloads.len(), 2, "neither valid request needs a summary");
+    for payload in payloads {
+        let current = &payload["conversationState"]["currentMessage"]["userInputMessage"];
+        assert_eq!(current["modelId"], "source-large");
+        assert_eq!(
+            current["content"], content,
+            "input must not be prematurely compacted"
+        );
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn temporarily_unavailable_model_falls_back_to_lower_same_family_model() {
+    assert_model_fallback_controls(false, false).await;
+}
+
+#[tokio::test]
+async fn streaming_http_fallback_rebuilds_model_controls() {
+    assert_model_fallback_controls(true, false).await;
+}
+
+#[tokio::test]
+async fn streaming_event_fallback_rebuilds_model_controls() {
+    assert_model_fallback_controls(true, true).await;
+}
+
+async fn assert_model_fallback_controls(stream: bool, stream_failure: bool) {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;
     Mock::given(method("GET"))
@@ -645,11 +1128,18 @@ async fn temporarily_unavailable_model_falls_back_to_lower_same_family_model() {
             "models": [
                 {
                     "modelId": "claude-opus-5",
-                    "tokenLimits": {"maxInputTokens": 1000000, "maxOutputTokens": 64000}
+                    "tokenLimits": {"maxInputTokens": 1000000, "maxOutputTokens": 64000},
+                    "additionalModelRequestFieldsSchema":{"properties":{
+                        "top_k":{"type":"integer"},
+                        "output_config":{"properties":{"effort":{"enum":["low","medium"]}}}
+                    }}
                 },
                 {
                     "modelId": "claude-opus-4.8",
-                    "tokenLimits": {"maxInputTokens": 1000000, "maxOutputTokens": 64000}
+                    "tokenLimits": {"maxInputTokens": 1000000, "maxOutputTokens": 64000},
+                    "additionalModelRequestFieldsSchema":{"properties":{
+                        "reasoning":{"properties":{"effort":{"enum":["low","high","xhigh"]}}}
+                    }}
                 }
             ]
         })))
@@ -657,7 +1147,7 @@ async fn temporarily_unavailable_model_falls_back_to_lower_same_family_model() {
         .await;
     Mock::given(method("POST"))
         .and(path("/generateAssistantResponse"))
-        .respond_with(ModelUnavailableFallbackResponder)
+        .respond_with(ModelUnavailableFallbackResponder { stream_failure })
         .mount(&mock)
         .await;
 
@@ -708,27 +1198,30 @@ async fn temporarily_unavailable_model_falls_back_to_lower_same_family_model() {
         .header("user-agent", "claude-cli/2.1.0 (external, e2e)")
         .json(&serde_json::json!({
             "model": "claude-opus-5",
-            "max_tokens": 64,
-            "stream": false,
+            "max_tokens": 64000,
+            "top_k":42,
+            "thinking":{"type":"enabled","budget_tokens":32000,"display":"omitted"},
+            "output_config":{"effort":"xhigh"},
+            "stream": stream,
             "messages": [{"role": "user", "content": "exercise model fallback"}]
         }))
         .send()
         .await
         .expect("call Claude fallback path");
     assert_eq!(response.status(), reqwest::StatusCode::OK);
-    let body: serde_json::Value = response.json().await.expect("Claude response JSON");
-    assert_eq!(
-        body["content"][0]["text"],
-        "completed with the fallback model"
-    );
+    let body = response.text().await.expect("Claude response body");
+    assert!(body.contains("completed with the fallback model"), "{body}");
 
-    let generated_models = mock
+    let generated_payloads = mock
         .received_requests()
         .await
         .expect("received requests")
         .iter()
         .filter(|request| request.url.path() == "/generateAssistantResponse")
         .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
+        .collect::<Vec<_>>();
+    let generated_models = generated_payloads
+        .iter()
         .filter_map(|payload| {
             payload["conversationState"]["currentMessage"]["userInputMessage"]["modelId"]
                 .as_str()
@@ -736,6 +1229,24 @@ async fn temporarily_unavailable_model_falls_back_to_lower_same_family_model() {
         })
         .collect::<Vec<_>>();
     assert_eq!(generated_models, vec!["claude-opus-5", "claude-opus-4.8"]);
+    for payload in &generated_payloads {
+        assert!(payload
+            .pointer("/additionalModelRequestFields/top_k")
+            .is_none());
+        assert!(payload.get("modelRequestIntent").is_none());
+    }
+    assert_eq!(
+        generated_payloads[0]["additionalModelRequestFields"],
+        serde_json::json!({
+            "thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"medium"}
+        })
+    );
+    assert_eq!(
+        generated_payloads[1]["additionalModelRequestFields"],
+        serde_json::json!({
+            "reasoning":{"effort":"high"}
+        })
+    );
 
     daemon.stop().await;
 }
@@ -940,6 +1451,15 @@ async fn mcp_tool_inputs_are_consistent_across_http_protocols_and_buffering_mode
 
 #[tokio::test]
 async fn claude_stream_stops_before_later_frames_in_the_same_upstream_chunk() {
+    assert_claude_stops_locally(true).await;
+}
+
+#[tokio::test]
+async fn claude_nonstream_stops_locally_without_native_stop_fields() {
+    assert_claude_stops_locally(false).await;
+}
+
+async fn assert_claude_stops_locally(stream: bool) {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;
     mount_context_alignment_models(&mock).await;
@@ -1000,7 +1520,7 @@ async fn claude_stream_stops_before_later_frames_in_the_same_upstream_chunk() {
             "model":"source-large",
             "max_tokens":64,
             "stop_sequences":["<END>"],
-            "stream":true,
+            "stream":stream,
             "system":[{"type":"text","text":"cacheable system ".repeat(1500),
                 "cache_control":{"type":"ephemeral"}}],
             "messages":[{"role":"user","content":"stop at the delimiter"}]
@@ -1015,23 +1535,34 @@ async fn claude_stream_stops_before_later_frames_in_the_same_upstream_chunk() {
     assert!(!body.contains("must not leak"), "{body}");
     assert!(body.contains(r#""stop_reason":"stop_sequence""#), "{body}");
     assert!(body.contains(r#""stop_sequence":"<END>""#), "{body}");
-    let message_start = body
-        .lines()
-        .filter_map(|line| line.strip_prefix("data: "))
-        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
-        .find(|event| event["type"] == "message_start")
-        .expect("message_start event");
-    assert!(
-        message_start["message"]["usage"]["cache_creation_input_tokens"]
-            .as_u64()
-            .is_some_and(|tokens| tokens >= 1024)
+    let usage = if stream {
+        let message_start = body
+            .lines()
+            .filter_map(|line| line.strip_prefix("data: "))
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|event| event["type"] == "message_start")
+            .expect("message_start event");
+        message_start["message"]["usage"].clone()
+    } else {
+        serde_json::from_str::<serde_json::Value>(&body).unwrap()["usage"].clone()
+    };
+    assert_eq!(
+        usage["cache_creation_input_tokens"], 0,
+        "cache usage must come from Kiro rather than a local estimate"
     );
+    let received = mock.received_requests().await.unwrap();
+    let generation = received
+        .iter()
+        .find(|request| request.url.path() == "/generateAssistantResponse")
+        .unwrap();
+    let wire: serde_json::Value = serde_json::from_slice(&generation.body).unwrap();
+    assert!(wire["inferenceConfig"].get("stopSequences").is_none());
 
     daemon.stop().await;
 }
 
 #[tokio::test]
-async fn claude_thinking_follows_body_state_and_normalizes_tagged_content() {
+async fn claude_thinking_follows_body_state_and_preserves_unsigned_tagged_content() {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;
     mount_context_alignment_models(&mock).await;
@@ -1128,23 +1659,81 @@ async fn claude_thinking_follows_body_state_and_normalizes_tagged_content() {
     assert!(enabled_body.contains("tagged secret"), "{enabled_body}");
     assert!(enabled_body.contains("native secret"), "{enabled_body}");
     assert!(enabled_body.contains("thinking_delta"), "{enabled_body}");
-    assert!(enabled_body.contains("signature_delta"), "{enabled_body}");
-    assert!(!enabled_body.contains("<thinking>"), "{enabled_body}");
+    assert!(!enabled_body.contains("signature_delta"), "{enabled_body}");
+    assert!(enabled_body.contains("<thinking>"), "{enabled_body}");
 
     let received = mock.received_requests().await.expect("received requests");
-    let prompts = received
+    let payloads = received
         .iter()
+        .filter(|request| request.url.path() == "/generateAssistantResponse")
         .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
-        .filter_map(|payload| {
-            payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
-                .as_str()
-                .map(str::to_owned)
-        })
         .collect::<Vec<_>>();
-    assert_eq!(prompts.len(), 2);
-    assert!(!prompts[0].contains("<thinking_mode>"));
-    assert!(prompts[1].starts_with("<thinking_mode>enabled</thinking_mode>"));
+    assert_eq!(payloads.len(), 2);
+    for payload in &payloads {
+        assert!(
+            !payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
+                .as_str()
+                .is_some_and(|prompt| prompt.contains("<thinking_mode>"))
+        );
+    }
+    assert!(payloads[0].get("additionalModelRequestFields").is_none());
+    assert_eq!(
+        payloads[1]["additionalModelRequestFields"]["thinking"]["type"],
+        "adaptive"
+    );
 
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn omitted_thinking_preserves_signatures_in_streaming_and_nonstreaming_responses() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let mut body = event_stream_frame(
+        "reasoningContentEvent",
+        serde_json::json!({
+            "reasoningContentEvent":{"text":"hidden native summary","signature":"native-signature"}
+        }),
+    );
+    body.extend(generation_body(
+        "<thinking>hidden tagged summary</thinking>Visible answer",
+    ));
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(body),
+        )
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    for stream in [false, true] {
+        let response = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .header("x-api-key", daemon.api_key.as_deref().unwrap())
+            .header("anthropic-version", "2023-06-01")
+            .header("user-agent", "claude-cli/2.1.235 (external, e2e)")
+            .json(&serde_json::json!({
+                "model":"source-large", "max_tokens":4096,"stream":stream,
+                "thinking":{"type":"adaptive","display":"omitted"},
+                "messages":[{"role":"user","content":"explain"}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let body = response.text().await.unwrap();
+        assert!(body.contains("Visible answer"), "{body}");
+        assert!(body.contains("native-signature"), "{body}");
+        assert!(!body.contains("hidden native summary"), "{body}");
+        assert!(!body.contains("hidden tagged summary"), "{body}");
+        assert!(!body.contains("thinking_delta"), "{body}");
+    }
     daemon.stop().await;
 }
 
@@ -1366,7 +1955,22 @@ priority = 10
     )
     .await;
 
-    let response = reqwest::Client::new()
+    let config_path = daemon.home().join("config.toml");
+    let raw = tokio::fs::read_to_string(&config_path).await.unwrap();
+    let mut config: kproxy_core::config::Config = toml::from_str(&raw).unwrap();
+    config.pool.max_concurrent_per_account = 1;
+    tokio::fs::write(&config_path, toml::to_string(&config).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(
+        expect_ok(daemon.call("config.reload", serde_json::json!({})).await)["applied"],
+        true
+    );
+
+    let response = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap()
         .post(format!("http://127.0.0.1:{port}/v1/messages"))
         .header(
             "x-api-key",

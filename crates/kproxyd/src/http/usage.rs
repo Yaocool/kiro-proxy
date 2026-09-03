@@ -165,6 +165,7 @@ mod tests {
             description: String::new(),
             rate_multiplier: Some(1.5),
             token_limits: None,
+            additional_model_request_fields_schema: None,
         }]);
 
         assert_eq!(fallback_credits(&state, "claude-4.6-sonnet", 800, 200), 3.0);

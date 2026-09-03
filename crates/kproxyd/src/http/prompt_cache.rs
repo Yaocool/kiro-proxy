@@ -1,4 +1,8 @@
-//! Per-account prompt-cache usage simulation for compatible cache-control blocks.
+//! Per-account prompt-cache breakpoint tracking.
+//!
+//! Plans are internal estimates only. API usage counters must come from Kiro's
+//! metadata events; exposing estimated cache reads/writes as real usage makes
+//! billing and cache diagnostics unreliable.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -26,16 +30,12 @@ pub struct PromptCacheProfile {
 pub struct PromptCachePlan {
     profile: Option<PromptCacheProfile>,
     cache_read_tokens: u64,
-    cache_write_tokens: u64,
 }
 
 impl PromptCachePlan {
+    #[cfg(test)]
     pub fn cache_read_tokens(&self) -> u64 {
         self.cache_read_tokens
-    }
-
-    pub fn cache_write_tokens(&self) -> u64 {
-        self.cache_write_tokens
     }
 }
 
@@ -129,16 +129,11 @@ impl PromptCacheTracker {
         PromptCachePlan {
             profile: Some(profile.clone()),
             cache_read_tokens: if cache_hit { profile.tokens } else { 0 },
-            cache_write_tokens: if cache_hit { 0 } else { profile.tokens },
         }
     }
 
     pub fn commit(&self, account_id: &str, plan: &PromptCachePlan, usage: &mut UsageInfo) {
-        if usage.cache_read_tokens > 0 || usage.cache_write_tokens > 0 {
-            return;
-        }
-        usage.cache_read_tokens = plan.cache_read_tokens;
-        usage.cache_write_tokens = plan.cache_write_tokens;
+        let _upstream_reported_usage = usage;
         let Some(profile) = plan.profile.as_ref() else {
             return;
         };
@@ -289,11 +284,8 @@ fn cache_ttl(value: &Value) -> Option<Duration> {
         return None;
     }
     match control.get("ttl") {
-        Some(Value::String(value)) if value.eq_ignore_ascii_case("1h") => Some(ONE_HOUR_TTL),
-        Some(Value::Number(value)) => value
-            .as_u64()
-            .filter(|seconds| *seconds > 0)
-            .map(Duration::from_secs),
+        Some(Value::String(value)) if value == "5m" => Some(DEFAULT_TTL),
+        Some(Value::String(value)) if value == "1h" => Some(ONE_HOUR_TTL),
         _ => Some(DEFAULT_TTL),
     }
 }
@@ -329,7 +321,7 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn repeated_prefix_is_a_read_and_accounts_are_isolated() {
+    fn estimated_cache_state_never_overwrites_upstream_usage() {
         let tracker = PromptCacheTracker::default();
         let request: ClaudeRequest = serde_json::from_value(json!({
             "model":"claude-sonnet-4","max_tokens":128,
@@ -343,13 +335,22 @@ mod tests {
             .expect("cache profile");
         let mut first = UsageInfo::default();
         tracker.apply("one", Some(&profile), &mut first);
-        assert!(first.cache_write_tokens >= 1024);
+        assert_eq!(first.cache_write_tokens, 0);
         let mut second = UsageInfo::default();
         tracker.apply("one", Some(&profile), &mut second);
-        assert_eq!(second.cache_read_tokens, first.cache_write_tokens);
+        assert_eq!(second.cache_read_tokens, 0);
         let mut other = UsageInfo::default();
         tracker.apply("two", Some(&profile), &mut other);
-        assert_eq!(other.cache_write_tokens, first.cache_write_tokens);
+        assert_eq!(other.cache_write_tokens, 0);
+
+        let mut upstream = UsageInfo {
+            cache_read_tokens: 1234,
+            cache_write_tokens: 56,
+            ..UsageInfo::default()
+        };
+        tracker.apply("one", Some(&profile), &mut upstream);
+        assert_eq!(upstream.cache_read_tokens, 1234);
+        assert_eq!(upstream.cache_write_tokens, 56);
     }
 
     #[test]
@@ -368,12 +369,12 @@ mod tests {
 
         let first = tracker.plan("one", Some(&profile));
         let concurrent = tracker.plan("one", Some(&profile));
-        assert_eq!(first.cache_write_tokens(), profile.tokens);
-        assert_eq!(concurrent.cache_write_tokens(), profile.tokens);
+        assert_eq!(first.cache_read_tokens(), 0);
+        assert_eq!(concurrent.cache_read_tokens(), 0);
 
         let mut usage = UsageInfo::default();
         tracker.commit("one", &first, &mut usage);
-        assert_eq!(usage.cache_write_tokens, profile.tokens);
+        assert_eq!(usage.cache_write_tokens, 0);
         let subsequent = tracker.plan("one", Some(&profile));
         assert_eq!(subsequent.cache_read_tokens(), profile.tokens);
     }

@@ -658,6 +658,30 @@ mod tests {
         }
     }
 
+    async fn install_context_test_account(state: &Arc<AppState>, model: &str) {
+        // Window validation now follows actual account/model resolution. The
+        // oversized input must still fail before this dummy token is used.
+        let account = account_with_usage(
+            "context-test",
+            "context@example.com",
+            true,
+            Some(Usage {
+                current: 0.0,
+                limit: 100.0,
+                percent_used: 0.0,
+                updated_at: 1,
+                next_reset_date: None,
+            }),
+        );
+        let pool = state.pool();
+        pool.replace_accounts(vec![account]).await;
+        pool.get("context-test")
+            .await
+            .expect("account")
+            .set_supported_models([model.to_owned()])
+            .await;
+    }
+
     #[tokio::test]
     async fn every_response_has_a_unique_trace_id() {
         let (_directory, state) = test_state(Config::default()).await;
@@ -787,6 +811,7 @@ mod tests {
         config.context.safe_input_ratio = 1.0;
         config.context.auto_compact_on_overflow = false;
         let (_directory, state) = test_state(config).await;
+        install_context_test_account(&state, "claude-sonnet-4.6").await;
         let response = router(state)
             .oneshot(
                 Request::post("/v1/messages")
@@ -1041,6 +1066,7 @@ mod tests {
         config.context.max_input_tokens = 1_000;
         config.context.auto_compact_on_overflow = true;
         let (_directory, state) = test_state(config).await;
+        install_context_test_account(&state, "mapped-small").await;
         let response = router(state)
             .oneshot(
                 Request::post("/v1/chat/completions")
@@ -1427,6 +1453,7 @@ mod tests {
             ],
             "context_management":{"edits":[{
                 "type":"clear_tool_uses_20250919",
+                "trigger":{"type":"tool_uses","value":1},
                 "keep":{"type":"tool_uses","value":0},
                 "clear_tool_inputs":true
             }]}

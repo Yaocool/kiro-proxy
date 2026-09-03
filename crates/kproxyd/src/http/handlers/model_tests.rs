@@ -5,6 +5,56 @@ use std::time::Duration;
 use super::*;
 
 #[test]
+fn conversation_fallback_is_stable_uuid_and_isolated_by_client() {
+    let first = vec![serde_json::json!({"role":"user","content":"hello"})];
+    let extended = vec![
+        first[0].clone(),
+        serde_json::json!({"role":"assistant","content":"hi"}),
+        serde_json::json!({"role":"user","content":"continue"}),
+    ];
+    let first_hint = conversation_fingerprint(&first).expect("first fingerprint");
+    let extended_hint = conversation_fingerprint(&extended).expect("extended fingerprint");
+    assert_eq!(first_hint, extended_hint);
+
+    let headers = HeaderMap::new();
+    let first_id = stable_conversation_id(&headers, Some("key-a"), None, Some(&first_hint))
+        .expect("conversation ID");
+    let second_id = stable_conversation_id(&headers, Some("key-a"), None, Some(&extended_hint))
+        .expect("conversation ID");
+    assert_eq!(first_id, second_id);
+    assert_eq!(
+        Uuid::parse_str(&first_id).expect("UUID").get_version_num(),
+        8
+    );
+    assert_ne!(
+        stable_conversation_id(&headers, Some("key-b"), None, Some(&first_hint)),
+        Some(first_id.clone())
+    );
+
+    let mut session_headers = HeaderMap::new();
+    session_headers.insert(
+        "x-claude-code-session-id",
+        HeaderValue::from_static("header-session"),
+    );
+    let explicit = stable_conversation_id(
+        &session_headers,
+        Some("key-a"),
+        Some("explicit-session"),
+        Some(&first_hint),
+    );
+    let without_header = stable_conversation_id(
+        &HeaderMap::new(),
+        Some("key-a"),
+        Some("explicit-session"),
+        Some(&first_hint),
+    );
+    assert_eq!(
+        explicit, without_header,
+        "explicit IDs take priority over headers"
+    );
+}
+
+#[test]
 fn internal_response_errors_have_proxy_classification() {
     assert_eq!(
         classify_api_error(StatusCode::INTERNAL_SERVER_ERROR, "tokenizer worker failed",),
@@ -150,6 +200,7 @@ async fn context_limits_use_the_resolved_kiro_model_alias() {
             max_input_tokens: Some(1_000_000),
             max_output_tokens: Some(16_384),
         }),
+        additional_model_request_fields_schema: None,
     }]);
 
     assert_eq!(
@@ -158,6 +209,87 @@ async fn context_limits_use_the_resolved_kiro_model_alias() {
     );
     assert!(check_context_limit(&state, 900_000, false, "claude-4.6-sonnet").is_ok());
     assert!(check_context_limit(&state, 960_000, false, "claude-4.6-sonnet").is_err());
+}
+
+#[tokio::test]
+async fn final_model_controls_do_not_borrow_another_versions_schema_or_disabled_mode() {
+    let directory = tempfile::tempdir().unwrap();
+    let paths = kproxy_core::paths::Paths::from_env_values(
+        Some(directory.path().to_str().unwrap()),
+        None,
+        None,
+        None,
+    );
+    kproxy_store::bootstrap::ensure_layout(&paths)
+        .await
+        .unwrap();
+    let accounts = kproxy_store::accounts::AccountStore::load(&paths.accounts_file)
+        .await
+        .unwrap();
+    let mut config = kproxy_core::config::Config::default();
+    // Persisted legacy settings must not resurrect turn-based suppression.
+    config.features.adaptive_thinking = true;
+    config
+        .model_thinking_mode
+        .insert("claude-opus-4.7".into(), false);
+    let state = AppState::new(
+        paths,
+        kproxy_store::config_loader::ConfigHandle::new(config),
+        accounts,
+    );
+    state.models.finish_refresh(
+        serde_json::from_value(json!([{
+            "modelId":"claude-opus-4.6",
+            "additionalModelRequestFieldsSchema":{"properties":{"output_config":{"properties":{
+                "effort":{"enum":["low","medium","high"]}
+            }}}}
+        }]))
+        .unwrap(),
+    );
+    let request: ClaudeRequest = serde_json::from_value(json!({
+        "model":"claude-opus-4.6", "max_tokens":4096,
+        "thinking":{"type":"adaptive"},
+        "output_config":{"effort":"high"},
+        "messages":[{"role":"user","content":"explain"}]
+    }))
+    .unwrap();
+    let mut payload = claude_to_kiro(
+        &request,
+        &TranslationOptions::new("claude-opus-4.6", "AI_EDITOR"),
+    );
+    state.prepare_model_request(&mut payload);
+    assert_eq!(
+        payload.additional_model_request_fields.as_ref().unwrap()["output_config"]["effort"],
+        "high"
+    );
+
+    payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .content = "continue".into();
+    assert!(state.prepare_model_request(&mut payload).enabled);
+
+    set_payload_model(&mut payload, "claude-opus-4.8");
+    state.prepare_model_request(&mut payload);
+    assert_eq!(
+        payload.additional_model_request_fields,
+        Some(json!({"thinking":{"type":"adaptive"}}))
+    );
+
+    set_payload_model(&mut payload, "claude-opus-4.7");
+    let decision = state.prepare_model_request(&mut payload);
+    assert!(!decision.enabled);
+    assert!(!payload.thinking_enabled());
+    assert!(payload.additional_model_request_fields.is_none());
+
+    set_payload_model(&mut payload, "claude-opus-4.6");
+    state.prepare_model_request(&mut payload);
+    assert!(payload.thinking_enabled());
+    assert_eq!(
+        payload.additional_model_request_fields.as_ref().unwrap()["output_config"]["effort"],
+        "high"
+    );
 }
 
 #[tokio::test]
@@ -319,6 +451,7 @@ fn fallback_chooses_the_highest_lower_model_in_the_same_family() {
             description: String::new(),
             rate_multiplier: None,
             token_limits: None,
+            additional_model_request_fields_schema: None,
         })
         .collect::<Vec<_>>();
     assert_eq!(
@@ -375,10 +508,66 @@ fn remote_image_addresses_must_be_public() {
         IpAddr::V6(Ipv6Addr::LOCALHOST),
         IpAddr::V6("fc00::1".parse().expect("valid IPv6")),
         IpAddr::V6("fe80::1".parse().expect("valid IPv6")),
+        IpAddr::V6("::ffff:127.0.0.1".parse().expect("valid mapped IPv6")),
+        IpAddr::V6("64:ff9b::7f00:1".parse().expect("valid NAT64 IPv6")),
+        IpAddr::V6("2001:db8::1".parse().expect("valid documentation IPv6")),
     ] {
         assert!(!is_public_address(address), "{address} must be rejected");
     }
     assert!(is_public_address(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))));
+    assert!(is_public_address(IpAddr::V6(
+        "2606:4700:4700::1111".parse().expect("public IPv6")
+    )));
+}
+
+#[test]
+fn remote_attachment_types_require_matching_content_signatures() {
+    let image_url = Url::parse("https://example.com/image.png").expect("URL");
+    assert_eq!(
+        validate_remote_media_type(
+            RemoteAttachmentKind::Image,
+            Some("image/png"),
+            &image_url,
+            b"\x89PNG\r\n\x1a\nrest"
+        ),
+        Some("image/png")
+    );
+    assert!(validate_remote_media_type(
+        RemoteAttachmentKind::Image,
+        Some("image/jpeg"),
+        &image_url,
+        b"\x89PNG\r\n\x1a\nrest"
+    )
+    .is_none());
+
+    let pdf_url = Url::parse("https://example.com/report.pdf").expect("URL");
+    assert_eq!(
+        validate_remote_media_type(
+            RemoteAttachmentKind::Document,
+            Some("application/pdf"),
+            &pdf_url,
+            b"%PDF-1.7"
+        ),
+        Some("application/pdf")
+    );
+    assert!(validate_remote_media_type(
+        RemoteAttachmentKind::Document,
+        Some("application/pdf"),
+        &pdf_url,
+        b"not a PDF"
+    )
+    .is_none());
+
+    let docx_url = Url::parse("https://example.com/report.docx").expect("URL");
+    assert_eq!(
+        validate_remote_media_type(
+            RemoteAttachmentKind::Document,
+            Some("application/octet-stream"),
+            &docx_url,
+            b"PK\x03\x04archive"
+        ),
+        Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+    );
 }
 
 #[test]
@@ -695,6 +884,7 @@ async fn mapped_overflow_decision_uses_the_mapped_safe_window() {
             max_input_tokens: Some(128_000),
             max_output_tokens: Some(16_384),
         }),
+        additional_model_request_fields_schema: None,
     }]);
 
     let decision = initial_compaction_decision(&state, "mapped-small", 180_000, None, true)
@@ -747,6 +937,7 @@ async fn summary_input_is_preprocessed_before_semantic_compaction() {
             max_input_tokens: Some(10_000),
             max_output_tokens: Some(4_096),
         }),
+        additional_model_request_fields_schema: None,
     }]);
     let request: ClaudeRequest = serde_json::from_value(json!({
         "model":"source-large",
@@ -958,18 +1149,24 @@ fn internal_rounds_receive_only_the_remaining_output_budget() {
         payload
             .inference_config
             .as_ref()
-            .map(|value| value.max_tokens),
+            .and_then(|value| value.max_tokens),
         Some(100)
     );
-    assert!(apply_remaining_output_budget(&mut payload, 100, 35));
+    assert!(apply_remaining_output_budget(&mut payload, Some(100), 35));
     assert_eq!(
         payload
             .inference_config
             .as_ref()
-            .map(|value| value.max_tokens),
+            .and_then(|value| value.max_tokens),
         Some(65)
     );
-    assert!(!apply_remaining_output_budget(&mut payload, 100, 100));
+    assert!(!apply_remaining_output_budget(&mut payload, Some(100), 100));
+    payload.inference_config = None;
+    assert!(apply_remaining_output_budget(&mut payload, Some(100), 35));
+    assert_eq!(payload.max_output_tokens(), Some(65));
+    payload.inference_config = None;
+    assert!(apply_remaining_output_budget(&mut payload, None, 9_000));
+    assert!(payload.inference_config.is_none());
 }
 
 #[test]
@@ -986,6 +1183,8 @@ fn nonstream_stop_discards_events_after_a_cross_chunk_match() {
         },
         KiroEvent::Reasoning {
             content: "must not be retained".into(),
+            signature: None,
+            redacted_content: None,
         },
     ];
     for event in events {
