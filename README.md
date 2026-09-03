@@ -237,14 +237,18 @@ tool, context, and translated-payload budget errors use 400 so Claude Code does
 not misreport them as a 32 MB attachment failure.
 
 Mapping-aware context compaction for Claude Messages is enabled by default with
-`context.auto_compact_on_overflow`. Before the first upstream generation, the
-proxy compacts against the mapped model's safe window. If upstream still
+`context.auto_compact_on_overflow`. Before deciding whether to compact or reject
+input, the proxy selects an account and resolves its actual model, including
+account-dependent mappings, weighted choices, aliases, and defaults. It uses that
+model's safe window and reuses the selection when no compaction is needed. If upstream still
 returns `prompt is too long` or `context length exceeded`, the proxy compacts
 against a conservative window and retries only once. A semantic-summary request
 never receives the original oversized conversation directly: the local
-tokenizer first creates a bounded checkpoint for the summary model. The same
-compaction artifact may also be reapplied once if the selected account resolves
-to a smaller window. OpenAI Chat
+tokenizer first creates a bounded checkpoint for the summary model. Checkpoint
+truncation preserves valid UTF-8 and verifies the final token count. The account
+slot is released before summarization so a single-concurrency account cannot
+block its own summary request. The same compaction artifact may also be reapplied
+once if dispatch after summarization resolves to a smaller window. OpenAI Chat
 Completions and context growth after a Tool Search response has started retain
 hard context-limit errors because they cannot safely return a leading Claude
 `compaction` boundary. A summary timeout releases the main request immediately;
@@ -300,6 +304,73 @@ streaming are rejected when Kiro cannot provide equivalent semantics. The
 proxy-generated encrypted fields
 are explicitly proxy-owned and are not claimed to be interoperable with
 Anthropic's hosted-search ciphertext.
+
+### Documents, context editing, and compatibility boundaries
+
+Claude `document` blocks support `base64`, `text`, HTTP(S) `url`, and `content`
+sources, including documents inside tool results. Custom content is flattened
+in order into a text document; embedded images are hoisted to the same Kiro
+message's image list with numbered markers. This does not preserve Anthropic's
+custom citation-chunk semantics. Each request accepts at most five documents
+(4,500,000 decoded bytes each) and twenty images (5 MiB each). Remote media is
+restricted to public addresses, revalidates DNS on every redirect, ignores
+environment proxies, and checks file signatures against media types. Kiro
+citations, web sources, and license details remain visible as References rather
+than fabricating Claude source-document character, page, or block coordinates.
+
+`clear_tool_uses` honors trigger, keep, clear_at_least, exclude_tools, and either
+a boolean or tool-name list for clear_tool_inputs. `clear_thinking` can retain
+the selected number of turns or all thinking. Generation reports executed edits
+in `context_management.applied_edits`; activation and cleared-token statistics
+use local estimates, while `count_tokens` reports estimated input sizes before
+and after editing. Generation clears discarded history before fetching the
+remaining remote attachments.
+
+Adjacent same-role messages are merged. Assistant prefill, `max_tokens=0` cache
+warming, strict structured outputs, and Anthropic Files API `file_id` sources
+are rejected explicitly because Kiro cannot provide equivalent behavior.
+OpenAI `/v1/responses` is not exposed. Protocol compatibility is resolved before
+the first upstream call, without a time-based rejection cache or field-removal
+probes. Cache markers contain only `type: default`; Claude cache TTL preferences
+do not control Kiro's cache lifetime. Historical thinking is omitted from Kiro
+request history without disabling current-generation thinking. Document context
+is preserved as separate JSON-labelled message text rather than a document field.
+Generation controls follow the explicit mapping in
+[chaogei/Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager/blob/447adcdb468157312621b1f09448278bd9bca748/src/main/proxy/translator.ts):
+
+| Client control | Kiro/proxy handling |
+| --- | --- |
+| `max_tokens`, `temperature`, `top_p` | Map to `inferenceConfig.maxTokens/temperature/topP`; explicit zero sampling values survive. An omitted OpenAI `max_tokens` stays omitted; no 8192 default is sent. Model-specific rejection is still possible. |
+| OpenAI `max_completion_tokens` | Accepted/validated but ignored, matching the reference; use `max_tokens` for an upstream limit. |
+| Claude `top_k` | Accepted but omitted with a debug diagnostic, regardless of model metadata. This is a gateway compatibility policy, not a claim that Kiro universally rejects it. |
+| Claude `stop_sequences` | Enforced locally in streaming and non-streaming responses; no native `stopSequences` is sent. This does not guarantee a server-side generation/cost limit. |
+| Thinking / effort | Metadata chooses `thinking: adaptive` + `output_config.effort`, or `reasoning.effort`; missing/incomplete effort metadata falls back to adaptive thinking only. |
+| Claude `output_config.effort` | Accepted/validated but ignored; it neither enables thinking nor overrides the budget-derived/default effort. |
+| OpenAI `reasoning_effort` | Takes precedence over `thinking.budget_tokens`; otherwise the default is high. Unsupported values select the last advertised effort, without sorting or nearest-rank matching. |
+| `thinking.display` | The output_config dialect always sends summarized; the reasoning and no-metadata paths omit display. Client display does not override these upstream shapes. |
+| `thinking.budget_tokens` | Maps directly to low (≤4000), medium (≤16000), high (≤64000), or xhigh; it is not an exact native thinking-token cap. |
+| `thinking: disabled` | Omits thinking controls and suppresses returned reasoning; omission does not guarantee that a model with thinking enabled by default stops thinking internally. |
+
+Unspecified effort defaults to `high`, not the JSON Schema default, matching the
+reference's runtime metadata extraction. Thinking is no longer automatically
+disabled on tool-result or control follow-ups. Both legacy `adaptive_thinking`
+and `max_thinking_budget_tokens` settings remain readable but no longer affect
+generation controls. An explicitly configured operator `model_thinking_mode`
+deny rule remains enforced.
+
+Alignment covers outbound generation parameters. Request validation, local stop
+filtering, bounded internal continuations, and response protection remain:
+`display: omitted` still hides returned reasoning text locally while retaining
+native signatures, without changing the reference's upstream display strategy.
+Original controls are kept in non-serialized metadata and rebuilt for each actual
+model, including HTTP/stream fallbacks and internal continuations. When OpenAI
+`max_tokens` is omitted, 8192 is used only for credit estimation; it neither
+limits internal continuations nor causes a `length` finish reason. Explicit
+output limits remain enforced, and no default `maxTokens` is sent upstream.
+Ordinary validation failures and
+invalid signatures are returned without learning or probing protocol capabilities;
+the existing authentication, transient-failure, and context-overflow handling is
+unchanged.
 
 ## Configuration and files
 
