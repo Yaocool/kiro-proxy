@@ -1,17 +1,17 @@
 use super::{
-    attempt_diagnostics, check_context_limit, estimated_credits, fallback_credits,
-    fill_missing_usage, loaded_tool_count, loaded_tool_names, map_model, meter_error, now_secs,
-    remaining_tool_search_budget, resolve_dynamic_model, resume_web_search_payload,
-    sanitize_error_message, sanitize_kiro_tool_history, tool_search_continue_payload_batch,
-    upstream_error, validate_kiro_tool_history, web_search_continue_payload_batch, AccountLease,
-    ApiError, AppState, Arc, ClaudeContextEditStats, ClaudeRequest, ClaudeServerEvent,
-    ClaudeToolSearchBudget, ClaudeToolSearchCatalog, ClaudeWebSearchTrace,
-    CompactionIterationUsage, CreditReservation, DecodedResponse, DispatchFailure, ErrorFormat,
-    ExecuteError, HashSet, Instant, IntoResponse, Json, KiroError, KiroEvent, KiroResponse,
-    OpenAiRequest, OpenAiToolIdentity, PoolError, PreparedUpstream, PromptCacheProfile,
-    RequestDiagnostics, RequestLog, RequestLogContext, Response, Rng, StopSequenceFilter,
-    ThinkingContentFilter, ToolLeakFilter, UpstreamAttemptLog, UpstreamExecution, UsageRecord,
-    Uuid, Value,
+    attempt_diagnostics, check_context_limit, empty_tool_result_disposition, estimated_credits,
+    fallback_credits, fill_missing_usage, loaded_tool_count, loaded_tool_names, map_model,
+    meter_error, now_secs, remaining_tool_search_budget, resolve_dynamic_model,
+    resume_web_search_payload, sanitize_error_message, sanitize_kiro_tool_history,
+    tool_search_continue_payload_batch, upstream_error, validate_kiro_tool_history,
+    web_search_continue_payload_batch, AccountLease, ApiError, AppState, Arc,
+    ClaudeContextEditStats, ClaudeRequest, ClaudeServerEvent, ClaudeToolSearchBudget,
+    ClaudeToolSearchCatalog, ClaudeWebSearchTrace, CompactionIterationUsage, CreditReservation,
+    DecodedResponse, DispatchFailure, EmptyToolResultDisposition, ErrorFormat, ExecuteError,
+    HashSet, Instant, IntoResponse, Json, KiroError, KiroEvent, KiroResponse, OpenAiRequest,
+    OpenAiToolIdentity, PoolError, PreparedUpstream, PromptCacheProfile, RequestDiagnostics,
+    RequestLog, RequestLogContext, Response, Rng, StopSequenceFilter, ThinkingContentFilter,
+    ToolLeakFilter, UpstreamAttemptLog, UpstreamExecution, UsageRecord, Uuid, Value,
 };
 
 mod dispatch;
@@ -229,6 +229,7 @@ pub(super) async fn collect_nonstream_rounds(
     let mut accumulated_server_events = resumed_server_events;
     let mut round = 0;
     let mut search_round = 0;
+    let mut empty_tool_result_retries = 0u8;
     let mut web_search_round = accumulated_web_searches
         .iter()
         .filter(|search| search.executed)
@@ -323,6 +324,74 @@ pub(super) async fn collect_nonstream_rounds(
                 .saturating_add(decoded.usage.output_tokens)
                 >= u64::from(maximum)
         });
+
+        match empty_tool_result_disposition(
+            &payload,
+            &decoded,
+            output_exhausted,
+            empty_tool_result_retries,
+        ) {
+            EmptyToolResultDisposition::Accept => {}
+            EmptyToolResultDisposition::Retry => {
+                empty_tool_result_retries += 1;
+                tracing::warn!(
+                    trace_id,
+                    account_id = %lease.account_id(),
+                    endpoint,
+                    retry = empty_tool_result_retries,
+                    "upstream returned an empty assistant turn after tool results; retrying"
+                );
+                merge_round_usage(&mut accumulated_usage, &decoded.usage);
+                decoded = DecodedResponse::default();
+                let budget_available = apply_remaining_output_budget(
+                    &mut payload,
+                    max_output_tokens,
+                    accumulated_usage.output_tokens,
+                );
+                debug_assert!(budget_available);
+                let next_input_tokens = validate_internal_continuation(
+                    state,
+                    &mut payload,
+                    compact,
+                    &endpoint,
+                    "empty tool-result retry",
+                    tool_search.is_some(),
+                )
+                .await
+                .map_err(ExecuteError::Upstream)?;
+                let continuation_estimate = estimated_credits(
+                    next_input_tokens,
+                    payload
+                        .max_output_tokens()
+                        .or(max_output_tokens)
+                        .unwrap_or(super::DEFAULT_OUTPUT_TOKEN_ESTIMATE),
+                    &config.pool,
+                );
+                reservation
+                    .extend(continuation_estimate)
+                    .map_err(ExecuteError::Meter)?;
+                let account = lease.account().await;
+                upstream = state
+                    .generate(&account, &payload)
+                    .await
+                    .map_err(ExecuteError::Upstream)?;
+                continue;
+            }
+            EmptyToolResultDisposition::Fail => {
+                tracing::error!(
+                    trace_id,
+                    account_id = %lease.account_id(),
+                    endpoint,
+                    "upstream repeated an empty assistant turn after tool results"
+                );
+                return Err(ExecuteError::Upstream(KiroError {
+                    status: None,
+                    endpoint,
+                    message: "upstream returned no assistant text or tool call after tool results"
+                        .into(),
+                }));
+            }
+        }
 
         let search_uses = tool_search
             .map(|catalog| decoded.take_tool_uses_where(|tool| catalog.is_search_tool(&tool.name)))
@@ -550,6 +619,7 @@ pub(super) async fn collect_nonstream_rounds(
             );
             accumulated_reasoning.push_str(&std::mem::take(&mut decoded.reasoning));
             payload = tool_search_continue_payload_batch(&payload, &round_text, &searches);
+            empty_tool_result_retries = 0;
             if !parallel_web_searches.is_empty() {
                 if let Some(assistant) = payload
                     .conversation_state
@@ -781,6 +851,7 @@ pub(super) async fn collect_nonstream_rounds(
             );
             accumulated_reasoning.push_str(&std::mem::take(&mut decoded.reasoning));
             payload = web_search_continue_payload_batch(&payload, &round_text, &searches);
+            empty_tool_result_retries = 0;
             merge_round_usage(&mut accumulated_usage, &decoded.usage);
             decoded = DecodedResponse::default();
             let budget_available = apply_remaining_output_budget(
@@ -861,6 +932,7 @@ pub(super) async fn collect_nonstream_rounds(
         accumulated_text.push_str(&round_text);
         accumulated_reasoning.push_str(&std::mem::take(&mut decoded.reasoning));
         payload = kproxy_translate::auto_continue_payload(&payload, &round_text, uses);
+        empty_tool_result_retries = 0;
         tracing::info!(
             trace_id,
             account_id = %lease.account_id(),

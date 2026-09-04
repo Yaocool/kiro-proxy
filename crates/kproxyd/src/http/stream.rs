@@ -641,6 +641,7 @@ fn openai_event(
     vec![format!("data: {chunk}\n\n")]
 }
 
+#[derive(Clone)]
 struct ClaudeState {
     request_id: String,
     model: String,

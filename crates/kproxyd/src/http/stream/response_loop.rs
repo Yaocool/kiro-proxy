@@ -1,3 +1,6 @@
+use super::super::handlers::{
+    current_message_has_tool_results, empty_tool_result_disposition, EmptyToolResultDisposition,
+};
 use super::{
     accumulate_usage, apply_stream_stop, auto_continue_payload, build_claude_state,
     classified_stream_error, classify_stream_failure, claude_initial_events, client_visible_event,
@@ -105,12 +108,22 @@ pub fn response(
             .user_input_message_context.as_ref().is_some_and(|context| !context.tools.is_empty());
         let mut auto_round = 0;
         let mut search_round = 0u32;
+        let mut empty_tool_result_retries = 0u8;
         let mut tool_search_operations = context.tool_search_operations;
         let mut web_search_round = accumulated_web_searches
             .iter()
             .filter(|search| search.executed)
             .count() as u32;
         'rounds: loop {
+            // A Kiro round following tool output is not semantically complete
+            // until it contains visible text, another tool call, or a terminal
+            // reason. Buffer its client events so a hollow reasoning-only
+            // attempt can be retried without leaking duplicate reasoning.
+            let guards_tool_result_round = current_message_has_tool_results(&payload);
+            let mut guarded_output = Vec::new();
+            let mut claude_checkpoint = guards_tool_result_round.then(|| claude.clone());
+            let mut pending_initial_checkpoint =
+                guards_tool_result_round.then(|| pending_initial.clone());
             if let Some(message) = failed.as_deref() {
                 yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
                     &protocol,
@@ -184,9 +197,13 @@ pub fn response(
                                                         &mut pending_initial,
                                                         output,
                                                     );
-                                                    data_started |= !output.is_empty();
-                                                    for data in output {
-                                                        yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                                                    if guards_tool_result_round {
+                                                        guarded_output.extend(output);
+                                                    } else {
+                                                        data_started |= !output.is_empty();
+                                                        for data in output {
+                                                            yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                                                        }
                                                     }
                                                 }
                                             }
@@ -215,9 +232,13 @@ pub fn response(
                                                         &mut pending_initial,
                                                         output,
                                                     );
-                                                    data_started |= !output.is_empty();
-                                                    for data in output {
-                                                        yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                                                    if guards_tool_result_round {
+                                                        guarded_output.extend(output);
+                                                    } else {
+                                                        data_started |= !output.is_empty();
+                                                        for data in output {
+                                                            yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                                                        }
                                                     }
                                                 }
                                             }
@@ -326,9 +347,13 @@ pub fn response(
                                 &context.openai_tools,
                             );
                             let output = prepend_pending_initial(&mut pending_initial, output);
-                            data_started |= !output.is_empty();
-                            for data in output {
-                                yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                            if guards_tool_result_round {
+                                guarded_output.extend(output);
+                            } else {
+                                data_started |= !output.is_empty();
+                                for data in output {
+                                    yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                                }
                             }
                         }
                     }
@@ -351,9 +376,13 @@ pub fn response(
                                 &context.openai_tools,
                             );
                             let output = prepend_pending_initial(&mut pending_initial, output);
-                            data_started |= !output.is_empty();
-                            for data in output {
-                                yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                            if guards_tool_result_round {
+                                guarded_output.extend(output);
+                            } else {
+                                data_started |= !output.is_empty();
+                                for data in output {
+                                    yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                                }
                             }
                         }
                     }
@@ -376,6 +405,12 @@ pub fn response(
                 }
             }
             if failed.is_some() {
+                if let Some(checkpoint) = claude_checkpoint.take() {
+                    claude = checkpoint;
+                }
+                if let Some(checkpoint) = pending_initial_checkpoint.take() {
+                    pending_initial = checkpoint;
+                }
                 let failure_text = failed.as_deref().unwrap_or_default().to_string();
                 let failed_account_id = context.lease.account_id();
                 let failure_details =
@@ -810,13 +845,21 @@ pub fn response(
             }
             pre_data_retries = 0;
             if !pending_initial.is_empty() {
-                data_started = true;
-                for data in std::mem::take(&mut pending_initial) {
-                    yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                let output = std::mem::take(&mut pending_initial);
+                if guards_tool_result_round {
+                    guarded_output.extend(output);
+                } else {
+                    data_started = true;
+                    for data in output {
+                        yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                    }
                 }
             }
             fill_missing_usage(&context.state, &mut decoded, &payload).await;
             if stop_filter.matched().is_some() {
+                for data in std::mem::take(&mut guarded_output) {
+                    yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                }
                 break 'rounds;
             }
             let output_exhausted = context.max_tokens.is_some_and(|maximum| {
@@ -825,6 +868,146 @@ pub fn response(
                     .saturating_add(decoded.usage.output_tokens)
                     >= u64::from(maximum)
             });
+            match empty_tool_result_disposition(
+                &payload,
+                &decoded,
+                output_exhausted,
+                empty_tool_result_retries,
+            ) {
+                EmptyToolResultDisposition::Accept => {
+                    data_started |= !guarded_output.is_empty();
+                    for data in std::mem::take(&mut guarded_output) {
+                        yield Ok::<Bytes, Infallible>(Bytes::from(data));
+                    }
+                }
+                EmptyToolResultDisposition::Retry => {
+                    if let Some(checkpoint) = claude_checkpoint.take() {
+                        claude = checkpoint;
+                    }
+                    if let Some(checkpoint) = pending_initial_checkpoint.take() {
+                        pending_initial = checkpoint;
+                    }
+                    empty_tool_result_retries += 1;
+                    tracing::warn!(
+                        trace_id = %context.trace_id,
+                        request_id = %context.request_id,
+                        account_id = %context.lease.account_id(),
+                        endpoint,
+                        retry = empty_tool_result_retries,
+                        "upstream returned an empty assistant turn after tool results; retrying"
+                    );
+                    accumulate_usage(&mut accumulated_usage, &decoded.usage);
+                    decoded = DecodedResponse::default();
+                    let budget_available =
+                        super::super::handlers::apply_remaining_output_budget(
+                            &mut payload,
+                            context.max_tokens,
+                            accumulated_usage.output_tokens,
+                        );
+                    debug_assert!(budget_available);
+                    match super::super::handlers::validate_internal_continuation(
+                        &context.state,
+                        &mut payload,
+                        context.compact,
+                        &endpoint,
+                        "empty tool-result retry",
+                        context.tool_search.is_some(),
+                    )
+                    .await
+                    {
+                        Ok(tokens) => context.input_tokens = tokens,
+                        Err(error) => {
+                            let message = error.to_string();
+                            failed = Some(message.clone());
+                            yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                                &protocol,
+                                &context.request_id,
+                                &message,
+                            )));
+                            break 'rounds;
+                        }
+                    }
+                    let config = context.state.config.current();
+                    let continuation_estimate = super::super::handlers::estimated_credits(
+                        context.input_tokens,
+                        payload
+                            .max_output_tokens()
+                            .or(context.max_tokens)
+                            .unwrap_or(super::super::handlers::DEFAULT_OUTPUT_TOKEN_ESTIMATE),
+                        &config.pool,
+                    );
+                    if let Err(error) = context.reservation.extend(continuation_estimate) {
+                        let message = error.to_string();
+                        failed = Some(message.clone());
+                        yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                            &protocol,
+                            &context.request_id,
+                            &message,
+                        )));
+                        break 'rounds;
+                    }
+                    let account = context.lease.account().await;
+                    match context.state.generate(&account, &payload).await {
+                        Ok(next) => {
+                            upstream_access_token = account.credentials.access_token.clone();
+                            effective_thinking = next.thinking_enabled();
+                            let (next_endpoint, next_response, next_permit) = next.into_parts();
+                            endpoint = next_endpoint.name.to_string();
+                            source = next_response.bytes_stream();
+                            upstream_metrics.reset();
+                            stream_failure = None;
+                            upstream_permit = next_permit;
+                            buffer.clear();
+                            decoder = EventStreamDecoder;
+                            stop_filter = StopSequenceFilter::new(&context.stop_sequences);
+                            continue 'rounds;
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            stream_failure = None;
+                            record_account_scoped_stream_failure(
+                                &context.state,
+                                &context.trace_id,
+                                &context.request_id,
+                                &account.id,
+                                classify_stream_failure(&message, None),
+                            )
+                            .await;
+                            failed = Some(message.clone());
+                            yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                                &protocol,
+                                &context.request_id,
+                                &message,
+                            )));
+                            break 'rounds;
+                        }
+                    }
+                }
+                EmptyToolResultDisposition::Fail => {
+                    if let Some(checkpoint) = claude_checkpoint.take() {
+                        claude = checkpoint;
+                    }
+                    if let Some(checkpoint) = pending_initial_checkpoint.take() {
+                        pending_initial = checkpoint;
+                    }
+                    let message =
+                        "upstream returned no assistant text or tool call after tool results";
+                    tracing::error!(
+                        trace_id = %context.trace_id,
+                        request_id = %context.request_id,
+                        account_id = %context.lease.account_id(),
+                        endpoint,
+                        "upstream repeated an empty assistant turn after tool results"
+                    );
+                    failed = Some(message.into());
+                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(
+                        &protocol,
+                        &context.request_id,
+                        message,
+                    )));
+                    break 'rounds;
+                }
+            }
             let search_uses = context
                 .tool_search
                 .as_ref()
@@ -1106,6 +1289,7 @@ pub fn response(
                 accumulated_text.push_str(&round_text);
                 accumulated_reasoning.push_str(&std::mem::take(&mut decoded.reasoning));
                 payload = tool_search_continue_payload_batch(&payload, &round_text, &searches);
+                empty_tool_result_retries = 0;
                 if !parallel_web_searches.is_empty() {
                     if let Some(assistant) = payload.conversation_state.history.last_mut()
                         .and_then(|message| message.assistant_response_message.as_mut())
@@ -1406,6 +1590,7 @@ pub fn response(
                 accumulated_text.push_str(&round_text);
                 accumulated_reasoning.push_str(&std::mem::take(&mut decoded.reasoning));
                 payload = web_search_continue_payload_batch(&payload, &round_text, &searches);
+                empty_tool_result_retries = 0;
                 accumulate_usage(&mut accumulated_usage, &decoded.usage);
                 decoded = DecodedResponse::default();
                 let budget_available = super::super::handlers::apply_remaining_output_budget(
@@ -1514,6 +1699,7 @@ pub fn response(
             accumulated_text.push_str(&round_text);
             accumulated_reasoning.push_str(&std::mem::take(&mut decoded.reasoning));
             payload = auto_continue_payload(&payload, &round_text, tool_uses);
+            empty_tool_result_retries = 0;
             decoded.tools.clear();
             accumulate_usage(&mut accumulated_usage, &decoded.usage);
             decoded.usage = kproxy_kiro::UsageInfo::default();

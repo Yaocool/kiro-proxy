@@ -47,6 +47,66 @@ impl wiremock::Respond for ToolRoundtrip {
     }
 }
 
+#[derive(Clone)]
+struct EmptyToolResultRetry {
+    tool_result_calls: Arc<AtomicUsize>,
+    recover: bool,
+}
+
+impl wiremock::Respond for EmptyToolResultRetry {
+    fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
+        let payload: Value = serde_json::from_slice(&request.body).unwrap();
+        let context = &payload["conversationState"]["currentMessage"]["userInputMessage"]
+            ["userInputMessageContext"];
+        let has_results = context["toolResults"]
+            .as_array()
+            .is_some_and(|results| !results.is_empty());
+        let body = if !has_results {
+            let name = context["tools"][0]["toolSpecification"]["name"]
+                .as_str()
+                .unwrap();
+            let mut body = event_stream_frame(
+                "toolUseEvent",
+                json!({
+                    "toolUseId":"call_read", "name":name,
+                    "input":"{\"path\":\"README.md\"}", "stop":true
+                }),
+            );
+            body.extend(event_stream_frame(
+                "messageMetadataEvent",
+                json!({"messageMetadataEvent":{"usage":{
+                    "inputTokens":100,"outputTokens":10,"creditsConsumed":0.1
+                }}}),
+            ));
+            body
+        } else {
+            let attempt = self.tool_result_calls.fetch_add(1, Ordering::SeqCst);
+            if !self.recover || attempt.is_multiple_of(2) {
+                // A transport-successful but semantically empty continuation
+                // must be retried rather than completed as an empty message.
+                let mut body = event_stream_frame(
+                    "reasoningContentEvent",
+                    json!({"reasoningContentEvent":{
+                        "text":"discarded reasoning from an empty tool-result turn"
+                    }}),
+                );
+                body.extend(event_stream_frame(
+                    "messageMetadataEvent",
+                    json!({"messageMetadataEvent":{"usage":{
+                        "inputTokens":100,"outputTokens":1,"creditsConsumed":0.01
+                    }}}),
+                ));
+                body
+            } else {
+                generation_body("Recovered after the empty tool-result continuation.")
+            }
+        };
+        ResponseTemplate::new(200)
+            .insert_header("content-type", "application/vnd.amazon.eventstream")
+            .set_body_bytes(body)
+    }
+}
+
 async fn create_response_with_session(
     client: &reqwest::Client,
     daemon: &Daemon,
@@ -273,6 +333,166 @@ async fn responses_tool_roundtrip_works_through_both_aliases_and_buffer_modes() 
         assert_eq!(read["content"][0]["text"], "README contents");
         assert_eq!(patch["content"][0]["text"], "Patch applied.");
     }
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn responses_retry_an_empty_turn_after_tool_results() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let tool_result_calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(EmptyToolResultRetry {
+            tool_result_calls: Arc::clone(&tool_result_calls),
+            recover: true,
+        })
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    let client = reqwest::Client::new();
+
+    for stream in [false, true] {
+        let initial = json!({
+            "model":"source-large", "input":"Read the file.", "stream":stream,
+            "tools":[{"type":"function","name":"read_file","parameters":{
+                "type":"object","properties":{"path":{"type":"string"}}
+            }}]
+        });
+        let session = format!("empty-tool-result-{stream}");
+        let first = create_response_with_session(
+            &client,
+            &daemon,
+            port,
+            "/v1/responses",
+            Some(&session),
+            &initial,
+        )
+        .await;
+        let call = first["output"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["type"] == "function_call")
+            .unwrap();
+        assert_eq!(call["call_id"], "call_read");
+
+        let continuation = json!({
+            "model":"source-large", "previous_response_id":first["id"],
+            "input":[{"type":"function_call_output","call_id":"call_read",
+                "output":"README contents"}],
+            "stream":stream
+        });
+        let second = create_response_with_session(
+            &client,
+            &daemon,
+            port,
+            "/v1/responses",
+            Some(&session),
+            &continuation,
+        )
+        .await;
+        assert_eq!(
+            second["output"][0]["content"][0]["text"],
+            "Recovered after the empty tool-result continuation."
+        );
+        assert!(!second
+            .to_string()
+            .contains("discarded reasoning from an empty tool-result turn"));
+        assert_eq!(second["usage"]["output_tokens"], 21);
+    }
+
+    assert_eq!(tool_result_calls.load(Ordering::SeqCst), 4);
+    let generate_calls = mock
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/generateAssistantResponse")
+        .count();
+    assert_eq!(generate_calls, 6);
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn responses_fail_after_repeated_empty_tool_result_turns() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let tool_result_calls = Arc::new(AtomicUsize::new(0));
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(EmptyToolResultRetry {
+            tool_result_calls: Arc::clone(&tool_result_calls),
+            recover: false,
+        })
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    let client = reqwest::Client::new();
+
+    for stream in [false, true] {
+        let session = format!("repeated-empty-tool-result-{stream}");
+        let initial = json!({
+            "model":"source-large", "input":"Read the file.", "stream":stream,
+            "tools":[{"type":"function","name":"read_file"}]
+        });
+        let first = create_response_with_session(
+            &client,
+            &daemon,
+            port,
+            "/v1/responses",
+            Some(&session),
+            &initial,
+        )
+        .await;
+        let continuation = json!({
+            "model":"source-large", "previous_response_id":first["id"],
+            "input":[{"type":"function_call_output","call_id":"call_read",
+                "output":"README contents"}],
+            "stream":stream
+        });
+        let response = client
+            .post(format!("http://127.0.0.1:{port}/v1/responses"))
+            .bearer_auth(daemon.api_key.as_deref().unwrap())
+            .header("user-agent", CODEX_AGENT)
+            .header("session-id", &session)
+            .json(&continuation)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.text().await.unwrap();
+        if stream {
+            assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+            assert!(body.contains("event: response.failed\n"), "{body}");
+            assert!(!body.contains("event: response.completed\n"), "{body}");
+            assert!(
+                !body.contains("discarded reasoning from an empty tool-result turn"),
+                "{body}"
+            );
+        } else {
+            assert_eq!(status, reqwest::StatusCode::BAD_GATEWAY, "{body}");
+            assert!(body.contains("no assistant text or tool call"), "{body}");
+        }
+    }
+
+    assert_eq!(tool_result_calls.load(Ordering::SeqCst), 4);
+    let generate_calls = mock
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| request.url.path() == "/generateAssistantResponse")
+        .count();
+    assert_eq!(generate_calls, 6);
     daemon.stop().await;
 }
 
