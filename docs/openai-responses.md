@@ -57,6 +57,7 @@ API key 认证、服务级 key 白名单、额度和并发限制继续生效。
 | `tool_choice` | 支持 auto、none、required、指定 function/custom 工具，以及仅限 function/custom 的 `allowed_tools` |
 | `parallel_tool_calls` | 沿用 Chat Completions 的工具选择与提示约束 |
 | `store` / `previous_response_id` | 默认启用的受限进程内续轮；`store: false` 显式关闭，按服务与 API key 隔离，不写磁盘 |
+| 工具结果后的空上游轮次 | 无可见文本、无后续工具且未触发输出上限时重试一次；再次为空则返回 502 / `response.failed`，不误报完成 |
 | `max_output_tokens` | 映射为 Kiro maxTokens；省略时不补默认生成上限 |
 | `temperature`、`top_p` | 复用现有参数校验和映射，保留零值 |
 | `reasoning.effort` | 复用现有 effort 映射；none 关闭本次推理 |
@@ -132,18 +133,19 @@ Responses 不使用 Chat Completions 的 `[DONE]` 结束标记。
 
 ## 参考项目核查
 
-2026-09-03 检查三个项目的默认分支快照：
+2026-09-04 检查四个项目的默认分支快照：
 
 | 项目与快照 | Responses 实现 |
 | --- | --- |
 | [jwadow/kiro-gateway · a5292ca](https://github.com/jwadow/kiro-gateway/blob/a5292ca04c7c6231e0b47673ac3f981f5a706e1e/kiro/routes_openai.py) | 无；OpenAI 路由为 Chat Completions 和模型列表 |
 | [hj01857655/kiro-account-manager · c5c4776](https://github.com/hj01857655/kiro-account-manager/blob/c5c477647f8cba4c9b9f07e8fb41e403672adf36/src-tauri/src/gateway/mod.rs) | 有；gateway 路由、converter、proxy 中包含 Responses 转换和输出 |
 | [chaogei/Kiro-account-manager · 447adcd](https://github.com/chaogei/Kiro-account-manager/blob/447adcdb468157312621b1f09448278bd9bca748/Kiro-account-manager/src/main/proxy/proxyServer.ts) | 有；Responses 转 Chat，再输出 Responses JSON/SSE |
+| [ZyphrZero/kiro.rs · f357292](https://github.com/ZyphrZero/kiro.rs/blob/f3572929fbc2c0c090c29b13a7c285d1b2777dcd/src/anthropic/responses.rs) | 有；额外覆盖 Responses Lite `additional_tools`、function/custom/namespace 桥接、工具结果后空响应重试、Responses SSE 与服务端 WebSearch loop |
 
-后两个项目的许可分别为 CC BY-NC-SA 4.0 与 AGPL-3.0。本实现参考其能力拆分，按官方协议在
-本项目的 Rust 执行链中独立实现，未复制其源代码；本仓库继续使用 MIT 许可。
+hj01857655、chaogei 和 ZyphrZero 三个实现的许可分别为 CC BY-NC-SA 4.0、AGPL-3.0 与 MIT。
+本实现参考其能力拆分，按官方协议在本项目的 Rust 执行链中独立实现，未复制其源代码；本仓库继续使用 MIT 许可。
 
 回归覆盖请求转换、可空参数、命名空间/自由文本工具、图片工具结果、协议准入矩阵、SSE 分片和错误，
 以及真实 daemon 对模拟 Kiro 上游的两轮工具交互（完整历史 replay 和 `store`/`previous_response_id`
-续轮），涵盖两个别名、两种流模式和工具缓冲开关。
+续轮）、空工具续轮的单次恢复与重复失败，涵盖两个别名、两种流模式和工具缓冲开关。
 工具分片用例包含交错的 function/custom 调用，以及只在首个片段发送工具名的上游输出。

@@ -1237,6 +1237,49 @@ fn nonstream_stop_discards_events_after_a_cross_chunk_match() {
 }
 
 #[test]
+fn empty_tool_result_round_retries_once_then_fails() {
+    let payload: KiroPayload = serde_json::from_value(json!({
+        "conversationState": {
+            "chatTriggerType": "MANUAL",
+            "conversationId": "conversation",
+            "history": [],
+            "currentMessage": {"userInputMessage": {
+                "content": "", "modelId": "model", "origin": "AI_EDITOR",
+                "userInputMessageContext": {"toolResults": [{
+                    "toolUseId": "call_1", "status": "success",
+                    "content": [{"text": "done"}]
+                }]}
+            }}
+        }
+    }))
+    .expect("payload");
+    let mut decoded = DecodedResponse {
+        reasoning: "reasoning alone is not a client continuation".into(),
+        ..DecodedResponse::default()
+    };
+
+    assert_eq!(
+        empty_tool_result_disposition(&payload, &decoded, false, 0),
+        EmptyToolResultDisposition::Retry
+    );
+    assert_eq!(
+        empty_tool_result_disposition(&payload, &decoded, false, 1),
+        EmptyToolResultDisposition::Fail
+    );
+
+    decoded.text = "finished".into();
+    assert_eq!(
+        empty_tool_result_disposition(&payload, &decoded, false, 0),
+        EmptyToolResultDisposition::Accept
+    );
+    decoded.text.clear();
+    assert_eq!(
+        empty_tool_result_disposition(&payload, &decoded, true, 0),
+        EmptyToolResultDisposition::Accept
+    );
+}
+
+#[test]
 fn fallback_models_use_catalog_and_keep_configured_targets() {
     let mut config = kproxy_core::config::Config::default();
     config.features.default_model_id = "private-model".into();
