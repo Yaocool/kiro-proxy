@@ -12,7 +12,13 @@ fn options() -> ResponsesOptions {
     }))
     .unwrap();
     let translated = responses_to_openai(&request).unwrap();
-    ResponsesOptions::new(&request, translated.tool_names, None, None)
+    ResponsesOptions::new(
+        &request,
+        translated.tools,
+        translated.tool_names,
+        None,
+        None,
+    )
 }
 
 fn stored_options(
@@ -36,6 +42,7 @@ fn stored_options(
     let store = ResponsesSessionStore::default();
     let mut options = ResponsesOptions::new(
         &request,
+        translated.tools,
         translated.tool_names,
         Some((store.clone(), owner.clone())),
         None,
@@ -69,6 +76,7 @@ fn stored_sessions_are_credential_scoped_and_do_not_replay_old_instructions() {
         "resp_1",
         StoredResponsesSession::from_request(
             &request,
+            request.tools.clone().unwrap_or_default(),
             owner.clone(),
             Some("response-affinity".into()),
         ),
@@ -122,6 +130,97 @@ fn stored_sessions_are_credential_scoped_and_do_not_replay_old_instructions() {
         .messages
         .iter()
         .any(|message| message.content == Some(json!("Old instructions must not persist."))));
+}
+
+#[test]
+fn additional_tools_are_stored_as_controls_and_inherited_canonically() {
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model":"gpt-5.6-sol",
+        "input":[
+            {"type":"additional_tools","role":"developer","tools":[
+                {"type":"custom","name":"exec"},
+                {"type":"function","name":"wait","parameters":{"type":"object"}}
+            ]},
+            {"type":"message","role":"user","content":"Run a command."}
+        ]
+    }))
+    .unwrap();
+    let translated = responses_to_openai(&request).expect("Responses Lite tools");
+    let owner = ResponsesSessionOwner::new("service-a".into(), Some("key-a".into()));
+    let store = ResponsesSessionStore::default();
+    let mut options = ResponsesOptions::new(
+        &request,
+        translated.tools,
+        translated.tool_names,
+        Some((store.clone(), owner.clone())),
+        None,
+    );
+    options.set_conversation_id(Some("response-affinity".into()));
+    let response_id = options.id().to_owned();
+    json_response(completed_chat("ready"), options).expect("stored response");
+
+    let session = store.get(&response_id, &owner).expect("stored session");
+    assert_eq!(session.history.len(), 2);
+    assert!(session
+        .history
+        .iter()
+        .all(|item| item["type"] != "additional_tools"));
+    assert_eq!(session.tools.len(), 2);
+
+    let mut continuation: ResponsesRequest = serde_json::from_value(json!({
+        "model":"gpt-5.6-sol",
+        "previous_response_id":response_id,
+        "input":"Continue."
+    }))
+    .unwrap();
+    resume_responses_request(&mut continuation, session);
+    assert_eq!(continuation.tools.as_ref().map(Vec::len), Some(2));
+    assert!(continuation
+        .input
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|item| item["type"] != "additional_tools"));
+    assert_eq!(
+        responses_to_openai(&continuation)
+            .expect("inherited Responses Lite tools")
+            .request
+            .tools
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn a_new_additional_tools_catalog_replaces_inherited_tools() {
+    let parent: ResponsesRequest = serde_json::from_value(json!({
+        "model":"test","input":"hello",
+        "tools":[{"type":"function","name":"old_tool"}]
+    }))
+    .unwrap();
+    let owner = ResponsesSessionOwner::new("service-a".into(), None);
+    let session = StoredResponsesSession::from_request(
+        &parent,
+        parent.tools.clone().unwrap(),
+        owner,
+        Some("response-affinity".into()),
+    );
+    let mut continuation: ResponsesRequest = serde_json::from_value(json!({
+        "model":"test",
+        "input":[
+            {"type":"additional_tools","tools":[{"type":"function","name":"new_tool"}]},
+            {"role":"user","content":"continue"}
+        ]
+    }))
+    .unwrap();
+    resume_responses_request(&mut continuation, session);
+    assert!(continuation.tools.is_none());
+    let translated = responses_to_openai(&continuation).unwrap();
+    assert_eq!(translated.tools.len(), 1);
+    assert_eq!(
+        translated.request.tools[0].body["function"]["name"],
+        "new_tool"
+    );
 }
 
 #[test]

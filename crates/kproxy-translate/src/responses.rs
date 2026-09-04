@@ -85,12 +85,17 @@ pub struct ResponsesTranslation {
     pub request: OpenAiRequest,
     /// Flattened OpenAI name -> original Responses namespace and leaf name.
     pub tool_names: HashMap<String, ResponsesToolName>,
+    /// Effective Responses declarations from the top-level `tools` field and
+    /// any `input[].additional_tools` control items. The HTTP adapter uses
+    /// this canonical list for response echoing and stateful inheritance.
+    pub tools: Vec<Value>,
 }
 
 pub fn responses_to_openai(
     request: &ResponsesRequest,
 ) -> Result<ResponsesTranslation, ValidationError> {
     validate_controls(request)?;
+    let declared_tools = declared_tools(request)?;
     crate::translate::common::log_ignored_controls(
         "responses",
         &[
@@ -152,6 +157,11 @@ pub fn responses_to_openai(
                         .ok_or_else(|| error(format!("{field}.type"), "expected a string"))?,
                 };
                 match kind {
+                    // Responses Lite transports the callable catalog as an
+                    // input control instead of the top-level `tools` field.
+                    // It was validated and collected before message parsing;
+                    // it is not conversational history.
+                    "additional_tools" => {}
                     "message" => {
                         let role = required_string(item, "role", &field)?;
                         if !matches!(role, "system" | "developer" | "user" | "assistant") {
@@ -289,14 +299,15 @@ pub fn responses_to_openai(
     let messages = merge_assistant_items(messages);
     let mut tools = Vec::new();
     let mut tool_names = HashMap::new();
-    for (index, tool) in request.tools.as_deref().unwrap_or(&[]).iter().enumerate() {
-        let field = format!("tools.{index}");
+    for declaration in &declared_tools {
+        let tool = declaration.value;
+        let field = declaration.field.as_str();
         if tool.get("type").and_then(Value::as_str) == Some("namespace") {
-            let namespace = required_string(tool, "name", &field)?;
+            let namespace = required_string(tool, "name", field)?;
             let description = tool
                 .get("description")
                 .filter(|value| !value.is_null())
-                .map(|_| string(tool, "description", &field))
+                .map(|_| string(tool, "description", field))
                 .transpose()?;
             let Some(children) = tool.get("tools").and_then(Value::as_array) else {
                 return invalid(
@@ -315,7 +326,7 @@ pub fn responses_to_openai(
                 )?;
             }
         } else {
-            add_tool(tool, None, None, &field, &mut tools, &mut tool_names)?;
+            add_tool(tool, None, None, field, &mut tools, &mut tool_names)?;
         }
     }
     let tool_choice = request
@@ -327,6 +338,9 @@ pub fn responses_to_openai(
                 return Ok(choice.clone());
             }
             let kind = required_string(choice, "type", "tool_choice")?;
+            if matches!(kind, "auto" | "none" | "required") {
+                return Ok(json!(kind));
+            }
             if matches!(kind, "function" | "custom") {
                 let name = qualified_name(choice, "tool_choice")?;
                 return Ok(json!({"type":kind,kind:{"name":name}}));
@@ -334,7 +348,7 @@ pub fn responses_to_openai(
             if kind != "allowed_tools" {
                 return invalid(
                     "tool_choice.type",
-                    "expected function, custom, or allowed_tools",
+                    "expected auto, none, required, function, custom, or allowed_tools",
                 );
             }
             let allowed = choice.get("allowed_tools").unwrap_or(choice);
@@ -395,7 +409,9 @@ pub fn responses_to_openai(
         parallel_tool_calls: request.parallel_tool_calls.unwrap_or(true),
         thinking,
         reasoning_effort: effort.filter(|effort| *effort != "none").map(str::to_owned),
-        conversation_id: None,
+        // Kiro's conversation ID is also its prompt-cache affinity key. The
+        // HTTP layer hashes this client hint into an API-key-scoped UUID.
+        conversation_id: request.prompt_cache_key.clone(),
         metadata: request.metadata.clone(),
         response_format: request.text.as_ref().and_then(|text| text.format.clone()),
     };
@@ -403,7 +419,53 @@ pub fn responses_to_openai(
     Ok(ResponsesTranslation {
         request: normalized,
         tool_names,
+        tools: declared_tools
+            .into_iter()
+            .map(|declaration| declaration.value.clone())
+            .collect(),
     })
+}
+
+struct DeclaredTool<'a> {
+    value: &'a Value,
+    field: String,
+}
+
+/// Collect both Responses tool declaration channels. Recent Codex Responses
+/// Lite requests omit top-level `tools` and place the complete catalog in an
+/// `additional_tools` input item instead. Exact duplicates are coalesced so a
+/// client can safely send both representations during a compatibility rollout;
+/// conflicting declarations still fail later as ambiguous tool names.
+fn declared_tools(request: &ResponsesRequest) -> Result<Vec<DeclaredTool<'_>>, ValidationError> {
+    let mut declarations = Vec::new();
+    let top_level = request.tools.as_deref().unwrap_or(&[]);
+    for (index, tool) in top_level.iter().enumerate() {
+        declarations.push(DeclaredTool {
+            value: tool,
+            field: format!("tools.{index}"),
+        });
+    }
+    if let Value::Array(items) = &request.input {
+        for (item_index, item) in items.iter().enumerate() {
+            if item.get("type").and_then(Value::as_str) != Some("additional_tools") {
+                continue;
+            }
+            let field = format!("input.{item_index}.tools");
+            let tools = item
+                .get("tools")
+                .and_then(Value::as_array)
+                .ok_or_else(|| error(&field, "expected an array of tool declarations"))?;
+            for (tool_index, tool) in tools.iter().enumerate() {
+                if !top_level.contains(tool) {
+                    declarations.push(DeclaredTool {
+                        value: tool,
+                        field: format!("{field}.{tool_index}"),
+                    });
+                }
+            }
+        }
+    }
+    Ok(declarations)
 }
 
 fn validate_controls(request: &ResponsesRequest) -> Result<(), ValidationError> {

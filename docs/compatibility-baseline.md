@@ -28,9 +28,12 @@ hj 的 OpenAI 路径另有 JSON 提示词引导，但 json_schema 主要使用�
 - 不把这些字段原样塞进 additionalModelRequestFields；Haiku 缺少原生参数元数据时仍省略整个扩展。
 
 - Responses 输入历史中无法转换的条目跳过而非拒绝：`reasoning.encrypted_content` 丢弃不透明块并保留
-  明文摘要，`item_reference` 与托管工具调用条目跳过。依据是 chaogei（唯一实现 `/v1/responses` 的参考项目，
-  `translator.ts` 的 `responsesToOpenAIChat`）只校验它实际读取的字段，且把 `reasoning` 定义为
+  明文摘要，`item_reference` 与托管工具调用条目跳过。初始依据是 chaogei 的 `/v1/responses` 实现
+  （`translator.ts` 的 `responsesToOpenAIChat`）只校验它实际读取的字段，且把 `reasoning` 定义为
   `unknown` 从不检查；Codex 会回传上一轮条目，拒绝会使第二轮起整段会话失效。输入只含可跳过条目时仍拒绝。
+- Responses Lite 的 `input[].additional_tools` 是已知控制项，不属于可跳过历史。依据 ZyphrZero/kiro.rs
+  与 Codex 0.144+ 的实际请求形态，它和顶层 `tools` 一起组成有效工具目录；状态存储只保留解析后的目录，
+  不把控制项反复追加到对话历史。两处完全相同的声明去重，名称相同但定义冲突时仍拒绝。
 
 宽松接收不代表新增原生 JSON Schema 约束，返回仍是正常 Kiro 生成结果。实现和文档须准确描述
 哪些参数实际使用、哪些参数忽略，不把 HTTP 成功和严格结构保证混为一谈。

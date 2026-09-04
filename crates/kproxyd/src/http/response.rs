@@ -927,12 +927,7 @@ impl DecodedResponse {
                 let identity = tool_identities.get(&tool.name);
                 let name = identity.map_or(tool.name.as_str(), |identity| identity.name.as_str());
                 if identity.is_some_and(|identity| identity.kind == "custom") {
-                    let input = repair_json(&tool.input);
-                    let input = input
-                        .get("input")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| input.to_string());
+                    let input = custom_tool_input(&tool.input);
                     json!({"id":tool.id,"type":"custom","custom":{"name":name,"input":input}})
                 } else {
                     json!({
@@ -1308,6 +1303,29 @@ pub fn repair_json(input: &str) -> Value {
         repaired.extend(stack.into_iter().rev());
         serde_json::from_str(&repaired).unwrap_or_else(|_| json!({"raw":trimmed}))
     })
+}
+
+/// Unwrap the object schema used to expose a Responses custom tool to Kiro.
+/// Models occasionally return a JSON string or use a different single field
+/// despite the schema; preserve the intended free-form payload in those cases
+/// instead of sending JSON quoting/wrapping back to the client.
+pub fn custom_tool_input(input: &str) -> String {
+    match repair_json(input) {
+        Value::Object(map) => map
+            .get("input")
+            .and_then(Value::as_str)
+            .or_else(|| {
+                if map.len() == 1 {
+                    map.values().next().and_then(Value::as_str)
+                } else {
+                    None
+                }
+            })
+            .map(str::to_owned)
+            .unwrap_or_else(|| input.to_owned()),
+        Value::String(value) => value,
+        _ => input.to_owned(),
+    }
 }
 
 fn normalize_partial_json(input: &str) -> String {
@@ -2003,6 +2021,19 @@ mod tests {
         assert_eq!(call["type"], "custom");
         assert_eq!(call["custom"]["name"], "shell.tool");
         assert_eq!(call["custom"]["input"], "echo ok");
+    }
+
+    #[test]
+    fn custom_openai_tools_recover_common_schema_violations() {
+        for (input, expected) in [
+            (r#"{"input":"echo ok"}"#, "echo ok"),
+            (r#"{"command":"echo ok"}"#, "echo ok"),
+            (r#""echo ok""#, "echo ok"),
+            (r#"{"left":"a","right":"b"}"#, r#"{"left":"a","right":"b"}"#),
+            ("not json", "not json"),
+        ] {
+            assert_eq!(custom_tool_input(input), expected);
+        }
     }
 
     #[test]

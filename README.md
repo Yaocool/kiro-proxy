@@ -202,7 +202,8 @@ accept Claude Code; OpenAI routes (including models) accept Codex. The shared
 API key authentication and each service's key allowlist still apply.
 
 Responses stores Codex conversations by default and supports explicit `store: false` stateless
-requests, streaming, function/custom tools, namespaced tools, image inputs, and tool-result replay. Configure Codex with
+requests, streaming, top-level or Responses Lite `additional_tools` catalogs, function/custom tools,
+namespaced tools, image inputs, and tool-result replay. Configure Codex with
 `wire_api = "responses"` and the service's `/v1` base URL. See
 [Responses compatibility and Codex setup](docs/openai-responses.md) for configuration,
 protocol coverage, and explicit unsupported controls.

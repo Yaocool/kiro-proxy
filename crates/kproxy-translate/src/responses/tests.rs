@@ -64,6 +64,115 @@ fn codex_request_preserves_instructions_controls_and_namespace_tools() {
 }
 
 #[test]
+fn responses_lite_additional_tools_are_callable_and_not_messages() {
+    let translated = normalize(json!({
+        "model":"gpt-5.6-sol",
+        "input":[
+            {"type":"additional_tools","role":"developer","tools":[
+                {"type":"custom","name":"exec","description":"Run JavaScript",
+                 "format":{"type":"grammar","syntax":"lark","definition":"start: /.+/"}},
+                {"type":"namespace","name":"collaboration","tools":[
+                    {"type":"function","name":"spawn_agent","parameters":{"type":"object"}}
+                ]}
+            ]},
+            {"type":"message","role":"developer","content":"Follow repository rules."},
+            {"type":"message","role":"user","content":"Inspect the project."}
+        ],
+        "prompt_cache_key":"thread-123"
+    }));
+
+    assert_eq!(translated.tools.len(), 2);
+    assert_eq!(translated.request.tools.len(), 2);
+    assert_eq!(translated.request.messages.len(), 2);
+    assert_eq!(translated.request.messages[0].role, "developer");
+    assert_eq!(translated.request.tools[0].body["custom"]["name"], "exec");
+    assert_eq!(
+        translated.request.tools[1].body["function"]["name"],
+        "collaboration.spawn_agent"
+    );
+    assert_eq!(
+        translated.request.conversation_id.as_deref(),
+        Some("thread-123")
+    );
+    assert_eq!(translated.tool_names["exec"].name, "exec");
+    assert_eq!(
+        translated.tool_names["collaboration.spawn_agent"]
+            .namespace
+            .as_deref(),
+        Some("collaboration")
+    );
+    let payload = openai_to_kiro(
+        &translated.request,
+        &TranslationOptions::new("gpt-5.6-sol", "AI_EDITOR"),
+    );
+    let custom = payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .user_input_message_context
+        .as_ref()
+        .unwrap()
+        .tools
+        .iter()
+        .filter_map(|tool| tool.specification())
+        .find(|tool| tool.name == "exec")
+        .unwrap();
+    assert!(custom.description.contains("Input format (lark grammar)"));
+    assert!(custom.description.contains("start: /.+/"));
+    assert_eq!(custom.input_schema.json["additionalProperties"], false);
+}
+
+#[test]
+fn duplicate_tool_channels_are_coalesced_but_conflicts_are_rejected() {
+    let tool = json!({
+        "type":"function","name":"read_file","parameters":{"type":"object"}
+    });
+    let translated = normalize(json!({
+        "model":"test",
+        "input":[
+            {"type":"additional_tools","tools":[tool.clone()]},
+            {"role":"user","content":"Read it."}
+        ],
+        "tools":[tool]
+    }));
+    assert_eq!(translated.tools.len(), 1);
+    assert_eq!(translated.request.tools.len(), 1);
+
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model":"test",
+        "input":[
+            {"type":"additional_tools","tools":[
+                {"type":"function","name":"read_file","description":"different"}
+            ]},
+            {"role":"user","content":"Read it."}
+        ],
+        "tools":[{"type":"function","name":"read_file"}]
+    }))
+    .unwrap();
+    assert!(responses_to_openai(&request).is_err());
+
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model":"test","input":"Read it.","tools":[tool.clone(),tool]
+    }))
+    .unwrap();
+    assert!(responses_to_openai(&request).is_err());
+}
+
+#[test]
+fn malformed_additional_tools_are_rejected_as_known_controls() {
+    for item in [
+        json!({"type":"additional_tools"}),
+        json!({"type":"additional_tools","tools":{}}),
+    ] {
+        let request: ResponsesRequest = serde_json::from_value(json!({
+            "model":"test","input":[item,{"role":"user","content":"hello"}]
+        }))
+        .unwrap();
+        assert!(responses_to_openai(&request).is_err());
+    }
+}
+
+#[test]
 fn stateless_tool_roundtrip_keeps_call_ids_inputs_reasoning_and_results() {
     let translated = normalize(json!({
         "model":"claude-sonnet-4.5", "input":[
@@ -269,6 +378,30 @@ fn allowed_tools_uses_the_responses_shape_and_limits_the_kiro_payload() {
     assert_eq!(tools.len(), 2);
     assert_eq!(tools[0].specification().unwrap().name, "read_file");
     assert_eq!(tools[1].specification().unwrap().name, "apply_patch");
+}
+
+#[test]
+fn object_shorthand_tool_choices_match_their_string_forms() {
+    for choice in ["auto", "none", "required"] {
+        let translated = normalize(json!({
+            "model":"test","input":"Inspect the project.",
+            "tools":[{"type":"function","name":"read_file"}],
+            "tool_choice":{"type":choice}
+        }));
+        assert_eq!(translated.request.tool_choice, Some(json!(choice)));
+        let payload = openai_to_kiro(
+            &translated.request,
+            &TranslationOptions::new("test", "AI_EDITOR"),
+        );
+        let tool_count = payload
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .as_ref()
+            .map_or(0, |context| context.tools.len());
+        assert_eq!(tool_count, usize::from(choice != "none"));
+    }
 }
 
 #[test]

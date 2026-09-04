@@ -185,13 +185,16 @@ async fn responses_tool_roundtrip_works_through_both_aliases_and_buffer_modes() 
         for stream in [false, true] {
             for endpoint in ["/v1/responses", "/responses"] {
                 let initial_input = json!({"role":"user","content":[{"type":"input_text","text":"Inspect the file."}]});
-                let mut request = json!({
-                    "model":"source-large","instructions":"Respect the repository rules.",
-                    "input":[initial_input.clone()],"stream":stream,"store":false,"max_output_tokens":512,
-                    "tools":[{"type":"namespace","name":"functions","tools":[
+                let additional_tools = json!({"type":"additional_tools","role":"developer","tools":[
+                    {"type":"namespace","name":"functions","tools":[
                         {"type":"function","name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}}}},
                         {"type":"custom","name":"apply_patch","format":{"type":"text"}}
-                    ]}]
+                    ]}
+                ]});
+                let mut request = json!({
+                    "model":"source-large","instructions":"Respect the repository rules.",
+                    "input":[additional_tools.clone(),initial_input.clone()],
+                    "stream":stream,"store":false,"max_output_tokens":512
                 });
                 let first = create_response(&client, &daemon, port, endpoint, &request).await;
                 assert_eq!(first["object"], "response");
@@ -200,6 +203,7 @@ async fn responses_tool_roundtrip_works_through_both_aliases_and_buffer_modes() 
                 assert_eq!(first["usage"]["input_tokens"], 100);
                 assert_eq!(first["usage"]["output_tokens"], 20);
                 assert!(first["id"].as_str().unwrap().starts_with("resp_"));
+                assert_eq!(first["tools"].as_array().map(Vec::len), Some(1));
                 let output = first["output"].as_array().unwrap();
                 let message = output
                     .iter()
@@ -225,7 +229,7 @@ async fn responses_tool_roundtrip_works_through_both_aliases_and_buffer_modes() 
                 assert_eq!(custom["namespace"], "functions");
                 assert_eq!(custom["input"], "*** Begin Patch\n*** End Patch");
 
-                let mut replay = vec![initial_input];
+                let mut replay = vec![additional_tools, initial_input];
                 replay.extend(output.iter().cloned());
                 replay.push(json!({"type":"function_call_output","call_id":"call_read","output":"README contents"}));
                 replay.push(json!({"type":"custom_tool_call_output","call_id":"call_patch","output":[{"type":"input_text","text":"Patch applied."}]}));

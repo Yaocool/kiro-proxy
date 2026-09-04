@@ -65,6 +65,7 @@ pub(crate) struct StoredResponsesSession {
 impl StoredResponsesSession {
     fn from_request(
         request: &ResponsesRequest,
+        tools: Vec<Value>,
         owner: ResponsesSessionOwner,
         conversation_id: Option<String>,
     ) -> Self {
@@ -72,7 +73,7 @@ impl StoredResponsesSession {
             owner,
             conversation_id,
             history: response_input_history(request),
-            tools: request.tools.clone().unwrap_or_default(),
+            tools,
             tool_choice: request.tool_choice.clone(),
             parallel_tool_calls: request.parallel_tool_calls,
             last_accessed: Instant::now(),
@@ -185,10 +186,14 @@ pub(crate) fn resume_responses_request(
     request: &mut ResponsesRequest,
     session: StoredResponsesSession,
 ) {
+    // An `additional_tools` item is the Responses Lite spelling of an
+    // explicitly supplied catalog, so it must prevent inheritance just like a
+    // present top-level `tools` field (including an empty catalog).
+    let declares_additional_tools = has_additional_tools(&request.input);
     let mut input = session.history;
     input.extend(response_input_items(&request.input));
     request.input = Value::Array(input);
-    let inherits_tools = request.tools.is_none();
+    let inherits_tools = request.tools.is_none() && !declares_additional_tools;
     if inherits_tools {
         request.tools = Some(session.tools);
     }
@@ -206,6 +211,17 @@ fn response_input_history(request: &ResponsesRequest) -> Vec<Value> {
     // request, so persisting it as a system message would make it impossible
     // to remove or swap.
     response_input_items(&request.input)
+        .into_iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) != Some("additional_tools"))
+        .collect()
+}
+
+fn has_additional_tools(input: &Value) -> bool {
+    input.as_array().is_some_and(|items| {
+        items
+            .iter()
+            .any(|item| item.get("type").and_then(Value::as_str) == Some("additional_tools"))
+    })
 }
 
 fn response_input_items(input: &Value) -> Vec<Value> {
@@ -228,6 +244,7 @@ pub(super) struct ResponsesOptions {
 impl ResponsesOptions {
     pub fn new(
         request: &ResponsesRequest,
+        tools: Vec<Value>,
         tool_names: HashMap<String, ResponsesToolName>,
         session: Option<(ResponsesSessionStore, ResponsesSessionOwner)>,
         inherited_conversation_id: Option<String>,
@@ -244,6 +261,7 @@ impl ResponsesOptions {
                     store,
                     StoredResponsesSession::from_request(
                         request,
+                        tools.clone(),
                         owner,
                         inherited_conversation_id.clone(),
                     ),
@@ -260,7 +278,7 @@ impl ResponsesOptions {
                 "max_output_tokens":request.max_output_tokens,
                 "parallel_tool_calls":request.parallel_tool_calls.unwrap_or(true),
                 "tool_choice":request.tool_choice.as_ref().unwrap_or(&json!("auto")),
-                "tools":request.tools.as_deref().unwrap_or(&[]), "reasoning":request.reasoning,
+                "tools":tools, "reasoning":request.reasoning,
                 "text":request.text.as_ref().map(|text| json!({
                     "format":text.format.as_ref().unwrap_or(&json!({"type":"text"})),
                     "verbosity":text.verbosity.as_deref().unwrap_or("medium")
