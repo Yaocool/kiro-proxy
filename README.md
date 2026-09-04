@@ -201,8 +201,8 @@ accept Claude Code; OpenAI routes (including models) accept Codex. The shared
 `server.enforce_user_agent_check = false` setting disables these User-Agent checks.
 API key authentication and each service's key allowlist still apply.
 
-Responses supports stateless Codex conversations, streaming, function/custom tools,
-namespaced tools, image inputs, and tool-result replay. Configure Codex with
+Responses stores Codex conversations by default and supports explicit `store: false` stateless
+requests, streaming, function/custom tools, namespaced tools, image inputs, and tool-result replay. Configure Codex with
 `wire_api = "responses"` and the service's `/v1` base URL. See
 [Responses compatibility and Codex setup](docs/openai-responses.md) for configuration,
 protocol coverage, and explicit unsupported controls.

@@ -4,6 +4,8 @@
 
 use std::collections::HashMap;
 use std::convert::Infallible;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::http::header;
@@ -20,25 +22,245 @@ pub(super) fn is_responses_path(path: &str) -> bool {
     matches!(path, "/v1/responses" | "/responses")
 }
 
+const RESPONSES_SESSION_TTL: Duration = Duration::from_secs(30 * 60);
+const MAX_RESPONSES_SESSIONS: usize = 256;
+const MAX_RESPONSES_SESSION_BYTES: usize = 2 * 1024 * 1024;
+const MAX_RESPONSES_SESSION_TOTAL_BYTES: usize = 32 * 1024 * 1024;
+const RESPONSES_STORE_FAILED: &str =
+    "unable to store response state within the configured in-memory limit";
+
+/// A stored Responses conversation is scoped to both the proxy service and
+/// authenticated API key. Response IDs are random, but scoping them prevents a
+/// caller on another service or credential from replaying a known ID.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ResponsesSessionOwner {
+    service_id: String,
+    api_key_id: Option<String>,
+}
+
+impl ResponsesSessionOwner {
+    pub(crate) fn new(service_id: String, api_key_id: Option<String>) -> Self {
+        Self {
+            service_id,
+            api_key_id,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StoredResponsesSession {
+    owner: ResponsesSessionOwner,
+    /// The final UUID sent to Kiro, not the client hint that produced it.
+    /// Persisting the resolved value keeps `previous_response_id` authoritative
+    /// even if a later request drops or changes its session-affinity header.
+    conversation_id: Option<String>,
+    history: Vec<Value>,
+    tools: Vec<Value>,
+    tool_choice: Option<Value>,
+    parallel_tool_calls: Option<bool>,
+    last_accessed: Instant,
+    stored_bytes: usize,
+}
+
+impl StoredResponsesSession {
+    fn from_request(
+        request: &ResponsesRequest,
+        owner: ResponsesSessionOwner,
+        conversation_id: Option<String>,
+    ) -> Self {
+        Self {
+            owner,
+            conversation_id,
+            history: response_input_history(request),
+            tools: request.tools.clone().unwrap_or_default(),
+            tool_choice: request.tool_choice.clone(),
+            parallel_tool_calls: request.parallel_tool_calls,
+            last_accessed: Instant::now(),
+            stored_bytes: 0,
+        }
+    }
+
+    pub(crate) fn conversation_id(&self) -> Option<&str> {
+        self.conversation_id.as_deref()
+    }
+
+    fn refresh_size(&mut self) -> bool {
+        let Ok(serialized) = serde_json::to_vec(&(
+            &self.conversation_id,
+            &self.history,
+            &self.tools,
+            &self.tool_choice,
+            self.parallel_tool_calls,
+        )) else {
+            return false;
+        };
+        self.stored_bytes = serialized.len();
+        self.stored_bytes <= MAX_RESPONSES_SESSION_BYTES
+    }
+}
+
+/// Small, process-local store for the stateful subset of the Responses API.
+/// It deliberately has no disk backing: prompts and tool results disappear on
+/// restart, instead of becoming a new durable-data surface for the proxy.
+#[derive(Clone, Default)]
+pub(crate) struct ResponsesSessionStore {
+    entries: Arc<Mutex<HashMap<String, StoredResponsesSession>>>,
+}
+
+impl ResponsesSessionStore {
+    pub(crate) fn get(
+        &self,
+        response_id: &str,
+        owner: &ResponsesSessionOwner,
+    ) -> Option<StoredResponsesSession> {
+        let now = Instant::now();
+        let mut entries = self.lock_entries();
+        Self::prune(&mut entries, now);
+        let session = entries.get_mut(response_id)?;
+        if &session.owner != owner {
+            return None;
+        }
+        session.last_accessed = now;
+        Some(session.clone())
+    }
+
+    fn insert(
+        &self,
+        response_id: &str,
+        mut session: StoredResponsesSession,
+        output: &[Value],
+    ) -> bool {
+        session.history.extend(output.iter().cloned());
+        session.last_accessed = Instant::now();
+        if !session.refresh_size() {
+            return false;
+        }
+        let mut entries = self.lock_entries();
+        Self::prune(&mut entries, session.last_accessed);
+        if let Some(replaced) = entries.remove(response_id) {
+            debug_assert!(replaced.stored_bytes <= MAX_RESPONSES_SESSION_TOTAL_BYTES);
+        }
+        let mut total_bytes = entries
+            .values()
+            .map(|entry| entry.stored_bytes)
+            .sum::<usize>();
+        while !entries.is_empty()
+            && (entries.len() >= MAX_RESPONSES_SESSIONS
+                || total_bytes.saturating_add(session.stored_bytes)
+                    > MAX_RESPONSES_SESSION_TOTAL_BYTES)
+        {
+            if let Some(oldest) = entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.last_accessed)
+                .map(|(id, _)| id.clone())
+            {
+                if let Some(removed) = entries.remove(&oldest) {
+                    total_bytes = total_bytes.saturating_sub(removed.stored_bytes);
+                }
+            }
+        }
+        if total_bytes.saturating_add(session.stored_bytes) > MAX_RESPONSES_SESSION_TOTAL_BYTES {
+            return false;
+        }
+        entries.insert(response_id.into(), session);
+        true
+    }
+
+    fn lock_entries(&self) -> std::sync::MutexGuard<'_, HashMap<String, StoredResponsesSession>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn prune(entries: &mut HashMap<String, StoredResponsesSession>, now: Instant) {
+        entries.retain(|_, session| {
+            now.saturating_duration_since(session.last_accessed) <= RESPONSES_SESSION_TTL
+        });
+    }
+}
+
+/// Merge a stored response history with a new stateful request. The translator
+/// then validates call/output pairing across the complete reconstructed input.
+pub(crate) fn resume_responses_request(
+    request: &mut ResponsesRequest,
+    session: StoredResponsesSession,
+) {
+    let mut input = session.history;
+    input.extend(response_input_items(&request.input));
+    request.input = Value::Array(input);
+    let inherits_tools = request.tools.is_none();
+    if inherits_tools {
+        request.tools = Some(session.tools);
+    }
+    if request.tool_choice.as_ref().is_none_or(Value::is_null) && inherits_tools {
+        request.tool_choice = session.tool_choice;
+    }
+    if request.parallel_tool_calls.is_none() {
+        request.parallel_tool_calls = session.parallel_tool_calls;
+    }
+}
+
+fn response_input_history(request: &ResponsesRequest) -> Vec<Value> {
+    // `instructions` deliberately does not become stored history. The
+    // Responses API lets a continuation replace instructions on its next
+    // request, so persisting it as a system message would make it impossible
+    // to remove or swap.
+    response_input_items(&request.input)
+}
+
+fn response_input_items(input: &Value) -> Vec<Value> {
+    match input {
+        Value::String(text) => {
+            vec![json!({"type":"message","role":"user","content":text})]
+        }
+        Value::Array(items) => items.clone(),
+        _ => Vec::new(),
+    }
+}
+
 pub(super) struct ResponsesOptions {
     template: Value,
     tool_names: HashMap<String, ResponsesToolName>,
+    session: Option<(ResponsesSessionStore, StoredResponsesSession)>,
+    inherited_conversation_id: Option<String>,
 }
 
 impl ResponsesOptions {
-    pub fn new(request: &ResponsesRequest, tool_names: HashMap<String, ResponsesToolName>) -> Self {
+    pub fn new(
+        request: &ResponsesRequest,
+        tool_names: HashMap<String, ResponsesToolName>,
+        session: Option<(ResponsesSessionStore, ResponsesSessionOwner)>,
+        inherited_conversation_id: Option<String>,
+    ) -> Self {
+        let response_id = format!("resp_{}", Uuid::new_v4().simple());
+        // Responses are stored by default. `store: false` is the explicit
+        // opt-out used by stateless and zero-retention clients.
+        let stores_session = request.store != Some(false) && session.is_some();
+        let session = stores_session
+            .then_some(session)
+            .flatten()
+            .map(|(store, owner)| {
+                (
+                    store,
+                    StoredResponsesSession::from_request(
+                        request,
+                        owner,
+                        inherited_conversation_id.clone(),
+                    ),
+                )
+            });
         Self {
             template: json!({
-                "id":format!("resp_{}", Uuid::new_v4().simple()),
+                "id":response_id,
                 "object":"response", "created_at":now_secs(),
                 "status":"in_progress", "error":null, "incomplete_details":null,
                 "model":request.model, "instructions":request.instructions,
-                "output":[], "usage":null, "store":false, "background":false,
-                "previous_response_id":null,
+                "output":[], "usage":null, "store":session.is_some(), "background":false,
+                "previous_response_id":request.previous_response_id,
                 "max_output_tokens":request.max_output_tokens,
                 "parallel_tool_calls":request.parallel_tool_calls.unwrap_or(true),
                 "tool_choice":request.tool_choice.as_ref().unwrap_or(&json!("auto")),
-                "tools":request.tools, "reasoning":request.reasoning,
+                "tools":request.tools.as_deref().unwrap_or(&[]), "reasoning":request.reasoning,
                 "text":request.text.as_ref().map(|text| json!({
                     "format":text.format.as_ref().unwrap_or(&json!({"type":"text"})),
                     "verbosity":text.verbosity.as_deref().unwrap_or("medium")
@@ -49,6 +271,8 @@ impl ResponsesOptions {
                 "metadata":request.metadata.as_ref().unwrap_or(&json!({}))
             }),
             tool_names,
+            session,
+            inherited_conversation_id,
         }
     }
 
@@ -56,8 +280,27 @@ impl ResponsesOptions {
         self.template["id"].as_str().expect("response id")
     }
 
+    pub(super) fn inherited_conversation_id(&self) -> Option<&str> {
+        self.inherited_conversation_id.as_deref()
+    }
+
+    /// A new stored chain uses its response ID only as an input to the stable
+    /// conversation-ID derivation. Continuations reuse the already-resolved ID.
+    pub(super) fn conversation_hint(&self) -> Option<&str> {
+        self.session.as_ref().map(|_| self.id())
+    }
+
+    pub(super) fn set_conversation_id(&mut self, conversation_id: Option<String>) {
+        if let Some((_, session)) = &mut self.session {
+            session.conversation_id = conversation_id;
+        }
+    }
+
     fn envelope(&self, output: Vec<Value>, status: &str, usage: Value, error: Value) -> Value {
         let mut response = self.template.clone();
+        if status == "failed" && self.session.is_some() {
+            response["store"] = json!(false);
+        }
         response["output"] = json!(output);
         response["status"] = json!(status);
         response["usage"] = usage;
@@ -66,6 +309,22 @@ impl ResponsesOptions {
             response["incomplete_details"] = json!({"reason":"max_output_tokens"});
         }
         response
+    }
+
+    fn finalize(
+        &self,
+        output: Vec<Value>,
+        status: &str,
+        usage: Value,
+    ) -> Result<Value, &'static str> {
+        if let Some((store, session)) = &self.session {
+            if session.conversation_id.is_none()
+                || !store.insert(self.id(), session.clone(), &output)
+            {
+                return Err(RESPONSES_STORE_FAILED);
+            }
+        }
+        Ok(self.envelope(output, status, usage, Value::Null))
     }
 
     fn tool(&self, call: &Value) -> ItemContent {
@@ -88,7 +347,7 @@ impl ResponsesOptions {
     }
 }
 
-pub(super) fn json_response(chat: Value, options: ResponsesOptions) -> Value {
+pub(super) fn json_response(chat: Value, options: ResponsesOptions) -> Result<Value, &'static str> {
     let message = &chat["choices"][0]["message"];
     let mut output = Vec::new();
     if let Some(text) = message["reasoning_content"]
@@ -122,7 +381,7 @@ pub(super) fn json_response(chat: Value, options: ResponsesOptions) -> Value {
             }
         }
     }
-    options.envelope(output, status, usage(&chat["usage"]), Value::Null)
+    options.finalize(output, status, usage(&chat["usage"]))
 }
 
 enum ItemContent {
@@ -452,17 +711,27 @@ impl ResponsesStream {
             let index = self.add(ItemContent::Message(String::new()), &mut events);
             events.push(self.event(json!({"type":"response.content_part.added","item_id":self.items[index].id,"output_index":index,"content_index":0,"part":text_part("")})));
         }
-        for index in 0..self.items.len() {
-            self.close(index, status, &mut events);
-        }
         let output = self
             .items
             .iter()
-            .map(|item| item.json(item.status))
+            .map(|item| {
+                item.json(if item.status == "in_progress" {
+                    status
+                } else {
+                    item.status
+                })
+            })
             .collect();
-        let response = self
-            .options
-            .envelope(output, status, self.usage.clone(), Value::Null);
+        let response = match self.options.finalize(output, status, self.usage.clone()) {
+            Ok(response) => response,
+            Err(message) => {
+                events.extend(self.fail("response_store_failed", message));
+                return events;
+            }
+        };
+        for index in 0..self.items.len() {
+            self.close(index, status, &mut events);
+        }
         events.push(self.event(json!({"type":if status == "incomplete" { "response.incomplete" } else { "response.completed" },"response":response})));
         self.terminal = true;
         events

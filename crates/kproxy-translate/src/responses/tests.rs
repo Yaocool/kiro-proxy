@@ -274,9 +274,7 @@ fn allowed_tools_uses_the_responses_shape_and_limits_the_kiro_payload() {
 #[test]
 fn unsupported_execution_controls_are_rejected_explicitly() {
     for (field, value) in [
-        ("store", json!(true)),
         ("background", json!(true)),
-        ("previous_response_id", json!("resp_unknown")),
         ("conversation", json!("conv_unknown")),
         ("truncation", json!("auto")),
         ("max_output_tokens", json!(0)),

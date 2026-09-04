@@ -156,9 +156,10 @@ fn responses_accepts_replayed_reasoning_and_unsupported_input_items() {
 }
 
 /// Relaxing additive fields must not weaken the checks that keep a Kiro payload
-/// well-formed.
+/// well-formed. Stateful controls are accepted here and resolved after
+/// authentication by the HTTP layer.
 #[test]
-fn responses_still_rejects_malformed_history_and_stateful_controls() {
+fn responses_still_rejects_malformed_history_and_unimplemented_controls() {
     for (label, body) in [
         (
             "tool output without a matching call",
@@ -171,14 +172,6 @@ fn responses_still_rejects_malformed_history_and_stateful_controls() {
             json!({"model":"claude-haiku-4.5","input":[
                 {"type":"message","role":"user","content":"hi"},
                 {"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}]}),
-        ),
-        (
-            "stateful store=true",
-            json!({"model":"claude-haiku-4.5","input":"hi","store":true}),
-        ),
-        (
-            "stateful previous_response_id",
-            json!({"model":"claude-haiku-4.5","input":"hi","previous_response_id":"resp_1"}),
         ),
         (
             "server-side truncation",
@@ -195,5 +188,17 @@ fn responses_still_rejects_malformed_history_and_stateful_controls() {
             responses_to_openai(&request).is_err(),
             "{label} must still be rejected"
         );
+    }
+}
+
+#[test]
+fn responses_accepts_stateful_controls_for_authenticated_http_handling() {
+    for body in [
+        json!({"model":"claude-haiku-4.5","input":"hi","store":true}),
+        json!({"model":"claude-haiku-4.5","input":"hi","previous_response_id":"resp_1"}),
+    ] {
+        let request: ResponsesRequest =
+            serde_json::from_value(body).expect("request should deserialize");
+        responses_to_openai(&request).expect("HTTP layer resolves stateful controls");
     }
 }

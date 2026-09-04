@@ -12,7 +12,164 @@ fn options() -> ResponsesOptions {
     }))
     .unwrap();
     let translated = responses_to_openai(&request).unwrap();
-    ResponsesOptions::new(&request, translated.tool_names)
+    ResponsesOptions::new(&request, translated.tool_names, None, None)
+}
+
+fn stored_options(
+    input: String,
+    store_control: Option<bool>,
+) -> (
+    ResponsesOptions,
+    ResponsesSessionStore,
+    ResponsesSessionOwner,
+) {
+    let mut body = json!({
+        "model":"claude-sonnet-4.5",
+        "input":input
+    });
+    if let Some(store) = store_control {
+        body["store"] = json!(store);
+    }
+    let request: ResponsesRequest = serde_json::from_value(body).unwrap();
+    let translated = responses_to_openai(&request).unwrap();
+    let owner = ResponsesSessionOwner::new("service-a".into(), Some("key-a".into()));
+    let store = ResponsesSessionStore::default();
+    let mut options = ResponsesOptions::new(
+        &request,
+        translated.tool_names,
+        Some((store.clone(), owner.clone())),
+        None,
+    );
+    options.set_conversation_id(Some("resolved-conversation-id".into()));
+    (options, store, owner)
+}
+
+fn completed_chat(text: &str) -> Value {
+    json!({
+        "choices":[{"finish_reason":"stop","message":{"content":text}}],
+        "usage":usage_chunk()["usage"]
+    })
+}
+
+#[test]
+fn stored_sessions_are_credential_scoped_and_do_not_replay_old_instructions() {
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model":"claude-sonnet-4.5",
+        "instructions":"Old instructions must not persist.",
+        "input":"Read the file.",
+        "store":true,
+        "parallel_tool_calls":false,
+        "tools":[{"type":"function","name":"read_file","parameters":{"type":"object"}}],
+        "tool_choice":{"type":"function","name":"read_file"}
+    }))
+    .unwrap();
+    let owner = ResponsesSessionOwner::new("service-a".into(), Some("key-a".into()));
+    let store = ResponsesSessionStore::default();
+    assert!(store.insert(
+        "resp_1",
+        StoredResponsesSession::from_request(
+            &request,
+            owner.clone(),
+            Some("response-affinity".into()),
+        ),
+        &[json!({
+            "type":"function_call","call_id":"call_read","name":"read_file","arguments":"{}"
+        })],
+    ));
+    assert!(store
+        .get(
+            "resp_1",
+            &ResponsesSessionOwner::new("service-a".into(), Some("other-key".into())),
+        )
+        .is_none());
+    assert!(store
+        .get(
+            "resp_1",
+            &ResponsesSessionOwner::new("service-b".into(), Some("key-a".into())),
+        )
+        .is_none());
+
+    let mut continuation: ResponsesRequest = serde_json::from_value(json!({
+        "model":"claude-sonnet-4.5",
+        "instructions":"Replacement instructions.",
+        "previous_response_id":"resp_1",
+        "input":[{
+            "type":"function_call_output","call_id":"call_read","output":"README contents"
+        }]
+    }))
+    .unwrap();
+    let session = store.get("resp_1", &owner).expect("owned session");
+    resume_responses_request(&mut continuation, session);
+
+    assert_eq!(continuation.input[0]["role"], "user");
+    assert_eq!(continuation.input[0]["content"], "Read the file.");
+    assert_eq!(continuation.input[1]["type"], "function_call");
+    assert_eq!(continuation.input[2]["type"], "function_call_output");
+    assert_eq!(continuation.tools.as_ref().unwrap().len(), 1);
+    assert_eq!(continuation.parallel_tool_calls, Some(false));
+    assert_eq!(
+        continuation.tool_choice,
+        Some(json!({"type":"function","name":"read_file"}))
+    );
+
+    let translated = responses_to_openai(&continuation).expect("combined tool roundtrip");
+    assert_eq!(
+        translated.request.messages[0].content,
+        Some(json!("Replacement instructions."))
+    );
+    assert!(!translated
+        .request
+        .messages
+        .iter()
+        .any(|message| message.content == Some(json!("Old instructions must not persist."))));
+}
+
+#[test]
+fn responses_store_by_default_and_explicit_false_opts_out() {
+    let (default_options, store, owner) = stored_options("hello".into(), None);
+    let response_id = default_options.id().to_owned();
+    let response = json_response(completed_chat("stored"), default_options)
+        .expect("default response should be stored");
+    assert_eq!(response["store"], true);
+    let session = store
+        .get(&response_id, &owner)
+        .expect("default response session");
+    assert_eq!(session.conversation_id(), Some("resolved-conversation-id"));
+
+    let (stateless_options, store, owner) = stored_options("hello".into(), Some(false));
+    let response_id = stateless_options.id().to_owned();
+    let response = json_response(completed_chat("not stored"), stateless_options)
+        .expect("stateless response should still complete");
+    assert_eq!(response["store"], false);
+    assert!(store.get(&response_id, &owner).is_none());
+}
+
+#[test]
+fn storage_overflow_fails_instead_of_completing_an_unstored_response() {
+    let oversized = "x".repeat(MAX_RESPONSES_SESSION_BYTES + 1);
+    let (options, _, _) = stored_options(oversized.clone(), Some(true));
+    assert_eq!(
+        json_response(completed_chat("too large"), options),
+        Err(RESPONSES_STORE_FAILED)
+    );
+
+    let (options, _, _) = stored_options(oversized, Some(true));
+    let mut stream = ResponsesStream::new(options);
+    let mut frames = stream.start();
+    frames.extend(stream.chunk(chunk(json!({"content":"too large"}))));
+    frames.extend(stream.chunk(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})));
+    frames.extend(stream.chunk(usage_chunk()));
+    frames.extend(stream.finish());
+    let events = events(&frames);
+    assert_eq!(events[0]["response"]["store"], true);
+    let failed = events.last().unwrap();
+    assert_eq!(failed["type"], "response.failed");
+    assert_eq!(failed["response"]["store"], false);
+    assert_eq!(failed["response"]["error"]["code"], "response_store_failed");
+    assert!(!events.iter().any(|event| matches!(
+        event["type"].as_str(),
+        Some("response.completed" | "response.incomplete")
+    )));
 }
 
 fn chunk(delta: Value) -> Value {
@@ -128,7 +285,7 @@ fn nonstream_response_preserves_text_alongside_tools_and_reasoning() {
             {"id":"call_1","type":"function","function":{"name":"functions.read_file","arguments":"{}"}},
             {"id":"call_2","type":"custom","custom":{"name":"functions.apply_patch","input":"a patch"}}
         ]}}],"usage":usage_chunk()["usage"]});
-    let response = json_response(chat, options());
+    let response = json_response(chat, options()).expect("response should be encoded");
     let output = response["output"].as_array().unwrap();
     assert_eq!(output.len(), 4);
     assert_eq!(output[1]["content"][0]["text"], "Checking.");
@@ -159,7 +316,8 @@ fn output_limit_is_incomplete_in_both_modes() {
     let response = json_response(
         json!({"choices":[{"finish_reason":"length","message":{"content":"partial"}}],"usage":usage_chunk()["usage"]}),
         options(),
-    );
+    )
+    .expect("response should be encoded");
     assert_eq!(response["status"], "incomplete");
     assert_eq!(response["output"][0]["status"], "incomplete");
 }

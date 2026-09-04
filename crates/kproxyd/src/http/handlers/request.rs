@@ -21,7 +21,10 @@ use super::{
 use futures::TryStreamExt;
 use kproxy_translate::{responses_to_openai, ResponsesRequest};
 
-use super::super::responses::{is_responses_path, stream_response, ResponsesOptions};
+use super::super::responses::{
+    is_responses_path, resume_responses_request, stream_response, ResponsesOptions,
+    ResponsesSessionOwner,
+};
 
 pub(super) async fn handle_claude(
     service: ServiceHttpState,
@@ -863,14 +866,40 @@ pub(super) async fn handle_openai(
         api_key_id = key_id.as_deref().unwrap_or("anonymous"),
         "client authentication completed"
     );
-    let (mut request, responses_options) = if is_responses_path(&path) {
-        let responses: ResponsesRequest = serde_json::from_slice(&body).map_err(|error| {
+    let (mut request, mut responses_options) = if is_responses_path(&path) {
+        let mut responses: ResponsesRequest = serde_json::from_slice(&body).map_err(|error| {
             ApiError::new(
                 StatusCode::BAD_REQUEST,
                 format!("Invalid Responses request: {error}"),
                 ErrorFormat::OpenAi,
             )
         })?;
+        let session_owner = ResponsesSessionOwner::new(service.service.id.clone(), key_id.clone());
+        let mut inherited_conversation_id = None;
+        if let Some(previous_response_id) = responses.previous_response_id.clone() {
+            let session = state
+                .responses_sessions
+                .get(&previous_response_id, &session_owner)
+                .ok_or_else(|| {
+                    ApiError::new(
+                        StatusCode::BAD_REQUEST,
+                        "unknown or expired previous_response_id",
+                        ErrorFormat::OpenAi,
+                    )
+                })?;
+            inherited_conversation_id = Some(
+                session
+                    .conversation_id()
+                    .ok_or_else(|| {
+                        ApiError::response_assembly(
+                            "stored response is missing its upstream conversation state",
+                            ErrorFormat::OpenAi,
+                        )
+                    })?
+                    .to_owned(),
+            );
+            resume_responses_request(&mut responses, session);
+        }
         let translated = responses_to_openai(&responses).map_err(|error| {
             ApiError::new(
                 StatusCode::BAD_REQUEST,
@@ -878,7 +907,12 @@ pub(super) async fn handle_openai(
                 ErrorFormat::OpenAi,
             )
         })?;
-        let options = ResponsesOptions::new(&responses, translated.tool_names);
+        let options = ResponsesOptions::new(
+            &responses,
+            translated.tool_names,
+            Some((state.responses_sessions.clone(), session_owner)),
+            inherited_conversation_id,
+        );
         (translated.request, Some(options))
     } else {
         let request: OpenAiRequest = serde_json::from_slice(&body).map_err(|_| {
@@ -929,14 +963,28 @@ pub(super) async fn handle_openai(
     let mut options = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
     options.enhance_system_prompt = config.features.enhance_system_prompt;
     options.enable_prompt_cache = config.features.enable_prompt_cache;
+    let inherited_responses_conversation_id = responses_options
+        .as_ref()
+        .and_then(|options| options.inherited_conversation_id())
+        .map(str::to_owned);
     let conversation_fingerprint = super::conversation_fingerprint(&request.messages);
-    options.conversation_id = super::stable_conversation_id(
-        &headers,
-        key_id.as_deref(),
-        request.conversation_id.as_deref(),
-        super::metadata_conversation_hint(request.metadata.as_ref())
-            .or(conversation_fingerprint.as_deref()),
-    );
+    options.conversation_id = inherited_responses_conversation_id.or_else(|| {
+        super::stable_conversation_id(
+            &headers,
+            key_id.as_deref(),
+            request.conversation_id.as_deref(),
+            super::metadata_conversation_hint(request.metadata.as_ref())
+                .or_else(|| {
+                    responses_options
+                        .as_ref()
+                        .and_then(|options| options.conversation_hint())
+                })
+                .or(conversation_fingerprint.as_deref()),
+        )
+    });
+    if let Some(responses_options) = responses_options.as_mut() {
+        responses_options.set_conversation_id(options.conversation_id.clone());
+    }
     options.additional_model_request_fields_schema = state
         .resolved_model_info(&route.mapped)
         .and_then(|model| model.additional_model_request_fields_schema);

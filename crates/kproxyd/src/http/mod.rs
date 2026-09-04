@@ -4,7 +4,7 @@ mod handlers;
 pub(crate) use handlers::fallback_models;
 pub(crate) mod prompt_cache;
 mod response;
-mod responses;
+pub(crate) mod responses;
 pub(crate) mod stream;
 mod usage;
 
@@ -1153,10 +1153,12 @@ mod tests {
                 .header(header::USER_AGENT, "codex_cli_rs/0.147.0")
                 .body(Body::from(r#"{"model":"test","input":"hello","previous_response_id":"resp_unknown"}"#)).unwrap()).await.unwrap();
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-            assert!(body_json(response).await["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("previous_response_id"));
+            let error = body_json(response).await;
+            assert_eq!(error["error"]["type"], "invalid_request_error");
+            assert_eq!(
+                error["error"]["message"],
+                "unknown or expired previous_response_id"
+            );
         }
     }
 

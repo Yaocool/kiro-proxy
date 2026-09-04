@@ -97,7 +97,7 @@ kproxyd / kproxy ← 二进制，聚合以上全部
 
 ### 服务端工具的本地执行
 
-Responses 的入站转换位于 `kproxy-translate/src/responses.rs`，复用 OpenAI 请求执行链；出站 JSON/SSE 编码位于 `kproxyd/src/http/responses.rs`。该端点为无状态模式，客户端传完整历史，`store=true`、`previous_response_id` 等有状态控制明确拒绝。协议支持范围见 `docs/openai-responses.md`。默认客户端准入按协议分流：Claude 仅限 Claude Code，OpenAI（含 Responses、Chat Completions、模型列表）仅限 Codex，统一受 `server.enforce_user_agent_check` 控制。
+Responses 的入站转换位于 `kproxy-translate/src/responses.rs`，复用 OpenAI 请求执行链；出站 JSON/SSE 编码位于 `kproxyd/src/http/responses.rs`。该端点按 Responses 语义默认存储、`store=false` 时客户端需传完整历史；`previous_response_id` 使用受限、按 service/API key 隔离的进程内续轮，托管工具等仍明确拒绝。协议支持范围见 `docs/openai-responses.md`。默认客户端准入按协议分流：Claude 仅限 Claude Code，OpenAI（含 Responses、Chat Completions、模型列表）仅限 Codex，统一受 `server.enforce_user_agent_check` 控制。
 
 Kiro 没有原生 Tool Search / Web Search server tool，代理在本地补齐并**续接同一次模型回合**：
 
