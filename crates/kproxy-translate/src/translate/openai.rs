@@ -13,6 +13,21 @@ use super::common::{
 use super::{TranslationOptions, SYSTEM_PROMPT_ACKNOWLEDGEMENT};
 
 pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> KiroPayload {
+    super::common::log_ignored_controls(
+        "openai",
+        &[
+            ("response_format", request.response_format.is_some()),
+            (
+                "tools.strict",
+                request.tools.iter().any(|tool| {
+                    tool.body
+                        .get(&tool.r#type)
+                        .and_then(|definition| definition.get("strict"))
+                        == Some(&Value::Bool(true))
+                }),
+            ),
+        ],
+    );
     if request.max_completion_tokens.is_some() {
         tracing::debug!(
             field = "max_completion_tokens",

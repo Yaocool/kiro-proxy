@@ -53,8 +53,8 @@ pub struct ClaudeRequest {
     pub conversation_id: Option<String>,
     #[serde(default)]
     pub context_management: Option<Value>,
-    /// Unknown top-level controls must remain visible to validation. Silently
-    /// dropping a future execution or safety field can change request meaning.
+    /// Additive client controls are accepted for reference-gateway compatibility
+    /// and are not automatically forwarded to Kiro.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -94,8 +94,7 @@ pub struct ClaudeTool {
     /// values instead of silently weakening the contract.
     #[serde(default)]
     pub allowed_callers: Option<Vec<String>>,
-    /// Fine-grained tool-input streaming is an execution guarantee, not a
-    /// schema hint, so it must be validated explicitly.
+    /// Accepted as a compatibility hint; Kiro's stream behavior is unchanged.
     #[serde(default)]
     pub eager_input_streaming: Option<bool>,
     /// Server-side web search controls.
@@ -109,9 +108,7 @@ pub struct ClaudeTool {
     pub user_location: Option<Value>,
     #[serde(default)]
     pub response_inclusion: Option<String>,
-    /// Keep unknown tool-level fields visible to validation. Silently dropping
-    /// a future caller, execution, or safety control could weaken the contract
-    /// the client asked Anthropic to enforce.
+    /// Extra tool hints are accepted but do not enter the Kiro tool definition.
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -145,7 +142,6 @@ pub struct ClaudeOutputConfig {
 
 /// OpenAI Chat Completions request.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OpenAiRequest {
     pub model: String,
     pub messages: Vec<OpenAiMessage>,

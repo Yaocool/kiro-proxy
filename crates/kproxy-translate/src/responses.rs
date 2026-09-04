@@ -13,7 +13,6 @@ use crate::{
 };
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ResponsesRequest {
     pub model: String,
     pub input: Value,
@@ -50,7 +49,6 @@ pub struct ResponsesRequest {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ResponsesReasoning {
     pub effort: Option<String>,
     pub summary: Option<String>,
@@ -58,7 +56,6 @@ pub struct ResponsesReasoning {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct ResponsesText {
     pub format: Option<Value>,
     pub verbosity: Option<String>,
@@ -90,6 +87,32 @@ pub fn responses_to_openai(
     request: &ResponsesRequest,
 ) -> Result<ResponsesTranslation, ValidationError> {
     validate_controls(request)?;
+    crate::translate::common::log_ignored_controls(
+        "responses",
+        &[
+            ("service_tier", request.service_tier.is_some()),
+            (
+                "prompt_cache_retention",
+                request.prompt_cache_retention.is_some(),
+            ),
+            ("include", !request.include.is_empty()),
+            ("stream_options", request.stream_options.is_some()),
+            (
+                "reasoning.summary",
+                request
+                    .reasoning
+                    .as_ref()
+                    .is_some_and(|value| value.summary.is_some()),
+            ),
+            (
+                "reasoning.context",
+                request
+                    .reasoning
+                    .as_ref()
+                    .is_some_and(|value| value.context.is_some()),
+            ),
+        ],
+    );
     let mut messages = Vec::new();
     if let Some(instructions) = &request.instructions {
         messages.push(message("system", Some(json!(instructions))));
@@ -103,9 +126,11 @@ pub fn responses_to_openai(
             "low" => "Keep the final response concise.",
             "medium" => "Use a moderate level of detail in the final response.",
             "high" => "Provide a detailed final response.",
-            _ => return invalid("text.verbosity", "expected low, medium, or high"),
+            _ => "",
         };
-        messages.push(message("system", Some(json!(instruction))));
+        if !instruction.is_empty() {
+            messages.push(message("system", Some(json!(instruction))));
+        }
     }
     match &request.input {
         Value::String(text) => messages.push(message("user", Some(json!(text)))),
@@ -124,9 +149,16 @@ pub fn responses_to_openai(
                     "message" => {
                         let role = required_string(item, "role", &field)?;
                         if !matches!(role, "system" | "developer" | "user" | "assistant") {
-                            return invalid(format!("{field}.role"), "expected system, developer, user, or assistant");
+                            return invalid(
+                                format!("{field}.role"),
+                                "expected system, developer, user, or assistant",
+                            );
                         }
-                        let content = content(item.get("content"), &format!("{field}.content"), role == "user")?;
+                        let content = content(
+                            item.get("content"),
+                            &format!("{field}.content"),
+                            role == "user",
+                        )?;
                         messages.push(message(role, Some(content)));
                     }
                     "function_call" | "custom_tool_call" => {
@@ -136,7 +168,11 @@ pub fn responses_to_openai(
                         }
                         pending.insert(id.to_owned(), kind);
                         let name = qualified_name(item, &field)?;
-                        let (tool_type, key) = if kind == "function_call" { ("function", "arguments") } else { ("custom", "input") };
+                        let (tool_type, key) = if kind == "function_call" {
+                            ("function", "arguments")
+                        } else {
+                            ("custom", "input")
+                        };
                         let input = string(item, key, &field)?;
                         let mut assistant = message("assistant", None);
                         assistant.tool_calls.push(json!({
@@ -146,7 +182,11 @@ pub fn responses_to_openai(
                     }
                     "function_call_output" | "custom_tool_call_output" => {
                         let id = required_string(item, "call_id", &field)?;
-                        let expected = if kind == "function_call_output" { "function_call" } else { "custom_tool_call" };
+                        let expected = if kind == "function_call_output" {
+                            "function_call"
+                        } else {
+                            "custom_tool_call"
+                        };
                         if pending.remove(id) != Some(expected) {
                             return invalid(format!("{field}.call_id"), "tool output must match an earlier, unanswered call in input; send the complete history");
                         }
@@ -156,8 +196,14 @@ pub fn responses_to_openai(
                         messages.push(result);
                     }
                     "reasoning" => {
-                        if item.get("encrypted_content").is_some_and(|v| !v.is_null() && v.as_str() != Some("")) {
-                            return invalid(format!("{field}.encrypted_content"), "opaque OpenAI reasoning cannot be replayed by Kiro; send plaintext history");
+                        if item
+                            .get("encrypted_content")
+                            .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
+                        {
+                            return invalid(
+                                format!("{field}.encrypted_content"),
+                                "opaque OpenAI reasoning cannot be replayed by Kiro; send plaintext history",
+                            );
                         }
                         let mut reasoning = Vec::new();
                         for key in ["summary", "content"] {
@@ -167,8 +213,14 @@ pub fn responses_to_openai(
                                 };
                                 for (part_index, part) in parts.iter().enumerate() {
                                     let part_field = format!("{field}.{key}.{part_index}");
-                                    if !matches!(part.get("type").and_then(Value::as_str), Some("summary_text" | "reasoning_text" | "text")) {
-                                        return invalid(part_field, "expected a plaintext reasoning part");
+                                    if !matches!(
+                                        part.get("type").and_then(Value::as_str),
+                                        Some("summary_text" | "reasoning_text" | "text")
+                                    ) {
+                                        return invalid(
+                                            part_field,
+                                            "expected a plaintext reasoning part",
+                                        );
                                     }
                                     reasoning.push(string(part, "text", &part_field)?.to_owned());
                                 }
@@ -178,11 +230,20 @@ pub fn responses_to_openai(
                             // Kiro has no Responses reasoning-history item.
                             // Preserve the supplied plaintext summary explicitly
                             // without changing Chat Completions history policy.
-                            let assistant = message("assistant", Some(json!(format!("Reasoning summary:\n{}", reasoning.join("\n")))));
+                            let assistant = message(
+                                "assistant",
+                                Some(json!(format!(
+                                    "Reasoning summary:\n{}",
+                                    reasoning.join("\n")
+                                ))),
+                            );
                             messages.push(assistant);
                         }
                     }
-                    _ => return invalid(format!("{field}.type"), "unsupported Responses input item; send messages and function/custom tool calls with their outputs"),
+                    _ => return invalid(
+                        format!("{field}.type"),
+                        "unsupported Responses input item; send messages and function/custom tool calls with their outputs",
+                    ),
                 }
             }
             if !pending.is_empty() {
@@ -308,50 +369,12 @@ fn validate_controls(request: &ResponsesRequest) -> Result<(), ValidationError> 
             "only disabled is supported; compact the history on the client",
         );
     }
-    if request.service_tier.as_deref().is_some_and(|v| v != "auto") {
-        return invalid(
-            "service_tier",
-            "only auto is supported by the Kiro upstream",
-        );
-    }
-    if request
-        .prompt_cache_retention
-        .as_deref()
-        .is_some_and(|v| !matches!(v, "in_memory" | "in-memory"))
-    {
-        return invalid("prompt_cache_retention", "only in_memory is supported");
-    }
-    if let Some(reasoning) = &request.reasoning {
-        if reasoning
-            .summary
-            .as_deref()
-            .is_some_and(|v| !matches!(v, "auto" | "concise" | "detailed"))
-        {
-            return invalid("reasoning.summary", "expected auto, concise, or detailed");
-        }
-        if reasoning.context.as_deref().is_some_and(|v| v != "auto") {
-            return invalid("reasoning.context", "only auto is supported");
-        }
-    }
-    for include in &request.include {
-        if include != "reasoning.encrypted_content" {
-            return invalid("include", "only reasoning.encrypted_content is accepted; Kiro returns plaintext reasoning without an encrypted replay token");
-        }
-    }
+    // Retention, include and reasoning presentation hints do not change the
+    // Kiro payload. Accept them like the reference gateways, without promising
+    // the originating API's service or output guarantees.
     if let Some(options) = &request.stream_options {
-        if !request.stream {
-            return invalid("stream_options", "is only valid when stream is true");
-        }
-        let Some(options) = options.as_object() else {
+        if !options.is_object() {
             return invalid("stream_options", "expected an object");
-        };
-        for (key, value) in options {
-            match key.as_str() {
-                "include_obfuscation" if value == false => {}
-                // Codex asks to finish each reasoning summary before the answer.
-                "reasoning_summary_delivery" if value == "sequential_cutoff" => {}
-                _ => return invalid(format!("stream_options.{key}"), "unsupported stream option"),
-            }
         }
     }
     Ok(())

@@ -311,8 +311,9 @@ required `x-amzn-kiro-profile-arn` header. When an imported account has no
 profile ARN, the proxy discovers it through `ListAvailableProfiles`, collapses
 concurrent discovery for the same token, and persists the result. Builder ID
 and Social accounts use Kiro's compatible fixed-profile fallback.
-Domain/location filters, code-execution callers, strict schemas, and eager
-streaming are rejected when Kiro cannot provide equivalent semantics. The
+Domain/location filters and code-execution callers still require compatible
+executor support. Strict and eager-streaming flags are accepted as ignored
+compatibility hints. The
 proxy-generated encrypted fields
 are explicitly proxy-owned and are not claimed to be interoperable with
 Anthropic's hosted-search ciphertext.
@@ -338,9 +339,15 @@ use local estimates, while `count_tokens` reports estimated input sizes before
 and after editing. Generation clears discarded history before fetching the
 remaining remote attachments.
 
+Compatibility follows the practical behavior of jwadow/kiro-gateway,
+hj01857655/kiro-account-manager, and chaogei/Kiro-account-manager rather than
+requiring exact Claude/OpenAI feature equivalence. Additive request/message/tool
+fields and format/strict hints do not cause an extra gateway rejection. See the
+[compatibility baseline](docs/compatibility-baseline.md) for pinned sources and scope.
+
 Adjacent same-role messages are merged. Assistant prefill, `max_tokens=0` cache
-warming, strict structured outputs, and Anthropic Files API `file_id` sources
-are rejected explicitly because Kiro cannot provide equivalent behavior.
+warming, and Anthropic Files API `file_id` sources remain outside the implemented
+generation/data-resolution paths and are still rejected.
 Protocol compatibility is resolved before
 the first upstream call, without a time-based rejection cache or field-removal
 probes. Cache markers contain only `type: default`; Claude cache TTL preferences
@@ -358,7 +365,10 @@ Generation controls use the explicit mapping in
 | Claude `top_k` | Accepted but omitted with a debug diagnostic, regardless of model metadata. This is a gateway compatibility policy, not a claim that Kiro universally rejects it. |
 | Claude `stop_sequences` | Enforced locally in streaming and non-streaming responses; no native `stopSequences` is sent. This does not guarantee a server-side generation/cost limit. |
 | Thinking / effort | Recognized effort metadata chooses `thinking: adaptive` + `output_config.effort`, or `reasoning.effort`. Missing, incomplete, or unrecognized metadata omits the entire `additionalModelRequestFields` field, never sending `{}`, `null`, or speculative adaptive thinking. |
-| Claude `output_config.effort` | Accepted/validated but ignored; it neither enables thinking nor overrides the budget-derived/default effort. |
+| Claude `output_config` | Accepted but ignored, including `format`, `effort`, and future keys. It neither enables thinking nor overrides the budget-derived/default effort. |
+| OpenAI `response_format` / Responses `text.format` | Accepted but omitted from Kiro input, matching the permissive reference behavior; no JSON/Schema guarantee or schema-driven retries are added. |
+| Tool `strict`, Claude `eager_input_streaming` | Accepted as hints; normal Kiro tool schemas and existing streaming behavior are retained. |
+| Service tier, additive fields, unused stream hints | Accepted without forwarding them as speculative Kiro fields. Used values such as `include_usage` retain type validation. |
 | OpenAI `reasoning_effort` | Takes precedence over `thinking.budget_tokens`; otherwise the default is high. Unsupported values select the last advertised effort, without sorting or nearest-rank matching. |
 | `thinking.display` | The output_config dialect always sends summarized; the reasoning dialect omits display. Without recognized metadata, the entire extension is omitted. Client display does not override these upstream shapes. |
 | `thinking.budget_tokens` | Maps directly to low (≤4000), medium (≤16000), high (≤64000), or xhigh; it is not an exact native thinking-token cap. |

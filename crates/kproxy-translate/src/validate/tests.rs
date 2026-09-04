@@ -187,7 +187,7 @@ fn rejects_a_single_oversized_tool_definition() {
 }
 
 #[test]
-fn rejects_strict_claude_tools_and_invalid_input_examples() {
+fn accepts_strict_claude_tools_but_rejects_invalid_input_examples() {
     let mut input = request();
     input.tools.push(ClaudeTool {
         r#type: Some("custom".into()),
@@ -208,19 +208,18 @@ fn rejects_strict_claude_tools_and_invalid_input_examples() {
         extra: Default::default(),
     });
     assert!(validate_claude(&input)
-        .expect_err("strict")
+        .expect_err("invalid input example")
         .to_string()
-        .contains("strict"));
+        .contains("input_examples"));
+    input.tools[0].input_examples = Some(vec![serde_json::json!({})]);
+    validate_claude(&input).expect("strict is an accepted compatibility hint");
 
     let mut server_tool = tool(1);
     server_tool.r#type = Some("web_search_20250305".into());
     server_tool.name = "web_search".into();
     server_tool.strict = Some(true);
     input.tools = vec![server_tool];
-    assert!(validate_claude(&input)
-        .expect_err("strict server tool")
-        .to_string()
-        .contains("strict"));
+    validate_claude(&input).expect("strict server tool hint does not block Kiro");
 }
 
 #[test]
@@ -656,7 +655,7 @@ fn rejects_unemulated_official_tool_execution_contracts_explicitly() {
 }
 
 #[test]
-fn rejects_unknown_tool_controls_instead_of_silently_dropping_them() {
+fn accepts_unknown_tool_hints_without_forwarding_them() {
     let input: ClaudeRequest = serde_json::from_value(serde_json::json!({
         "model":"claude-sonnet-4",
         "max_tokens":100,
@@ -665,14 +664,19 @@ fn rejects_unknown_tool_controls_instead_of_silently_dropping_them() {
             "name":"controlled_tool",
             "description":"test",
             "input_schema":{"type":"object"},
-            "future_execution_policy":"sandbox_only"
+            "future_tool_hint":"preferred"
         }]
     }))
     .expect("parse future tool control");
 
-    let error = validate_claude(&input).expect_err("unknown controls must be rejected");
-    assert!(error.to_string().contains("future_execution_policy"));
-    assert!(error.to_string().contains("cannot be safely ignored"));
+    validate_claude(&input).expect("additive hints match the reference gateways");
+    let payload = crate::claude_to_kiro(
+        &input,
+        &crate::TranslationOptions::new("claude-sonnet-4", "AI_EDITOR"),
+    );
+    assert!(!serde_json::to_string(&payload)
+        .unwrap()
+        .contains("future_tool_hint"));
 }
 
 #[test]

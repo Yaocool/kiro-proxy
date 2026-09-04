@@ -17,6 +17,36 @@ use super::tool_search::is_tool_search_tool;
 use super::{TranslationOptions, SYSTEM_PROMPT_ACKNOWLEDGEMENT};
 
 pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> KiroPayload {
+    super::common::log_ignored_controls(
+        "claude",
+        &[
+            ("output_config", request.output_config.is_some()),
+            ("service_tier", request.service_tier.is_some()),
+            ("extra_request_fields", !request.extra.is_empty()),
+            (
+                "extra_message_fields",
+                request
+                    .messages
+                    .iter()
+                    .any(|message| !message.extra.is_empty()),
+            ),
+            (
+                "extra_tool_fields",
+                request.tools.iter().any(|tool| !tool.extra.is_empty()),
+            ),
+            (
+                "tools.strict",
+                request.tools.iter().any(|tool| tool.strict == Some(true)),
+            ),
+            (
+                "tools.eager_input_streaming",
+                request
+                    .tools
+                    .iter()
+                    .any(|tool| tool.eager_input_streaming == Some(true)),
+            ),
+        ],
+    );
     let selected_tools = claude_loaded_tools(request);
     let completed_server_tool_ids = completed_server_tool_ids(request);
     let tool_names = ToolNameRegistry::new(request.tools.iter().map(|tool| tool.name.as_str()));
@@ -210,17 +240,6 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
         tracing::debug!(
             field = "top_k",
             "omitting client sampling field outside the Kiro gateway compatibility contract"
-        );
-    }
-    if request
-        .output_config
-        .as_ref()
-        .and_then(|config| config.effort.as_ref())
-        .is_some()
-    {
-        tracing::debug!(
-            field = "output_config.effort",
-            "ignoring Claude effort to match the reference Kiro adapter"
         );
     }
     // stop_sequences is enforced by the proxy's streaming/non-streaming
