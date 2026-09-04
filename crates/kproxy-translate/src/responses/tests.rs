@@ -226,6 +226,52 @@ fn in_memory_prompt_cache_retention_is_accepted() {
 }
 
 #[test]
+fn allowed_tools_uses_the_responses_shape_and_limits_the_kiro_payload() {
+    let translated = normalize(json!({
+        "model":"test","input":"Inspect the project.",
+        "tools":[
+            {"type":"function","name":"read_file","parameters":{"type":"object"}},
+            {"type":"function","name":"list_files","parameters":{"type":"object"}},
+            {"type":"custom","name":"apply_patch"}
+        ],
+        "tool_choice":{
+            "type":"allowed_tools","mode":"required","tools":[
+                {"type":"function","name":"read_file"},
+                {"type":"custom","name":"apply_patch"}
+            ]
+        }
+    }));
+    assert_eq!(
+        translated.request.tool_choice,
+        Some(json!({
+            "type":"allowed_tools",
+            "allowed_tools":{
+                "mode":"required",
+                "tools":[
+                    {"type":"function","function":{"name":"read_file"}},
+                    {"type":"custom","custom":{"name":"apply_patch"}}
+                ]
+            }
+        }))
+    );
+    let payload = openai_to_kiro(
+        &translated.request,
+        &TranslationOptions::new("test", "AI_EDITOR"),
+    );
+    let tools = &payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .user_input_message_context
+        .as_ref()
+        .unwrap()
+        .tools;
+    assert_eq!(tools.len(), 2);
+    assert_eq!(tools[0].specification().unwrap().name, "read_file");
+    assert_eq!(tools[1].specification().unwrap().name, "apply_patch");
+}
+
+#[test]
 fn unsupported_execution_controls_are_rejected_explicitly() {
     for (field, value) in [
         ("store", json!(true)),
