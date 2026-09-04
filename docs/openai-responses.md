@@ -56,6 +56,7 @@ API key 认证、服务级 key 白名单、额度和并发限制继续生效。
 | function、custom、namespace 工具 | 展平命名空间后复用名称规范化，返回时恢复 namespace 与名称；拒绝名称冲突 |
 | `tool_choice` | 支持 auto、none、required、指定 function/custom 工具，以及仅限 function/custom 的 `allowed_tools` |
 | `parallel_tool_calls` | 沿用 Chat Completions 的工具选择与提示约束 |
+| `store` / `previous_response_id` | 默认启用的受限进程内续轮；`store: false` 显式关闭，按服务与 API key 隔离，不写磁盘 |
 | `max_output_tokens` | 映射为 Kiro maxTokens；省略时不补默认生成上限 |
 | `temperature`、`top_p` | 复用现有参数校验和映射，保留零值 |
 | `reasoning.effort` | 复用现有 effort 映射；none 关闭本次推理 |
@@ -73,15 +74,28 @@ API key 认证、服务级 key 白名单、额度和并发限制继续生效。
 可选的 `stream`、`include`，以及 function 工具的 `description`、`parameters`、`strict`
 显式传 `null` 时按省略处理；`parameters: null` 使用无参数工具的默认 schema。
 
-## 无状态对话与明确拒绝项
+## 无状态与受限状态续轮
 
-此实现采用无状态模式，`store` 缺省或 `false` 均可，响应始终返回 `store: false`。
-下一轮需把上一轮的 `output` 和对应的工具执行结果追加到 `input`。
-`function_call_output.call_id` 对应调用的 `call_id`，不是 `fc_...` 条目 ID。
+与 OpenAI Responses 一致，`store` 缺省或为 `true` 时，完成的 response 会暂存于代理进程内；
+下一轮可只提交新输入和
+`previous_response_id`。代理会恢复此前 input/output，并在新请求省略 `tools` 时继承此前的
+function/custom 工具及 tool choice。显式 `tools: []` 会清空继承的工具；此时也不继承此前的
+tool choice。续轮复用父 response 已解析出的 Kiro conversation ID，不受后续请求缺失或更换
+session-affinity 请求头影响。
+
+显式传 `store: false` 时保持无状态：下一轮需把上一轮的 `output` 和对应工具执行结果追加到
+`input`。`function_call_output.call_id` 对应调用的 `call_id`，不是 `fc_...` 条目 ID。
+
+这是有边界的兼容实现，而非 OpenAI 的持久化存储服务：会话仅在进程存活期间可用，空闲 30 分钟
+过期，最多保留 256 个会话；单会话最大 2 MiB、总量最大 32 MiB。无法保存状态时，非流式请求
+返回服务端错误，流式请求以 `response.failed` 结束，避免成功返回一个无法续轮的 response。
+会话按代理 service 和已认证 API key 隔离，重启后全部清空；不提供
+response 的查询、删除或取消端点。按照官方语义，父 response 的 `instructions` 不会自动带入
+续轮，续轮可单独设置新的 `instructions`。
 
 以下参数仍需要尚未实现的执行/数据链路，因此返回 HTTP 400：
 
-- `store: true`、`previous_response_id`、`conversation`、`background: true`。
+- `conversation`、`background: true`。
 - `truncation: auto`、`context_management`、`max_tool_calls`。
 - defer_loading 工具、托管工具（如 web_search、file_search、computer、MCP server 执行）。
 - Files API 的 file_id、input_file；附加控制字段则兼容忽略。
@@ -96,8 +110,8 @@ API key 认证、服务级 key 白名单、额度和并发限制继续生效。
 - 若输入**只**由这些可跳过条目组成、不含任何真实消息，仍按缺少会话内容拒绝。
 
 Codex 常用的 `include: ["reasoning.encrypted_content"]` 可以提交，但本代理只返回明文推理，
-不会伪造加密 replay token。这里不提供存储查询、删除、取消、WebSocket 或 `/responses/compact`；
-上下文由客户端维护。
+不会伪造加密 replay token。这里不提供 WebSocket 或 `/responses/compact`；长上下文仍应由客户端
+维护或自行裁剪。
 
 ## 流式事件
 
@@ -127,5 +141,6 @@ Responses 不使用 Chat Completions 的 `[DONE]` 结束标记。
 本项目的 Rust 执行链中独立实现，未复制其源代码；本仓库继续使用 MIT 许可。
 
 回归覆盖请求转换、可空参数、命名空间/自由文本工具、图片工具结果、协议准入矩阵、SSE 分片和错误，
-以及真实 daemon 对模拟 Kiro 上游的两轮工具交互，涵盖两个别名和工具缓冲开关。
+以及真实 daemon 对模拟 Kiro 上游的两轮工具交互（完整历史 replay 和 `store`/`previous_response_id`
+续轮），涵盖两个别名、两种流模式和工具缓冲开关。
 工具分片用例包含交错的 function/custom 调用，以及只在首个片段发送工具名的上游输出。

@@ -1,7 +1,8 @@
-//! Stateless OpenAI Responses input, normalized into the shared OpenAI/Kiro path.
+//! OpenAI Responses input, normalized into the shared OpenAI/Kiro path.
 //!
 //! Protocol reference: https://developers.openai.com/api/reference/resources/responses
-//! Storage, opaque replay and hosted tools are rejected before upstream execution.
+//! Hosted tools are rejected before upstream execution. Ephemeral state is handled
+//! at the HTTP boundary, after request authentication.
 
 use std::collections::{HashMap, HashSet};
 
@@ -23,8 +24,11 @@ pub struct ResponsesRequest {
     pub max_output_tokens: Option<u32>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    /// Keep omission distinct from an explicit empty list so a stateful
+    /// continuation can inherit prior tools without preventing a caller from
+    /// intentionally clearing them.
     #[serde(default)]
-    pub tools: Vec<Value>,
+    pub tools: Option<Vec<Value>>,
     pub tool_choice: Option<Value>,
     pub parallel_tool_calls: Option<bool>,
     pub reasoning: Option<ResponsesReasoning>,
@@ -285,7 +289,7 @@ pub fn responses_to_openai(
     let messages = merge_assistant_items(messages);
     let mut tools = Vec::new();
     let mut tool_names = HashMap::new();
-    for (index, tool) in request.tools.iter().enumerate() {
+    for (index, tool) in request.tools.as_deref().unwrap_or(&[]).iter().enumerate() {
         let field = format!("tools.{index}");
         if tool.get("type").and_then(Value::as_str) == Some("namespace") {
             let namespace = required_string(tool, "name", &field)?;
@@ -404,18 +408,13 @@ pub fn responses_to_openai(
 
 fn validate_controls(request: &ResponsesRequest) -> Result<(), ValidationError> {
     for (field, unsupported) in [
-        ("store", request.store == Some(true)),
         ("background", request.background == Some(true)),
-        (
-            "previous_response_id",
-            request.previous_response_id.is_some(),
-        ),
         ("conversation", request.conversation.is_some()),
         ("max_tool_calls", request.max_tool_calls.is_some()),
         ("context_management", request.context_management.is_some()),
     ] {
         if unsupported {
-            return invalid(field, "not supported by this stateless endpoint; use store=false and send the complete history in input");
+            return invalid(field, "not supported by this endpoint");
         }
     }
     if request

@@ -1432,7 +1432,8 @@ pub(super) async fn nonstream_openai(
         &openai_tools,
     );
     let response = match responses_options {
-        Some(options) => super::super::responses::json_response(chat, options),
+        Some(options) => super::super::responses::json_response(chat, options)
+            .map_err(|message| ApiError::response_assembly(message, ErrorFormat::OpenAi))?,
         None => chat,
     };
     Ok(Json(response).into_response())

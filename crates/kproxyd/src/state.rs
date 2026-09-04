@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::http::prompt_cache::PromptCacheTracker;
+use crate::http::responses::ResponsesSessionStore;
 use crate::http::stream::KeepaliveHub;
 use crate::meter::Meter;
 use crate::stats::{ModelCache, StatsStore};
@@ -160,6 +161,8 @@ pub struct AppState {
     pub body_budget: Arc<BodyBudget>,
     pub keepalive: KeepaliveHub,
     pub prompt_cache: PromptCacheTracker,
+    /// Ephemeral, credential-scoped state for Responses `store=true` turns.
+    pub responses_sessions: ResponsesSessionStore,
     pub task_registry: TaskRegistry,
     /// Dynamically managed API proxy listeners.
     pub proxy_services: Arc<crate::http::ProxyServiceManager>,
@@ -293,6 +296,7 @@ impl AppState {
             body_budget: Arc::new(BodyBudget::new(128 * 1024 * 1024)),
             keepalive: KeepaliveHub::new(),
             prompt_cache: PromptCacheTracker::default(),
+            responses_sessions: ResponsesSessionStore::default(),
             task_registry: TaskRegistry::default(),
             proxy_services: Arc::new(crate::http::ProxyServiceManager::default()),
             shutdown: CancellationToken::new(),

@@ -47,22 +47,22 @@ impl wiremock::Respond for ToolRoundtrip {
     }
 }
 
-async fn create_response(
+async fn create_response_with_session(
     client: &reqwest::Client,
     daemon: &Daemon,
     port: u16,
     path: &str,
+    session_id: Option<&str>,
     request: &Value,
 ) -> Value {
-    let response = client
+    let mut builder = client
         .post(format!("http://127.0.0.1:{port}{path}"))
         .bearer_auth(daemon.api_key.as_deref().unwrap())
-        .header("user-agent", CODEX_AGENT)
-        .header("session-id", "codex-response-e2e")
-        .json(request)
-        .send()
-        .await
-        .unwrap();
+        .header("user-agent", CODEX_AGENT);
+    if let Some(session_id) = session_id {
+        builder = builder.header("session-id", session_id);
+    }
+    let response = builder.json(request).send().await.unwrap();
     let status = response.status();
     assert!(response.headers().contains_key("request-id"));
     let content_type = response
@@ -109,6 +109,24 @@ async fn create_response(
         assert!(content_type.starts_with("application/json"));
         serde_json::from_str(&body).unwrap()
     }
+}
+
+async fn create_response(
+    client: &reqwest::Client,
+    daemon: &Daemon,
+    port: u16,
+    path: &str,
+    request: &Value,
+) -> Value {
+    create_response_with_session(
+        client,
+        daemon,
+        port,
+        path,
+        Some("codex-response-e2e"),
+        request,
+    )
+    .await
 }
 
 #[tokio::test]
@@ -250,6 +268,101 @@ async fn responses_tool_roundtrip_works_through_both_aliases_and_buffer_modes() 
             .unwrap();
         assert_eq!(read["content"][0]["text"], "README contents");
         assert_eq!(patch["content"][0]["text"], "Patch applied.");
+    }
+    daemon.stop().await;
+}
+
+#[tokio::test]
+async fn responses_default_store_preserves_affinity_and_resumes_tool_roundtrips() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(ToolRoundtrip)
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    let client = reqwest::Client::new();
+
+    for (index, stream) in [false, true].into_iter().enumerate() {
+        let initial = json!({
+            "model":"source-large",
+            "instructions":"Follow the repository rules.",
+            "input":"Inspect the file.",
+            "stream":stream,
+            "tools":[{"type":"namespace","name":"functions","tools":[
+                {"type":"function","name":"read_file","parameters":{"type":"object"}},
+                {"type":"custom","name":"apply_patch"}
+            ]}],
+            "tool_choice":{"type":"allowed_tools","mode":"required","tools":[
+                {"type":"function","name":"functions.read_file"},
+                {"type":"custom","name":"functions.apply_patch"}
+            ]}
+        });
+        let first = create_response_with_session(
+            &client,
+            &daemon,
+            port,
+            "/v1/responses",
+            Some("responses-parent"),
+            &initial,
+        )
+        .await;
+        let first_id = first["id"].as_str().expect("response id").to_owned();
+        assert_eq!(first["store"], true);
+
+        // Only newly supplied items are sent. Omitted `store` defaults to true,
+        // and the stored response keeps the resolved Kiro conversation ID even
+        // if a continuation drops or changes its affinity header.
+        let continuation = json!({
+            "model":"source-large",
+            "previous_response_id":first_id,
+            "input":[
+                {"type":"function_call_output","call_id":"call_read","output":"README contents"},
+                {"type":"custom_tool_call_output","call_id":"call_patch","output":"Patch applied."}
+            ],
+            "stream":stream
+        });
+        let continuation_session = (index == 1).then_some("responses-child");
+        let second = create_response_with_session(
+            &client,
+            &daemon,
+            port,
+            "/v1/responses",
+            continuation_session,
+            &continuation,
+        )
+        .await;
+        assert_eq!(second["previous_response_id"], first_id);
+        assert_eq!(second["store"], true);
+        assert_eq!(
+            second["output"][0]["content"][0]["text"],
+            "Read the file and applied the patch."
+        );
+    }
+
+    let payloads = mock
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/generateAssistantResponse")
+        .map(|request| serde_json::from_slice::<Value>(&request.body).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(payloads.len(), 4);
+    for pair in payloads.chunks_exact(2) {
+        assert_eq!(
+            pair[1]["conversationState"]["conversationId"],
+            pair[0]["conversationState"]["conversationId"]
+        );
+        let context = &pair[1]["conversationState"]["currentMessage"]["userInputMessage"]
+            ["userInputMessageContext"];
+        assert_eq!(context["tools"].as_array().unwrap().len(), 2);
+        assert_eq!(context["toolResults"].as_array().unwrap().len(), 2);
     }
     daemon.stop().await;
 }
