@@ -52,12 +52,37 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
                 .flatten();
             let definition = tool.body.get(&tool.r#type)?;
             let name = definition.get("name")?.as_str()?;
-            let description = definition
+            let mut description = definition
                 .get("description")
                 .and_then(Value::as_str)
-                .unwrap_or_default();
+                .unwrap_or_default()
+                .to_owned();
             let schema = if tool.r#type == "custom" {
-                json!({"type":"object","properties":{"input":{"type":"string"}},"required":["input"]})
+                if let Some(grammar) = definition
+                    .get("format")
+                    .filter(|format| format.get("type").and_then(Value::as_str) == Some("grammar"))
+                    .and_then(|format| format.get("grammar"))
+                {
+                    let syntax = grammar
+                        .get("syntax")
+                        .and_then(Value::as_str)
+                        .unwrap_or("grammar");
+                    if let Some(value) = grammar.get("definition").and_then(Value::as_str) {
+                        description = join(
+                            &description,
+                            &format!("Input format ({syntax} grammar):\n{value}"),
+                        );
+                    }
+                }
+                json!({
+                    "type":"object",
+                    "properties":{"input":{
+                        "type":"string",
+                        "description":"The complete raw tool input text. Do not wrap or escape it again."
+                    }},
+                    "required":["input"],
+                    "additionalProperties":false
+                })
             } else {
                 definition
                     .get("parameters")
@@ -67,7 +92,7 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
             let (translated_tool, docs) = kiro_tool_named(
                 name,
                 &tool_names.kiro_name(name),
-                description,
+                &description,
                 &schema,
             );
             documentation.extend(docs);

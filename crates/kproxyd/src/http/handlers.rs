@@ -72,7 +72,9 @@ fn stable_conversation_id(
                 "thread-id",
                 "x-opencode-session",
                 "x-session-affinity",
+                "x-client-request-id",
                 "x-conversation-id",
+                "session_id",
             ]
             .into_iter()
             .find_map(|name| {

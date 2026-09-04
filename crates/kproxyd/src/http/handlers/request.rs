@@ -909,6 +909,7 @@ pub(super) async fn handle_openai(
         })?;
         let options = ResponsesOptions::new(
             &responses,
+            translated.tools,
             translated.tool_names,
             Some((state.responses_sessions.clone(), session_owner)),
             inherited_conversation_id,

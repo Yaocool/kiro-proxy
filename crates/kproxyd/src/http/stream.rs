@@ -28,9 +28,9 @@ use crate::stats::{RequestDiagnostics, RequestLog, UpstreamAttemptLog};
 
 use super::prompt_cache::{PromptCachePlan, PromptCacheProfile};
 use super::response::{
-    kiro_citation_key, kiro_visible_references, repair_json, web_search_citations,
-    CompactionIterationUsage, DecodedResponse, OpenAiToolIdentity, StopSequenceFilter,
-    ThinkingContentFilter, ToolLeakFilter,
+    custom_tool_input, kiro_citation_key, kiro_visible_references, repair_json,
+    web_search_citations, CompactionIterationUsage, DecodedResponse, OpenAiToolIdentity,
+    StopSequenceFilter, ThinkingContentFilter, ToolLeakFilter,
 };
 use super::usage::{fallback_credits, fill_missing_usage, produced_output};
 
@@ -601,11 +601,7 @@ fn openai_event(
                 // Custom input is free-form; never add a JSON function delta.
                 state.tools_with_input.insert(id.clone());
                 let input = if *stop {
-                    repair_json(input_delta)
-                        .get("input")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .unwrap_or_else(|| input_delta.clone())
+                    custom_tool_input(input_delta)
                 } else {
                     input_delta.clone()
                 };

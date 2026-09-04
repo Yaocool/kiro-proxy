@@ -1914,6 +1914,10 @@ pub fn validate_openai(request: &OpenAiRequest) -> Result<(), ValidationError> {
             }
         } else {
             validate_custom_format(definition.get("format"), index)?;
+            docs += definition
+                .pointer("/format/grammar/definition")
+                .and_then(Value::as_str)
+                .map_or(0, |grammar| grammar.chars().count());
         }
     }
     if docs > MAX_TOOL_DOC_CHARS {

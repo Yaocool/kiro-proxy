@@ -53,7 +53,7 @@ API key 认证、服务级 key 白名单、额度和并发限制继续生效。
 | `input_image` | 支持公开 HTTP(S) URL 和 base64 data URL，复用图片下载与校验限制；工具结果也可返回图片 |
 | `function_call` / `function_call_output` | 保留 call_id、名称、JSON 参数和结果；校验调用与结果配对 |
 | `custom_tool_call` / `custom_tool_call_output` | 自由文本工具映射为 Kiro 的 input 字符串参数，返回时恢复原格式 |
-| function、custom、namespace 工具 | 展平命名空间后复用名称规范化，返回时恢复 namespace 与名称；拒绝名称冲突 |
+| function、custom、namespace 工具 | 同时读取顶层 `tools` 与 Responses Lite 的 `input[].additional_tools`；展平命名空间后复用名称规范化，返回时恢复 namespace 与名称；拒绝名称冲突 |
 | `tool_choice` | 支持 auto、none、required、指定 function/custom 工具，以及仅限 function/custom 的 `allowed_tools` |
 | `parallel_tool_calls` | 沿用 Chat Completions 的工具选择与提示约束 |
 | `store` / `previous_response_id` | 默认启用的受限进程内续轮；`store: false` 显式关闭，按服务与 API key 隔离，不写磁盘 |
@@ -66,11 +66,13 @@ API key 认证、服务级 key 白名单、额度和并发限制继续生效。
 | `metadata` | 回显为响应元数据，不作为客户端认证凭据 |
 | usage | 返回 input_tokens、output_tokens、total_tokens、cached_tokens、reasoning_tokens |
 
-`custom.format` 的 grammar 定义沿用现有 custom 工具兼容策略；Kiro 不提供原生语法约束。
+`custom.format` 的 grammar 定义会附加到 custom 工具描述中作为模型输入提示；Kiro 不提供原生语法约束，
+因此这不是服务端强校验。
 `reasoning.summary/context`、`include`、`service_tier` 和未使用的 `stream_options` 键宽松接收；
 输出使用 Kiro 可提供的数据，不按官方参数枚举额外拒绝。未知的 `text.verbosity` 不添加详略提示。
-`prompt_cache_key`、`prompt_cache_retention`、`safety_identifier`、`user` 和
-`client_metadata` 作为客户端元数据接受，不传给 Kiro；缓存命中仍由既有缓存规则和上游决定。
+`prompt_cache_key` 用作 Kiro 会话/Prompt Cache 亲和提示，经 API key 隔离后哈希为 UUID，不原样传给
+Kiro。`prompt_cache_retention`、`safety_identifier`、`user` 和 `client_metadata` 作为客户端元数据
+接受，不传给 Kiro；缓存命中仍由既有缓存规则和上游决定。
 可选的 `stream`、`include`，以及 function 工具的 `description`、`parameters`、`strict`
 显式传 `null` 时按省略处理；`parameters: null` 使用无参数工具的默认 schema。
 
@@ -78,9 +80,10 @@ API key 认证、服务级 key 白名单、额度和并发限制继续生效。
 
 与 OpenAI Responses 一致，`store` 缺省或为 `true` 时，完成的 response 会暂存于代理进程内；
 下一轮可只提交新输入和
-`previous_response_id`。代理会恢复此前 input/output，并在新请求省略 `tools` 时继承此前的
-function/custom 工具及 tool choice。显式 `tools: []` 会清空继承的工具；此时也不继承此前的
-tool choice。续轮复用父 response 已解析出的 Kiro conversation ID，不受后续请求缺失或更换
+`previous_response_id`。代理会恢复此前 input/output，并在新请求省略两种工具声明渠道时继承此前的
+function/custom 工具及 tool choice。显式 `tools: []` 或 `additional_tools` 控制项会提供新的有效
+工具集，而不是叠加进已存目录；此时也不继承此前的 tool choice。`additional_tools` 本身不会作为
+对话历史反复存储，解析出的有效工具会单独继承。续轮复用父 response 已解析出的 Kiro conversation ID，不受后续请求缺失或更换
 session-affinity 请求头影响。
 
 显式传 `store: false` 时保持无状态：下一轮需把上一轮的 `output` 和对应工具执行结果追加到
