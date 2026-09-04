@@ -54,7 +54,7 @@ API key 认证、服务级 key 白名单、额度和并发限制继续生效。
 | `function_call` / `function_call_output` | 保留 call_id、名称、JSON 参数和结果；校验调用与结果配对 |
 | `custom_tool_call` / `custom_tool_call_output` | 自由文本工具映射为 Kiro 的 input 字符串参数，返回时恢复原格式 |
 | function、custom、namespace 工具 | 展平命名空间后复用名称规范化，返回时恢复 namespace 与名称；拒绝名称冲突 |
-| `tool_choice` | 支持 auto、none、required，以及指定 function/custom 工具 |
+| `tool_choice` | 支持 auto、none、required、指定 function/custom 工具，以及仅限 function/custom 的 `allowed_tools` |
 | `parallel_tool_calls` | 沿用 Chat Completions 的工具选择与提示约束 |
 | `max_output_tokens` | 映射为 Kiro maxTokens；省略时不补默认生成上限 |
 | `temperature`、`top_p` | 复用现有参数校验和映射，保留零值 |

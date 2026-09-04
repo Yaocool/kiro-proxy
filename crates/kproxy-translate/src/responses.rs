@@ -323,11 +323,52 @@ pub fn responses_to_openai(
                 return Ok(choice.clone());
             }
             let kind = required_string(choice, "type", "tool_choice")?;
-            if !matches!(kind, "function" | "custom") {
-                return invalid("tool_choice.type", "expected function or custom");
+            if matches!(kind, "function" | "custom") {
+                let name = qualified_name(choice, "tool_choice")?;
+                return Ok(json!({"type":kind,kind:{"name":name}}));
             }
-            let name = qualified_name(choice, "tool_choice")?;
-            Ok(json!({"type":kind,kind:{"name":name}}))
+            if kind != "allowed_tools" {
+                return invalid(
+                    "tool_choice.type",
+                    "expected function, custom, or allowed_tools",
+                );
+            }
+            let allowed = choice.get("allowed_tools").unwrap_or(choice);
+            let mode = required_string(allowed, "mode", "tool_choice.allowed_tools")?;
+            let tools = allowed
+                .get("tools")
+                .and_then(Value::as_array)
+                .ok_or_else(|| {
+                    error(
+                        "tool_choice.allowed_tools.tools",
+                        "expected an array of function or custom tool references",
+                    )
+                })?;
+            let mut normalized = Vec::with_capacity(tools.len());
+            for (index, tool) in tools.iter().enumerate() {
+                let field = format!("tool_choice.allowed_tools.tools.{index}");
+                let tool_kind = required_string(tool, "type", &field)?;
+                if !matches!(tool_kind, "function" | "custom") {
+                    return invalid(format!("{field}.type"), "expected function or custom");
+                }
+                // Responses uses a flat `{type, name}` reference. Accept the
+                // nested form too because this normalizer also accepts the
+                // shared OpenAI representation internally. Flat references
+                // retain the optional namespace extension used by this proxy.
+                let name = if tool.get("name").is_some() {
+                    qualified_name(tool, &field)?
+                } else {
+                    let definition = tool.get(tool_kind).ok_or_else(|| {
+                        error(format!("{field}.{tool_kind}.name"), "tool name is required")
+                    })?;
+                    required_string(definition, "name", &format!("{field}.{tool_kind}"))?.to_owned()
+                };
+                normalized.push(json!({"type":tool_kind,tool_kind:{"name":name}}));
+            }
+            Ok(json!({
+                "type":"allowed_tools",
+                "allowed_tools":{"mode":mode,"tools":normalized}
+            }))
         })
         .transpose()?;
     let effort = request.reasoning.as_ref().and_then(|r| r.effort.as_deref());
