@@ -249,8 +249,8 @@ server call 会保持 pending，等客户端回传 client tool 结果后再按�
 `upstream.web_search_timeout_ms` 默认为 60000。每个 MCP 请求都会携带 Kiro 必需的
 `x-amzn-kiro-profile-arn` 请求头。导入账号缺少 profile ARN 时，代理会通过
 `ListAvailableProfiles` 自动发现，并发请求会按同一 token 合并，发现结果会写回账号文件；
-Builder ID 和 Social 账号使用 Kiro 兼容的固定 profile 回退。Kiro MCP 不具备等价语义的
-domain/location 过滤、code-execution caller、strict 或 eager streaming 会被明确拒绝，不会静默降级。代理生成
+Builder ID 和 Social 账号使用 Kiro 兼容的固定 profile 回退。domain/location 过滤和
+code-execution caller 仍需兼容执行器支持；strict 和 eager streaming 作为兼容提示接收并忽略。代理生成
 的加密字段明确属于 kproxy 自有格式，不宣称与 Anthropic 托管搜索的 ciphertext 互通。
 
 ### 文档、上下文编辑与兼容边界
@@ -267,8 +267,12 @@ clear_tool_inputs；`clear_thinking` 支持保留指定轮次或全部 thinking�
 `context_management.applied_edits`；清理触发与清除 token 数采用本地估算，`count_tokens` 返回
 编辑前后输入估算。生成路径会先清理已无需保留的历史，再获取仍然需要的远程附件。
 
-相邻同角色消息会合并。Kiro 无法等价实现的 assistant prefill、`max_tokens=0` 缓存预热、严格
-结构化输出和 Anthropic Files API 的 `file_id` 来源会被明确拒绝。
+兼容性以 jwadow/kiro-gateway、hj01857655/kiro-account-manager、chaogei/Kiro-account-manager
+的实际接入行为为基线，不要求完整复刻 Claude/OpenAI 官方语义。请求、消息、工具的附加字段，以及
+format/strict 提示不会额外触发网关拒绝。固定源码版本和范围见[兼容性基线](docs/compatibility-baseline.md)。
+
+相邻同角色消息会合并。assistant prefill、`max_tokens=0` 缓存预热和 Anthropic Files API 的
+`file_id` 来源尚未接入对应的生成/数据获取链路，仍会拒绝。
 协议兼容在首次发送前确定，不再缓存字段拒绝结果、定时过期重探测或通过逐项删字段重试。
 缓存标记只发送 `type: default`，Claude 的缓存 TTL 不控制 Kiro 缓存有效期。Claude 历史 thinking 不回传
 到 Kiro 请求历史，但不关闭当前生成的 thinking；Responses 的明文推理摘要保留在 assistant 历史中。
@@ -282,7 +286,10 @@ clear_tool_inputs；`clear_thinking` 支持保留指定轮次或全部 thinking�
 | Claude `top_k` | 接收但不发送，不因模型 schema 而开启；记录 debug 诊断。这是网关兼容策略，不代表断言 Kiro 全局不支持。 |
 | Claude `stop_sequences` | 在流式 / 非流式响应中本地执行，不发送原生 `stopSequences`；不保证上游生成量或费用也因此受限。 |
 | thinking / effort | 有可识别的 effort 元数据时使用 `thinking: adaptive` + `output_config.effort`，或 `reasoning.effort`；元数据缺失、不完整或不可识别时，完全省略 `additionalModelRequestFields`，不发送 `{}`、`null` 或猜测的 adaptive thinking。 |
-| Claude `output_config.effort` | 接收、校验但忽略；不单独启用 thinking，也不覆盖预算映射值或默认 effort。 |
+| Claude `output_config` | 宽松接收并忽略，包括 `format`、`effort` 和未来附加键；不单独启用 thinking，也不覆盖预算映射值或默认 effort。 |
+| OpenAI `response_format` / Responses `text.format` | 接收但不放入 Kiro 输入，沿用参考项目的宽松行为；不新增 JSON/Schema 保证或基于 Schema 的生成重试。 |
+| 工具 `strict`、Claude `eager_input_streaming` | 接收为提示，保留正常 Kiro 工具 schema 和既有流式行为。 |
+| 服务等级、附加字段、未使用的流式提示 | 接收但不猜测为 Kiro 字段发送；实际使用的 `include_usage` 等值仍校验类型。 |
 | OpenAI `reasoning_effort` | 优先于 `thinking.budget_tokens`；均未提供时默认 high。档位不支持时取模型枚举最后一项，不排序、不做最近档位匹配。 |
 | `thinking.display` | output_config 路径固定发送 summarized；reasoning 路径不发 display；没有可识别的元数据时省略整个扩展字段。客户端 display 不覆盖这些上游格式。 |
 | `thinking.budget_tokens` | 原始预算直接映射为 low（≤4000）、medium（≤16000）、high（≤64000）、xhigh，不是上游独立 thinking token 硬上限。 |

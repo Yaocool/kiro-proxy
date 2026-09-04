@@ -60,15 +60,8 @@ pub enum ValidationError {
 
 pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
     common(&request.model, request.messages.is_empty())?;
-    if !request.extra.is_empty() {
-        let fields = request.extra.keys().cloned().collect::<Vec<_>>().join(", ");
-        return invalid(
-            "request",
-            format!(
-                "unsupported Claude protocol field(s): {fields}; unknown request controls cannot be safely ignored"
-            ),
-        );
-    }
+    // Match the reference gateways' permissive handling of additive controls.
+    // Validate data we consume, not official guarantees Kiro does not expose.
     if request.max_tokens == 0 {
         return invalid(
             "max_tokens",
@@ -121,38 +114,6 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
     if let Some(control) = request.cache_control.as_ref() {
         validate_cache_control(control, "cache_control")?;
     }
-    if let Some(config) = request.output_config.as_ref() {
-        if !config.extra.is_empty() {
-            let fields = config.extra.keys().cloned().collect::<Vec<_>>().join(", ");
-            return invalid(
-                "output_config",
-                format!("unsupported output configuration field(s): {fields}"),
-            );
-        }
-        if config
-            .effort
-            .as_deref()
-            .is_some_and(|effort| !matches!(effort, "low" | "medium" | "high" | "xhigh" | "max"))
-        {
-            return invalid(
-                "output_config.effort",
-                "expected low, medium, high, xhigh, or max",
-            );
-        }
-    }
-    if request.service_tier.as_deref() == Some("standard_only") {
-        return invalid(
-            "service_tier",
-            "standard_only cannot be guaranteed by the Kiro upstream",
-        );
-    }
-    if request
-        .service_tier
-        .as_deref()
-        .is_some_and(|tier| tier != "auto" && tier != "standard_only")
-    {
-        return invalid("service_tier", "expected auto or standard_only");
-    }
     if request
         .metadata
         .as_ref()
@@ -184,13 +145,6 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
             &message.role,
             format!("messages.{index}.content"),
         )?;
-        if !message.extra.is_empty() {
-            let fields = message.extra.keys().cloned().collect::<Vec<_>>().join(", ");
-            return invalid(
-                format!("messages.{index}"),
-                format!("unsupported message field(s): {fields}"),
-            );
-        }
         if let Some(control) = message.cache_control.as_ref() {
             validate_cache_control(control, &format!("messages.{index}.cache_control"))?;
             cache_breakpoints = cache_breakpoints.saturating_add(1);
@@ -317,21 +271,6 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
                 ),
             );
         }
-        if !tool.extra.is_empty() {
-            let fields = tool.extra.keys().cloned().collect::<Vec<_>>().join(", ");
-            return invalid(
-                format!("tools.{index}"),
-                format!(
-                    "unsupported tool protocol field(s): {fields}; unknown tool controls cannot be safely ignored"
-                ),
-            );
-        }
-        if tool.strict == Some(true) {
-            return invalid(
-                format!("tools.{index}.strict"),
-                "strict tool generation is not supported by the Kiro upstream",
-            );
-        }
         if !web_tool && !search_tool {
             validate_tool(&tool.name, &tool.input_schema).map_err(|error| {
                 if error == ValidationError::ToolNameTooLong {
@@ -347,18 +286,6 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
         if let Some(control) = tool.cache_control.as_ref() {
             validate_cache_control(control, &format!("tools.{index}.cache_control"))?;
             cache_breakpoints = cache_breakpoints.saturating_add(1);
-        }
-        if (web_tool || search_tool) && tool.eager_input_streaming.is_some() {
-            return invalid(
-                format!("tools.{index}.eager_input_streaming"),
-                "eager_input_streaming is only valid for client-defined tools",
-            );
-        }
-        if tool.eager_input_streaming == Some(true) {
-            return invalid(
-                format!("tools.{index}.eager_input_streaming"),
-                "eager tool input streaming is not supported by the Kiro upstream",
-            );
         }
         if let Some(callers) = &tool.allowed_callers {
             if callers.as_slice() != ["direct"] {
@@ -1876,32 +1803,15 @@ pub fn validate_openai(request: &OpenAiRequest) -> Result<(), ValidationError> {
         return invalid("max_tokens", "token limits must be positive");
     }
     if let Some(options) = &request.stream_options {
-        if !request.stream {
-            return invalid("stream_options", "is only valid when stream is true");
-        }
         let Some(options) = options.as_object() else {
             return invalid("stream_options", "expected an object");
         };
-        if options.keys().any(|field| field != "include_usage")
-            || options
-                .get("include_usage")
-                .is_some_and(|value| !value.is_boolean())
+        if options
+            .get("include_usage")
+            .is_some_and(|value| !value.is_boolean())
         {
-            return invalid(
-                "stream_options",
-                "only the boolean include_usage field is supported",
-            );
+            return invalid("stream_options", "include_usage must be a boolean");
         }
-    }
-    if request
-        .response_format
-        .as_ref()
-        .is_some_and(|format| format.get("type").and_then(Value::as_str) != Some("text"))
-    {
-        return invalid(
-            "response_format",
-            "only response_format.type=text is supported",
-        );
     }
     let mut image_count = 0usize;
     for (index, message) in request.messages.iter().enumerate() {
@@ -2000,12 +1910,6 @@ pub fn validate_openai(request: &OpenAiRequest) -> Result<(), ValidationError> {
                 return invalid(
                     format!("tools.{index}.function.strict"),
                     "expected a boolean",
-                );
-            }
-            if definition.get("strict").and_then(Value::as_bool) == Some(true) {
-                return invalid(
-                    format!("tools.{index}.function.strict"),
-                    "strict tool generation is not supported by the Kiro upstream",
                 );
             }
         } else {

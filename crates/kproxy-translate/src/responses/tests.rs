@@ -233,20 +233,10 @@ fn unsupported_execution_controls_are_rejected_explicitly() {
         ("previous_response_id", json!("resp_unknown")),
         ("conversation", json!("conv_unknown")),
         ("truncation", json!("auto")),
-        ("service_tier", json!("priority")),
         ("max_output_tokens", json!(0)),
         ("max_tool_calls", json!(2)),
         ("context_management", json!([])),
-        ("include", json!(["file_search_call.results"])),
-        (
-            "text",
-            json!({"format":{"type":"json_schema","name":"output","schema":{"type":"object"}}}),
-        ),
         ("tools", json!([{"type":"web_search"}])),
-        (
-            "tools",
-            json!([{"type":"function","name":"strict_tool","strict":true}]),
-        ),
         (
             "tools",
             json!([{"type":"function","name":"deferred","defer_loading":true}]),
@@ -292,8 +282,4 @@ fn unsupported_or_broken_history_is_never_silently_dropped() {
             "invalid history: {input}"
         );
     }
-    assert!(serde_json::from_value::<ResponsesRequest>(
-        json!({"model":"test","input":"hello","unknown_execution_control":true})
-    )
-    .is_err());
 }

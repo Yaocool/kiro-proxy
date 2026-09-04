@@ -21,6 +21,9 @@ mod responses;
 #[path = "end_to_end/thinking_controls.rs"]
 mod thinking_controls;
 
+#[path = "end_to_end/compatibility_controls.rs"]
+mod compatibility_controls;
+
 struct Daemon {
     child: Child,
     socket: PathBuf,

@@ -12,6 +12,22 @@ use crate::{
 const MAX_KIRO_TOOL_NAME: usize = 64;
 const MAX_KIRO_DESCRIPTION: usize = 1024;
 
+/// Log only known field names, never client schemas or arbitrary hint values.
+pub(crate) fn log_ignored_controls(protocol: &str, controls: &[(&str, bool)]) {
+    let fields: Vec<_> = controls
+        .iter()
+        .filter_map(|(field, present)| present.then_some(*field))
+        .collect();
+    if !fields.is_empty() {
+        tracing::debug!(
+            event = "proxy.compatibility.controls_ignored",
+            protocol,
+            fields = ?fields,
+            "accepting client hints without forwarding them, matching the reference Kiro gateways"
+        );
+    }
+}
+
 /// Tool definitions belong only on Kiro's current message. Keeping them on
 /// copied history turns multiplies a large catalog on every internal server
 /// tool continuation and can exceed the upstream payload budget.
