@@ -61,12 +61,14 @@ API key 认证、服务级 key 白名单、额度和并发限制继续生效。
 | `reasoning.effort` | 复用现有 effort 映射；none 关闭本次推理 |
 | 推理输出与历史 | 返回 reasoning summary 事件/条目；回传的明文摘要保留在 assistant 上下文 |
 | `text.verbosity` | 转为回答详略的 system 提示；不提供硬性字数保证 |
+| `text.format`、工具 `strict` | 作为兼容提示接收并忽略；不因 JSON Schema 或 strict=true 拒绝请求 |
 | `metadata` | 回显为响应元数据，不作为客户端认证凭据 |
 | usage | 返回 input_tokens、output_tokens、total_tokens、cached_tokens、reasoning_tokens |
 
 `custom.format` 的 grammar 定义沿用现有 custom 工具兼容策略；Kiro 不提供原生语法约束。
-`reasoning.summary` 的 auto/concise/detailed 接受为兼容偏好，输出使用 Kiro 可提供的推理文本。
-`prompt_cache_key`、`prompt_cache_retention=in_memory`（兼容 `in-memory` 写法）、`safety_identifier`、`user` 和
+`reasoning.summary/context`、`include`、`service_tier` 和未使用的 `stream_options` 键宽松接收；
+输出使用 Kiro 可提供的数据，不按官方参数枚举额外拒绝。未知的 `text.verbosity` 不添加详略提示。
+`prompt_cache_key`、`prompt_cache_retention`、`safety_identifier`、`user` 和
 `client_metadata` 作为客户端元数据接受，不传给 Kiro；缓存命中仍由既有缓存规则和上游决定。
 可选的 `stream`、`include`，以及 function 工具的 `description`、`parameters`、`strict`
 显式传 `null` 时按省略处理；`parameters: null` 使用无参数工具的默认 schema。
@@ -77,13 +79,21 @@ API key 认证、服务级 key 白名单、额度和并发限制继续生效。
 下一轮需把上一轮的 `output` 和对应的工具执行结果追加到 `input`。
 `function_call_output.call_id` 对应调用的 `call_id`，不是 `fc_...` 条目 ID。
 
-以下参数无法在现有 Kiro 链路中等价实现，因此返回 HTTP 400：
+以下参数仍需要尚未实现的执行/数据链路，因此返回 HTTP 400：
 
 - `store: true`、`previous_response_id`、`conversation`、`background: true`。
-- `truncation: auto`、`context_management`、`max_tool_calls`、非 auto 的 `service_tier`。
-- JSON Schema 等结构化文本输出、`strict: true`、defer_loading 工具、托管工具（如 web_search、file_search、computer、MCP server 执行）。
-- Files API 的 file_id、input_file、item_reference、无法识别的输入条目和控制字段。
-- 非空的 OpenAI encrypted_content：Kiro 无法解密，需改传明文历史。
+- `truncation: auto`、`context_management`、`max_tool_calls`。
+- defer_loading 工具、托管工具（如 web_search、file_search、computer、MCP server 执行）。
+- Files API 的 file_id、input_file；附加控制字段则兼容忽略。
+
+输入历史里无法转换的条目**不再拒绝**，而是跳过后继续处理，因为 Codex 会把上一轮收到的条目原样回传，
+拒绝会让第二轮起的整段会话不可用：
+
+- `reasoning` 条目的非空 `encrypted_content`（Kiro 无法解密）：丢弃该不透明块，保留同条目内的明文
+  `summary`/`content`。
+- `item_reference`、托管工具调用条目（如 `web_search_call`）及其他未识别类型：跳过。
+- 上述跳过会记录 debug 事件 `proxy.compatibility.controls_ignored`，只含固定字段/类型名。
+- 若输入**只**由这些可跳过条目组成、不含任何真实消息，仍按缺少会话内容拒绝。
 
 Codex 常用的 `include: ["reasoning.encrypted_content"]` 可以提交，但本代理只返回明文推理，
 不会伪造加密 replay token。这里不提供存储查询、删除、取消、WebSocket 或 `/responses/compact`；

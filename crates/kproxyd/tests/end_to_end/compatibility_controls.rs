@@ -24,6 +24,9 @@ async fn reference_gateway_hints_succeed_without_leaking_into_kiro() {
                 "response_format",
                 "strict",
                 "future_hint",
+                "future_summary",
+                "future_context",
+                "future.include",
             ] {
                 assert!(!serialized.contains(field), "{field} leaked into {wire}");
             }
@@ -65,6 +68,16 @@ async fn reference_gateway_hints_succeed_without_leaking_into_kiro() {
             if route == "responses" {
                 request["input"] = json!("Reply pong");
                 request["max_output_tokens"] = json!(4096);
+                // Codex sends reasoning presentation hints whose values are not
+                // in the published enum. They must not reach Kiro, and must not
+                // be rejected: `reasoning.context` outside {auto} was a 400.
+                request["reasoning"] = json!({
+                    "effort":"medium","summary":"future_summary",
+                    "context":"future_context","future_hint":true
+                });
+                request["prompt_cache_retention"] = json!("24h");
+                request["include"] = json!(["reasoning.encrypted_content", "future.include"]);
+                request["truncation"] = json!("disabled");
                 request["text"] = json!({"format":{"type":"json_schema","schema":format_schema},"future_hint":true});
                 request["tools"] = json!([{"type":"function","name":"lookup","parameters":tool_schema,"strict":true}]);
             } else {
