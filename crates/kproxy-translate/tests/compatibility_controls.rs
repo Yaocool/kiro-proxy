@@ -110,3 +110,90 @@ fn responses_format_and_additive_hints_use_the_same_kiro_projection() {
         .unwrap(),
     );
 }
+
+/// Codex replays the reasoning item it received on the previous turn, including
+/// an opaque `encrypted_content` this proxy never issued. Kiro cannot decrypt
+/// it, but failing the request strands the conversation on turn two, so the
+/// blob is dropped and any plaintext summary is preserved.
+#[test]
+fn responses_accepts_replayed_reasoning_and_unsupported_input_items() {
+    let request: ResponsesRequest = serde_json::from_value(json!({
+        "model":"claude-haiku-4.5","max_output_tokens":4096,
+        "reasoning":{"effort":"medium","summary":"auto","context":"future_context"},
+        "include":["reasoning.encrypted_content"],
+        "input":[
+            {"type":"message","role":"user","content":"Reply pong"},
+            {"type":"reasoning","id":"rs_1","encrypted_content":"gAAAAAB_opaque_blob",
+                "summary":[{"type":"summary_text","text":"weighing the options"}]},
+            {"type":"message","role":"assistant",
+                "content":[{"type":"output_text","text":"pong"}]},
+            // Hosted-tool and reference items carry nothing Kiro needs.
+            {"type":"web_search_call","id":"ws_1","status":"completed"},
+            {"type":"item_reference","id":"msg_1"},
+            {"type":"message","role":"user","content":"Reply pong again"}
+        ]
+    }))
+    .expect("replayed Responses history");
+    let normalized = responses_to_openai(&request).expect("replayed reasoning is not fatal");
+    let wire = serde_json::to_value(openai_to_kiro(
+        &normalized.request,
+        &TranslationOptions::new("claude-haiku-4.5", "AI_EDITOR"),
+    ))
+    .unwrap();
+    let serialized = wire.to_string();
+    // The opaque blob and the skipped item types must not reach Kiro.
+    for leaked in [
+        "gAAAAAB_opaque_blob",
+        "encrypted_content",
+        "web_search_call",
+        "item_reference",
+        "future_context",
+    ] {
+        assert!(!serialized.contains(leaked), "{leaked} leaked into {wire}");
+    }
+    // The plaintext summary the client did send is still carried.
+    assert!(serialized.contains("weighing the options"), "{wire}");
+}
+
+/// Relaxing additive fields must not weaken the checks that keep a Kiro payload
+/// well-formed.
+#[test]
+fn responses_still_rejects_malformed_history_and_stateful_controls() {
+    for (label, body) in [
+        (
+            "tool output without a matching call",
+            json!({"model":"claude-haiku-4.5","input":[
+                {"type":"message","role":"user","content":"hi"},
+                {"type":"function_call_output","call_id":"c1","output":"r"}]}),
+        ),
+        (
+            "tool call left unanswered",
+            json!({"model":"claude-haiku-4.5","input":[
+                {"type":"message","role":"user","content":"hi"},
+                {"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}]}),
+        ),
+        (
+            "stateful store=true",
+            json!({"model":"claude-haiku-4.5","input":"hi","store":true}),
+        ),
+        (
+            "stateful previous_response_id",
+            json!({"model":"claude-haiku-4.5","input":"hi","previous_response_id":"resp_1"}),
+        ),
+        (
+            "server-side truncation",
+            json!({"model":"claude-haiku-4.5","input":"hi","truncation":"auto"}),
+        ),
+        (
+            "hosted tool the proxy cannot execute",
+            json!({"model":"claude-haiku-4.5","input":"hi","tools":[{"type":"web_search"}]}),
+        ),
+    ] {
+        let request: ResponsesRequest =
+            serde_json::from_value(body).expect("request should deserialize");
+        assert!(
+            responses_to_openai(&request).is_err(),
+            "{label} must still be rejected"
+        );
+    }
+}

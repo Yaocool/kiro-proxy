@@ -137,6 +137,8 @@ pub fn responses_to_openai(
         Value::Array(items) if !items.is_empty() => {
             let mut calls = HashSet::new();
             let mut pending = HashMap::new();
+            let mut opaque_reasoning = false;
+            let mut ignored_items: Vec<&str> = Vec::new();
             for (index, item) in items.iter().enumerate() {
                 let field = format!("input.{index}");
                 let kind = match item.get("type") {
@@ -196,15 +198,16 @@ pub fn responses_to_openai(
                         messages.push(result);
                     }
                     "reasoning" => {
-                        if item
+                        // Codex replays the reasoning item it was handed on the
+                        // previous turn. An opaque `encrypted_content` cannot be
+                        // decrypted by Kiro, but it is also not the client's
+                        // fault: rejecting it strands the whole conversation on
+                        // turn two. Drop the opaque blob and keep any plaintext
+                        // summary, mirroring how the reference gateways ignore
+                        // reasoning history rather than failing the request.
+                        opaque_reasoning |= item
                             .get("encrypted_content")
-                            .is_some_and(|v| !v.is_null() && v.as_str() != Some(""))
-                        {
-                            return invalid(
-                                format!("{field}.encrypted_content"),
-                                "opaque OpenAI reasoning cannot be replayed by Kiro; send plaintext history",
-                            );
-                        }
+                            .is_some_and(|v| !v.is_null() && v.as_str() != Some(""));
                         let mut reasoning = Vec::new();
                         for key in ["summary", "content"] {
                             if let Some(parts) = item.get(key).filter(|v| !v.is_null()) {
@@ -240,10 +243,17 @@ pub fn responses_to_openai(
                             messages.push(assistant);
                         }
                     }
-                    _ => return invalid(
-                        format!("{field}.type"),
-                        "unsupported Responses input item; send messages and function/custom tool calls with their outputs",
-                    ),
+                    // Responses grows new output item types (hosted tool calls,
+                    // item_reference, ...). Codex echoes back whatever it was
+                    // given, so a hard failure here breaks the next turn of an
+                    // otherwise valid conversation. These items carry no content
+                    // Kiro needs, so skip them and record the type once.
+                    other => {
+                        if !ignored_items.contains(&kind) {
+                            ignored_items.push(kind);
+                        }
+                        let _ = other;
+                    }
                 }
             }
             if !pending.is_empty() {
@@ -252,6 +262,14 @@ pub fn responses_to_openai(
                     "every tool call in input must have a matching tool output",
                 );
             }
+            // Only fixed field/type names are recorded, never user content.
+            crate::translate::common::log_ignored_controls(
+                "responses",
+                &[
+                    ("input.reasoning.encrypted_content", opaque_reasoning),
+                    ("input.unsupported_item_types", !ignored_items.is_empty()),
+                ],
+            );
         }
         _ => {
             return invalid(
