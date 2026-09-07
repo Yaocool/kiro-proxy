@@ -147,6 +147,7 @@ fn spawn_injector(
         let mut interval = tokio::time::interval(std::time::Duration::from_millis(600));
         let mut last_action: Option<String> = None;
         let mut evaluate_error_logged = false;
+        let mut navigation_error_logged = false;
         loop {
             tokio::select! {
                 _ = cancel.cancelled() => break,
@@ -154,6 +155,7 @@ fn spawn_injector(
                     match page.evaluate(script.clone()).await {
                         Ok(result) => {
                             evaluate_error_logged = false;
+                            navigation_error_logged = false;
                             if let Ok(action) = result.into_value::<String>() {
                                 if last_action.as_deref() != Some(action.as_str()) {
                                     if let Some(stage) = action.strip_prefix("waiting:") {
@@ -165,9 +167,15 @@ fn spawn_injector(
                                 }
                             }
                         }
-                        Err(error) if !evaluate_error_logged => {
+                        Err(error) if is_navigation_context_error(&error.to_string()) => {
                             // A navigation can briefly invalidate the execution context. Log the
                             // first failure and keep polling so the next page can continue login.
+                            if !navigation_error_logged {
+                                tracing::debug!(%error, "SSO browser navigation replaced the execution context; retrying");
+                                navigation_error_logged = true;
+                            }
+                        }
+                        Err(error) if !evaluate_error_logged => {
                             tracing::warn!(%error, "SSO browser automation step failed");
                             evaluate_error_logged = true;
                         }
@@ -177,6 +185,11 @@ fn spawn_injector(
             }
         }
     }))
+}
+
+fn is_navigation_context_error(error: &str) -> bool {
+    error.contains("Cannot find context with specified id")
+        || error.contains("Execution context was destroyed")
 }
 
 fn automation_script(email: &str, password: &str) -> String {
@@ -229,6 +242,23 @@ fn automation_script(email: &str, password: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn navigation_errors_are_distinct_from_real_browser_failures() {
+        assert!(is_navigation_context_error(
+            "Error -32000: Cannot find context with specified id"
+        ));
+        assert!(is_navigation_context_error(
+            "Execution context was destroyed, most likely because of a navigation"
+        ));
+        for error in [
+            "Browser connection closed",
+            "Evaluation timed out",
+            "Error -32000: Permission denied",
+        ] {
+            assert!(!is_navigation_context_error(error));
+        }
+    }
 
     #[test]
     fn chromium_profiles_are_unique_and_removed_after_close() {
