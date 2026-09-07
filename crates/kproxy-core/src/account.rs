@@ -12,6 +12,9 @@ pub enum AuthMethod {
     Idc,
     /// 手工导入的社交登录凭据；阶段 1 只持久化，不实现登录流。
     Social,
+    /// Kiro CLI/headless API key (ksk_...), stored in access_token.
+    #[serde(rename = "api_key", alias = "apikey")]
+    ApiKey,
 }
 
 /// 订阅等级。
@@ -170,7 +173,8 @@ impl Account {
 
     /// 判断 token 是否已进入刷新窗口。
     pub fn is_token_expiring(&self, now: i64, before_secs: i64) -> bool {
-        self.credentials.expires_at - now <= before_secs
+        self.credentials.auth_method != AuthMethod::ApiKey
+            && self.credentials.expires_at.saturating_sub(now) <= before_secs
     }
 }
 

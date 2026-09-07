@@ -50,6 +50,8 @@ pub enum Endpoint {
     Codewhisperer,
     /// Amazon Q。
     Amazonq,
+    /// Regional Kiro CLI runtime.
+    Runtime,
 }
 
 /// Kiro agent mode。
@@ -1368,8 +1370,8 @@ overload_error_rate = 0.05
 # Kiro 上游请求与连接池
 # ----------------------------------------------------------------------------
 [upstream]
-# 强制首选 Kiro 上游端点；可选值："codewhisperer"、"amazonq"。
-# 不配置时按账号类型和已探测结果自动选择。
+# 强制首选 Kiro 上游端点；可选值："codewhisperer"、"amazonq"、"runtime"。
+# 不配置时按账号类型和已探测结果自动选择；API key / GovCloud 使用区域化 runtime。
 # preferred_endpoint = "amazonq"
 # Kiro agent mode；可选值："auto"、"vibe"、"spec"。
 agent_mode = "vibe"

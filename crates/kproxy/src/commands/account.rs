@@ -64,6 +64,16 @@ pub enum AccountCommand {
         #[arg(long)]
         stdin: bool,
     },
+    /// 导入 Kiro headless API key，从 KIRO_API_KEY 环境变量或标准输入读取。
+    AddApiKey {
+        #[arg(long)]
+        email: String,
+        #[arg(long, default_value = "us-east-1")]
+        region: String,
+        /// 从标准输入读取 key，避免在命令行参数中暴露凭据。
+        #[arg(long)]
+        key_stdin: bool,
+    },
     /// 导出账号 JSON；默认含凭证，仅应写入受保护位置。
     #[command(
         after_help = "示例：\n  kproxy --json account export > accounts.json\n  kproxy --json account export --redact"
@@ -368,6 +378,44 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                         result.skipped.join(", ")
                     );
                 }
+            }
+        }
+        AccountCommand::AddApiKey {
+            email,
+            region,
+            key_stdin,
+        } => {
+            let key = if key_stdin {
+                read_import_source(None, true).await?
+            } else {
+                std::env::var("KIRO_API_KEY").context("请设置 KIRO_API_KEY 或使用 --key-stdin")?
+            };
+            let key = key.trim();
+            if !key.starts_with("ksk_") || key.len() <= 4 || key.chars().any(char::is_whitespace) {
+                return Err(anyhow!("Kiro API key 必须是非空的 ksk_... 凭据"));
+            }
+            let accounts = parse_import_payload(
+                &serde_json::json!({
+                    "email":email, "credentials":{
+                        "access_token":key, "region":region, "expires_at":0, "auth_method":"api_key"
+                    }
+                })
+                .to_string(),
+            )?;
+            let result: AccountImportResult = client
+                .call(
+                    method::ACCOUNT_IMPORT,
+                    serde_json::json!({"accounts":accounts}),
+                )
+                .await?;
+            if json {
+                print_json(&result)?;
+            } else {
+                println!(
+                    "已导入 {} 个 API key 账号，跳过 {} 个",
+                    result.imported,
+                    result.skipped.len()
+                );
             }
         }
         AccountCommand::Export { redact } => {
@@ -831,10 +879,14 @@ fn print_detail(detail: &AccountDetail) {
         ),
         _ => println!("额度      -（尚未拉取）"),
     }
-    println!(
-        "凭证      {} 过期",
-        format_timestamp(summary.token_expires_at)
-    );
+    if detail.auth_method == "ApiKey" || detail.auth_method == "api_key" {
+        println!("凭证      Kiro API key（无 OAuth 自动刷新；撤销后需重新导入）");
+    } else {
+        println!(
+            "凭证      {} 过期",
+            format_timestamp(summary.token_expires_at)
+        );
+    }
     println!("区域      {}", detail.region);
     println!("认证      {}", detail.auth_method);
     println!(

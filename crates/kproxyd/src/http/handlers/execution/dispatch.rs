@@ -381,7 +381,7 @@ async fn dispatch_upstream(
                     endpoint = %error.endpoint,
                     upstream_status = error.status.unwrap_or_default(),
                     error = %sanitize_error_message(&error.message),
-                    "upstream authentication failed; refreshing token"
+                    "upstream authentication failed; checking credential recovery"
                 );
                 let mut ban_account = true;
                 if state

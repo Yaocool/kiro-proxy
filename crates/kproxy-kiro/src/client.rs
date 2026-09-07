@@ -13,14 +13,13 @@ use kproxy_core::config::{AgentMode, UpstreamConfig};
 use kproxy_translate::{validate_kiro_tool_history, KiroPayload, WebSearchResults};
 use reqwest::{Client, Response};
 use serde::{Deserialize, Serialize};
-use thiserror::Error;
 use tokio_util::codec::Decoder;
 use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::endpoint::{
-    endpoint_for_auth, EndpointCache, EndpointDefinition, EndpointKey, EndpointOverrides,
-    EndpointPurpose,
+    account_api_region, endpoint_for_auth, EndpointCache, EndpointDefinition, EndpointKey,
+    EndpointOverrides, EndpointPurpose,
 };
 use crate::event_stream::{EventStreamDecoder, KiroEvent};
 
@@ -29,13 +28,42 @@ const KIRO_BUILDER_ID_PROFILE_ARN: &str =
 const KIRO_SOCIAL_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
 
-#[derive(Debug, Clone, Error)]
-#[error("Kiro {endpoint} returned {status:?}: {message}")]
+#[derive(Clone)]
 pub struct KiroError {
     pub status: Option<u16>,
     pub endpoint: String,
     pub message: String,
 }
+
+impl std::fmt::Display for KiroError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Kiro {} returned {:?}: {}",
+            kproxy_translate::error::redact_kiro_keys(&self.endpoint),
+            self.status,
+            kproxy_translate::error::redact_kiro_keys(&self.message)
+        )
+    }
+}
+
+impl std::fmt::Debug for KiroError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KiroError")
+            .field("status", &self.status)
+            .field(
+                "endpoint",
+                &kproxy_translate::error::redact_kiro_keys(&self.endpoint),
+            )
+            .field(
+                "message",
+                &kproxy_translate::error::redact_kiro_keys(&self.message),
+            )
+            .finish()
+    }
+}
+
+impl std::error::Error for KiroError {}
 
 impl KiroError {
     pub fn is_auth(&self) -> bool {
@@ -542,7 +570,7 @@ impl KiroClient {
         let mut forbidden_rejections = 0usize;
         let attempt_count = order.len();
         for key in order {
-            let endpoint = EndpointDefinition::for_key(key, &self.overrides);
+            let endpoint = EndpointDefinition::for_account(key, &self.overrides, account)?;
             match self
                 .send_generation(account, payload, endpoint.clone())
                 .await
@@ -579,7 +607,9 @@ impl KiroClient {
             return Err(KiroError {
                 status: Some(403),
                 endpoint: "all".into(),
-                message: if forbidden_rejections == attempt_count {
+                message: if account.credentials.auth_method == AuthMethod::ApiKey {
+                    "Kiro rejected the API key; replace or reissue the key"
+                } else if forbidden_rejections == attempt_count {
                     "All Kiro endpoints returned 403; token refresh required"
                 } else {
                     "All Kiro endpoints returned 401/403; token refresh required"
@@ -598,15 +628,26 @@ impl KiroClient {
     /// values and the fixed Social profile do not require a network request;
     /// missing IdC values are discovered once per access token.
     pub async fn resolve_profile_arn(&self, account: &Account) -> Result<String, KiroError> {
+        if account.credentials.auth_method == AuthMethod::ApiKey {
+            return Err(KiroError {
+                status: Some(400),
+                endpoint: "ListAvailableProfiles".into(),
+                message: "Kiro API keys do not use profile ARNs".into(),
+            });
+        }
+        let govcloud = account_api_region(account)?.starts_with("us-gov-");
         if let Some(profile_arn) = account
             .profile_arn
             .as_deref()
             .map(str::trim)
             .filter(|profile_arn| !profile_arn.is_empty())
+            .filter(|profile_arn| {
+                !govcloud || profile_arn.starts_with("arn:aws-us-gov:codewhisperer:us-gov-")
+            })
         {
             return Ok(profile_arn.to_owned());
         }
-        if account.credentials.auth_method == kproxy_core::account::AuthMethod::Social {
+        if account.credentials.auth_method == AuthMethod::Social && !govcloud {
             return Ok(KIRO_SOCIAL_PROFILE_ARN.into());
         }
 
@@ -666,6 +707,7 @@ impl KiroClient {
             .await
             .map_err(build_error)?;
         let urls = self.profile_discovery_urls(account)?;
+        let govcloud = account_api_region(account)?.starts_with("us-gov-");
         let mut fallback_allowed = false;
         let mut last_error = None;
         for url in urls {
@@ -697,7 +739,10 @@ impl KiroClient {
                     .filter_map(|profile| profile.arn)
                     .map(|profile_arn| profile_arn.trim().to_owned())
                     .find(|profile_arn| {
-                        profile_arn.starts_with("arn:") && profile_arn.len() <= 2_048
+                        profile_arn.starts_with("arn:")
+                            && profile_arn.len() <= 2_048
+                            && (!govcloud
+                                || profile_arn.starts_with("arn:aws-us-gov:codewhisperer:us-gov-"))
                     })
                 {
                     debug!(
@@ -726,7 +771,7 @@ impl KiroClient {
             return Err(error);
         }
 
-        if fallback_allowed {
+        if fallback_allowed && !govcloud {
             debug!(account = %account.id, "using Kiro Builder ID profile ARN");
             return Ok(KIRO_BUILDER_ID_PROFILE_ARN.into());
         }
@@ -754,11 +799,7 @@ impl KiroClient {
                 message: "account has an invalid API region".into(),
             });
         }
-        let regions = if region.starts_with("eu-") {
-            ["eu-central-1", "us-east-1"]
-        } else {
-            ["us-east-1", "eu-central-1"]
-        };
+        let regions = usage_api_regions(account);
         regions
             .into_iter()
             .map(|region| {
@@ -898,7 +939,8 @@ impl KiroClient {
     }
 
     fn web_search_url(&self, account: &Account) -> Result<url::Url, KiroError> {
-        let region = account.credentials.region.trim();
+        let api_region = account_api_region(account)?;
+        let region = api_region.as_str();
         if region.is_empty()
             || !region
                 .chars()
@@ -935,13 +977,25 @@ impl KiroClient {
         &self,
         account: &Account,
         payload: &KiroPayload,
-        endpoint: EndpointDefinition,
+        mut endpoint: EndpointDefinition,
     ) -> Result<KiroResponse, KiroError> {
         // Protocol capabilities are resolved before dispatch. A 400 describes
         // this request, not temporary account health: do not probe by removing
         // fields or learn time-limited capabilities from error message text.
         let mut payload = payload.clone();
         set_payload_origin(&mut payload, endpoint.origin);
+        if endpoint.key == EndpointKey::Runtime {
+            payload.conversation_state.agent_continuation_id = None;
+            if account.credentials.auth_method == AuthMethod::ApiKey {
+                payload.profile_arn = None;
+            } else {
+                payload.profile_arn = Some(self.resolve_profile_arn(account).await?);
+            }
+            let mut routed_account = account.clone();
+            routed_account.profile_arn.clone_from(&payload.profile_arn);
+            endpoint =
+                EndpointDefinition::for_account(endpoint.key, &self.overrides, &routed_account)?;
+        }
         validate_kiro_tool_history(&payload).map_err(|message| KiroError {
             status: Some(400),
             endpoint: endpoint.name.into(),
@@ -965,11 +1019,27 @@ impl KiroClient {
         })?
         .map_err(build_error)?;
         let stream_slot_wait_ms = slot_wait_started.elapsed().as_millis() as u64;
+        let mut wire = serde_json::to_value(&payload).map_err(build_error)?;
+        if endpoint.key == EndpointKey::Runtime {
+            if let Some(history) = wire
+                .pointer_mut("/conversationState/history")
+                .and_then(serde_json::Value::as_array_mut)
+            {
+                for item in history {
+                    if let Some(user) = item
+                        .get_mut("userInputMessage")
+                        .and_then(serde_json::Value::as_object_mut)
+                    {
+                        user.remove("modelId");
+                    }
+                }
+            }
+        }
         let response = self
             .stream
             .post(&endpoint.url)
             .headers(headers(account, &endpoint, self.upstream.agent_mode)?)
-            .json(&payload)
+            .json(&wire)
             .send()
             .await
             .map_err(|error| KiroError {
@@ -1048,6 +1118,7 @@ impl KiroClient {
             let response = self
                 .short
                 .get(url)
+                .headers(token_type_headers(account))
                 .header("accept", "application/json")
                 .header(
                     "authorization",
@@ -1097,6 +1168,7 @@ impl KiroClient {
     }
 
     fn usage_limits_urls(&self, account: &Account) -> Result<Vec<url::Url>, KiroError> {
+        account_api_region(account)?;
         if let Some(endpoint) = self.overrides.amazonq_url.as_deref() {
             return Ok(vec![usage_limits_url(endpoint, account)?]);
         }
@@ -1107,6 +1179,11 @@ impl KiroClient {
     }
 
     pub async fn list_models(&self, account: &Account) -> Result<Vec<ModelInfo>, KiroError> {
+        // Kiro's management catalog requires an OAuth profile ARN, which API
+        // keys do not have. Do not mark a valid generation key as unauthorized.
+        if account.credentials.auth_method == AuthMethod::ApiKey {
+            return Ok(crate::catalog::static_models_for_account(account));
+        }
         let fetch_key = (account.id.clone(), account.credentials.access_token.clone());
         let fetch_id = Uuid::new_v4();
         let fetch = match self.model_fetches.entry(fetch_key.clone()) {
@@ -1143,12 +1220,7 @@ impl KiroClient {
         match fetch.await {
             Ok(models) => Ok(models),
             Err(error) => {
-                let models = crate::catalog::static_models_for_subscription(
-                    account
-                        .subscription
-                        .as_ref()
-                        .map(|subscription| subscription.kind),
-                );
+                let models = crate::catalog::static_models_for_account(account);
                 if models.is_empty() {
                     return Err(error);
                 }
@@ -1173,18 +1245,42 @@ impl KiroClient {
         );
         let mut last_error = None;
         for key in order {
+            let endpoint = EndpointDefinition::for_account(key, &self.overrides, account)?;
+            let request = if key == EndpointKey::Runtime {
+                let profile = self.resolve_profile_arn(account).await?;
+                let mut routed_account = account.clone();
+                routed_account.profile_arn = Some(profile.clone());
+                let region = account_api_region(&routed_account)?;
+                let url = self
+                    .overrides
+                    .management_url
+                    .clone()
+                    .unwrap_or_else(|| format!("https://management.{region}.kiro.dev/"))
+                    .replace("{region}", &region);
+                self.short
+                    .post(url)
+                    .bearer_auth(&account.credentials.access_token)
+                    .header("accept", "*/*")
+                    .header("content-type", "application/x-amz-json-1.0")
+                    .header(
+                        "x-amz-target",
+                        "AmazonCodeWhispererService.ListAvailableModels",
+                    )
+                    .json(&serde_json::json!({"origin":"KIRO_CLI", "profileArn":profile}))
+            } else {
+                self.short
+                    .get(models_url(&endpoint.url, account)?)
+                    .headers(metadata_headers(
+                        account,
+                        &endpoint,
+                        self.upstream.agent_mode,
+                        false,
+                    )?)
+            };
             let _permit = Arc::clone(&self.short_slots)
                 .acquire_owned()
                 .await
                 .map_err(build_error)?;
-            let endpoint = EndpointDefinition::for_key(key, &self.overrides);
-            let url = models_url(&endpoint.url, account)?;
-            let request = self.short.get(url).headers(metadata_headers(
-                account,
-                &endpoint,
-                self.upstream.agent_mode,
-                false,
-            )?);
             let response = match tokio::time::timeout(Duration::from_secs(15), request.send()).await
             {
                 Ok(Ok(response)) => response,
@@ -1259,10 +1355,15 @@ impl KiroClient {
             .acquire_owned()
             .await
             .map_err(build_error)?;
-        let endpoint = EndpointDefinition::for_key(
-            endpoint_for_auth(account.credentials.auth_method),
+        let endpoint = EndpointDefinition::for_account(
+            if account.credentials.auth_method == AuthMethod::ApiKey {
+                EndpointKey::Amazonq
+            } else {
+                endpoint_for_auth(account.credentials.auth_method)
+            },
             &self.overrides,
-        );
+            account,
+        )?;
         let base = endpoint
             .url
             .split("/generateAssistantResponse")
@@ -1338,14 +1439,14 @@ fn headers(
         HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, CONTENT_TYPE, USER_AGENT,
     };
     let mut headers = HeaderMap::new();
-    let cli = endpoint.origin == "CLI";
+    let cli = matches!(endpoint.origin, "CLI" | "KIRO_CLI");
     let user_agent = if cli {
-        "aws-sdk-rust/1.3.9 os/macos lang/rust/1.87.0".to_string()
+        "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17593 os/macos lang/rust/1.92.0 md/appVersion-2.10.0 app/AmazonQ-For-CLI".to_string()
     } else {
         kiro_user_agent(&account.machine_id)
     };
     let amz_user_agent = if cli {
-        "aws-sdk-rust/1.3.9 ua/2.1 api/ssooidc/1.88.0 os/macos lang/rust/1.87.0 m/E app/AmazonQ-For-CLI".to_string()
+        "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17593 os/macos lang/rust/1.92.0 m/F app/AmazonQ-For-CLI".to_string()
     } else {
         kiro_amz_user_agent(&account.machine_id)
     };
@@ -1357,7 +1458,14 @@ fn headers(
     };
     let authorization = format!("Bearer {}", account.credentials.access_token);
     let pairs = [
-        (CONTENT_TYPE, "application/json"),
+        (
+            CONTENT_TYPE,
+            if cli {
+                "application/x-amz-json-1.0"
+            } else {
+                "application/json"
+            },
+        ),
         (ACCEPT, "*/*"),
         (USER_AGENT, &user_agent),
         (AUTHORIZATION, &authorization),
@@ -1365,6 +1473,7 @@ fn headers(
     for (name, value) in pairs {
         headers.insert(name, HeaderValue::from_str(value).map_err(build_error)?);
     }
+    headers.extend(token_type_headers(account));
     let invocation_id = Uuid::new_v4().to_string();
     if !endpoint.amz_target.is_empty() {
         headers.insert(
@@ -1408,20 +1517,26 @@ fn mcp_headers(account: &Account) -> Result<reqwest::header::HeaderMap, KiroErro
         reqwest::header::HeaderName::from_static("x-amzn-codewhisperer-optout"),
         HeaderValue::from_static("false"),
     );
+    headers.extend(token_type_headers(account));
     let profile_arn = account
         .profile_arn
         .as_deref()
         .map(str::trim)
-        .filter(|profile_arn| !profile_arn.is_empty())
-        .ok_or_else(|| KiroError {
+        .filter(|profile_arn| !profile_arn.is_empty());
+    if let Some(profile_arn) =
+        profile_arn.filter(|_| account.credentials.auth_method != AuthMethod::ApiKey)
+    {
+        headers.insert(
+            reqwest::header::HeaderName::from_static("x-amzn-kiro-profile-arn"),
+            HeaderValue::from_str(profile_arn).map_err(build_error)?,
+        );
+    } else if account.credentials.auth_method != AuthMethod::ApiKey {
+        return Err(KiroError {
             status: None,
             endpoint: "MCP web_search".into(),
             message: "account profile ARN was not resolved before web search".into(),
-        })?;
-    headers.insert(
-        reqwest::header::HeaderName::from_static("x-amzn-kiro-profile-arn"),
-        HeaderValue::from_str(profile_arn).map_err(build_error)?,
-    );
+        });
+    }
     headers.insert(
         reqwest::header::HeaderName::from_static("x-amz-user-agent"),
         HeaderValue::from_str(&kiro_amz_user_agent(&account.machine_id)).map_err(build_error)?,
@@ -1566,11 +1681,18 @@ fn models_url(endpoint: &str, account: &Account) -> Result<url::Url, KiroError> 
 }
 
 fn usage_profile_arn(account: &Account) -> Option<&str> {
+    if account.credentials.auth_method == AuthMethod::ApiKey {
+        return None;
+    }
     account
         .profile_arn
         .as_deref()
         .map(str::trim)
         .filter(|profile_arn| !profile_arn.is_empty())
+        .filter(|profile_arn| {
+            !account.credentials.region.trim().starts_with("us-gov-")
+                || profile_arn.starts_with("arn:aws-us-gov:codewhisperer:us-gov-")
+        })
         .filter(|profile_arn| {
             account.credentials.auth_method != AuthMethod::Idc
                 || *profile_arn != KIRO_BUILDER_ID_PROFILE_ARN
@@ -1582,6 +1704,12 @@ fn usage_api_regions(account: &Account) -> Vec<String> {
     let primary = profile_region
         .map(str::to_owned)
         .unwrap_or_else(|| canonical_api_region(&account.credentials.region).to_owned());
+    if account.credentials.region.trim().starts_with("us-gov-") {
+        return vec![account.credentials.region.trim().to_owned()];
+    }
+    if primary.starts_with("us-gov-") || account.credentials.auth_method == AuthMethod::ApiKey {
+        return vec![account_api_region(account).unwrap_or(primary)];
+    }
     let fallback = if primary == "us-east-1" {
         "eu-central-1"
     } else {
@@ -1592,6 +1720,17 @@ fn usage_api_regions(account: &Account) -> Vec<String> {
         regions.push(fallback.to_owned());
     }
     regions
+}
+
+fn token_type_headers(account: &Account) -> reqwest::header::HeaderMap {
+    let mut headers = reqwest::header::HeaderMap::new();
+    if account.credentials.auth_method == AuthMethod::ApiKey {
+        headers.insert(
+            "tokentype",
+            reqwest::header::HeaderValue::from_static("API_KEY"),
+        );
+    }
+    headers
 }
 
 fn canonical_api_region(region: &str) -> &'static str {

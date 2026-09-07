@@ -313,6 +313,7 @@ impl TokenRefresher {
             return Err(RefreshRequestFailure::NotRefreshable);
         };
         let response = match snapshot.credentials.auth_method {
+            AuthMethod::ApiKey => return Err(RefreshRequestFailure::NotRefreshable),
             AuthMethod::Idc => {
                 let (Some(client_id), Some(client_secret)) = (
                     snapshot.credentials.client_id.as_deref(),
@@ -395,7 +396,9 @@ impl TokenRefresher {
 }
 
 fn validate_refreshable(account: &Account) -> Result<(), RefreshError> {
-    if account.credentials.refresh_token.is_none() {
+    if account.credentials.auth_method == AuthMethod::ApiKey
+        || account.credentials.refresh_token.is_none()
+    {
         return Err(RefreshError::NotRefreshable);
     }
     if account.credentials.auth_method == AuthMethod::Idc
@@ -545,6 +548,31 @@ mod tests {
             state.account.read().await.credentials.access_token,
             "new-access-token"
         );
+    }
+
+    #[tokio::test]
+    async fn api_keys_never_enter_oauth_refresh_even_with_stale_refresh_fields() {
+        let server = MockServer::start().await;
+        let mut account = account();
+        account.credentials.auth_method = AuthMethod::ApiKey;
+        account.credentials.access_token = "ksk_test-key".into();
+        account.credentials.expires_at = 0;
+        let pool = AccountPool::new(vec![account], PoolConfig::default());
+        let refresher = TokenRefresher::new(300)
+            .unwrap()
+            .with_endpoint(format!("{}/refresh", server.uri()));
+        let state = pool.get("acc_refresh").await.unwrap();
+        let before = state.health();
+        assert!(!refresher
+            .refresh_account(&pool, "acc_refresh", false)
+            .await
+            .unwrap());
+        assert!(matches!(
+            refresher.refresh_account(&pool, "acc_refresh", true).await,
+            Err(RefreshError::NotRefreshable)
+        ));
+        assert_eq!(state.health(), before);
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

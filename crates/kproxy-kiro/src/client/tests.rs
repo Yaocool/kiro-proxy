@@ -85,9 +85,235 @@ fn test_client(server: &MockServer) -> KiroClient {
                 server.uri()
             )),
             mcp_url: Some(format!("{}/mcp", server.uri())),
+            runtime_url: Some(format!("{}/runtime", server.uri())),
+            management_url: Some(format!("{}/management", server.uri())),
         },
     )
     .expect("client")
+}
+
+#[test]
+fn formatted_upstream_errors_redact_api_keys_without_changing_classification() {
+    let error = KiroError {
+        status: Some(402),
+        endpoint: "Runtime".into(),
+        message: "Quota exhausted for ksk_synthetic-secret_123".into(),
+    };
+    assert!(error.is_quota());
+    for formatted in [error.to_string(), format!("{error:?}")] {
+        assert!(
+            !formatted.contains("ksk_synthetic-secret_123"),
+            "{formatted}"
+        );
+        assert!(formatted.contains("[REDACTED]"), "{formatted}");
+        assert!(formatted.contains("Quota exhausted"), "{formatted}");
+    }
+    assert_eq!(
+        error.message,
+        "Quota exhausted for ksk_synthetic-secret_123"
+    );
+}
+
+#[tokio::test]
+async fn api_key_generation_uses_runtime_without_oauth_profile_or_refresh() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/runtime"))
+        .respond_with(|request: &wiremock::Request| {
+            assert_eq!(request.headers["authorization"], "Bearer ksk_test-key");
+            assert_eq!(request.headers["tokentype"], "API_KEY");
+            assert_eq!(
+                request.headers["x-amz-target"],
+                "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+            );
+            assert_eq!(
+                request.headers["content-type"],
+                "application/x-amz-json-1.0"
+            );
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert!(body.get("profileArn").is_none());
+            assert!(body["conversationState"]
+                .get("agentContinuationId")
+                .is_none());
+            let user = &body["conversationState"]["currentMessage"]["userInputMessage"];
+            assert_eq!(user["origin"], "KIRO_CLI");
+            assert_eq!(user["modelId"], "claude-opus-5");
+            assert!(body["conversationState"]["history"][0]["userInputMessage"]
+                .get("modelId")
+                .is_none());
+            ResponseTemplate::new(200).set_body_bytes(Vec::<u8>::new())
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = test_client(&server);
+    let mut account = account(AuthMethod::ApiKey);
+    account.credentials.access_token = "ksk_test-key".into();
+    account.credentials.expires_at = 0;
+    let request: kproxy_translate::ClaudeRequest = serde_json::from_value(serde_json::json!({
+        "model":"claude-opus-5", "max_tokens":256,
+        "messages":[{"role":"user","content":"before"},{"role":"assistant","content":"done"},{"role":"user","content":"hello"}]
+    })).unwrap();
+    let mut payload = kproxy_translate::claude_to_kiro(
+        &request,
+        &kproxy_translate::TranslationOptions::new("claude-opus-5", "AI_EDITOR"),
+    );
+    payload.profile_arn = Some("stale-oauth-profile".into());
+    let response = client
+        .generate(&account, &payload, Some(EndpointKey::Amazonq))
+        .await
+        .unwrap();
+    assert_eq!(response.endpoint.key, EndpointKey::Runtime);
+    let models = client.list_models(&account).await.unwrap();
+    assert!(models.iter().any(|model| model.model_id == "claude-opus-5"));
+    assert_eq!(
+        server.received_requests().await.unwrap().len(),
+        1,
+        "API keys must not trigger profile/catalog discovery"
+    );
+    assert!(!account.is_token_expiring(1_000_000, 300));
+    let headers = mcp_headers(&account).unwrap();
+    assert_eq!(headers["tokentype"], "API_KEY");
+    assert!(!headers.contains_key("x-amzn-kiro-profile-arn"));
+}
+
+#[tokio::test]
+async fn runtime_catalog_uses_management_rpc_and_oauth_profile() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/management"))
+        .respond_with(|request: &wiremock::Request| {
+            assert_eq!(request.headers["x-amz-target"], "AmazonCodeWhispererService.ListAvailableModels");
+            assert!(!request.headers.contains_key("tokentype"));
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["origin"], "KIRO_CLI");
+            assert_eq!(body["profileArn"], "arn:aws:codewhisperer:us-east-1:123456789012:profile/enterprise");
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"models":[{
+                "modelId":"claude-opus-5", "modelName":"Opus 5",
+                "additionalModelRequestFieldsSchema":{"properties":{"output_config":{"properties":{"effort":{"enum":["low","high"]}}}}}
+            }]}))
+        }).expect(1).mount(&server).await;
+    let mut client = test_client(&server);
+    client.upstream.preferred_endpoint = Some(kproxy_core::config::Endpoint::Runtime);
+    let models = client
+        .list_models(&power_account(AuthMethod::Idc))
+        .await
+        .unwrap();
+    assert_eq!(models.len(), 1);
+    assert_eq!(models[0].model_name, "Opus 5");
+}
+
+#[test]
+fn regional_endpoints_use_profile_region_and_keep_govcloud_isolated() {
+    let mut account = account(AuthMethod::Idc);
+    account.credentials.region = "eu-west-1".into();
+    account.profile_arn = Some("arn:aws:codewhisperer:eu-central-1:123:profile/test".into());
+    let overrides = EndpointOverrides::default();
+    assert_eq!(
+        EndpointDefinition::for_account(EndpointKey::Runtime, &overrides, &account)
+            .unwrap()
+            .url,
+        "https://runtime.eu-central-1.kiro.dev/"
+    );
+    assert_eq!(
+        EndpointDefinition::for_account(EndpointKey::Amazonq, &overrides, &account)
+            .unwrap()
+            .url,
+        "https://q.eu-central-1.amazonaws.com/generateAssistantResponse"
+    );
+    account.credentials.region = "us-gov-west-1".into();
+    account.profile_arn = Some(KIRO_BUILDER_ID_PROFILE_ARN.into());
+    assert_eq!(
+        EndpointCache::default().order(
+            &account,
+            Some(EndpointKey::Amazonq),
+            EndpointPurpose::Generation
+        ),
+        vec![EndpointKey::Runtime]
+    );
+    assert_eq!(
+        EndpointDefinition::for_account(EndpointKey::Runtime, &overrides, &account)
+            .unwrap()
+            .url,
+        "https://runtime.us-gov-west-1.kiro.dev/"
+    );
+    assert_eq!(usage_api_regions(&account), ["us-gov-west-1"]);
+    assert!(usage_profile_arn(&account).is_none());
+    account.credentials.region = "bad/region".into();
+    account.profile_arn = None;
+    assert!(EndpointDefinition::for_account(EndpointKey::Runtime, &overrides, &account).is_err());
+}
+
+#[tokio::test]
+async fn govcloud_replaces_commercial_profile_before_runtime_and_management_requests() {
+    let server = MockServer::start().await;
+    let profile = "arn:aws-us-gov:codewhisperer:us-gov-west-1:123456789012:profile/enterprise";
+    Mock::given(method("POST"))
+        .and(path("/amazon/ListAvailableProfiles"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "profiles":[{"arn":KIRO_BUILDER_ID_PROFILE_ARN},{"arn":profile}]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/management/us-gov-west-1"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["profileArn"], profile);
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({"models":[{
+                "modelId":"claude-opus-5","modelName":"Opus 5"
+            }]}))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/runtime/us-gov-west-1"))
+        .respond_with(move |request: &wiremock::Request| {
+            let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["profileArn"], profile);
+            ResponseTemplate::new(200).set_body_bytes(Vec::<u8>::new())
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut client = test_client(&server);
+    client.overrides.management_url = Some(format!("{}/management/{{region}}", server.uri()));
+    client.overrides.runtime_url = Some(format!("{}/runtime/{{region}}", server.uri()));
+    let mut account = power_account(AuthMethod::Idc);
+    account.credentials.region = "us-gov-west-1".into();
+    account.profile_arn = Some(KIRO_BUILDER_ID_PROFILE_ARN.into());
+    assert_eq!(client.list_models(&account).await.unwrap().len(), 1);
+    let mut payload = payload();
+    payload.profile_arn.clone_from(&account.profile_arn);
+    let response = client
+        .generate(&account, &payload, Some(EndpointKey::Amazonq))
+        .await
+        .unwrap();
+    assert_eq!(response.endpoint.key, EndpointKey::Runtime);
+    assert!(!server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .any(|request| request.url.path().contains("us-east-1")
+            || request.url.path() == "/amazon/generateAssistantResponse"));
+}
+
+#[tokio::test]
+async fn govcloud_without_a_profile_does_not_use_the_builder_id_fallback() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/amazon/ListAvailableProfiles"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "profiles":[{"arn":KIRO_BUILDER_ID_PROFILE_ARN}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = test_client(&server);
+    let mut account = account(AuthMethod::Idc);
+    account.credentials.region = "us-gov-west-1".into();
+    assert!(client.resolve_profile_arn(&account).await.is_err());
 }
 
 fn generation_endpoint(server: &MockServer) -> EndpointDefinition {

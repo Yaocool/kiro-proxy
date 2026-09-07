@@ -21,7 +21,22 @@ const BAN_TRIGGER_PHRASES: &[&str] = &[
     "too many active sessions",
 ];
 
+/// Redacts headless credentials without changing error-classification prose.
+/// Shared with upstream error formatting so background logs are safe as well.
+pub fn redact_kiro_keys(message: &str) -> std::borrow::Cow<'_, str> {
+    static KIRO_KEY: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    KIRO_KEY
+        .get_or_init(|| {
+            regex::Regex::new(r#"(?i)ksk_[^\s"'<>\x60,;()\[\]{}]+"#).expect("Kiro key pattern")
+        })
+        .replace_all(message, "[REDACTED]")
+}
+
 pub fn sanitize_error_message(message: &str) -> String {
+    // Quota/context branches intentionally preserve useful diagnostics. Strip
+    // headless credentials before any branch can reflect upstream prose.
+    let message = redact_kiro_keys(message);
+    let message = message.as_ref();
     let lower = message.to_ascii_lowercase();
     // This is deliberately the first and unconditional classification. Moving
     // it below quota/auth/context handling can leak a CRS trigger through a
@@ -161,33 +176,13 @@ fn is_network_error(lower: &str) -> bool {
 }
 
 fn redact_endpoint_names(message: &str) -> String {
-    let filtered = redact_domain_token(message, "codewhisperer.us-east-1.amazonaws.com");
-    let filtered = redact_domain_token(&filtered, "q.us-east-1.amazonaws.com");
+    static ENDPOINT: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let filtered = ENDPOINT.get_or_init(|| {
+        regex::Regex::new(r"(?i)(?:(?:codewhisperer|q)\.[a-z0-9-]+\.amazonaws\.com|(?:runtime|management)\.[a-z0-9-]+\.kiro\.dev)\S*")
+            .expect("regional Kiro endpoint pattern")
+    }).replace_all(message, "upstream");
     let filtered = replace_ascii_case_insensitive(&filtered, "CodeWhisperer", "endpoint");
     replace_ascii_case_insensitive(&filtered, "AmazonQ", "endpoint")
-}
-
-fn redact_domain_token(message: &str, domain: &str) -> String {
-    let lower = message.to_ascii_lowercase();
-    let mut output = String::with_capacity(message.len());
-    let mut cursor = 0;
-    while let Some(relative) = lower[cursor..].find(domain) {
-        let start = cursor + relative;
-        output.push_str(&message[cursor..start]);
-        output.push_str("upstream");
-        cursor = start + domain.len();
-        while cursor < message.len() {
-            let Some(character) = message[cursor..].chars().next() else {
-                break;
-            };
-            if character.is_whitespace() {
-                break;
-            }
-            cursor += character.len_utf8();
-        }
-    }
-    output.push_str(&message[cursor..]);
-    output
 }
 
 fn replace_ascii_case_insensitive(message: &str, needle: &str, replacement: &str) -> String {
@@ -415,5 +410,30 @@ mod tests {
             sanitize_error_message("AMAZONQ and CODEWHISPERER failed"),
             "endpoint and endpoint failed"
         );
+    }
+
+    #[test]
+    fn kiro_api_keys_and_regional_endpoints_are_redacted_before_classification() {
+        for message in [
+            "quota exhausted for ksk_synthetic-secret_123",
+            "invalid request: key=ksk_synthetic-secret_123",
+            "ThrottlingException: ksk_synthetic-secret_123 reached the limit",
+            "prompt is too long for model 'ksk_synthetic-secret_123': 200 tokens > 100",
+        ] {
+            let safe = sanitize_error_message(message);
+            assert!(!safe.contains("ksk_synthetic"), "{safe}");
+            assert!(!safe.contains("secret_123"), "{safe}");
+        }
+        for host in [
+            "runtime.eu-central-1.kiro.dev",
+            "management.us-gov-west-1.kiro.dev",
+            "q.eu-central-1.amazonaws.com",
+            "codewhisperer.us-gov-east-1.amazonaws.com",
+        ] {
+            assert_eq!(
+                sanitize_error_message(&format!("request to {host}/private?token=secret failed")),
+                "request to upstream failed"
+            );
+        }
     }
 }
