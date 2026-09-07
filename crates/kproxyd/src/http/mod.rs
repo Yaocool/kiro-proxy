@@ -242,7 +242,7 @@ async fn trace_requests(
             duration_ms,
             "unhandled server response headers ready"
         );
-    } else if status.is_client_error() || status.is_server_error() {
+    } else if (status.is_client_error() || status.is_server_error()) && !handled_error {
         tracing::warn!(
             event = "http.response.ready",
             trace_id = %trace_id,
@@ -1325,7 +1325,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_request_stats_hide_unauthenticated_models_and_truncate_authenticated_ones() {
+    async fn failed_request_stats_hide_untrusted_models_and_bound_valid_aliases() {
         let mut config = Config::default();
         config.api_key.push(ApiKeyConfig {
             id: Some("ak_test".into()),
@@ -1376,28 +1376,30 @@ mod tests {
             .expect("response");
         assert_eq!(rejected_user_agent.status(), StatusCode::BAD_REQUEST);
 
-        let long_model = "界".repeat(200);
-        let invalid = router(Arc::clone(&state))
-            .oneshot(
-                Request::post("/v1/chat/completions")
-                    .header(header::USER_AGENT, "codex_cli_rs/0.147.0 (test)")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .header(header::AUTHORIZATION, "Bearer sk-secret")
-                    .body(Body::from(
-                        serde_json::json!({"model": long_model, "messages": []}).to_string(),
-                    ))
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        for long_model in ["界".repeat(200), "x".repeat(200)] {
+            let invalid = router(Arc::clone(&state))
+                .oneshot(
+                    Request::post("/v1/chat/completions")
+                        .header(header::USER_AGENT, "codex_cli_rs/0.147.0 (test)")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::AUTHORIZATION, "Bearer sk-secret")
+                        .body(Body::from(
+                            serde_json::json!({"model": long_model, "messages": []}).to_string(),
+                        ))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+        }
 
         let snapshot = state.stats.snapshot(None);
         assert!(snapshot.by_model.contains_key("unknown"));
         assert!(!snapshot.by_model.contains_key(attacker_model));
         assert!(!snapshot.by_model.contains_key(rejected_user_agent_model));
-        let truncated = "界".repeat(128);
-        assert!(snapshot.by_model.contains_key(&truncated));
+        assert!(!snapshot.by_model.contains_key(&"界".repeat(128)));
+        assert!(snapshot.by_model.contains_key("[invalid-model]"));
+        assert!(snapshot.by_model.contains_key(&"x".repeat(128)));
         assert!(snapshot
             .recent_requests
             .iter()

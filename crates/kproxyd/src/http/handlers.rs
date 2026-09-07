@@ -13,6 +13,7 @@ use bytes::BytesMut;
 use futures::StreamExt;
 use kproxy_kiro::{EventStreamDecoder, KiroError, KiroEvent, KiroResponse};
 use kproxy_pool::{AccountLease, PoolError};
+use kproxy_translate::error::log_model;
 use kproxy_translate::model::{map_model, resolve_dynamic_model};
 use kproxy_translate::{
     apply_context_management_edits, claude_loaded_tools, claude_pending_server_tool_uses,
@@ -449,7 +450,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         tracing::info!(
             trace_id = %trace_id,
             protocol = "claude_count_tokens",
-            model = %request.model,
+            model = %log_model(&request.model),
             message_count = request.messages.len(),
             tool_count = request.tools.len(),
             "client token-count request validated"
@@ -576,7 +577,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         tracing::info!(
             trace_id = %trace_id,
             protocol = "claude_count_tokens",
-            model = %request.model,
+            model = %log_model(&request.model),
             input_tokens,
             original_input_tokens,
             compaction_boundary_applied = boundary_applied,

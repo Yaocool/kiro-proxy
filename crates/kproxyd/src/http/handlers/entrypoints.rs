@@ -1,9 +1,9 @@
 use super::{
-    handle_claude, handle_openai, json, now_secs, request_trace_id, sanitize_error_message,
-    ApiError, AppState, Arc, BTreeSet, Body, Bytes, Duration, ErrorFormat, HeaderMap, Instant,
-    IntoResponse, Json, Request, RequestDiagnostics, RequestLog, Response, ServiceHttpState, State,
-    StatusCode, StreamExt, UpstreamAttemptLog, Uuid, Value, MAX_ATTEMPT_LOG_SUMMARY_CHARS,
-    MAX_STATS_MODEL_CHARS, UNKNOWN_STATS_MODEL,
+    handle_claude, handle_openai, json, log_model, now_secs, request_trace_id,
+    sanitize_error_message, ApiError, AppState, Arc, BTreeSet, Body, Bytes, Duration, ErrorFormat,
+    HeaderMap, Instant, IntoResponse, Json, Request, RequestDiagnostics, RequestLog, Response,
+    ServiceHttpState, State, StatusCode, StreamExt, UpstreamAttemptLog, Uuid, Value,
+    MAX_ATTEMPT_LOG_SUMMARY_CHARS, MAX_STATS_MODEL_CHARS, UNKNOWN_STATS_MODEL,
 };
 
 pub async fn root() -> Json<Value> {
@@ -236,10 +236,12 @@ fn request_model_hint(body: &[u8]) -> String {
     serde_json::from_slice::<Value>(body)
         .ok()
         .and_then(|value| {
-            value
-                .get("model")
-                .and_then(Value::as_str)
-                .map(|model| model.chars().take(MAX_STATS_MODEL_CHARS).collect())
+            value.get("model").and_then(Value::as_str).map(|model| {
+                log_model(model)
+                    .chars()
+                    .take(MAX_STATS_MODEL_CHARS)
+                    .collect()
+            })
         })
         .unwrap_or_default()
 }
@@ -289,7 +291,7 @@ pub(super) fn attempt_diagnostics(attempts: &[UpstreamAttemptLog]) -> AttemptDia
                 attempt
                     .status
                     .map_or_else(|| "-".into(), |status| status.to_string()),
-                attempt.error
+                sanitize_error_message(&attempt.error)
             )
         })
         .collect::<Vec<_>>()
@@ -326,11 +328,21 @@ pub(super) fn record_failed_request(
     let model = if error.suppress_model_stats {
         UNKNOWN_STATS_MODEL.to_owned()
     } else {
-        model.chars().take(MAX_STATS_MODEL_CHARS).collect()
+        log_model(model)
+            .chars()
+            .take(MAX_STATS_MODEL_CHARS)
+            .collect()
     };
     let safe_error = sanitize_error_message(&error.message);
     let duration_ms = started.elapsed().as_millis() as u64;
-    let model_path = error.log_context.model_path.join(" -> ");
+    let model_path = error
+        .log_context
+        .model_path
+        .iter()
+        .map(|model| log_model(model))
+        .collect::<Vec<_>>();
+    let mapped_model = log_model(&error.log_context.mapped_model);
+    let kiro_model = log_model(&error.log_context.kiro_model);
     let request_id = format!("req_{}", Uuid::new_v4().simple());
     let attempts = attempt_diagnostics(&error.log_context.attempts);
     let upstream_status = error.upstream_status.or_else(|| {
@@ -348,9 +360,9 @@ pub(super) fn record_failed_request(
             request_id,
             http_path = path,
             model = %model,
-            mapped_model = %error.log_context.mapped_model,
-            kiro_model = %error.log_context.kiro_model,
-            model_path,
+            mapped_model,
+            kiro_model,
+            model_path = %model_path.join(" -> "),
             mapping_rule = error.log_context.model_mapping_rule.as_deref().unwrap_or("none"),
             account_id = %error.log_context.account_id,
             account_name = %error.log_context.account_name,
@@ -377,9 +389,9 @@ pub(super) fn record_failed_request(
             request_id,
             http_path = path,
             model = %model,
-            mapped_model = %error.log_context.mapped_model,
-            kiro_model = %error.log_context.kiro_model,
-            model_path,
+            mapped_model,
+            kiro_model,
+            model_path = %model_path.join(" -> "),
             mapping_rule = error.log_context.model_mapping_rule.as_deref().unwrap_or("none"),
             account_id = %error.log_context.account_id,
             account_name = %error.log_context.account_name,
@@ -408,14 +420,14 @@ pub(super) fn record_failed_request(
         model: if error.log_context.mapped_model.is_empty() {
             model.clone()
         } else {
-            error.log_context.mapped_model.clone()
+            mapped_model
         },
         original_model: model,
-        kiro_model: error.log_context.kiro_model.clone(),
+        kiro_model,
         account_id: error.log_context.account_id.clone(),
         account_name: error.log_context.account_name.clone(),
         endpoint: error.log_context.endpoint.clone(),
-        model_path: error.log_context.model_path.clone(),
+        model_path,
         model_mapping_rule: error.log_context.model_mapping_rule.clone(),
         attempts: error.log_context.attempts.clone(),
         duration_ms,

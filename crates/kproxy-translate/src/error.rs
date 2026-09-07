@@ -33,6 +33,32 @@ pub fn redact_kiro_keys(message: &str) -> std::borrow::Cow<'_, str> {
 }
 
 pub fn sanitize_error_message(message: &str) -> String {
+    let normalized = normalize_error_message(message);
+    let mut chars = normalized.chars();
+    let mut bounded = chars
+        .by_ref()
+        .take(1_024)
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect::<String>();
+    if chars.next().is_some() {
+        bounded.push('…');
+    }
+    bounded
+}
+
+/// Invalid model hints may actually contain pasted prompts or credentials.
+/// Replace the entire value before truncation; never retain a prompt prefix.
+pub fn log_model(model: &str) -> String {
+    if model.is_empty() {
+        return String::new();
+    }
+    if crate::validate::validate_model(model).is_err() {
+        return "[invalid-model]".into();
+    }
+    redact_kiro_keys(model).into_owned()
+}
+
+fn normalize_error_message(message: &str) -> String {
     // Quota/context branches intentionally preserve useful diagnostics. Strip
     // headless credentials before any branch can reflect upstream prose.
     let message = redact_kiro_keys(message);
@@ -248,6 +274,31 @@ fn openai_error_type(status: u16) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_logs_discard_invalid_values_and_redact_keys() {
+        for model in [
+            "SELECT secret\nFROM private",
+            "claude\u{001b}[31m",
+            &"x".repeat(257),
+        ] {
+            assert_eq!(log_model(model), "[invalid-model]");
+        }
+        assert_eq!(log_model("ksk_test-credential"), "[REDACTED]");
+        assert_eq!(
+            log_model("anthropic/claude:latest[1m]"),
+            "anthropic/claude:latest[1m]"
+        );
+    }
+
+    #[test]
+    fn error_logs_are_bounded_without_splitting_utf8_or_retaining_control_characters() {
+        let safe = sanitize_error_message(&format!("reason\n{} ksk_hidden", "消息".repeat(2_000)));
+        assert_eq!(safe.chars().count(), 1_025);
+        assert!(safe.ends_with('…'));
+        assert!(!safe.chars().any(char::is_control));
+        assert!(!safe.contains("ksk_hidden"));
+    }
 
     #[test]
     fn ports_quota_cases_from_typescript() {
