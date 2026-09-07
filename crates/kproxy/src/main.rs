@@ -422,9 +422,9 @@ enum ConfigCommand {
         /// 只编辑指定模块；使用 `kproxy config list` 查看模块名。
         module: Option<String>,
     },
-    /// 备份配置并重置全部通用配置或指定模块，保留基础服务资源。
+    /// 备份配置并重置全部通用配置或指定模块。
     #[command(
-        after_help = "示例：\n  kproxy config reset pool\n  kproxy config reset features\n  kproxy config reset\n\n指定模块时只重置该模块；不指定模块时重置全部通用配置。API key 和代理服务不会被 config reset 清除；原配置自动备份。"
+        after_help = "示例：\n  kproxy config reset pool\n  kproxy config reset features\n  kproxy config reset\n\n指定模块时只重置该模块；不指定模块时重置全部通用配置，并保留 API key、代理服务和告警配置；原配置自动备份。"
     )]
     Reset {
         /// 只重置指定模块；使用 `kproxy config list` 查看模块名。
@@ -615,7 +615,9 @@ async fn main() -> Result<()> {
                     if let Some(module) = result.module.as_deref() {
                         println!("配置模块 {module} 已恢复为默认设置并重载；其他配置未改动");
                     } else {
-                        println!("通用配置已恢复为默认设置并重载；API key 和代理服务已保留");
+                        println!(
+                            "通用配置已恢复为默认设置并重载；API key、代理服务和告警配置已保留"
+                        );
                     }
                     println!("原配置备份 {}", result.backup_file.display());
                     for field in result.needs_restart {

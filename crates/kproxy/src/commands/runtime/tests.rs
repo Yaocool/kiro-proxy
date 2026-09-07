@@ -156,7 +156,7 @@ api_key_ids = ["ak_keep"]
 created_at = 123
 "#;
 
-    let output = render_reset_config_preserving_services(raw).expect("reset config");
+    let output = render_reset_config_preserving_resources_and_alerts(raw).expect("reset config");
     let reset: kproxy_core::config::Config = toml::from_str(&output).expect("parse reset config");
     let defaults = kproxy_core::config::Config::default();
 
@@ -189,12 +189,53 @@ format = "token"
 enabled = true
 "#;
 
-    let output = render_reset_config_preserving_services(raw).expect("reset config");
+    let output = render_reset_config_preserving_resources_and_alerts(raw).expect("reset config");
     let reset: kproxy_core::config::Config = toml::from_str(&output).expect("parse reset config");
 
     assert_eq!(reset.api_key.len(), 1);
     assert_eq!(reset.api_key[0].id.as_deref(), Some("ak_unbound"));
     assert!(reset.proxy_service.is_empty());
+}
+
+#[test]
+fn config_reset_preserves_alert_policy_and_targets() {
+    let raw = r#"[server]
+port = 6200
+
+[notify]
+low_credit_threshold_percent = 25.0
+max_notifications = 9
+suppress_window_ms = 42000
+
+[[webhook]]
+name = "ops"
+kind = "dingtalk"
+url = "https://example.com/alert"
+enabled = true
+events = ["token-refresh-failed", "service-quota-exhausted"]
+dingtalk_sign = "SEC-keep-secret"
+"#;
+
+    let output = render_reset_config_preserving_resources_and_alerts(raw).expect("reset config");
+    let reset: kproxy_core::config::Config = toml::from_str(&output).expect("parse reset config");
+    let defaults = kproxy_core::config::Config::default();
+
+    assert_eq!(reset.server.port, defaults.server.port);
+    assert_eq!(reset.notify.low_credit_threshold_percent, 25.0);
+    assert_eq!(reset.notify.max_notifications, 9);
+    assert_eq!(reset.notify.suppress_window_ms, 42_000);
+    assert_eq!(reset.webhook.len(), 1);
+    assert_eq!(reset.webhook[0].name, "ops");
+    assert_eq!(reset.webhook[0].kind, "dingtalk");
+    assert_eq!(reset.webhook[0].url, "https://example.com/alert");
+    assert_eq!(
+        reset.webhook[0].events,
+        ["token-refresh-failed", "service-quota-exhausted"]
+    );
+    assert_eq!(
+        reset.webhook[0].dingtalk_sign.as_deref(),
+        Some("SEC-keep-secret")
+    );
 }
 
 #[test]
