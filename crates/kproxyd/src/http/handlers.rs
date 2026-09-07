@@ -601,26 +601,25 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
 
 pub async fn models(State(service): State<ServiceHttpState>, headers: HeaderMap) -> Response {
     let state = Arc::clone(&service.app);
+    let agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    // This endpoint is shared. An additive Anthropic header must not
+    // override a positively identified Codex client or change its model IDs.
+    let claude = is_claude_user_agent(agent)
+        || (!is_codex_user_agent(agent) && headers.contains_key("anthropic-version"));
+    let format = if claude {
+        ErrorFormat::Claude
+    } else {
+        ErrorFormat::OpenAi
+    };
     let result = async {
-        authenticate(
-            &state,
-            &service.allowed_api_key_ids,
-            &headers,
-            ErrorFormat::OpenAi,
-        )?;
-        enforce_codex_user_agent(&state, &headers)?;
+        authenticate(&state, &service.allowed_api_key_ids, &headers, format)?;
+        enforce_client_user_agent(&state, &headers, format)?;
         let config = state.config.current();
         if !config.models.dynamic_discovery {
-            let created = now_secs();
-            return Ok::<_, ApiError>(
-                Json(json!({
-                    "object":"list",
-                    "data":fallback_models(&config).into_iter().map(|model| json!({
-                        "id":model.model_id,"object":"model","created":created,"owned_by":"kiro"
-                    })).collect::<Vec<_>>()
-                }))
-                .into_response(),
-            );
+            return Ok::<_, ApiError>(model_list(fallback_models(&config), claude));
         }
         let (cached, fresh) = state.models.get(config.models.cache_ttl_ms);
         if !fresh && state.models.begin_refresh() {
@@ -636,19 +635,40 @@ pub async fn models(State(service): State<ServiceHttpState>, headers: HeaderMap)
         } else {
             cached
         };
-        let created = now_secs();
-        Ok::<_, ApiError>(
-            Json(json!({
-                "object":"list",
-                "data":models.into_iter().map(|model| json!({
-                    "id":model.model_id,"object":"model","created":created,"owned_by":"kiro"
-                })).collect::<Vec<_>>()
-            }))
-            .into_response(),
-        )
+        Ok::<_, ApiError>(model_list(models, claude))
     }
     .await;
     result.unwrap_or_else(IntoResponse::into_response)
+}
+
+fn model_list(models: Vec<kproxy_kiro::ModelInfo>, claude: bool) -> Response {
+    let created = now_secs();
+    let data = models.into_iter().map(|model| {
+        let mut entry = json!({
+            "id": if claude { kproxy_translate::model::claude_discovery_model_id(&model.model_id) }
+                else { model.model_id.clone() },
+            "object":"model", "created":created, "owned_by":"kiro"
+        });
+        if claude {
+            entry["type"] = json!("model");
+            if !model.model_name.is_empty() { entry["display_name"] = json!(model.model_name); }
+            if !model.description.is_empty() { entry["description"] = json!(model.description); }
+        }
+        entry
+    }).collect::<Vec<_>>();
+    let mut result = json!({"object":"list", "data":data});
+    if claude {
+        result["has_more"] = json!(false);
+        result["first_id"] = data
+            .first()
+            .map(|entry| entry["id"].clone())
+            .unwrap_or(Value::Null);
+        result["last_id"] = data
+            .last()
+            .map(|entry| entry["id"].clone())
+            .unwrap_or(Value::Null);
+    }
+    Json(result).into_response()
 }
 
 pub async fn event_logging(
@@ -792,12 +812,7 @@ fn enforce_client_user_agent(
         .and_then(|value| value.to_str().ok())
         .unwrap_or_default();
     let (valid, client) = match format {
-        ErrorFormat::Claude => (
-            value.starts_with("claude-cli/")
-                && value.contains(" (external,")
-                && value.ends_with(')'),
-            "Claude Code",
-        ),
+        ErrorFormat::Claude => (is_claude_user_agent(value), "Claude Code"),
         ErrorFormat::OpenAi => (is_codex_user_agent(value), "Codex"),
     };
     if valid {
@@ -811,6 +826,10 @@ fn enforce_client_user_agent(
         error.suppress_model_stats = true;
         Err(error)
     }
+}
+
+fn is_claude_user_agent(value: &str) -> bool {
+    value.starts_with("claude-cli/") && value.contains(" (external,") && value.ends_with(')')
 }
 
 fn is_codex_user_agent(value: &str) -> bool {
