@@ -33,7 +33,7 @@ requires_openai_auth = false
 | `/v1/messages`、`/messages`、`/anthropic/v1/messages` 及对应 `/count_tokens` | Claude Code |
 | `/v1/responses`、`/responses` | Codex |
 | `/v1/chat/completions`、`/chat/completions` | Codex |
-| `/v1/models`、`/models` | Codex |
+| `/v1/models`、`/models` | Codex、Claude Code |
 
 检查使用 User-Agent 中的客户端产品标识，覆盖 Codex CLI、exec、编辑器和桌面端。
 仅有 `originator` 请求头或 User-Agent 中随意包含 `codex` 不会通过检查。
