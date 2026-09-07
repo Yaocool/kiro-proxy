@@ -64,7 +64,7 @@ fn defaults_match_the_spec() {
     assert_eq!(config.context.max_loaded_tools, MAX_LOADED_TOOLS);
     assert_eq!(config.context.max_upstream_payload_bytes, 8 * 1024 * 1024);
     assert!(config.context.compaction_summary_model.is_empty());
-    assert_eq!(config.context.compaction_summary_timeout_ms, 30_000);
+    assert_eq!(config.context.compaction_summary_timeout_ms, 60_000);
     assert_eq!(config.context.compaction_preserve_recent_turns, 3);
     assert_eq!(config.notify.low_credit_threshold_percent, 10.0);
     assert_eq!(config.notify.max_notifications, 5);
@@ -97,6 +97,18 @@ fn default_toml_parses_into_default_config() {
         parsed.upstream.pool.stream_pipelining,
         expected.upstream.pool.stream_pipelining
     );
+}
+
+#[test]
+fn summary_timeout_default_preserves_existing_explicit_settings() {
+    for (source, expected) in [
+        ("", 60_000),
+        (DEFAULT_CONFIG_TOML, 60_000),
+        ("[context]\ncompaction_summary_timeout_ms = 30000\n", 30_000),
+    ] {
+        let config: Config = toml::from_str(source).expect("valid config");
+        assert_eq!(config.context.compaction_summary_timeout_ms, expected);
+    }
 }
 
 #[test]

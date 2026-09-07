@@ -9,6 +9,7 @@ use super::{
     RequestDiagnostics, StatusCode, StreamExt, UpstreamExecution, Uuid, COMPACTION_CLEANUP_GRACE,
     COMPACTION_USAGE_PATH, MAX_COMPACTION_BACKGROUND_GRACE, MIN_COMPACTION_BACKGROUND_GRACE,
 };
+use crate::http::usage::produced_output;
 use tokio_util::codec::Decoder;
 
 async fn generate_compaction_summary(
@@ -37,6 +38,7 @@ async fn generate_compaction_summary(
         .await
     });
     await_compaction_summary_task_with_policy(
+        trace_id,
         task,
         timeout_ms,
         cancel,
@@ -52,6 +54,7 @@ pub(super) async fn await_compaction_summary_task(
     timeout_ms: u64,
 ) -> Result<GeneratedCompactionSummary, CompactionSummaryFailure> {
     await_compaction_summary_task_with_policy(
+        "trace_compaction_test",
         task,
         timeout_ms,
         CancellationToken::new(),
@@ -68,6 +71,7 @@ fn compaction_background_grace(timeout_ms: u64) -> Duration {
 }
 
 pub(super) async fn await_compaction_summary_task_with_policy(
+    trace_id: &str,
     mut task: tokio::task::JoinHandle<Result<GeneratedCompactionSummary, CompactionSummaryFailure>>,
     timeout_ms: u64,
     cancel: CancellationToken,
@@ -81,17 +85,19 @@ pub(super) async fn await_compaction_summary_task_with_policy(
             usage: None,
         }),
         Err(_) => {
+            let trace_id = trace_id.to_owned();
             tokio::spawn(async move {
                 match tokio::time::timeout(background_grace, &mut task).await {
-                    Ok(result) => log_late_compaction_result(result),
+                    Ok(result) => log_late_compaction_result(&trace_id, result),
                     Err(_) => {
                         cancel.cancel();
                         match tokio::time::timeout(cleanup_grace, &mut task).await {
-                            Ok(result) => log_late_compaction_result(result),
+                            Ok(result) => log_late_compaction_result(&trace_id, result),
                             Err(_) => {
                                 task.abort();
                                 let _ = task.await;
                                 tracing::warn!(
+                                    trace_id,
                                     background_grace_ms = background_grace.as_millis() as u64,
                                     cleanup_grace_ms = cleanup_grace.as_millis() as u64,
                                     "timed-out compaction summary exceeded its bounded accounting grace and was aborted"
@@ -110,22 +116,26 @@ pub(super) async fn await_compaction_summary_task_with_policy(
 }
 
 fn log_late_compaction_result(
+    trace_id: &str,
     result: Result<
         Result<GeneratedCompactionSummary, CompactionSummaryFailure>,
         tokio::task::JoinError,
     >,
 ) {
     match result {
-        Ok(Ok(summary)) => tracing::info!(
+        Ok(Ok(summary)) => tracing::debug!(
+            trace_id,
             input_tokens = summary.usage.input_tokens,
             output_tokens = summary.usage.output_tokens,
             "timed-out compaction summary completed and was accounted"
         ),
-        Ok(Err(error)) => tracing::warn!(
+        Ok(Err(error)) => tracing::debug!(
+            trace_id,
             reason = %sanitize_error_message(&error.message),
             "timed-out compaction summary finished with an error"
         ),
         Err(error) => tracing::warn!(
+            trace_id,
             %error,
             "timed-out compaction summary task could not be joined"
         ),
@@ -257,6 +267,7 @@ async fn generate_compaction_summary_inner(
     }
     drop(source);
     drop(upstream_permit);
+    let received_output = produced_output(&decoded);
     fill_missing_usage(state, &mut decoded, &payload).await;
     let parsed_summary = if let Some(error) = collection_error.clone() {
         Err(error)
@@ -265,7 +276,18 @@ async fn generate_compaction_summary_inner(
     } else {
         Err("Kiro compaction summary unexpectedly returned a tool call".into())
     };
-    let credits = credits(state, &kiro_model, &decoded);
+    // Match main-stream accounting: a failed summary with no output/usage must
+    // not spend an input-only fallback estimate as if it were a reported cost.
+    let credits = if parsed_summary.is_err() && !received_output {
+        0.0
+    } else {
+        credits(state, &kiro_model, &decoded)
+    };
+    let credits_source = if decoded.usage.credits > 0.0 {
+        "server"
+    } else {
+        "estimated"
+    };
     lease.settle_credits(credits).await;
     let settlement_error = reservation
         .settle(usage_record(
@@ -300,13 +322,24 @@ async fn generate_compaction_summary_inner(
         &decoded,
         credits,
     );
-    if let Some(error) = collection_error.as_deref() {
-        log.status = 502;
+    if let Err(error) = &parsed_summary {
+        log.status = if cancel.is_cancelled() { 504 } else { 502 };
         log.error = Some(sanitize_error_message(error));
-        log.diagnostics.client_status = 502;
-        log.diagnostics.upstream_status = None;
-        log.diagnostics.error_code = "compaction_stream_error".into();
-        log.diagnostics.error_stage = "upstream_stream".into();
+        log.diagnostics.client_status = log.status;
+        log.diagnostics.error_code = if cancel.is_cancelled() {
+            "compaction_timeout"
+        } else if collection_error.is_some() {
+            "compaction_stream_error"
+        } else {
+            "compaction_invalid_summary"
+        }
+        .into();
+        log.diagnostics.error_stage = if collection_error.is_some() {
+            "upstream_stream"
+        } else {
+            "response_validation"
+        }
+        .into();
     }
     state.stats.record(log);
     let usage = CompactionIterationUsage {
@@ -326,8 +359,10 @@ async fn generate_compaction_summary_inner(
             usage: Some(usage),
         });
     }
-    if let Some(error) = collection_error.as_deref() {
-        tracing::warn!(
+    if let Err(error) = &parsed_summary {
+        // run_compaction already emitted the fallback warning (or will do so
+        // when this returns). Accounting is the same event's informational tail.
+        tracing::info!(
             trace_id,
             account_id,
             account_name,
@@ -338,6 +373,8 @@ async fn generate_compaction_summary_inner(
             input_tokens = decoded.usage.input_tokens,
             output_tokens = decoded.usage.output_tokens,
             credits,
+            credits_source,
+            canceled = cancel.is_cancelled(),
             duration_ms = started.elapsed().as_millis() as u64,
             reason = %sanitize_error_message(error),
             "Kiro semantic compaction summary failed after partial usage was accounted"
@@ -354,6 +391,7 @@ async fn generate_compaction_summary_inner(
             input_tokens = decoded.usage.input_tokens,
             output_tokens = decoded.usage.output_tokens,
             credits,
+            credits_source,
             duration_ms = started.elapsed().as_millis() as u64,
             "Kiro semantic compaction summary completed"
         );

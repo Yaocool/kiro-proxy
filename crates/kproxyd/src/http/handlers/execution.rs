@@ -1618,6 +1618,12 @@ pub(super) fn request_log(
         .sum();
     diagnostics.client_status = 200;
     diagnostics.upstream_status = Some(200);
+    diagnostics.credits_source = if decoded.usage.credits > 0.0 {
+        "server"
+    } else {
+        "estimated"
+    }
+    .into();
     RequestLog {
         timestamp: now_secs(),
         trace_id: trace_id.into(),

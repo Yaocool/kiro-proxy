@@ -141,6 +141,7 @@ async fn timed_out_summary_task_is_aborted_after_the_bounded_grace() {
     });
 
     let result = await_compaction_summary_task_with_policy(
+        "trace_timeout_grace",
         task,
         1,
         CancellationToken::new(),

@@ -119,7 +119,7 @@ auto_compact_on_overflow = true
 
 # 已有配置；超长摘要输入会先在本地预处理到保守窗口内。
 compaction_summary_model = ""
-compaction_summary_timeout_ms = 30000
+compaction_summary_timeout_ms = 60000
 compaction_preserve_recent_turns = 3
 ```
 

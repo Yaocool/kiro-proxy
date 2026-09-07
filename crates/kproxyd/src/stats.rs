@@ -74,6 +74,10 @@ pub struct RequestDiagnostics {
     pub failure_scope: String,
     #[serde(default)]
     pub account_error: bool,
+    /// "server" when Kiro reported credits, otherwise "estimated". Empty for
+    /// legacy records and requests that never reached generation.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub credits_source: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
