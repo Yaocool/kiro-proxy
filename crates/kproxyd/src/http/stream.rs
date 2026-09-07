@@ -1327,6 +1327,12 @@ async fn finish_accounting(
         )
     };
     context.lease.settle_credits(credits).await;
+    context.diagnostics.credits_source = if decoded.usage.credits > 0.0 {
+        "server"
+    } else {
+        "estimated"
+    }
+    .into();
     if let Err(error) = context
         .reservation
         .settle(UsageRecord {

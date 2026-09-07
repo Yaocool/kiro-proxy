@@ -225,6 +225,10 @@ checkpoint，再交给摘要模型做语义整理。截断保留完整 UTF-8 字
 Claude 响应首部的 `compaction` 边界。摘要超时会立即释放主请求；后台仅在有界宽限期内继续结算，
 到期后主动取消摘要流，并结算此前已经解码的 usage。
 
+摘要等待默认 60 秒（`context.compaction_summary_timeout_ms`）；升级会保留已有显式值，原先的
+`30000` 不会自动改写。超时回退只记录一条 WARN，后台结算为带 trace ID 的 INFO，
+`credits_source=estimated` 表示本地估算，并非上游实际扣费证明。日志卷按日持久化，重建容器不会清除旧 WARN。
+
 `features.tool_search_max_rounds` 默认 4、硬上限 8；单次请求达到内部轮次上限时返回 Claude
 `pause_turn` 续轮状态，不再把合法的 server call 转换成 HTTP 5xx。
 `features.tool_search_max_operations` 默认 32（有效范围 1–256），统一限制历史待续调用及所有内部

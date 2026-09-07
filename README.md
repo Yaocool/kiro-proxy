@@ -272,6 +272,12 @@ hard context-limit errors because they cannot safely return a leading Claude
 late accounting is allowed only for a bounded grace period, after which the
 summary stream is canceled and any already decoded usage is settled.
 
+Summary waiting defaults to 60 seconds (`context.compaction_summary_timeout_ms`);
+upgrades preserve explicit settings, including an existing `30000`. A timeout emits
+one fallback warning, with subsequent accounting at INFO under the same trace.
+`credits_source=estimated` identifies a local estimate, not confirmed upstream
+charges. Daily logs persist in the data volume across container replacements.
+
 `features.tool_search_max_rounds` defaults to 4 and is hard-clamped to 8. If
 that per-request server loop is exhausted, the response uses Claude's
 `pause_turn` continuation state instead of converting a valid server call into

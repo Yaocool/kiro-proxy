@@ -18,6 +18,11 @@
 
 尚未实现的质量优化项是摘要内容哈希缓存和分块滚动摘要；自动触发的范围、限制及后续 prepared-dispatch 工作见 `model-mapping-context-window.md`。
 
+2026-09-07 生产回归修正：默认等待提高到 60 秒，显式配置仍优先。
+超时回退只记一条 WARN，后台用量结算记 INFO 并携带 trace ID；`credits_source` 区分 `server` 与
+`estimated`，估算值不是上游实际扣费凭据。完全没有输出/usage 的失败摘要不会按输入估算消耗 credits。
+空摘要/非法摘要也记录为失败，不再因 HTTP 200 而计入摘要成功数。
+
 ## 现状：截断拼接，不是摘要
 
 `kproxy-translate/src/tokenizer.rs` 的 `compact_kiro_payload` 分三步：
@@ -121,7 +126,7 @@ Kiro 上游没有 compaction 能力，官方那套服务端行为需由本项目
 # 摘要生成使用的模型，留空则复用当轮的映射后模型
 compaction_summary_model = ""
 # 摘要生成的超时，超时后回落到截断降级路径
-compaction_summary_timeout_ms = 30000
+compaction_summary_timeout_ms = 60000
 # 摘要之前保留的完整轮次数（对齐官方 messages[-3:] 的思路）
 compaction_preserve_recent_turns = 3
 ```

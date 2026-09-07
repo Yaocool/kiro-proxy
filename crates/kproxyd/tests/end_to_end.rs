@@ -2233,7 +2233,7 @@ priority = 10
     tokio::fs::write(
         &config_path,
         raw.replace(
-            "compaction_summary_timeout_ms = 30000",
+            "compaction_summary_timeout_ms = 60000",
             "compaction_summary_timeout_ms = 1",
         ),
     )
