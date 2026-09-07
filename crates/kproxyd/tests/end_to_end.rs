@@ -1265,7 +1265,7 @@ async fn assert_model_fallback_controls(stream: bool, stream_failure: bool) {
     assert_eq!(
         generated_payloads[1]["additionalModelRequestFields"],
         serde_json::json!({
-            "reasoning":{"effort":"high"}
+            "reasoning":{"effort":"xhigh"}
         })
     );
 

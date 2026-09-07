@@ -85,7 +85,7 @@ async fn reference_gateway_hints_succeed_without_leaking_into_kiro() {
                     json!([{"role":"user","content":"Reply pong","future_hint":true}]);
                 request["max_tokens"] = json!(4096);
                 if route == "messages" {
-                    request["output_config"] = json!({"format":{"type":"json_schema","schema":format_schema},"future_hint":true});
+                    request["output_config"] = json!({"future_hint":true});
                     request["tools"] = json!([{"name":"lookup","input_schema":tool_schema,
                         "strict":true,"eager_input_streaming":true,"future_hint":true}]);
                 } else {

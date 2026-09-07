@@ -65,6 +65,8 @@ pub struct ClaudeMessage {
     pub content: Value,
     #[serde(default)]
     pub cache_control: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_config: Option<ClaudeOutputConfig>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -205,8 +207,7 @@ pub struct OpenAiTool {
 pub struct ModelRequestIntent {
     pub requested_model: String,
     pub thinking: Option<ThinkingConfig>,
-    /// OpenAI reasoning_effort only. The reference Claude adapter ignores
-    /// output_config.effort when constructing upstream model controls.
+    /// Explicit OpenAI reasoning_effort or the effective Claude output_config.effort.
     pub effort: Option<String>,
 }
 
@@ -384,6 +385,17 @@ pub struct KiroMessageContext {
     pub tool_results: Vec<KiroToolResult>,
     #[serde(skip_serializing_if = "Vec::is_empty", default)]
     pub tools: Vec<KiroTool>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub env_state: Option<KiroEnvState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroEnvState {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_working_directory: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub operating_system: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

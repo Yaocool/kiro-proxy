@@ -91,6 +91,10 @@ pub fn tool_search_continue_payload_batch(
     current.user_input_message_context = Some(KiroMessageContext {
         tool_results,
         tools,
+        env_state: current
+            .user_input_message_context
+            .as_ref()
+            .and_then(|context| context.env_state.clone()),
     });
     next.truncate_history_preserving_protected_prefix(30);
     next
@@ -212,6 +216,10 @@ pub fn auto_continue_payload(
     current.user_input_message_context = Some(KiroMessageContext {
         tool_results: results,
         tools,
+        env_state: current
+            .user_input_message_context
+            .as_ref()
+            .and_then(|context| context.env_state.clone()),
     });
     next.truncate_history_preserving_protected_prefix(30);
     next
@@ -450,6 +458,7 @@ mod tests {
                 },
             }],
             tool_results: vec![],
+            env_state: None,
         });
         let search_use = KiroToolUse {
             tool_use_id: "srvtoolu_1".into(),

@@ -20,7 +20,6 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
     super::common::log_ignored_controls(
         "claude",
         &[
-            ("output_config", request.output_config.is_some()),
             ("service_tier", request.service_tier.is_some()),
             ("extra_request_fields", !request.extra.is_empty()),
             (
@@ -129,6 +128,7 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
             );
         }
     }
+    let env_state = parse_env_state(&system);
     if options.enhance_system_prompt {
         let chunked_write_hint = selected_tools
             .iter()
@@ -220,6 +220,12 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
     if current.user_input_message_context.is_none() {
         current.user_input_message_context = context(tools.clone(), Vec::new());
     }
+    if env_state.is_some() {
+        current
+            .user_input_message_context
+            .get_or_insert_with(Default::default)
+            .env_state = env_state;
+    }
     if options.enable_prompt_cache {
         current.cache_point = merged_cache_point(
             current.cache_point,
@@ -261,9 +267,7 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
         model_request_intent: Some(crate::ModelRequestIntent {
             requested_model: request.model.clone(),
             thinking: request.thinking.clone(),
-            // The reference Claude adapter does not consume output_config;
-            // only the OpenAI adapter supplies an explicit reasoning effort.
-            effort: None,
+            effort: effective_effort(request),
         }),
         protected_history_messages,
     };
@@ -273,6 +277,63 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
         true,
     );
     payload
+}
+
+fn effective_effort(request: &ClaudeRequest) -> Option<String> {
+    let mut pending = request
+        .output_config
+        .as_ref()
+        .and_then(|config| config.effort.clone());
+    let mut effective = pending.clone();
+    for message in &request.messages {
+        if message.role == "system" {
+            if let Some(effort) = message
+                .output_config
+                .as_ref()
+                .and_then(|config| config.effort.as_ref())
+            {
+                pending = Some(effort.clone());
+            }
+        } else if message.role == "user" {
+            // A per-message change applies from the next user turn, not to an
+            // earlier turn when an effort-only system message trails it.
+            effective.clone_from(&pending);
+        }
+    }
+    effective
+}
+
+fn parse_env_state(system: &str) -> Option<crate::KiroEnvState> {
+    let mut env = crate::KiroEnvState::default();
+    for candidate in system.split("<env>").skip(1) {
+        let Some((block, _)) = candidate.split_once("</env>") else {
+            continue;
+        };
+        for line in block.lines().map(str::trim) {
+            if let Some(value) = line
+                .strip_prefix("Working directory:")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                env.current_working_directory = Some(value.into());
+            }
+            if let Some(value) = line
+                .strip_prefix("Platform:")
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                env.operating_system = Some(
+                    match value {
+                        "darwin" => "macos",
+                        "win32" => "windows",
+                        other => other,
+                    }
+                    .into(),
+                );
+            }
+        }
+    }
+    (env.current_working_directory.is_some() || env.operating_system.is_some()).then_some(env)
 }
 
 pub fn claude_tool_name_map(request: &ClaudeRequest) -> std::collections::HashMap<String, String> {
@@ -1508,6 +1569,7 @@ mod tests {
                     }
                 }]),
                 cache_control: None,
+                output_config: None,
                 extra: serde_json::Map::new(),
             },
         );

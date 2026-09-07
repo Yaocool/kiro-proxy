@@ -947,7 +947,7 @@ mod tests {
     }
 
     #[test]
-    fn claude_output_config_and_display_do_not_override_reference_mapping() {
+    fn claude_explicit_effort_overrides_budget_and_keeps_display_filtering() {
         let request: crate::ClaudeRequest = serde_json::from_value(serde_json::json!({
             "model":"claude-sonnet-4.6", "max_tokens":4096,
             "thinking":{"type":"enabled","budget_tokens":1024,"display":"omitted"},
@@ -965,11 +965,11 @@ mod tests {
         );
         let decision = apply_adaptive_thinking(&mut payload, Some(&schema), true);
         assert_eq!(decision.reason, ThinkingReason::Standard);
-        assert_eq!(decision.effort.as_deref(), Some("low"));
+        assert_eq!(decision.effort.as_deref(), Some("high"));
         assert_eq!(
             payload.additional_model_request_fields,
             Some(serde_json::json!({
-                "thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"low"}
+                "thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"high"}
             }))
         );
     }

@@ -111,6 +111,7 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
         );
     }
     validate_claude_system(request.system.as_ref())?;
+    validate_claude_output_config(request.output_config.as_ref(), "output_config")?;
     if let Some(control) = request.cache_control.as_ref() {
         validate_cache_control(control, "cache_control")?;
     }
@@ -140,6 +141,16 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
         if !matches!(message.role.as_str(), "user" | "assistant" | "system") {
             return Err(ValidationError::InvalidRole(message.role.clone()));
         }
+        if message.output_config.is_some() && message.role != "system" {
+            return invalid(
+                format!("messages.{index}.output_config"),
+                "per-message output_config is only supported on system messages",
+            );
+        }
+        validate_claude_output_config(
+            message.output_config.as_ref(),
+            &format!("messages.{index}.output_config"),
+        )?;
         validate_claude_content(
             &message.content,
             &message.role,
@@ -442,6 +453,34 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
     }
     validate_thinking(request.thinking.as_ref(), request.max_tokens)?;
     validate_context_management(request.context_management.as_ref())?;
+    Ok(())
+}
+
+fn validate_claude_output_config(
+    config: Option<&crate::ClaudeOutputConfig>,
+    path: &str,
+) -> Result<(), ValidationError> {
+    let Some(config) = config else {
+        return Ok(());
+    };
+    if let Some(effort) = &config.effort {
+        if !matches!(effort.as_str(), "low" | "medium" | "high" | "xhigh" | "max") {
+            return invalid(
+                format!("{path}.effort"),
+                "expected low, medium, high, xhigh, or max",
+            );
+        }
+    }
+    for field in ["format", "task_budget"] {
+        if config
+            .extra
+            .get(field)
+            .is_some_and(|value| !value.is_null())
+        {
+            return invalid(format!("{path}.{field}"),
+                format!("{field} is not supported by the Kiro upstream; remove this field (it cannot be silently ignored)"));
+        }
+    }
     Ok(())
 }
 

@@ -297,6 +297,10 @@ pub fn web_search_continue_payload_batch(
     current.user_input_message_context = Some(KiroMessageContext {
         tool_results,
         tools,
+        env_state: current
+            .user_input_message_context
+            .as_ref()
+            .and_then(|context| context.env_state.clone()),
     });
     next.truncate_history_preserving_protected_prefix(30);
     next
