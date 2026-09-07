@@ -7,13 +7,13 @@
 1. 在翻译阶段提前保护 system prompt，使自动触发的 compact 不会丢掉系统指令。
 2. 在第一次上游调用前，按路由得到的映射模型窗口主动触发 compact。
 3. 保证摘要请求本身装得下待压缩上下文；否则大窗口映射到小窗口时，语义摘要会先超限，只能退回抽取式压缩。
-4. 账号选定后按实际解析模型再做一次精确校验；窗口更小时只允许一次重规划，且同一主请求最多生成一次语义摘要。
+4. 账号选定后按实际解析模型再做一次精确校验；窗口更小时只允许一次重规划，同一主请求最多启动一次摘要操作，重规划复用合成 checkpoint。
 
 第一阶段只对 Claude Messages 的首次上游调用启用自动 compact。OpenAI 协议没有可回传的 `compaction` 块，已经开始输出后的 Tool Search 轮次也不能安全地补发位于响应首部的 compact 边界，这两类场景继续返回明确的上下文错误，不能静默删历史。
 
 ## 实现状态（2026-08-26）
 
-第一阶段已经按本文方案落地，配置开关 `context.auto_compact_on_overflow` 默认开启。已实现映射窗口主动触发、上游上下文拒绝后的保守窗口压缩与单次重试、摘要输入的本地有界预处理、可复用的 `CompactionArtifact`、账号实际窗口下的单次重规划、独立摘要用量迭代、流式首块顺序和压缩后的保守 prompt-cache 断点。流式 compaction prelude 会暂存到首个成功且通过工具参数校验的语义轮次，避免在上游尚可切号重试时过早提交客户端数据；摘要超时后后台任务只在有界宽限期内继续独立结算，到期会主动取消流并结算已解码 usage。分块滚动摘要、prepared-dispatch 重构以及 Tool Search 已开始输出后的 pause/resume compact 仍是后续工作。
+第一阶段已经落地，`context.auto_compact_on_overflow` 默认开启。已实现映射窗口主动触发、上游上下文拒绝后的单次重试、完整摘要输入的有界分段、可复用的 `CompactionArtifact`、账号实际窗口下的单次重规划、独立摘要用量迭代、流式首块顺序和压缩后的保守 prompt-cache 断点。流式 compaction prelude 暂存到首个成功且通过工具参数校验的语义轮次，保留切号重试能力；超时摘要任务只在有界宽限期内继续结算。跨段滚动归并、prepared-dispatch 重构以及 Tool Search 已开始输出后的 pause/resume compact 仍是后续工作。
 
 ## 目标与约束
 
@@ -22,7 +22,7 @@
 1. **映射硬生效。** 目标模型装不下时不能回退到源模型，否则降本规则失效。
 2. **客户端尽量无感。** Claude Code 获得正常响应，并通过协议内 `compaction` 块携带服务端边界。
 3. **token 上报真实。** `count_tokens` 延续现有语义，返回应用客户端边界/编辑后的真实 token，并在有编辑时保留 `original_input_tokens`；生成响应的 `usage.input_tokens` 返回实际发给主模型的 token，不通过虚报诱导客户端压缩。
-4. **一次请求有界。** 主请求最多生成一次语义摘要、最多做一次账号级精确重规划，不允许递归 compact。
+4. **一次请求有界。** 主请求最多进行一次语义摘要操作（内部最多 16 段）、最多做一次账号级精确重规划，不允许递归 compact。
 5. **工具配对和系统指令不能被破坏。** 压缩边界必须保持 tool use/result 配对，system prompt 必须存在于压缩后的有效上下文中。
 
 ## 当前实现基线
@@ -70,7 +70,7 @@ Claude 请求
 - `compaction_summary_model` 为空时，摘要也使用 128k 映射模型。
 - 如果没有容量预检，摘要调用会在窗口校验处失败，最终只能使用抽取式 fallback。
 
-因此，自动触发不能只复用旧 compact 代码。当前实现会先做摘要容量预检；生产配置足够大的 `compaction_summary_model` 时走一次语义摘要，装不下时不发起注定失败的请求并明确降级。摘要容量仍是本方案的 P0 条件，不是后续优化项。
+因此，自动触发不能只复用旧 compact 代码。当前实现会先做摘要容量预检；完整输入能装下时调用一次，否则按完整源内容分段，只有不可拆输入或分段资源上限无法满足时明确降级。摘要容量仍是本方案的 P0 条件。
 
 ## 官方行为对齐
 
@@ -117,7 +117,7 @@ Claude 请求
 # 映射后窗口装不下或上游拒绝超长请求时，自动 compact 并单次重试。
 auto_compact_on_overflow = true
 
-# 已有配置；超长摘要输入会先在本地预处理到保守窗口内。
+# 已有配置；超长摘要输入会先在本地无损分段到保守窗口内。
 compaction_summary_model = ""
 compaction_summary_timeout_ms = 60000
 compaction_preserve_recent_turns = 3
@@ -191,14 +191,14 @@ summary_input <= context_maximum(summary_model, compact = true)
 
 1. 优先使用显式 `context.compaction_summary_model`。
 2. 为空时保持当前行为，使用 `route.mapped`，但必须记录它是否具备足够窗口。
-3. 元数据预检已经确定装不下时，不发起注定失败的 Kiro 请求，直接进入 fallback 并记录 `summary_capacity_insufficient`。
+3. 完整摘要输入装不下时，无损分为有界摘要请求。当前指令或不可拆文档本身超限、或超过 16 段资源上限时，进入 fallback 并记录 `summary_capacity_insufficient`；不能只摘要输入前缀并声称 semantic 成功。
 4. 元数据预检能装下、账号实际解析后仍装不下时，按普通摘要失败处理。
 
 生产启用自动 compact 时，应将 `compaction_summary_model` 配置成能覆盖 `W_client` 主要流量的模型。主请求仍严格使用降本后的映射模型；摘要模型只是一次内部操作，不改变主请求映射结果。
 
-为了彻底消除对大窗口摘要模型的依赖，后续应实现分块语义摘要：按完整 user/assistant turn 和 tool use/result 配对切块，每块控制在 `W_summary` 的约 75%，使用“上一个 checkpoint + 下一块历史”滚动归并，最后再与近期保留轮次组合。分块前禁止按字符切割 JSON、tool 参数或 tool result。
+2026-09-07 已实现分段语义摘要：优先按完整历史消息打包；单条超长消息在工具调用/结果已转换为摘要文本后按 UTF-8 token 边界无损拆分，实际 RPC JSON 与主请求的结构化工具对不被切割。每段都满足 `W_summary` 的保守安全窗口，各段只提取自己看到的事实，不能把本段未出现的事实断言为不存在。最后按时间顺序合成一个 checkpoint，再与近期保留轮次组合。
 
-分块摘要属于质量增强，不阻塞第一阶段功能上线；但在未配置大窗口摘要模型时，自动 compact 的质量 SLO 必须按 extractive fallback 统计，不能按 semantic 成功率笼统计算。
+一次语义摘要操作最多 16 段、并发最多 2，服从账号并发配置，共用一次总超时。失败或超时后停止派发新段，已接受的请求在原有有界宽限期内分别完成结算。只有所有段成功才能标记 semantic；账号窗口重规划复用合成后的产物，不重新摘要。分段输出按时间拼接，跨段滚动归并仍是后续质量优化。
 
 ### 5. 账号实际模型只允许一次精确重规划
 
@@ -281,7 +281,7 @@ enum CompactionArtifact {
 
 - `compaction_reason`: `client_trigger` / `mapped_overflow` / `resolved_overflow`，允许多值。
 - `compaction_mode`: `semantic` / `extractive_fallback` / `none`。
-- `compaction_summary_model`、摘要模型实际解析结果和 `summary_input_tokens`。
+- `compaction_summary_model`、摘要模型实际解析结果、完整摘要源的 `summary_input_tokens` 和 `summary_chunk_count`；分段自己的实际输入/输出记录在各自 `/internal/compact` 用量中。
 - `summary_capacity_insufficient`、`summary_timeout`、`summary_upstream_error` 等 fallback reason。
 - `mapped_context_maximum`、`resolved_context_maximum` 和 `resolved_replanned`。
 - 内部摘要 request id；与主请求共享 trace id，但保持独立用量记录。

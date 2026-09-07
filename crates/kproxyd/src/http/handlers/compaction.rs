@@ -17,27 +17,113 @@ async fn generate_compaction_summary(
     trace_id: &str,
     key_id: Option<&str>,
     summary_model: &str,
-    payload: kproxy_translate::KiroPayload,
+    payloads: Vec<KiroPayload>,
     timeout_ms: u64,
 ) -> Result<GeneratedCompactionSummary, CompactionSummaryFailure> {
     let owned_state = Arc::clone(state);
     let owned_trace_id = trace_id.to_owned();
     let owned_key_id = key_id.map(str::to_owned);
     let owned_summary_model = summary_model.to_owned();
+    let concurrency = state
+        .config
+        .current()
+        .pool
+        .max_concurrent_per_account
+        .clamp(1, 2);
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
+    let completed_usage = Arc::new(std::sync::Mutex::new(None));
+    let progress = Arc::clone(&completed_usage);
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
     let task = tokio::spawn(async move {
-        generate_compaction_summary_inner(
-            &owned_state,
-            &owned_trace_id,
-            owned_key_id.as_deref(),
-            &owned_summary_model,
-            payload,
-            task_cancel,
-        )
-        .await
+        let count = payloads.len();
+        let failed = std::sync::atomic::AtomicBool::new(false);
+        let mut summaries = vec![String::new(); count];
+        let mut failure = None;
+        let mut usage = None;
+        // A single operation deadline covers all parts. At most two accepted
+        // requests run at once; failures stop dispatching new parts while
+        // already accepted streams still settle their own reservations/stats.
+        let mut requests = futures::stream::iter(payloads.into_iter().enumerate())
+            .map(|(index, payload)| {
+                let state = &owned_state;
+                let trace_id = &owned_trace_id;
+                let key_id = owned_key_id.as_deref();
+                let model = &owned_summary_model;
+                let cancel = task_cancel.clone();
+                let failed = &failed;
+                async move {
+                    let result = if Instant::now() >= deadline || cancel.is_cancelled() {
+                        Err("Kiro compaction summary timed out before the next part"
+                            .to_owned()
+                            .into())
+                    } else if failed.load(std::sync::atomic::Ordering::Relaxed) {
+                        Err("Kiro compaction summary stopped after a failed part"
+                            .to_owned()
+                            .into())
+                    } else {
+                        generate_compaction_summary_inner(
+                            state, trace_id, key_id, model, payload, cancel,
+                        )
+                        .await
+                    };
+                    if result.is_err() {
+                        failed.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    (index, result)
+                }
+            })
+            .buffer_unordered(concurrency);
+        while let Some((index, result)) = requests.next().await {
+            let part_usage = match result {
+                Ok(summary) => {
+                    summaries[index] = summary.content;
+                    Some(summary.usage)
+                }
+                Err(error) => {
+                    let part_usage = error.usage;
+                    if failure.is_none() {
+                        failure = Some(error.message);
+                    }
+                    part_usage
+                }
+            };
+            if let Some(part) = part_usage {
+                let total = usage.get_or_insert(CompactionIterationUsage {
+                    input_tokens: 0,
+                    output_tokens: 0,
+                });
+                total.input_tokens = total.input_tokens.saturating_add(part.input_tokens);
+                total.output_tokens = total.output_tokens.saturating_add(part.output_tokens);
+                *progress.lock().unwrap_or_else(|error| error.into_inner()) = usage;
+            }
+        }
+        if let Some(message) = failure {
+            return Err(CompactionSummaryFailure { message, usage });
+        }
+        let content = if count == 1 {
+            summaries.remove(0)
+        } else {
+            summaries
+                .into_iter()
+                .enumerate()
+                .map(|(index, summary)| {
+                    format!(
+                        "Checkpoint part {} of {count} (chronological):\n{summary}",
+                        index + 1
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+        Ok(GeneratedCompactionSummary {
+            content,
+            usage: usage.ok_or_else(|| {
+                CompactionSummaryFailure::from("No compaction summary parts completed".to_owned())
+            })?,
+        })
     });
-    await_compaction_summary_task_with_policy(
+    let mut result = await_compaction_summary_task_with_policy(
         trace_id,
         task,
         timeout_ms,
@@ -45,7 +131,15 @@ async fn generate_compaction_summary(
         compaction_background_grace(timeout_ms),
         COMPACTION_CLEANUP_GRACE,
     )
-    .await
+    .await;
+    if let Err(error) = &mut result {
+        if error.usage.is_none() {
+            error.usage = *completed_usage
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -682,70 +776,14 @@ pub(super) async fn run_compaction(
         });
     };
 
-    // Never send the original oversized conversation directly to the summary
-    // model. Dynamic model metadata can overstate the real upstream window, so
-    // first create a bounded local checkpoint using the configured fallback
-    // window. The semantic summary then improves that checkpoint instead of
-    // recursively failing on the same oversized prompt.
+    // Bound each request without discarding source facts before the model can
+    // inspect them. An extractive checkpoint here silently lost the middle of
+    // long messages even when the later semantic call reported success.
     let summary_context_maximum = conservative_summary_context_maximum(state, summary_model);
-    let summary_preprocess_target = compact_target_from_maximum(summary_context_maximum);
-    let source_input_tokens = state
-        .tokenizer
-        .estimate_kiro_payload(source_payload)
-        .await
-        .map_err(|error| {
-            ApiError::new(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                error,
-                ErrorFormat::Claude,
-            )
-        })? as u64;
-    let (summary_source, summary_preprocessed) = if source_input_tokens > summary_preprocess_target
-    {
-        match extractive_compaction(
-            state,
-            source_payload,
-            summary_preprocess_target,
-            preserve_recent_turns,
-            None,
-        )
-        .await
-        {
-            Ok((payload, stats)) => {
-                tracing::info!(
-                    trace_id,
-                    summary_model,
-                    original_input_tokens = source_input_tokens,
-                    preprocessed_input_tokens = stats.compacted_tokens,
-                    preprocess_target_tokens = summary_preprocess_target,
-                    removed_messages = stats.removed_messages,
-                    "compaction summary input preprocessed locally"
-                );
-                (payload, true)
-            }
-            Err(error)
-                if error
-                    .message
-                    .contains("local compaction did not reach target") =>
-            {
-                // The summary model is an optimization, not the authority for
-                // the client's context limit. Let the capacity check skip the
-                // semantic round and have the main compaction path classify
-                // any irreducible request against the resolved model window.
-                tracing::warn!(
-                    trace_id,
-                    summary_model,
-                    reason = %sanitize_error_message(&error.message),
-                    "summary preprocessing could not reach its preferred target; skipping semantic summary"
-                );
-                (source_payload.clone(), false)
-            }
-            Err(error) => return Err(error),
-        }
-    } else {
-        (source_payload.clone(), false)
-    };
-    let summary_payload = compaction_summary_payload(&summary_source, &plan, summary_model);
+    // Leave headroom for tokenizer differences, upstream framing and output.
+    // Real DeepSeek rejected a ~162k estimated input despite advertising 164k.
+    let summary_chunk_input_limit = compact_target_from_maximum(summary_context_maximum);
+    let summary_payload = compaction_summary_payload(source_payload, &plan, summary_model);
     let summary_input_tokens = state
         .tokenizer
         .estimate_kiro_payload(&summary_payload)
@@ -757,27 +795,29 @@ pub(super) async fn run_compaction(
                 ErrorFormat::Claude,
             )
         })? as u64;
-    let capacity_insufficient = summary_input_tokens > summary_context_maximum;
+    let summary_parts = state
+        .tokenizer
+        .partition_compaction_summary(summary_payload, summary_chunk_input_limit as usize)
+        .await;
     let mut fallback_reason = None;
     let mut semantic_summary = None;
     let mut iteration_usage = None;
-    if capacity_insufficient {
-        fallback_reason = Some("summary_capacity_insufficient");
-        tracing::warn!(
+    if let Ok(summary_parts) = summary_parts {
+        tracing::info!(
             trace_id,
             summary_model,
             summary_input_tokens,
             summary_context_maximum,
-            summary_preprocessed,
-            "semantic compaction summary cannot fit its model; using extractive fallback"
+            summary_chunk_input_limit,
+            summary_chunk_count = summary_parts.len(),
+            "complete compaction summary input partitioned within its model window"
         );
-    } else {
         match generate_compaction_summary(
             state,
             trace_id,
             key_id,
             summary_model,
-            summary_payload,
+            summary_parts,
             summary_timeout_ms,
         )
         .await
@@ -797,6 +837,13 @@ pub(super) async fn run_compaction(
                 );
             }
         }
+    } else if let Err(reason) = summary_parts {
+        fallback_reason = Some("summary_capacity_insufficient");
+        tracing::warn!(
+            trace_id, summary_model, summary_input_tokens, summary_context_maximum,
+            reason = %sanitize_error_message(&reason),
+            "semantic compaction summary cannot fit its bounds; using extractive fallback"
+        );
     }
 
     if let Some(generated) = semantic_summary {

@@ -8,15 +8,17 @@
 
 本文的语义摘要主方案已经落地；下文“现状”章节保留的是改造前问题记录。当前实现具有以下行为：
 
-- compact 触发后，kproxy 会先用本地 tokenizer 把有效历史预处理成有界 checkpoint，再转换为一个**无 tools 的普通 Kiro 对话请求**。工具调用与工具结果会转成可读文本，当前用户轮以 JSON 字符串作为不可信源数据放入摘要 prompt；模型被要求只返回 `<summary>` checkpoint，不回答原任务。原始超长会话不会直接发送给摘要模型。
+- compact 触发后，kproxy 将完整有效历史转换为无 tools 的摘要输入。工具调用与工具结果转为完整可读文本，当前用户轮以 JSON 字符串作为源数据放入摘要 prompt；模型只生成 `<summary>`，不回答原任务。输入能装下时只调用一次；超长时按 token 预算无损分段，各段摘要按原顺序组成一个 checkpoint。正常语义路径不再先生成有损 extractive 摘录。
 - 摘要 checkpoint 覆盖完整历史和当前用户轮。主请求同时尽量保留最近 `compaction_preserve_recent_turns` 轮结构化原文；payload 中注入的 checkpoint 与返回客户端的 compaction block 是同一份内容，下一轮应用 compaction boundary 后不会换成另一份字符碎片。
 - 摘要调用独立走 `AccountPool`、额度预留、usage 与 stats，内部统计路径为 `/internal/compact`，不会混入主响应的顶层 token usage。
 - 摘要调用超时、额度不足、上游失败、返回空/非法摘要或无法压到目标窗口时，会恢复原 payload 并使用 extractive fallback；日志中的 `compaction_mode` 可区分 `semantic` 与 `extractive_fallback`。超时立即结束主链路等待，已启动任务只在有界后台宽限期内继续结算；到期后取消摘要流，并保留已经解码的 usage、credits 与失败 stats。
 - 已加入 `compaction_summary_model`、`compaction_summary_timeout_ms`、`compaction_preserve_recent_turns` 三个配置项及校验，均随现有配置热更新机制生效。
-- `auto_compact_on_overflow` 默认开启；模型映射窗口溢出会在首次调用前触发，上游返回 `prompt is too long`/`context length exceeded` 时会按保守窗口重新压缩并只重试一次。摘要容量会在本地预处理后预检，账号实际窗口更小时只复用同一压缩产物重规划一次。
+- `auto_compact_on_overflow` 默认开启；模型映射窗口溢出会在首次调用前触发，上游返回 `prompt is too long`/`context length exceeded` 时会按保守窗口重新压缩并只重试一次。每个摘要分段单独预检窗口，账号实际窗口更小时只复用同一压缩产物重规划一次。
 - 流式和非流式响应都先返回同一份 compaction checkpoint；流式 prelude 在首个成功语义事件前暂存，以保留 pre-data retry。摘要与主调用分别记账，Claude usage 可通过 `iterations` 观察摘要与累计主采样，内部续轮的 input tokens 不会只上报第一轮。
 
-尚未实现的质量优化项是摘要内容哈希缓存和分块滚动摘要；自动触发的范围、限制及后续 prepared-dispatch 工作见 `model-mapping-context-window.md`。
+2026-09-07 长历史保真修复：分段优先保留完整历史消息，单条超长消息只在已经转换为摘要文本后按可解码 UTF-8 token 边界拆分，不截掉任何源字符；文档附件只分配一次。每段输入使用保守 compact 窗口的 75%，为 tokenizer 差异、上游封装和输出留出余量；真实 DeepSeek 会拒绝贴近标称 164k 窗口的约 162k 估算输入。最多 16 段、并发最多 2，配置为单账号并发 1 时串行执行，所有分段共用 `compaction_summary_timeout_ms`。任一分段失败都不能把局部结果标为 semantic 成功；已接受请求分别结算，客户端 compaction iteration 汇总已知分段用量。`summary_input_tokens` 表示完整摘要源输入，`summary_chunk_count` 表示有界分段数，`summary_chunk_input_limit` 表示每段输入上限。
+
+尚未实现的质量优化项是摘要内容哈希缓存及跨段滚动归并。当前按时间顺序拼接各段摘要，保留后续决策覆盖早期决策的语境；压缩质量仍依赖模型。自动触发的范围及 prepared-dispatch 工作见 `model-mapping-context-window.md`。
 
 2026-09-07 生产回归修正：Claude Code 2.1.260 的自有流累积器忽略摘要 delta，导致 null checkpoint
 被反复回传，服务端每轮重新摘要。对该客户端改为完整 start 块 + stop，其他 SDK 保留标准 delta

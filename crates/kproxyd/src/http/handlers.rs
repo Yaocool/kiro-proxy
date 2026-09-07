@@ -830,6 +830,15 @@ fn enforce_client_user_agent(
 }
 
 fn is_claude_user_agent(value: &str) -> bool {
+    // Gateway discovery uses a different product token from Messages requests.
+    // Match the whole product/version, never an embedded Claude brand string.
+    if let Some(version) = value.strip_prefix("claude-code/") {
+        return !version.is_empty()
+            && version.starts_with(|c: char| c.is_ascii_digit())
+            && version
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-' | b'+'));
+    }
     value.starts_with("claude-cli/") && value.contains(" (external,") && value.ends_with(')')
 }
 
