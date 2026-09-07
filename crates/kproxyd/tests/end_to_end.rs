@@ -24,6 +24,9 @@ mod thinking_controls;
 #[path = "end_to_end/compatibility_controls.rs"]
 mod compatibility_controls;
 
+#[path = "end_to_end/claude_gateway.rs"]
+mod claude_gateway;
+
 struct Daemon {
     child: Child,
     socket: PathBuf,
@@ -65,6 +68,7 @@ impl Daemon {
             .env("KPROXY_HOME", home.path())
             .env("KPROXY_CODEWHISPERER_URL", upstream_url)
             .env("KPROXY_AMAZONQ_URL", upstream_url)
+            .env("KPROXY_RUNTIME_URL", upstream_url)
             .env("RUST_LOG", "warn")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
