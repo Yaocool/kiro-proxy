@@ -36,6 +36,7 @@ pub(crate) fn history_user_without_tools(
 ) -> KiroUserInputMessage {
     if let Some(context) = message.user_input_message_context.as_mut() {
         context.tools.clear();
+        context.env_state = None;
         if context.tool_results.is_empty() {
             message.user_input_message_context = None;
         }
@@ -665,6 +666,7 @@ pub fn context(
     (!tools.is_empty() || !tool_results.is_empty()).then_some(KiroMessageContext {
         tools,
         tool_results,
+        env_state: None,
     })
 }
 

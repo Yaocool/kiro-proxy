@@ -8,6 +8,7 @@ fn request() -> ClaudeRequest {
             role: "user".into(),
             content: Value::String("hi".into()),
             cache_control: None,
+            output_config: None,
             extra: Default::default(),
         }],
         max_tokens: 100,
@@ -555,12 +556,14 @@ fn validates_anthropic_tool_search_contract() {
                 }}
             ]),
             cache_control: None,
+            output_config: None,
             extra: Default::default(),
         },
         ClaudeMessage {
             role: "user".into(),
             content: Value::String("continue".into()),
             cache_control: None,
+            output_config: None,
             extra: Default::default(),
         },
     ];
@@ -693,12 +696,14 @@ fn accepts_official_web_search_history_blocks() {
                 }]}
             ]),
             cache_control: None,
+            output_config: None,
             extra: Default::default(),
         },
         ClaudeMessage {
             role: "user".into(),
             content: Value::String("continue".into()),
             cache_control: None,
+            output_config: None,
             extra: Default::default(),
         },
     ];
@@ -910,6 +915,7 @@ fn generation_rejects_assistant_prefill_without_rejecting_token_count_validation
         role: "assistant".into(),
         content: Value::String("The answer begins".into()),
         cache_control: None,
+        output_config: None,
         extra: Default::default(),
     });
 

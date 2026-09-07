@@ -1140,6 +1140,70 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn claude_model_discovery_preserves_codex_ids_and_exposes_alias_metadata() {
+        let mut config = Config::default();
+        config.models.dynamic_discovery = false;
+        let (_directory, state) = test_state(config).await;
+        for (agent, expected) in [
+            (
+                "claude-cli/2.1.235 (external, test)",
+                "anthropic.deepseek-3.2",
+            ),
+            ("codex_cli_rs/0.147.0 (test)", "deepseek-3.2"),
+        ] {
+            let response = router(Arc::clone(&state))
+                .oneshot(
+                    Request::get("/v1/models?limit=1000")
+                        .header(header::USER_AGENT, agent)
+                        .header("anthropic-version", "2023-06-01")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = body_json(response).await;
+            let entry = body["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["id"] == expected)
+                .expect("model alias");
+            if agent.starts_with("claude-cli/") {
+                assert_eq!(entry["display_name"], "DeepSeek 3.2");
+                assert!(entry["description"].is_string());
+                assert_eq!(body["has_more"], false);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn claude_unsupported_output_guarantees_fail_before_account_selection() {
+        let (_directory, state) = test_state(Config::default()).await;
+        for stream in [false, true] {
+            for config in [
+                serde_json::json!({"format":{"type":"json_schema","schema":{"type":"object"}}}),
+                serde_json::json!({"task_budget":{"type":"tokens","total":64000}}),
+            ] {
+                let response = router(Arc::clone(&state)).oneshot(Request::post("/v1/messages")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::USER_AGENT, "claude-cli/2.1.235 (external, test)")
+                    .body(Body::from(serde_json::json!({"model":"claude-opus-5", "max_tokens":4096,
+                        "stream":stream, "messages":[{"role":"user","content":"hello"}], "output_config":config
+                    }).to_string())).unwrap()).await.unwrap();
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let body = body_json(response).await;
+                assert_eq!(body["type"], "error");
+                assert_eq!(body["error"]["type"], "invalid_request_error");
+                assert!(body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("output_config."));
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn responses_methods_and_validation_use_openai_errors() {
         let (_directory, state) = test_state(Config::default()).await;
         for path in ["/v1/responses", "/responses"] {

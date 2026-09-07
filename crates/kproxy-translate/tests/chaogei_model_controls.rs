@@ -5,6 +5,8 @@
 //! The two missing-metadata cases intentionally diverge: live Kiro Haiku 4.5
 //! rejects the entire additionalModelRequestFields field, even an empty object.
 //! Keep the original fixture intact to document rather than hide that difference.
+//! Claude explicit effort also intentionally diverges: the current gateway
+//! honors output_config.effort instead of retaining the older adapter's omission.
 
 use kproxy_translate::{
     claude_to_kiro, openai_to_kiro, validate_claude, validate_openai, ClaudeRequest, OpenAiRequest,
@@ -29,7 +31,7 @@ fn canonical(value: &Value) -> Value {
 }
 
 #[test]
-fn outbound_model_controls_match_reference_except_unsupported_metadata_fallback() {
+fn outbound_model_controls_document_supported_departures_from_reference() {
     let fixture: Value = serde_json::from_str(include_str!("fixtures/chaogei_model_controls.json"))
         .expect("reference fixture");
     assert_eq!(
@@ -63,6 +65,12 @@ fn outbound_model_controls_match_reference_except_unsupported_metadata_fallback(
             "{name}: inferenceConfig"
         );
         let expected_additional = match name {
+            "claude_effort_alone_is_ignored" => json!({
+                "thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"high"}
+            }),
+            "claude_budget_ignores_effort_and_display" => json!({
+                "thinking":{"type":"adaptive","display":"summarized"},"output_config":{"effort":"xhigh"}
+            }),
             "missing_metadata_omits_display" | "openai_effort_without_metadata" => {
                 assert!(case["schema"].is_null());
                 assert_eq!(

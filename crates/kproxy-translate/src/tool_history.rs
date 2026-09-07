@@ -102,6 +102,7 @@ pub fn sanitize_kiro_tool_history(payload: &mut KiroPayload) -> KiroToolHistoryS
                     .removed_historical_tool_definitions
                     .saturating_add(context.tools.len());
                 context.tools.clear();
+                context.env_state = None;
                 if context.tool_results.is_empty() {
                     user.user_input_message_context = None;
                 }
@@ -578,7 +579,7 @@ fn take_tool_results(user: &mut KiroUserInputMessage) -> Vec<KiroToolResult> {
         return Vec::new();
     };
     let results = std::mem::take(&mut context.tool_results);
-    if context.tools.is_empty() {
+    if context.tools.is_empty() && context.env_state.is_none() {
         user.user_input_message_context = None;
     }
     results
@@ -640,6 +641,7 @@ fn synthetic_user(
         user_input_message_context: (!results.is_empty()).then_some(KiroMessageContext {
             tool_results: results,
             tools: Vec::new(),
+            env_state: None,
         }),
     }
 }
@@ -706,6 +708,7 @@ mod tests {
                 KiroMessageContext {
                     tool_results: results,
                     tools,
+                    env_state: None,
                 },
             ),
         }

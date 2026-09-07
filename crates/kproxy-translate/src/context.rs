@@ -527,6 +527,27 @@ pub fn normalize_compaction_boundary(
                 .map(|(block_index, _)| (message_index, block_index))
         });
     if let Some((message_index, block_index)) = boundary {
+        // Per-message effort persists until another system message changes
+        // it. Carry that control across a content compaction boundary.
+        if let Some(effort) = request.messages[..message_index]
+            .iter()
+            .rev()
+            .filter(|message| message.role == "system")
+            .find_map(|message| {
+                message
+                    .output_config
+                    .as_ref()
+                    .and_then(|config| config.effort.clone())
+            })
+        {
+            request
+                .output_config
+                .get_or_insert_with(|| crate::ClaudeOutputConfig {
+                    effort: None,
+                    extra: Default::default(),
+                })
+                .effort = Some(effort);
+        }
         request.messages.drain(..message_index);
         if let Some(blocks) = request
             .messages
