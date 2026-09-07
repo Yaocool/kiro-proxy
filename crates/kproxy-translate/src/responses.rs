@@ -196,6 +196,23 @@ pub fn responses_to_openai(
                         }));
                         messages.push(assistant);
                     }
+                    "function_call_output" if is_codex_automation_bootstrap(item) => {
+                        // Codex starts scheduled turns with named automation
+                        // context, without an actual preceding tool call:
+                        // https://github.com/openai/codex/issues/41799
+                        // Preserve that context using the developer-message
+                        // workaround instead of inventing an unpaired Kiro ID.
+                        let output =
+                            content(item.get("output"), &format!("{field}.output"), false)?;
+                        messages.push(message("developer", Some(output)));
+                        tracing::debug!(
+                            event = "proxy.compatibility.input_normalized",
+                            protocol = "responses",
+                            input_index = index,
+                            normalization = "codex_automation_bootstrap",
+                            "preserved standalone Codex automation output as developer context"
+                        );
+                    }
                     "function_call_output" | "custom_tool_call_output" => {
                         let id = required_string(item, "call_id", &field)?;
                         let expected = if kind == "function_call_output" {
@@ -639,6 +656,12 @@ fn content(value: Option<&Value>, field: &str, images: bool) -> Result<Value, Va
             .map(Value::Array),
         _ => invalid(field, "expected a string or content array"),
     }
+}
+
+fn is_codex_automation_bootstrap(item: &Value) -> bool {
+    item.get("name").and_then(Value::as_str) == Some("automation_update")
+        && item.get("namespace").and_then(Value::as_str) == Some("codex_app")
+        && item.get("call_id").is_none_or(Value::is_null)
 }
 
 fn message(role: &str, content: Option<Value>) -> OpenAiMessage {

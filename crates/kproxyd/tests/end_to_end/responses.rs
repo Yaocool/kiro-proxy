@@ -337,6 +337,127 @@ async fn responses_tool_roundtrip_works_through_both_aliases_and_buffer_modes() 
 }
 
 #[tokio::test]
+async fn responses_codex_automation_bootstrap_survives_tool_roundtrip_and_replay() {
+    const BOOTSTRAP: &str = "Automation: File maintenance\nAutomation ID: file-maintenance\nPreserve the saved task instructions.";
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(|request: &wiremock::Request| {
+            let payload: Value = serde_json::from_slice(&request.body).unwrap();
+            let context = payload["conversationState"]["history"][0]["userInputMessage"]["content"]
+                .as_str()
+                .unwrap();
+            assert!(context.contains("Follow repository instructions."));
+            assert_eq!(context.matches(BOOTSTRAP).count(), 1, "{context}");
+            assert!(!payload.to_string().contains("fco_bootstrap"));
+            let results = payload["conversationState"]["currentMessage"]["userInputMessage"]
+                ["userInputMessageContext"]["toolResults"]
+                .as_array();
+            if let Some(results) = results.filter(|results| !results.is_empty()) {
+                assert_eq!(results.len(), 2);
+                for (id, text) in [
+                    ("call_read", "README contents"),
+                    ("call_patch", "Patch applied."),
+                ] {
+                    let result = results
+                        .iter()
+                        .find(|result| result["toolUseId"] == id)
+                        .unwrap();
+                    assert_eq!(result["content"][0]["text"], text);
+                }
+            }
+            wiremock::Respond::respond(&ToolRoundtrip, request)
+        })
+        .expect(24)
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    let client = reqwest::Client::new();
+    let tools = json!([
+        {"type":"function","name":"read_file","parameters":{"type":"object",
+            "properties":{"path":{"type":"string"}}}},
+        {"type":"custom","name":"apply_patch","format":{"type":"text"}}
+    ]);
+
+    for endpoint in ["/v1/responses", "/responses"] {
+        for stream in [false, true] {
+            for bootstrap_index in [6, 14] {
+                let mut bootstrap = json!({
+                    "type":"function_call_output", "id":"fco_bootstrap",
+                    "namespace":"codex_app", "name":"automation_update", "output":BOOTSTRAP
+                });
+                if bootstrap_index == 14 {
+                    bootstrap["call_id"] = Value::Null;
+                    bootstrap["output"] = json!([{"type":"input_text","text":BOOTSTRAP}]);
+                }
+                let mut input = vec![
+                    json!({"role":"developer","content":"Follow repository instructions."});
+                    bootstrap_index
+                ];
+                input.push(bootstrap);
+                input.push(json!({"role":"user","content":"Run scheduled file maintenance."}));
+                let initial = json!({
+                    "model":"source-large", "input":input, "tools":tools,
+                    "stream":stream, "max_output_tokens":512
+                });
+                let first = create_response(&client, &daemon, port, endpoint, &initial).await;
+                let output = first["output"].as_array().unwrap();
+                assert!(output.iter().any(|item| item["call_id"] == "call_read"));
+                assert!(output.iter().any(|item| item["call_id"] == "call_patch"));
+                let results = vec![
+                    json!({"type":"function_call_output","call_id":"call_read","output":"README contents"}),
+                    json!({"type":"custom_tool_call_output","call_id":"call_patch","output":"Patch applied."}),
+                ];
+                for stateful in [false, true] {
+                    let mut continuation = json!({
+                        "model":"source-large", "stream":stream, "store":false,
+                        "max_output_tokens":512
+                    });
+                    if stateful {
+                        continuation["previous_response_id"] = first["id"].clone();
+                        continuation["input"] = json!(results);
+                    } else {
+                        let mut replay = input.clone();
+                        replay.extend(output.iter().cloned());
+                        replay.extend(results.iter().cloned());
+                        continuation["input"] = json!(replay);
+                        continuation["tools"] = tools.clone();
+                    }
+                    let second =
+                        create_response(&client, &daemon, port, endpoint, &continuation).await;
+                    assert_eq!(
+                        second["output"][0]["content"][0]["text"],
+                        "Read the file and applied the patch."
+                    );
+                }
+            }
+        }
+    }
+
+    // A malformed ordinary tool result must still fail before upstream execution.
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/v1/responses"))
+        .bearer_auth(daemon.api_key.as_deref().unwrap())
+        .header("user-agent", CODEX_AGENT)
+        .json(&json!({"model":"source-large","input":[{
+            "type":"function_call_output", "namespace":"codex_app",
+            "name":"automation_update", "call_id":123, "output":BOOTSTRAP
+        }]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+    assert!(response.text().await.unwrap().contains("input.0.call_id"));
+    mock.verify().await;
+    daemon.stop().await;
+}
+
+#[tokio::test]
 async fn responses_retry_an_empty_turn_after_tool_results() {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;

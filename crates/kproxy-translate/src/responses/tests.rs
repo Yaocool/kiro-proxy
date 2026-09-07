@@ -225,6 +225,168 @@ fn stateless_tool_roundtrip_keeps_call_ids_inputs_reasoning_and_results() {
 }
 
 #[test]
+fn codex_automation_bootstrap_preserves_context_without_a_tool_call() {
+    let text =
+        "Automation: Daily check\nAutomation ID: daily-check\nRead the saved task instructions.";
+    for call_id in [None, Some(Value::Null)] {
+        for output in [json!(text), json!([{"type":"input_text","text":text}])] {
+            let mut bootstrap = json!({
+                "type":"function_call_output", "id":"fco_bootstrap",
+                "name":"automation_update", "namespace":"codex_app", "output":output
+            });
+            if let Some(call_id) = &call_id {
+                bootstrap["call_id"] = call_id.clone();
+            }
+            // A standalone bootstrap is enough to start a scheduled turn.
+            let request: ResponsesRequest = serde_json::from_value(json!({
+                "model":"gpt-5.6-sol", "input":[bootstrap]
+            }))
+            .unwrap();
+            let original = request.input.clone();
+            let translated = responses_to_openai(&request).expect("Codex automation bootstrap");
+            assert_eq!(request.input, original, "keep replayable Responses history");
+            assert_eq!(translated.request.messages.len(), 1);
+            let message = &translated.request.messages[0];
+            assert_eq!(message.role, "developer");
+            assert_eq!(
+                message.content,
+                Some(if output.is_array() {
+                    json!([{"type":"text","text":text}])
+                } else {
+                    json!(text)
+                })
+            );
+            assert!(message.tool_calls.is_empty());
+            assert!(message.tool_call_id.is_none());
+
+            let mut payload = openai_to_kiro(
+                &translated.request,
+                &TranslationOptions::new("gpt-5.6-sol", "AI_EDITOR"),
+            );
+            sanitize_kiro_tool_history(&mut payload);
+            validate_kiro_tool_history(&payload).expect("no orphan Kiro tool result");
+            assert!(payload.conversation_state.history[0]
+                .user_input_message
+                .as_ref()
+                .unwrap()
+                .content
+                .contains(text));
+            assert_eq!(payload.protected_history_messages, 2);
+            assert!(!serde_json::to_string(&payload)
+                .unwrap()
+                .contains("toolUseId"));
+        }
+    }
+}
+
+#[test]
+fn codex_automation_bootstrap_keeps_regular_tool_calls_paired() {
+    let translated = normalize(json!({
+        "model":"gpt-5.6-sol", "input":[
+            {"role":"user","content":"Run the scheduled check."},
+            {"type":"function_call_output","name":"automation_update",
+                "namespace":"codex_app","output":"Automation ID: daily-check"},
+            {"type":"function_call","call_id":"call_update","namespace":"codex_app",
+                "name":"automation_update","arguments":"{\"mode\":\"view\"}"},
+            {"type":"function_call_output","call_id":"call_update","namespace":"codex_app",
+                "name":"automation_update","output":"The automation is active."}
+        ]
+    }));
+    let messages = &translated.request.messages;
+    assert_eq!(messages.len(), 4);
+    assert_eq!(messages[0].content, Some(json!("Run the scheduled check.")));
+    assert_eq!(messages[1].role, "developer");
+    assert_eq!(messages[2].tool_calls[0]["id"], "call_update");
+    assert_eq!(messages[3].role, "tool");
+    assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_update"));
+    assert_eq!(
+        messages[3].content,
+        Some(json!("The automation is active."))
+    );
+}
+
+#[test]
+fn codex_automation_bootstrap_does_not_relax_other_call_id_validation() {
+    let bootstrap = json!({
+        "type":"function_call_output", "name":"automation_update",
+        "namespace":"codex_app", "output":"Automation context"
+    });
+    for (key, value) in [
+        ("name", json!("read_file")),
+        ("name", Value::Null),
+        ("namespace", json!("other_app")),
+        ("namespace", Value::Null),
+        ("type", json!("custom_tool_call_output")),
+        ("call_id", json!("")),
+        ("call_id", json!(" ")),
+        ("call_id", json!(123)),
+        ("call_id", json!(false)),
+        ("call_id", json!({})),
+        ("call_id", json!([])),
+        ("call_id", json!("unmatched_call")),
+    ] {
+        let mut item = bootstrap.clone();
+        item[key] = value;
+        let request = serde_json::from_value(json!({
+            "model":"test", "input":[{"role":"user","content":"Check."}, item]
+        }))
+        .unwrap();
+        assert!(
+            matches!(
+                responses_to_openai(&request),
+                Err(ValidationError::InvalidField { field, .. }) if field == "input.1.call_id"
+            ),
+            "invalid tool result must still fail: {item}"
+        );
+    }
+
+    let request = serde_json::from_value(json!({
+        "model":"test", "input":[
+            {"type":"function_call","call_id":"pending","namespace":"codex_app",
+                "name":"automation_update","arguments":"{}"},
+            bootstrap
+        ]
+    }))
+    .unwrap();
+    assert!(matches!(
+        responses_to_openai(&request),
+        Err(ValidationError::InvalidField { field, message })
+            if field == "input" && message.contains("matching tool output")
+    ));
+}
+
+#[test]
+fn codex_automation_bootstrap_validates_its_output() {
+    for (output, field) in [
+        (Value::Null, "input.0.output"),
+        (json!({"text":"invalid object"}), "input.0.output"),
+        (
+            json!([{"type":"input_text","text":123}]),
+            "input.0.output.0.text",
+        ),
+        (
+            json!([{"type":"input_image","image_url":"https://example.com/a.png"}]),
+            "input.0.output.0.type",
+        ),
+    ] {
+        let request = serde_json::from_value(json!({
+            "model":"test", "input":[{
+                "type":"function_call_output", "name":"automation_update",
+                "namespace":"codex_app", "output":output
+            }]
+        }))
+        .unwrap();
+        assert!(
+            matches!(
+                responses_to_openai(&request),
+                Err(ValidationError::InvalidField { field: actual, .. }) if actual == field
+            ),
+            "invalid bootstrap output: {output}"
+        );
+    }
+}
+
+#[test]
 fn image_tool_output_remains_in_the_kiro_tool_result_turn() {
     let image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jB9sAAAAASUVORK5CYII=";
     for next_user in [false, true] {

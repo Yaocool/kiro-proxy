@@ -52,6 +52,7 @@ API key 认证、服务级 key 白名单、额度和并发限制继续生效。
 | `instructions` | 转换为受保护的 system 上下文 |
 | `input_image` | 支持公开 HTTP(S) URL 和 base64 data URL，复用图片下载与校验限制；工具结果也可返回图片 |
 | `function_call` / `function_call_output` | 保留 call_id、名称、JSON 参数和结果；校验调用与结果配对 |
+| Codex 定时任务启动上下文 | `codex_app.automation_update` 的独立 `function_call_output` 在缺省或 null `call_id` 时转为 developer 文本消息，保留任务上下文 |
 | `custom_tool_call` / `custom_tool_call_output` | 自由文本工具映射为 Kiro 的 input 字符串参数，返回时恢复原格式 |
 | function、custom、namespace 工具 | 同时读取顶层 `tools` 与 Responses Lite 的 `input[].additional_tools`；展平命名空间后复用名称规范化，返回时恢复 namespace 与名称；拒绝名称冲突 |
 | `tool_choice` | 支持 auto、none、required、指定 function/custom 工具，以及仅限 function/custom 的 `allowed_tools` |
@@ -76,6 +77,35 @@ Kiro。`prompt_cache_retention`、`safety_identifier`、`user` 和 `client_metad
 接受，不传给 Kiro；缓存命中仍由既有缓存规则和上游决定。
 可选的 `stream`、`include`，以及 function 工具的 `description`、`parameters`、`strict`
 显式传 `null` 时按省略处理；`parameters: null` 使用无参数工具的默认 schema。
+
+## Codex 定时任务兼容
+
+Codex Desktop 启动定时任务时可能注入以下输入项，它承载任务信息，没有对应的模型工具调用：
+
+```json
+{
+  "type": "function_call_output",
+  "id": "fco_bootstrap",
+  "namespace": "codex_app",
+  "name": "automation_update",
+  "output": "Automation: Daily check\nAutomation ID: daily-check\nRead the saved task instructions."
+}
+```
+
+此前该条目会在本地请求校验阶段触发 `invalid value for input.N.call_id: expected a string`，
+尚未选择账号或访问 Kiro。Codex 上游已有相同报告：
+[macOS / Azure #41799](https://github.com/openai/codex/issues/41799) 和
+[Windows / DeepSeek #41690](https://github.com/openai/codex/issues/41690)。
+
+代理采用上述报告中验证过的 developer 消息转换方式：仅对 `function_call_output`、
+`namespace: "codex_app"`、`name: "automation_update"` 且 `call_id` 缺省或为 `null` 的组合，
+将 `output` 字符串或文本内容数组保留为 developer 上下文。转换沿用 system/developer 的 Kiro
+上下文保护路径，不丢弃任务信息，也不生成虚构的工具调用或 ID。空字符串、非字符串 ID、其他工具
+及带 ID 的未配对结果仍按原规则校验；启动上下文也不能替代实际工具调用的结果。
+
+该转换支持两个 Responses 路由、JSON/SSE，以及完整历史回放和 `previous_response_id` 续轮。
+debug 事件 `proxy.compatibility.input_normalized` 记录转换类型和输入索引，不记录任务正文。
+任务调度仍由 Codex Desktop 执行，代理处理其发来的模型请求。
 
 ## 无状态与受限状态续轮
 
@@ -145,7 +175,16 @@ Responses 不使用 Chat Completions 的 `[DONE]` 结束标记。
 hj01857655、chaogei 和 ZyphrZero 三个实现的许可分别为 CC BY-NC-SA 4.0、AGPL-3.0 与 MIT。
 本实现参考其能力拆分，按官方协议在本项目的 Rust 执行链中独立实现，未复制其源代码；本仓库继续使用 MIT 许可。
 
+2026-09-07 针对定时任务的 `call_id` 问题补充核查：
+[Colin3191/kiro-proxy · b00c4d8](https://github.com/Colin3191/kiro-proxy/blob/b00c4d8b15454f2394e16f8adf33b4b87d3a8602/responses-api.js#L179)
+直接把工具结果的 `call_id` 传入 `tool_use_id`；
+[ZyphrZero/kiro.rs · 22d2c2d](https://github.com/ZyphrZero/kiro.rs/blob/22d2c2d0695ba350890072c19990f54782827ae5/src/anthropic/responses.rs#L668)
+将缺失 ID 转为空字符串。这两处转换均没有针对 Codex 定时任务启动上下文的专门处理。
+本项目沿用已有 Responses → OpenAI → Kiro 转换结构，并依据 Codex 问题报告独立补充上述兼容分支。
+
 回归覆盖请求转换、可空参数、命名空间/自由文本工具、图片工具结果、协议准入矩阵、SSE 分片和错误，
 以及真实 daemon 对模拟 Kiro 上游的两轮工具交互（完整历史 replay 和 `store`/`previous_response_id`
 续轮）、空工具续轮的单次恢复与重复失败，涵盖两个别名、两种流模式和工具缓冲开关。
 工具分片用例包含交错的 function/custom 调用，以及只在首个片段发送工具名的上游输出。
+定时任务回归另覆盖启动上下文的缺省/null ID、文本数组、普通工具校验边界，以及真实 daemon 对模拟
+Kiro 上游的启动与工具续轮，确认任务上下文保留且没有额外的孤立工具结果。
