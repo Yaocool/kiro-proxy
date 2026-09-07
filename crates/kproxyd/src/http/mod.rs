@@ -1178,27 +1178,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn claude_unsupported_output_guarantees_fail_before_account_selection() {
+    async fn claude_output_hints_pass_validation_for_generation_and_token_counting() {
         let (_directory, state) = test_state(Config::default()).await;
-        for stream in [false, true] {
+        for (path, stream) in [
+            "/v1/messages",
+            "/messages",
+            "/anthropic/v1/messages",
+            "/v1/messages/count_tokens",
+            "/messages/count_tokens",
+            "/anthropic/v1/messages/count_tokens",
+        ]
+        .into_iter()
+        .flat_map(|path| [false, true].map(|stream| (path, stream)))
+        {
             for config in [
                 serde_json::json!({"format":{"type":"json_schema","schema":{"type":"object"}}}),
+                serde_json::json!({"format":{"type":"text"}}),
                 serde_json::json!({"task_budget":{"type":"tokens","total":64000}}),
             ] {
-                let response = router(Arc::clone(&state)).oneshot(Request::post("/v1/messages")
+                let response = router(Arc::clone(&state)).oneshot(Request::post(path)
                     .header(header::CONTENT_TYPE, "application/json")
                     .header(header::USER_AGENT, "claude-cli/2.1.235 (external, test)")
                     .body(Body::from(serde_json::json!({"model":"claude-opus-5", "max_tokens":4096,
                         "stream":stream, "messages":[{"role":"user","content":"hello"}], "output_config":config
                     }).to_string())).unwrap()).await.unwrap();
-                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                // Generation reaches account selection (this fixture has no
+                // accounts); token counting completes entirely in the gateway.
+                let counting = path.ends_with("count_tokens");
+                assert_eq!(
+                    response.status(),
+                    if counting {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::SERVICE_UNAVAILABLE
+                    },
+                    "path={path}, stream={stream}, output_config={config}"
+                );
                 let body = body_json(response).await;
-                assert_eq!(body["type"], "error");
-                assert_eq!(body["error"]["type"], "invalid_request_error");
-                assert!(body["error"]["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("output_config."));
+                if counting {
+                    assert!(body["input_tokens"].as_u64().is_some());
+                } else {
+                    assert_eq!(body["type"], "error");
+                    assert_ne!(body["error"]["type"], "invalid_request_error");
+                }
             }
         }
     }

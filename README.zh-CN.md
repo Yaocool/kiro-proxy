@@ -273,8 +273,8 @@ clear_tool_inputs；`clear_thinking` 支持保留指定轮次或全部 thinking�
 
 兼容性以 jwadow/kiro-gateway、hj01857655/kiro-account-manager、chaogei/Kiro-account-manager
 的实际接入行为为基线，不要求完整复刻 Claude/OpenAI 官方语义。请求、消息、工具的附加字段，以及
-工具 strict 和 OpenAI format 提示继续宽松接收；Claude 输出保证若无已验证的 Kiro 对应能力，
-会明确拒绝。固定源码版本和范围见[兼容性基线](docs/compatibility-baseline.md)。
+工具 strict 和 Claude/OpenAI format 提示继续宽松接收；接收格式提示不代表提供原生结构化输出保证。
+固定源码版本和范围见[兼容性基线](docs/compatibility-baseline.md)。
 
 相邻同角色消息会合并。assistant prefill、`max_tokens=0` 缓存预热和 Anthropic Files API 的
 `file_id` 来源尚未接入对应的生成/数据获取链路，仍会拒绝。
@@ -292,7 +292,7 @@ clear_tool_inputs；`clear_thinking` 支持保留指定轮次或全部 thinking�
 | Claude `stop_sequences` | 在流式 / 非流式响应中本地执行，不发送原生 `stopSequences`；不保证上游生成量或费用也因此受限。 |
 | thinking / effort | 有可识别的 effort 元数据时使用 `thinking: adaptive` + `output_config.effort`，或 `reasoning.effort`；元数据缺失、不完整或不可识别时，完全省略 `additionalModelRequestFields`，不发送 `{}`、`null` 或猜测的 adaptive thinking。 |
 | Claude `output_config.effort` | 显式 effort 优先于 thinking budget，按实际模型元数据映射；system 消息中的 effort 从下一条 user 消息开始生效，压缩和内部续写后保留。映射为 Kiro 的请求级 effort，不保证 Anthropic 的逐消息缓存语义。 |
-| Claude `output_config.format` / `task_budget` | 非 null 值返回含字段路径的 `400`，避免默默丢弃输出保证；null、未提供及未知附加提示仍接收。 |
+| Claude `output_config.format` / `task_budget` | 接收但不发送给 Kiro，debug 诊断仅记录字段名；不提供 JSON/Schema 或 task budget 保证，`output_config.effort` 仍独立映射。 |
 | OpenAI `response_format` / Responses `text.format` | 接收但不放入 Kiro 输入，沿用参考项目的宽松行为；不新增 JSON/Schema 保证或基于 Schema 的生成重试。 |
 | 工具 `strict`、Claude `eager_input_streaming` | 接收为提示，保留正常 Kiro 工具 schema 和既有流式行为。 |
 | 服务等级、附加字段、未使用的流式提示 | 接收但不猜测为 Kiro 字段发送；实际使用的 `include_usage` 等值仍校验类型。 |

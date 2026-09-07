@@ -17,9 +17,28 @@ use super::tool_search::is_tool_search_tool;
 use super::{TranslationOptions, SYSTEM_PROMPT_ACKNOWLEDGEMENT};
 
 pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> KiroPayload {
+    let has_output_hint = |field: &str| {
+        request
+            .output_config
+            .iter()
+            .chain(
+                request
+                    .messages
+                    .iter()
+                    .filter_map(|message| message.output_config.as_ref()),
+            )
+            .any(|config| {
+                config
+                    .extra
+                    .get(field)
+                    .is_some_and(|value| !value.is_null())
+            })
+    };
     super::common::log_ignored_controls(
         "claude",
         &[
+            ("output_config.format", has_output_hint("format")),
+            ("output_config.task_budget", has_output_hint("task_budget")),
             ("service_tier", request.service_tier.is_some()),
             ("extra_request_fields", !request.extra.is_empty()),
             (

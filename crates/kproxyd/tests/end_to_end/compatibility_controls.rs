@@ -21,6 +21,7 @@ async fn reference_gateway_hints_succeed_without_leaking_into_kiro() {
             for field in [
                 "output_format_sentinel",
                 "output_config",
+                "task_budget",
                 "response_format",
                 "strict",
                 "future_hint",
@@ -85,7 +86,9 @@ async fn reference_gateway_hints_succeed_without_leaking_into_kiro() {
                     json!([{"role":"user","content":"Reply pong","future_hint":true}]);
                 request["max_tokens"] = json!(4096);
                 if route == "messages" {
-                    request["output_config"] = json!({"future_hint":true});
+                    request["output_config"] = json!({
+                        "format":{"type":"json_schema","schema":format_schema},
+                        "task_budget":{"type":"tokens","total":64000},"future_hint":true});
                     request["tools"] = json!([{"name":"lookup","input_schema":tool_schema,
                         "strict":true,"eager_input_streaming":true,"future_hint":true}]);
                 } else {

@@ -471,16 +471,9 @@ fn validate_claude_output_config(
             );
         }
     }
-    for field in ["format", "task_budget"] {
-        if config
-            .extra
-            .get(field)
-            .is_some_and(|value| !value.is_null())
-        {
-            return invalid(format!("{path}.{field}"),
-                format!("{field} is not supported by the Kiro upstream; remove this field (it cannot be silently ignored)"));
-        }
-    }
+    // Only effort is consumed by the Kiro adapter. Preserve the gateway's
+    // existing acceptance of format/task_budget and other additive hints;
+    // accepting them does not promise native structured-output enforcement.
     Ok(())
 }
 
