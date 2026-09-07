@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
-use kproxy_core::account::{Account, Usage};
+use kproxy_core::account::{Account, AuthMethod, Usage};
 use kproxy_core::config::Config;
 use kproxy_core::paths::Paths;
 use kproxy_kiro::endpoint::EndpointOverrides;
@@ -259,6 +259,8 @@ impl AppState {
             codewhisperer_url: std::env::var("KPROXY_CODEWHISPERER_URL").ok(),
             amazonq_url: std::env::var("KPROXY_AMAZONQ_URL").ok(),
             mcp_url: std::env::var("KPROXY_MCP_URL").ok(),
+            runtime_url: std::env::var("KPROXY_RUNTIME_URL").ok(),
+            management_url: std::env::var("KPROXY_MANAGEMENT_URL").ok(),
         };
         let kiro = KiroClient::new(current.upstream.clone(), overrides)
             .map_err(|error| anyhow::anyhow!(error.to_string()))?;
@@ -627,6 +629,9 @@ impl AppState {
         account_id: &str,
         force: bool,
     ) -> Result<RefreshOutcome, RefreshError> {
+        if let Some(outcome) = Self::api_key_refresh_outcome(pool, account_id, force, None).await {
+            return outcome;
+        }
         let (account_name, account_enabled) = self.account_refresh_identity(pool, account_id).await;
         let result = match self.lock_account_refresh(account_id).await {
             Ok(_coordination) => {
@@ -657,6 +662,11 @@ impl AppState {
         account_id: &str,
         rejected_access_token: &str,
     ) -> Result<RefreshOutcome, RefreshError> {
+        if let Some(outcome) =
+            Self::api_key_refresh_outcome(pool, account_id, true, Some(rejected_access_token)).await
+        {
+            return outcome;
+        }
         let (account_name, account_enabled) = self.account_refresh_identity(pool, account_id).await;
         let result = match self.lock_account_refresh(account_id).await {
             Ok(_coordination) => {
@@ -677,6 +687,35 @@ impl AppState {
             ))),
         };
         self.finish_token_refresh_with_identity(account_id, &account_name, account_enabled, result)
+    }
+
+    async fn api_key_refresh_outcome(
+        pool: &AccountPool,
+        account_id: &str,
+        force: bool,
+        rejected_access_token: Option<&str>,
+    ) -> Option<Result<RefreshOutcome, RefreshError>> {
+        let runtime = pool.get(account_id).await?;
+        let account = runtime.account.read().await;
+        if account.credentials.auth_method != AuthMethod::ApiKey {
+            return None;
+        }
+        // Static keys have no OAuth refresh lifecycle: do not acquire refresh
+        // coordination locks or raise token-refresh incidents. A concurrent key
+        // rotation can still satisfy recovery of a request using the old key.
+        Some(
+            if !force
+                || rejected_access_token
+                    .is_some_and(|token| token != account.credentials.access_token)
+            {
+                Ok(RefreshOutcome {
+                    changed: false,
+                    persistence_error: None,
+                })
+            } else {
+                Err(RefreshError::NotRefreshable)
+            },
+        )
     }
 
     async fn account_refresh_identity(
@@ -949,6 +988,8 @@ impl AppState {
                 codewhisperer_url: std::env::var("KPROXY_CODEWHISPERER_URL").ok(),
                 amazonq_url: std::env::var("KPROXY_AMAZONQ_URL").ok(),
                 mcp_url: std::env::var("KPROXY_MCP_URL").ok(),
+                runtime_url: std::env::var("KPROXY_RUNTIME_URL").ok(),
+                management_url: std::env::var("KPROXY_MANAGEMENT_URL").ok(),
             };
             if let Ok(client) = KiroClient::new(next.upstream.clone(), overrides) {
                 *write_lock(&self.kiro) = client;
@@ -1336,6 +1377,71 @@ mod tests {
             report.summary(),
             "ok: 3 checked, 1 eligible, 1 refreshed, 0 failures"
         );
+    }
+
+    #[tokio::test]
+    async fn rejected_api_keys_do_not_start_oauth_refresh_or_raise_refresh_incidents() {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let paths =
+            Paths::from_env_values(Some(directory.path().to_str().unwrap()), None, None, None);
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .unwrap();
+        let mut accounts = AccountStore::load(&paths.accounts_file).await.unwrap();
+        let mut account =
+            refreshable_account("acc_00000009", "headless@example.com", "ksk_synthetic");
+        account.credentials.auth_method = AuthMethod::ApiKey;
+        account.credentials.refresh_token = None;
+        account.credentials.client_id = None;
+        account.credentials.client_secret = None;
+        accounts.insert(account).unwrap();
+        accounts.save().await.unwrap();
+        let mut config = Config::default();
+        config.webhook.push(
+            serde_json::from_value(json!({
+                "name":"test", "kind":"custom", "url":server.uri(),
+                "events":[kproxy_notify::WebhookEventKind::TokenRefreshFailed.as_str()]
+            }))
+            .unwrap(),
+        );
+        let state = AppState::new(paths, ConfigHandle::new(config), accounts);
+        let pool = state.pool();
+        assert!(matches!(
+            state
+                .refresh_account_token_after_auth_failure(&pool, "acc_00000009", "ksk_synthetic")
+                .await,
+            Err(RefreshError::NotRefreshable)
+        ));
+        assert!(matches!(
+            state
+                .refresh_account_token(&pool, "acc_00000009", true)
+                .await,
+            Err(RefreshError::NotRefreshable)
+        ));
+        assert!(!state.notifier().incident_active(
+            kproxy_notify::WebhookEventKind::TokenRefreshFailed,
+            Some("acc_00000009")
+        ));
+        assert!(
+            !state
+                .refresh_account_token(&pool, "acc_00000009", false)
+                .await
+                .unwrap()
+                .changed
+        );
+        let runtime = pool.get("acc_00000009").await.unwrap();
+        runtime.account.write().await.credentials.access_token = "ksk_rotated".into();
+        let outcome = state
+            .refresh_account_token_after_auth_failure(&pool, "acc_00000009", "ksk_synthetic")
+            .await
+            .unwrap();
+        assert!(!outcome.changed);
+        let mut entries = tokio::fs::read_dir(directory.path()).await.unwrap();
+        while let Some(entry) = entries.next_entry().await.unwrap() {
+            assert!(!entry.file_name().to_string_lossy().contains(".refresh."));
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

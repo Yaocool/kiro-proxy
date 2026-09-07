@@ -227,6 +227,25 @@ pub(super) fn validate_account_input(account: &Account) -> Result<(), RpcError> 
     if account.credentials.region.trim().is_empty() {
         return Err(RpcError::bad_params("credentials.region must not be empty"));
     }
+    kproxy_kiro::endpoint::account_api_region(account)
+        .map_err(|_| RpcError::bad_params("credentials/profile ARN has an invalid region"))?;
+    if account.credentials.auth_method == kproxy_core::account::AuthMethod::ApiKey {
+        let key = &account.credentials.access_token;
+        if !key.starts_with("ksk_") || key.len() <= 4 || key.chars().any(char::is_whitespace) {
+            return Err(RpcError::bad_params(
+                "Kiro API key must be a non-empty ksk_... credential",
+            ));
+        }
+        if account.profile_arn.is_some()
+            || account.credentials.refresh_token.is_some()
+            || account.credentials.client_id.is_some()
+            || account.credentials.client_secret.is_some()
+        {
+            return Err(RpcError::bad_params(
+                "API key accounts do not use OAuth refresh credentials or profileArn",
+            ));
+        }
+    }
     if account
         .profile_arn
         .as_deref()

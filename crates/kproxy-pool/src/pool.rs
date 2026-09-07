@@ -639,6 +639,9 @@ impl AccountPool {
 }
 
 fn can_serve_subscription(account: &Account, model: &str) -> bool {
+    if account.credentials.auth_method == kproxy_core::account::AuthMethod::ApiKey {
+        return true;
+    }
     kproxy_kiro::static_subscription_can_serve(
         account
             .subscription

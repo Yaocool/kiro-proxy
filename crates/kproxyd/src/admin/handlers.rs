@@ -1003,15 +1003,10 @@ async fn handle_model_resolve(state: &Arc<AppState>, params: serde_json::Value) 
             (runtime.supported_models().await, "account_cache")
         } else {
             (
-                kproxy_kiro::static_models_for_subscription(
-                    account
-                        .subscription
-                        .as_ref()
-                        .map(|subscription| subscription.kind),
-                )
-                .into_iter()
-                .map(|model| model.model_id)
-                .collect(),
+                kproxy_kiro::static_models_for_account(&account)
+                    .into_iter()
+                    .map(|model| model.model_id)
+                    .collect(),
                 "static_catalog",
             )
         };

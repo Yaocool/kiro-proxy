@@ -80,6 +80,21 @@ pub fn static_models_for_subscription(subscription: Option<SubscriptionKind>) ->
         .collect()
 }
 
+pub fn static_models_for_account(account: &kproxy_core::account::Account) -> Vec<ModelInfo> {
+    // Kiro only issues headless API keys to paid accounts. This selects the
+    // fallback catalog without fabricating a subscription or credit balance.
+    if account.credentials.auth_method == kproxy_core::account::AuthMethod::ApiKey {
+        static_models()
+    } else {
+        static_models_for_subscription(
+            account
+                .subscription
+                .as_ref()
+                .map(|subscription| subscription.kind),
+        )
+    }
+}
+
 /// Applies the public tier matrix only when dynamic discovery has no answer.
 /// Unknown models are permitted for paid/managed subscriptions for forward
 /// compatibility, but not for Free/unknown subscriptions where doing so would

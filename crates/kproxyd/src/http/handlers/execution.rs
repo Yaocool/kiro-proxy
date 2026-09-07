@@ -124,11 +124,7 @@ pub(in crate::http) fn resolve_static_model(
     account: &kproxy_core::account::Account,
     model: &str,
 ) -> Option<String> {
-    let subscription = account
-        .subscription
-        .as_ref()
-        .map(|subscription| subscription.kind);
-    let available = kproxy_kiro::static_models_for_subscription(subscription)
+    let available = kproxy_kiro::static_models_for_account(account)
         .into_iter()
         .map(|model| model.model_id)
         .collect::<Vec<_>>();
@@ -1032,7 +1028,7 @@ pub(in crate::http) async fn execute_kiro_web_search(
                 .map_err(|refresh| KiroError {
                     status: error.status,
                     endpoint: "MCP web_search".into(),
-                    message: format!("web search authentication refresh failed: {refresh}"),
+                    message: format!("web search authentication recovery failed: {refresh}"),
                 })?;
             execute_kiro_web_search_once(state, lease, query).await
         }
@@ -1055,15 +1051,13 @@ pub(super) async fn ensure_web_search_profile_arn(
 ) -> Result<kproxy_core::account::Account, KiroError> {
     for _attempt in 0..2 {
         let account = lease.account().await;
-        if account
-            .profile_arn
-            .as_deref()
-            .is_some_and(|profile_arn| !profile_arn.trim().is_empty())
-        {
+        if account.credentials.auth_method == kproxy_core::account::AuthMethod::ApiKey {
             return Ok(account);
         }
-
         let profile_arn = state.kiro().resolve_profile_arn(&account).await?;
+        if account.profile_arn.as_deref() == Some(profile_arn.as_str()) {
+            return Ok(account);
+        }
         let pool = state.pool();
         let account_state = pool.get(&account.id).await.ok_or_else(|| KiroError {
             status: None,
@@ -1071,14 +1065,10 @@ pub(super) async fn ensure_web_search_profile_arn(
             message: "web search account disappeared during profile discovery".into(),
         })?;
         let mut current = account_state.account.write().await;
-        if current
-            .profile_arn
-            .as_deref()
-            .is_some_and(|existing| !existing.trim().is_empty())
+        if current.credentials.access_token != account.credentials.access_token
+            || current.credentials.region != account.credentials.region
+            || current.profile_arn != account.profile_arn
         {
-            return Ok(current.clone());
-        }
-        if current.credentials.access_token != account.credentials.access_token {
             continue;
         }
         current.profile_arn = Some(profile_arn);

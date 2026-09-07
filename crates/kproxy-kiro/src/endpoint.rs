@@ -16,6 +16,7 @@ const MAX_ENDPOINT_CACHE_SIZE: usize = 500;
 pub enum EndpointKey {
     Codewhisperer,
     Amazonq,
+    Runtime,
 }
 
 impl From<Endpoint> for EndpointKey {
@@ -23,6 +24,7 @@ impl From<Endpoint> for EndpointKey {
         match value {
             Endpoint::Codewhisperer => Self::Codewhisperer,
             Endpoint::Amazonq => Self::Amazonq,
+            Endpoint::Runtime => Self::Runtime,
         }
     }
 }
@@ -69,8 +71,94 @@ impl EndpointDefinition {
                 amz_target: "",
                 name: "AmazonQ",
             },
+            EndpointKey::Runtime => Self {
+                key,
+                url: overrides
+                    .runtime_url
+                    .clone()
+                    .unwrap_or_else(|| "https://runtime.us-east-1.kiro.dev/".into()),
+                origin: "KIRO_CLI",
+                amz_target: "AmazonCodeWhispererStreamingService.GenerateAssistantResponse",
+                name: "KiroRuntime",
+            },
         }
     }
+
+    pub fn for_account(
+        key: EndpointKey,
+        overrides: &EndpointOverrides,
+        account: &Account,
+    ) -> Result<Self, crate::KiroError> {
+        let region = account_api_region(account)?;
+        let mut endpoint = Self::for_key(key, overrides);
+        endpoint.url = match key {
+            EndpointKey::Codewhisperer => {
+                overrides.codewhisperer_url.clone().unwrap_or_else(|| {
+                    format!(
+                        "https://codewhisperer.{region}.amazonaws.com/generateAssistantResponse"
+                    )
+                })
+            }
+            EndpointKey::Amazonq => overrides.amazonq_url.clone().unwrap_or_else(|| {
+                format!("https://q.{region}.amazonaws.com/generateAssistantResponse")
+            }),
+            EndpointKey::Runtime => overrides
+                .runtime_url
+                .clone()
+                .unwrap_or_else(|| format!("https://runtime.{region}.kiro.dev/")),
+        }
+        .replace("{region}", &region);
+        Ok(endpoint)
+    }
+}
+
+pub fn account_api_region(account: &Account) -> Result<String, crate::KiroError> {
+    let credential_region = account.credentials.region.trim();
+    if credential_region.is_empty()
+        || !credential_region
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(crate::KiroError {
+            status: Some(400),
+            endpoint: "region".into(),
+            message: "account has an invalid API region".into(),
+        });
+    }
+    let profile_region = account.profile_arn.as_deref().and_then(|arn| {
+        let parts = arn.split(':').collect::<Vec<_>>();
+        (parts.len() >= 6
+            && parts[0] == "arn"
+            && matches!(parts[1], "aws" | "aws-us-gov")
+            && parts[2] == "codewhisperer")
+            .then(|| parts[3])
+    });
+    // Never route a GovCloud account into the commercial partition because
+    // of an imported Builder ID placeholder ARN.
+    let region = if credential_region.starts_with("us-gov-")
+        || account.credentials.auth_method == AuthMethod::ApiKey
+    {
+        credential_region
+    } else {
+        // An IdC login region is not necessarily a Kiro service region.
+        profile_region.unwrap_or(if credential_region.starts_with("eu-") {
+            "eu-central-1"
+        } else {
+            "us-east-1"
+        })
+    };
+    if region.is_empty()
+        || !region
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
+        return Err(crate::KiroError {
+            status: Some(400),
+            endpoint: "region".into(),
+            message: "account has an invalid API region".into(),
+        });
+    }
+    Ok(region.into())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -78,6 +166,8 @@ pub struct EndpointOverrides {
     pub codewhisperer_url: Option<String>,
     pub amazonq_url: Option<String>,
     pub mcp_url: Option<String>,
+    pub runtime_url: Option<String>,
+    pub management_url: Option<String>,
 }
 
 type PurposeKey = (String, EndpointPurpose);
@@ -118,6 +208,16 @@ impl EndpointCache {
         let cache_key = (account.id.clone(), purpose);
         let cached = state.preferred.get(&cache_key).copied();
         let mut order = Vec::with_capacity(2);
+        if account.credentials.auth_method == AuthMethod::ApiKey
+            || account_api_region(account).is_ok_and(|region| region.starts_with("us-gov-"))
+        {
+            // API keys use the CLI runtime. GovCloud credentials must never
+            // fall back to a commercial endpoint.
+            if !Self::is_disabled(&mut state, &cache_key, EndpointKey::Runtime) {
+                order.push(EndpointKey::Runtime);
+            }
+            return order;
+        }
         for candidate in [
             explicit,
             explicit.is_none().then_some(cached).flatten(),
@@ -339,6 +439,7 @@ pub fn endpoint_for_auth(method: AuthMethod) -> EndpointKey {
     match method {
         AuthMethod::Idc => EndpointKey::Amazonq,
         AuthMethod::Social => EndpointKey::Codewhisperer,
+        AuthMethod::ApiKey => EndpointKey::Runtime,
     }
 }
 
@@ -346,6 +447,7 @@ pub fn other(endpoint: EndpointKey) -> EndpointKey {
     match endpoint {
         EndpointKey::Codewhisperer => EndpointKey::Amazonq,
         EndpointKey::Amazonq => EndpointKey::Codewhisperer,
+        EndpointKey::Runtime => EndpointKey::Amazonq,
     }
 }
 
