@@ -445,7 +445,7 @@ kproxy config reset pool         # 只重置单个模块，其他模块保持不
 kproxy config path
 kproxy config validate
 kproxy config reload
-kproxy config reset              # 重置全部通用配置，保留 API key 和代理服务
+kproxy config reset              # 重置通用配置，保留 API key、代理服务和告警配置
 
 kproxy pool --watch --explain
 kproxy diagnose endpoints

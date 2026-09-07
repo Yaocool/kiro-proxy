@@ -557,7 +557,7 @@ kproxy config reset pool         # resets only one module and preserves every ot
 kproxy config path
 kproxy config validate
 kproxy config reload
-kproxy config reset              # resets all general settings, preserves API keys/services
+kproxy config reset              # resets general settings, preserves API keys/services and alerts
 
 kproxy pool --watch --explain
 kproxy diagnose endpoints

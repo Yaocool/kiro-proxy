@@ -1806,7 +1806,7 @@ pub async fn reset_config(
     let path = PathBuf::from(paths.config_file);
     let prompt = module.map_or_else(
         || {
-            "确认将通用配置恢复为默认设置？API key 和代理服务会保留，模型映射和告警目标会被清除"
+            "确认将通用配置恢复为默认设置？API key、代理服务和告警配置会保留，模型映射会被清除"
                 .to_string()
         },
         |module| {
@@ -1829,7 +1829,7 @@ pub async fn reset_config(
     let raw = std::str::from_utf8(&original).context("当前配置不是有效的 UTF-8")?;
     let reset = match module {
         Some(module) => render_config_module_reset(raw, module)?,
-        None => render_reset_config_preserving_services(raw)?,
+        None => render_reset_config_preserving_resources_and_alerts(raw)?,
     };
 
     let backup_file = write_config_backup(&path, &original).await?;
@@ -1913,10 +1913,9 @@ fn render_config_module_reset(raw: &str, module: &ConfigModule) -> Result<String
     Ok(output)
 }
 
-/// Renders defaults while retaining the two resource sections managed by
-/// `kproxy apikey` and `kproxy service`.
-fn render_reset_config_preserving_services(raw: &str) -> Result<String> {
-    const PRESERVED_SECTIONS: [&str; 2] = ["api_key", "proxy_service"];
+/// Renders defaults while retaining separately managed resources and alert settings.
+fn render_reset_config_preserving_resources_and_alerts(raw: &str) -> Result<String> {
+    const PRESERVED_SECTIONS: [&str; 4] = ["notify", "webhook", "api_key", "proxy_service"];
 
     let current = raw.parse::<toml::Value>().context("当前配置 TOML 无效")?;
     let current_table = current
@@ -2432,7 +2431,7 @@ pub fn print_topic(topic: Option<&str>) -> Result<()> {
             "`kproxy service list/show/create/edit/enable/disable/apikeys/delete` 管理独立代理监听。edit 可修改监听并按 API key ID 或名称增删绑定；disable 会保留配置和 key；删除时仅级联删除未共享 key，并要求 y/yes 确认。"
         }
         "config" => {
-            "配置默认位于 $KPROXY_HOME/config.toml，修改后热重载；server.host/port、admin.socket 和 TLS 监听变更需要重启。\n`kproxy config list` 列出全部顶层模块及是否允许重置；`show [模块]` 可查看完整配置或单个模块，增加 `--effective` 查看合并默认值后的结果；`edit [模块]` 可编辑完整配置或单个模块，保存时会合并、整体校验并重载。`reset [模块]` 只恢复指定模块，其他配置不变；不指定模块时恢复全部通用配置。API key 和代理服务属于基础服务资源，不会被 config reset 清除。`validate [file]` 只校验，不应用。"
+            "配置默认位于 $KPROXY_HOME/config.toml，修改后热重载；server.host/port、admin.socket 和 TLS 监听变更需要重启。\n`kproxy config list` 列出全部顶层模块及是否允许重置；`show [模块]` 可查看完整配置或单个模块，增加 `--effective` 查看合并默认值后的结果；`edit [模块]` 可编辑完整配置或单个模块，保存时会合并、整体校验并重载。`reset [模块]` 只恢复指定模块，其他配置不变；不指定模块时恢复全部通用配置，并保留 API key、代理服务和告警配置。`validate [file]` 只校验，不应用。"
         }
         "apikey" => {
             "API key 限额采用在途预留：请求进入时预留估算 credits，结束后按上游实际用量结算，避免并发突破限额。\n`kproxy apikey show <ID|名称>` 查看单项，`list --detail` 查看 token/credits 消耗；`limit <ID|名称> --clear` 可恢复不限，`rm`/`delete` 均可删除。日维度、模型、路径和历史可用 `usage` 与 `history` 查询。"
