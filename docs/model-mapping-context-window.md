@@ -351,11 +351,21 @@ cargo test --workspace --all-features --locked
 
 ## 已验证的客户端前提
 
-Claude Code 2.1.235 的 mock-server 实测结果仍有效：
+此前对 Claude Code 2.1.235 的记录不能替代当前版本验证。2.1.260 的真实客户端 + 本地模拟上游已复现并修正：
 
 - assistant 响应中的 `compaction` block 会在下一轮原样回传。
-- 流式 start/delta/stop 生成的 compaction block 也会完整保留。
+- Claude Code 2.1.260 只保存 start 中的 compaction content，忽略 compaction_delta。代理对已识别的
+  Claude Code 在 start 里放完整摘要并直接 stop；普通 SDK 继续使用标准的 null start、完整 delta、stop。
+  这两种形式都覆盖语义摘要和 fallback；不同时发送两份内容，也不通过猜测恢复历史中的 null 块。
 - 客户端不会按这个块裁掉自己的旧历史，裁剪必须由服务端 `apply_compaction_boundary` 完成。
 - 客户端普通请求只携带 `clear_thinking_20251015`，不主动发送 `compact_20260112`。
 
-客户端大版本升级后应重跑该兼容性验证。如果客户端开始丢弃未知块，服务端方案会退化为每轮重新摘要，届时应自动关闭 `auto_compact_on_overflow`，而不是继续产生隐藏成本。
+客户端升级后应重跑兼容性验证；本地有支持 `--bare` 的 Claude Code 时运行：
+
+```bash
+cargo test -p kproxyd --test end_to_end real_claude_code_retains_the_compaction_checkpoint -- --ignored
+```
+
+测试隔离客户端配置、禁用工具和非必要网络，并仅调用临时本地 daemon 与模拟上游，不需要生产账号。
+常规 CI 的 `warning_regressions` 同时覆盖 Claude Code、TypeScript SDK 的拼接累积和 Python SDK 的替换累积。
+未来若客户端彻底丢弃未知块，应重新评估自动 compact；单纯增加超时或恢复 null 占位块会掩盖协议问题。

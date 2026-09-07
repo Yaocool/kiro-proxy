@@ -2183,13 +2183,20 @@ priority = 10
     assert_eq!(responder.main_calls.load(Ordering::SeqCst), 2);
     assert!(!body.contains("broken-write"), "{body}");
     assert!(!body.contains("produced complete JSON"), "{body}");
-    assert!(body.contains("compaction_delta"), "{body}");
+    assert!(body.contains("\"type\":\"compaction\""), "{body}");
+    assert!(!body.contains("\"type\":\"compaction_delta\""), "{body}");
+    assert_eq!(
+        body.matches("Task Overview: preserve the compacted stream across a retry.")
+            .count(),
+        1,
+        "the retry must preserve exactly one complete Claude Code checkpoint"
+    );
     assert!(
         body.contains("main request completed after retry"),
         "{body}"
     );
     assert!(
-        body.find("compaction_delta").expect("compaction")
+        body.find("\"type\":\"compaction\"").expect("compaction")
             < body
                 .find("main request completed after retry")
                 .expect("retried content")

@@ -226,7 +226,8 @@ Claude 响应首部的 `compaction` 边界。摘要超时会立即释放主请�
 到期后主动取消摘要流，并结算此前已经解码的 usage。
 
 摘要等待默认 60 秒（`context.compaction_summary_timeout_ms`）；升级会保留已有显式值，原先的
-`30000` 不会自动改写。超时回退只记录一条 WARN，后台结算为带 trace ID 的 INFO，
+`30000` 不会自动改写。Claude Code 流式压缩使用完整 start 块以兼容忽略 compaction delta 的客户端；
+普通 SDK 仍使用标准 delta。超时回退只记录一条 WARN，后台结算为带 trace ID 的 INFO，
 `credits_source=estimated` 表示本地估算，并非上游实际扣费证明。日志卷按日持久化，重建容器不会清除旧 WARN。
 
 `features.tool_search_max_rounds` 默认 4、硬上限 8；单次请求达到内部轮次上限时返回 Claude
