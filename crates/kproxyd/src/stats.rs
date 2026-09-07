@@ -404,7 +404,22 @@ impl StatsStore {
         }
     }
 
-    pub fn record(&self, request: RequestLog) {
+    pub fn record(&self, mut request: RequestLog) {
+        use kproxy_translate::error::{log_model, sanitize_error_message};
+        request.model = log_model(&request.model);
+        request.original_model = log_model(&request.original_model);
+        request.kiro_model = log_model(&request.kiro_model);
+        for model in &mut request.model_path {
+            *model = log_model(model);
+        }
+        for attempt in &mut request.attempts {
+            attempt.model = log_model(&attempt.model);
+            for model in &mut attempt.available_models {
+                *model = log_model(model);
+            }
+            attempt.error = sanitize_error_message(&attempt.error);
+        }
+        request.error = request.error.as_deref().map(sanitize_error_message);
         let notification = request.clone();
         let request = Arc::new(request);
         let mut state = lock(&self.state);

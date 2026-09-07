@@ -19,7 +19,7 @@ use super::{
     UpstreamExecution, Url, Uuid, Value,
 };
 use futures::TryStreamExt;
-use kproxy_translate::{responses_to_openai, ResponsesRequest};
+use kproxy_translate::{error::log_model, responses_to_openai, ResponsesRequest};
 
 use super::super::responses::{
     is_responses_path, resume_responses_request, stream_response, ResponsesOptions,
@@ -89,7 +89,7 @@ pub(super) async fn handle_claude(
         event = "proxy.request.validated",
         trace_id = %trace_id,
         protocol = "claude",
-        model = %request.model,
+        model = %log_model(&request.model),
         streaming = request.stream,
         message_count = request.messages.len(),
         tool_count = request.tools.len(),
@@ -558,7 +558,7 @@ pub(super) async fn handle_claude(
         event = "proxy.request.prepared",
         trace_id = %trace_id,
         protocol = "claude",
-        requested_model = %request.model,
+        requested_model = %log_model(&request.model),
         mapped_model = %route.mapped,
         input_tokens,
         original_tool_count = diagnostics.original_tool_count,
@@ -936,7 +936,7 @@ pub(super) async fn handle_openai(
         event = "proxy.request.validated",
         trace_id = %trace_id,
         protocol = "openai",
-        model = %request.model,
+        model = %log_model(&request.model),
         streaming = request.stream,
         message_count = request.messages.len(),
         tool_count = request.tools.len(),
@@ -1069,7 +1069,7 @@ pub(super) async fn handle_openai(
         event = "proxy.request.prepared",
         trace_id = %trace_id,
         protocol = "openai",
-        requested_model = %request.model,
+        requested_model = %log_model(&request.model),
         mapped_model = %route.mapped,
         input_tokens,
         original_tool_count = diagnostics.original_tool_count,

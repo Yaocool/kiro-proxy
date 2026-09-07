@@ -27,6 +27,9 @@ mod compatibility_controls;
 #[path = "end_to_end/claude_gateway.rs"]
 mod claude_gateway;
 
+#[path = "end_to_end/warning_regressions.rs"]
+mod warning_regressions;
+
 struct Daemon {
     child: Child,
     socket: PathBuf,

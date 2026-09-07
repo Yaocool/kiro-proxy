@@ -5,6 +5,7 @@ use super::{
     Arc, ExecuteError, HashSet, KiroError, PoolError, PreparedUpstream, Rng, UpstreamAttemptLog,
     UpstreamExecution,
 };
+use kproxy_translate::error::log_model;
 
 enum DispatchOutcome {
     Prepared(Box<PreparedUpstream>),
@@ -265,31 +266,31 @@ async fn dispatch_upstream(
                 let reason = if default_model.trim().is_empty() {
                     format!(
                     "model '{}' is not present in this account's model cache and no default model is configured",
-                    actual_model
+                    log_model(&actual_model)
                 )
                 } else {
                     format!(
                     "model '{}' and default model '{}' are not present in this account's model cache",
-                    actual_model, default_model
+                    log_model(&actual_model), log_model(default_model)
                 )
                 };
                 attempt_logs.push(UpstreamAttemptLog {
                     attempt: attempt + 1,
                     account_id: account.id.clone(),
                     account_name: account_name.clone(),
-                    model: actual_model.clone(),
+                    model: log_model(&actual_model),
                     available_models: available_models.clone(),
                     endpoint: "model-resolution".into(),
                     status: None,
                     error: reason.clone(),
                 });
-                tracing::warn!(
+                tracing::debug!(
                     trace_id,
                     attempt = attempt + 1,
                     account_id = %account.id,
                     account_name,
-                    model = %actual_model,
-                    model_path = %model_path.join(" -> "),
+                    model = %log_model(&actual_model),
+                    model_path = %model_path.iter().map(|model| log_model(model)).collect::<Vec<_>>().join(" -> "),
                     available_models = %available_models.join(","),
                     reason,
                     "account cannot serve resolved model"
@@ -726,7 +727,8 @@ async fn dispatch_upstream(
             .into(),
             message: if model_resolution_failed {
                 format!(
-                    "no selected account can serve resolved model '{actual_model}' ({} distinct models are available); inspect routing with 'kproxy models resolve <model-id>'",
+                    "no selected account can serve resolved model '{}' ({} distinct models are available); inspect routing with 'kproxy models resolve <model-id>'",
+                    log_model(&actual_model),
                     attempt_diagnostics.available_model_count
                 )
             } else {
@@ -735,7 +737,8 @@ async fn dispatch_upstream(
         }
     });
     if model_resolution_failed {
-        tracing::warn!(
+        // The HTTP boundary emits the single rejection warning with attempts.
+        tracing::debug!(
             event = "upstream.model_resolution.exhausted",
             trace_id,
             failure_kind = "model_not_available",
@@ -743,8 +746,8 @@ async fn dispatch_upstream(
             endpoint = %error.endpoint,
             upstream_status = error.status.unwrap_or_default(),
             error = %sanitize_error_message(&error.message),
-            requested_model,
-            default_model,
+            requested_model = %log_model(requested_model),
+            default_model = %log_model(default_model),
             max_attempts = attempts,
             attempt_count = attempt_logs.len(),
             attempted_accounts = attempted_accounts.len(),
@@ -753,9 +756,9 @@ async fn dispatch_upstream(
             available_model_count = attempt_diagnostics.available_model_count,
             available_models = %attempt_diagnostics.available_models,
             attempt_errors = %attempt_diagnostics.errors,
-            mapped_model,
-            kiro_model = actual_model,
-            model_path = %model_path.join(" -> "),
+            mapped_model = %log_model(&mapped_model),
+            kiro_model = %log_model(&actual_model),
+            model_path = %model_path.iter().map(|model| log_model(model)).collect::<Vec<_>>().join(" -> "),
             mapping_rule = model_mapping_rule.as_deref().unwrap_or("none"),
             "model resolution exhausted selected accounts"
         );

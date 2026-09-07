@@ -27,6 +27,8 @@ pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 pub const MAX_IMAGES_PER_REQUEST: usize = 20;
 pub const MAX_DOCUMENTS_PER_REQUEST: usize = 5;
 pub const MAX_CACHE_BREAKPOINTS: usize = 4;
+/// Resource/logging boundary, not an enumeration of Kiro's supported models.
+pub const MAX_MODEL_BYTES: usize = 256;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum ValidationError {
@@ -2374,11 +2376,27 @@ fn invalid<T>(field: impl Into<String>, message: impl Into<String>) -> Result<T,
 }
 
 fn common(model: &str, messages_empty: bool) -> Result<(), ValidationError> {
+    validate_model(model)?;
+    if messages_empty {
+        return Err(ValidationError::MissingMessages);
+    }
+    Ok(())
+}
+
+/// Check the identifier's resource/logging boundary without enumerating model
+/// names or rejecting otherwise valid custom routing aliases.
+pub fn validate_model(model: &str) -> Result<(), ValidationError> {
     if model.trim().is_empty() {
         return Err(ValidationError::MissingModel);
     }
-    if messages_empty {
-        return Err(ValidationError::MissingMessages);
+    if model.len() > MAX_MODEL_BYTES {
+        return invalid("model", format!("must be at most {MAX_MODEL_BYTES} bytes"));
+    }
+    if model
+        .chars()
+        .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return invalid("model", "must not contain whitespace or control characters");
     }
     Ok(())
 }
