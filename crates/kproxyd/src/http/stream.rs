@@ -95,6 +95,8 @@ pub struct StreamContext {
     pub input_tokens: u64,
     pub compact: bool,
     pub compaction_summary: Option<String>,
+    /// Claude Code 2.1.260 retains compaction starts but ignores their deltas.
+    pub compaction_in_start: bool,
     pub compaction_iteration: Option<CompactionIterationUsage>,
     /// Effective input size before proxy-triggered model-mapping compaction.
     pub auto_compaction_original_input_tokens: Option<u64>,
@@ -187,6 +189,7 @@ fn build_claude_state(context: &StreamContext, prompt_cache: &PromptCachePlan) -
     claude.openai_include_usage = context.include_usage_chunk;
     claude.auto_compaction_original_input_tokens = context.auto_compaction_original_input_tokens;
     claude.compaction_iteration = context.compaction_iteration;
+    claude.compaction_in_start = context.compaction_in_start;
     claude
         .context_edit_stats
         .clone_from(&context.context_edit_stats);
@@ -648,6 +651,7 @@ struct ClaudeState {
     input_tokens: u64,
     auto_compaction_original_input_tokens: Option<u64>,
     compaction_iteration: Option<CompactionIterationUsage>,
+    compaction_in_start: bool,
     context_edit_stats: ClaudeContextEditStats,
     message_started: bool,
     block: Option<(usize, &'static str)>,
@@ -676,6 +680,7 @@ impl ClaudeState {
             input_tokens,
             auto_compaction_original_input_tokens: None,
             compaction_iteration: None,
+            compaction_in_start: false,
             context_edit_stats: ClaudeContextEditStats::default(),
             message_started: false,
             block: None,
@@ -855,12 +860,18 @@ impl ClaudeState {
         let index = self.switch_block(
             &mut output,
             "compaction",
-            json!({"type":"compaction","content":Value::Null}),
+            json!({"type":"compaction","content":self.compaction_in_start.then_some(content)}),
         );
-        output.push(sse(&json!({
-            "type":"content_block_delta","index":index,
-            "delta":{"type":"compaction_delta","content":content}
-        })));
+        // Claude Code's own accumulator ignores compaction_delta (verified on
+        // 2.1.260). Publish the complete start block for that client. Do not also
+        // send a delta: TS SDKs append it, while Python SDKs replace the content.
+        // All other clients retain Anthropic's standard null-start/full-delta.
+        if !self.compaction_in_start {
+            output.push(sse(&json!({
+                "type":"content_block_delta","index":index,
+                "delta":{"type":"compaction_delta","content":content}
+            })));
+        }
         output.push(sse(&json!({"type":"content_block_stop","index":index})));
         self.block = None;
         output

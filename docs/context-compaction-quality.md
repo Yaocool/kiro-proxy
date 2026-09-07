@@ -18,7 +18,9 @@
 
 尚未实现的质量优化项是摘要内容哈希缓存和分块滚动摘要；自动触发的范围、限制及后续 prepared-dispatch 工作见 `model-mapping-context-window.md`。
 
-2026-09-07 生产回归修正：默认等待提高到 60 秒，显式配置仍优先。
+2026-09-07 生产回归修正：Claude Code 2.1.260 的自有流累积器忽略摘要 delta，导致 null checkpoint
+被反复回传，服务端每轮重新摘要。对该客户端改为完整 start 块 + stop，其他 SDK 保留标准 delta
+形式；语义摘要和抽取式 fallback 都必须通过第二轮回传测试。默认等待提高到 60 秒，显式配置仍优先。
 超时回退只记一条 WARN，后台用量结算记 INFO 并携带 trace ID；`credits_source` 区分 `server` 与
 `estimated`，估算值不是上游实际扣费凭据。完全没有输出/usage 的失败摘要不会按输入估算消耗 credits。
 空摘要/非法摘要也记录为失败，不再因 HTTP 200 而计入摘要成功数。

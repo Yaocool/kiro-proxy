@@ -273,7 +273,9 @@ late accounting is allowed only for a bounded grace period, after which the
 summary stream is canceled and any already decoded usage is settled.
 
 Summary waiting defaults to 60 seconds (`context.compaction_summary_timeout_ms`);
-upgrades preserve explicit settings, including an existing `30000`. A timeout emits
+upgrades preserve explicit settings, including an existing `30000`. Claude Code
+receives a complete compaction start block because its accumulator can ignore
+compaction deltas; other SDKs retain the standard delta stream. A timeout emits
 one fallback warning, with subsequent accounting at INFO under the same trace.
 `credits_source=estimated` identifies a local estimate, not confirmed upstream
 charges. Daily logs persist in the data volume across container replacements.
