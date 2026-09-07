@@ -240,7 +240,8 @@ pub(super) async fn collect_nonstream_rounds(
             .await
             .map_err(ExecuteError::Upstream)?;
         let event_count = events.len();
-        let mut leak_filter = ToolLeakFilter::new(config.features.enable_tool_leak_filter);
+        let mut leak_filter =
+            ToolLeakFilter::for_payload(config.features.enable_tool_leak_filter, &payload);
         let mut thinking_filter = ThinkingContentFilter::new(effective_thinking)
             .with_omitted_summary(payload.thinking_summary_omitted());
         let mut stop_filter = StopSequenceFilter::new(stop_sequences);
