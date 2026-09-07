@@ -1,6 +1,6 @@
 //! Compatibility baseline: jwadow a5292ca, hj01857655 c5c4776 and chaogei 447adcd.
-//! OpenAI hints retain that baseline. Claude output guarantees are now rejected
-//! when Kiro cannot implement them; ordinary additive hints remain accepted.
+//! Format and additive hints are accepted without enforcing structured output.
+//! Compare actual serialized Kiro input, including non-null Claude formats.
 use kproxy_translate::{
     claude_to_kiro, openai_to_kiro, responses_to_openai, validate_claude, validate_openai,
     ClaudeRequest, OpenAiRequest, ResponsesRequest, TranslationOptions,
@@ -40,12 +40,21 @@ fn assert_kiro_projection(wire: Value) {
 }
 
 #[test]
-fn claude_additive_hints_do_not_reject_a_kiro_request() {
-    for stream in [false, true] {
+fn claude_format_and_additive_hints_do_not_reject_a_kiro_request() {
+    for (stream, format) in [false, true].into_iter().flat_map(|stream| {
+        [
+            output_format(),
+            json!({"type":"text"}),
+            json!({"type":"json_object"}),
+            Value::Null,
+        ]
+        .into_iter()
+        .map(move |format| (stream, format))
+    }) {
         let request: ClaudeRequest = serde_json::from_value(json!({
             "model":"claude-haiku-4-5-20251001","max_tokens":4096,"stream":stream,
             "messages":[{"role":"user","content":"Reply pong","future_hint":true}],
-            "output_config":{"format":null,"future_hint":true},
+            "output_config":{"format":format,"task_budget":{"type":"tokens","total":64000},"future_hint":true},
             "service_tier":"standard_only","future_hint":true,
             "tools":[{"name":"lookup","description":"Find a record","strict":true,
                 "eager_input_streaming":true,"future_hint":true,

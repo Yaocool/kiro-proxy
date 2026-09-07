@@ -347,8 +347,8 @@ remaining remote attachments.
 Compatibility follows the practical behavior of jwadow/kiro-gateway,
 hj01857655/kiro-account-manager, and chaogei/Kiro-account-manager rather than
 requiring exact Claude/OpenAI feature equivalence. Additive request/message/tool
-fields, tool strict hints, and OpenAI format hints remain permissive. Claude
-output guarantees without a verified Kiro equivalent are explicitly rejected. See the
+fields, tool strict hints, and Claude/OpenAI format hints remain permissive.
+Accepted format hints do not provide native structured-output guarantees. See the
 [compatibility baseline](docs/compatibility-baseline.md) for pinned sources and scope.
 
 Adjacent same-role messages are merged. Assistant prefill, `max_tokens=0` cache
@@ -372,7 +372,7 @@ Generation controls use the explicit mapping in
 | Claude `stop_sequences` | Enforced locally in streaming and non-streaming responses; no native `stopSequences` is sent. This does not guarantee a server-side generation/cost limit. |
 | Thinking / effort | Recognized effort metadata chooses `thinking: adaptive` + `output_config.effort`, or `reasoning.effort`. Missing, incomplete, or unrecognized metadata omits the entire `additionalModelRequestFields` field, never sending `{}`, `null`, or speculative adaptive thinking. |
 | Claude `output_config.effort` | Explicit effort takes precedence over the thinking budget and is mapped through the selected model's Kiro metadata. Effort-only system messages apply from the next user turn and survive compaction and internal continuations. Kiro receives the effective request-level effort; Anthropic's per-message cache semantics are not guaranteed. |
-| Claude `output_config.format` / `task_budget` | Non-null values return a field-specific `400`: Kiro has no verified equivalent for these output guarantees. Null/omitted fields and unknown additive hints remain accepted. |
+| Claude `output_config.format` / `task_budget` | Accepted but omitted from Kiro input, with a debug diagnostic containing only field names. No JSON/Schema or task-budget guarantee is added; `output_config.effort` is still mapped independently. |
 | OpenAI `response_format` / Responses `text.format` | Accepted but omitted from Kiro input, matching the permissive reference behavior; no JSON/Schema guarantee or schema-driven retries are added. |
 | Tool `strict`, Claude `eager_input_streaming` | Accepted as hints; normal Kiro tool schemas and existing streaming behavior are retained. |
 | Service tier, additive fields, unused stream hints | Accepted without forwarding them as speculative Kiro fields. Used values such as `include_usage` retain type validation. |

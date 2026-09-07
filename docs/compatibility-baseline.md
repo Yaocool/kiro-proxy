@@ -15,8 +15,8 @@
 | [pinealctx/kiro-gateway](https://github.com/pinealctx/kiro-gateway/tree/9f614d4b270e8e80e13c7d3603cbb1b090f327c4) | `9f614d4` | Claude Code 非 Claude 模型的 anthropic. 发现别名 |
 
 hj 的 OpenAI 路径另有 JSON 提示词引导，但 json_schema 主要使用名称/描述，没有传入完整 Schema。
-OpenAI 格式兼容保留 jwadow/chaogei 的接收并忽略策略。Claude 显式格式和 task budget 请求现在返回
-字段级 400，避免 HTTP 成功被误认为兑现了上游无法实现的输出约束；没有新增提示词或生成重试模拟。
+Claude/OpenAI 格式兼容保留 jwadow/chaogei 的接收并忽略策略；Claude task budget 也作为未使用的
+附加提示接收。没有新增提示词、结果校验或生成重试来模拟这些约束。
 三个项目存在差异时，应明确采用哪一条实际路径，而不是宣称三者实现完全相同。
 
 ## 当前兼容策略
@@ -24,7 +24,7 @@ OpenAI 格式兼容保留 jwadow/chaogei 的接收并忽略策略。Claude 显�
 - Claude output_config.effort 按模型元数据映射，显式 effort 优先于 thinking budget；取值校验为
   low/medium/high/xhigh/max。消息级 effort 仅允许用于 system 消息，从后续 user 轮起生效，保留经过
   compaction 的有效 effort；该映射不承诺 Anthropic 原生 per-message prompt-cache 行为。
-- Claude output_config.format/task_budget 的非 null 值返回明确不支持错误；其他额外键保持宽松接收。
+- Claude output_config.format/task_budget 接收并忽略；只记录字段名的 debug 诊断，不影响 effort 映射。
 - Chat Completions 的 response_format 和 Responses 的 text.format 接收并忽略。
 - 工具 strict=true、Claude eager_input_streaming=true 接收为兼容提示，保留原有工具输入 Schema。
 - Claude 顶层、消息、工具附加字段，以及 OpenAI/Responses 的额外请求字段，均不因未知而拒绝。
@@ -57,7 +57,7 @@ OpenAI 格式兼容保留 jwadow/chaogei 的接收并忽略策略。Claude 显�
 对应数据/执行路径。
 
 添加新的拒绝条件前，检查参考项目的对应路径，说明拒绝是实际转换所需、Kiro 能力限制，
-还是资源/安全边界。Claude 显式输出约束是已说明的契约边界，不能把普通兼容提示一并改成拒绝。
+还是资源/安全边界。不能仅因 Kiro 没有可用的原生映射，就把此前接受的附加提示改成请求拒绝。
 已实测会导致上游错误的参考逻辑（如缺少元数据时猜测发送 adaptive thinking）不照搬。
 
 ## 回归验证
@@ -101,3 +101,8 @@ kproxy-kiro 的 mock 测试覆盖 API key runtime、OAuth management 和区域�
 `cargo test -p kproxyd --test end_to_end thinking_markup_survives_interleaved_usage` 覆盖
 Claude、Chat Completions、Responses 三种协议，在 thinking 开关和流式开关下的 12 种组合。
 这不是生产 Kiro 服务可用性验证，不消耗真实账号额度。
+
+生产回归修正：`1871981` 曾将非 null 的 Claude `output_config.format/task_budget` 改为本地 400，
+导致升级前可用的请求在账号选择之前失败。现恢复接收并忽略的兼容行为，保留 effort 校验和映射。
+回归用例必须保留非 null 的真实格式 Schema，覆盖 Messages/别名/token counting、流式/非流式，
+并断言格式 Schema 和 task budget 不进入 Kiro 请求；不得用 null 替换格式字段来规避兼容性验证。

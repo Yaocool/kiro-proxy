@@ -21,12 +21,15 @@ fn options() -> TranslationOptions {
 #[test]
 fn per_message_effort_applies_from_next_user_turn_and_survives_model_fallback() {
     let mut value = request();
-    value["output_config"] = json!({"effort":"high"});
+    value["output_config"] = json!({"effort":"high",
+        "format":{"type":"json_schema","schema":{"type":"object","properties":{"format_sentinel":{"type":"string"}}}},
+        "task_budget":{"type":"tokens","total":64000}});
     value["thinking"] = json!({"type":"enabled","budget_tokens":1024});
     value["messages"] = json!([
         {"role":"user", "content":"first"},
         {"role":"assistant", "content":"done"},
-        {"role":"system", "content":[], "output_config":{"effort":"medium"}},
+        {"role":"system", "content":[], "output_config":{"effort":"medium",
+            "format":{"type":"text"}, "task_budget":{"type":"tokens","total":64000}}},
         {"role":"user", "content":"follow-up"},
         {"role":"system", "content":[], "output_config":{"effort":"max"}}
     ]);
@@ -34,9 +37,15 @@ fn per_message_effort_applies_from_next_user_turn_and_survives_model_fallback() 
     validate_claude(&request).unwrap();
     let mut payload = claude_to_kiro(&request, &options());
     assert_eq!(
-        payload.additional_model_request_fields.as_ref().unwrap()["output_config"]["effort"],
-        "medium"
+        payload.additional_model_request_fields,
+        Some(json!({
+            "thinking":{"type":"adaptive","display":"summarized"},
+            "output_config":{"effort":"medium"}
+        }))
     );
+    let wire = serde_json::to_string(&payload).unwrap();
+    assert!(!wire.contains("format_sentinel"));
+    assert!(!wire.contains("task_budget"));
     let schema = json!({"properties":{"reasoning":{"properties":{"effort":{"enum":["low","medium","high"]}}}}});
     kproxy_translate::model::apply_adaptive_thinking(&mut payload, Some(&schema), true);
     assert_eq!(
@@ -49,36 +58,25 @@ fn per_message_effort_applies_from_next_user_turn_and_survives_model_fallback() 
 }
 
 #[test]
-fn unsupported_output_guarantees_and_invalid_effort_are_rejected_with_field_paths() {
-    for (config, field) in [
-        (
-            json!({"format":{"type":"json_schema","schema":{"type":"object"}}}),
-            "format",
-        ),
-        (
-            json!({"task_budget":{"type":"tokens","total":64000}}),
-            "task_budget",
-        ),
-        (json!({"effort":"adaptive"}), "effort"),
-    ] {
-        for per_message in [false, true] {
-            let mut value = request();
-            let path = if per_message {
-                value["messages"].as_array_mut().unwrap().insert(
-                    0,
-                    json!({"role":"system","content":[],"output_config":config}),
-                );
-                format!("messages.0.output_config.{field}")
-            } else {
-                value["output_config"] = config.clone();
-                format!("output_config.{field}")
-            };
-            let request: ClaudeRequest = serde_json::from_value(value).unwrap();
-            assert!(validate_claude(&request)
-                .unwrap_err()
-                .to_string()
-                .contains(&path));
-        }
+fn invalid_effort_is_rejected_with_field_paths_even_with_ignored_format_hints() {
+    for per_message in [false, true] {
+        let mut value = request();
+        let config = json!({"effort":"adaptive", "format":{"type":"text"}});
+        let path = if per_message {
+            value["messages"].as_array_mut().unwrap().insert(
+                0,
+                json!({"role":"system","content":[],"output_config":config}),
+            );
+            "messages.0.output_config.effort"
+        } else {
+            value["output_config"] = config;
+            "output_config.effort"
+        };
+        let request: ClaudeRequest = serde_json::from_value(value).unwrap();
+        assert!(validate_claude(&request)
+            .unwrap_err()
+            .to_string()
+            .contains(path));
     }
     let mut value = request();
     value["messages"][0]["output_config"] = json!({"effort":"low"});
