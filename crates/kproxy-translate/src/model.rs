@@ -16,6 +16,7 @@ pub fn resolve_dynamic_model(model: &str, available: &[String]) -> Option<String
     {
         return Some(exact.clone());
     }
+    let model = strip_discovery_prefix(model);
     let requested = normalize_model_name(model);
     if let Some(exact) = available
         .iter()
@@ -103,6 +104,24 @@ fn compare_token_matches(left: &str, right: &str) -> std::cmp::Ordering {
 
 pub fn can_resolve_dynamic_model(model: &str, available: &[String]) -> bool {
     resolve_dynamic_model(model, available).is_some()
+}
+
+/// Claude Code discovers only IDs containing `claude` or `anthropic`.
+pub fn claude_discovery_model_id(model: &str) -> String {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("claude") || lower.contains("anthropic") {
+        model.into()
+    } else {
+        format!("anthropic.{model}")
+    }
+}
+
+fn strip_discovery_prefix(model: &str) -> &str {
+    model
+        .get(..10)
+        .filter(|prefix| prefix.eq_ignore_ascii_case("anthropic."))
+        .map(|_| &model[10..])
+        .unwrap_or(model)
 }
 
 fn normalize_model_name(model: &str) -> String {
@@ -214,7 +233,7 @@ pub fn map_model(
         if !rule
             .source_models
             .iter()
-            .any(|pattern| glob(pattern, model))
+            .any(|pattern| glob(pattern, model) || glob(pattern, strip_discovery_prefix(model)))
         {
             continue;
         }
@@ -239,7 +258,7 @@ pub fn map_model(
     ModelRoute {
         original: model.into(),
         mapped: if default_model.trim().is_empty() {
-            model.into()
+            strip_discovery_prefix(model).into()
         } else {
             default_model.into()
         },

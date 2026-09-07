@@ -1067,6 +1067,7 @@ mod tests {
                         .unwrap();
                     let allowed = !enforced
                         || (claude && client == "claude")
+                        || (models && client == "claude")
                         || (!claude && client == "codex");
                     let expected = if !allowed {
                         StatusCode::BAD_REQUEST
