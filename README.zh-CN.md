@@ -7,8 +7,9 @@ OpenAI Chat Completions 的 API，并包含多账号调度、自动 Token 刷新
 API Key 限额、TLS、Webhook、统计和运维 CLI。
 
 > [!IMPORTANT]
-> 本项目仅支持通过企业 SSO（AWS IAM Identity Center/IdC）认证的 Kiro 企业账号。
-> 其他所有账号和认证类型均不支持，包括个人账号和社交登录账号。
+> 支持 Kiro 企业 SSO（AWS IAM Identity Center/IdC）凭证，以及显式导入的
+> Kiro headless API key（`ksk_...`）。不支持个人/社交 OAuth 登录流程。
+> 上游 Kiro key 与代理对客户端签发的 API key 是两类独立凭证。
 
 本仓库不包含 GUI、MITM 或本机 Kiro 应用配置修改功能。
 
@@ -18,7 +19,7 @@ API Key 限额、TLS、Webhook、统计和运维 CLI。
 - 兼容 OpenAI 的 `/v1/responses`、`/v1/chat/completions` 和 `/v1/models` 端点。
 - 带单账号并发限制、冷却、额度追踪和模型兼容检查的多账号加权调度。
 - Kiro 企业账号的 IdC/SSO Token 自动刷新，并对同一账号做 singleflight 防并发刷新。
-- 根据账号选择 Amazon Q 或 CodeWhisperer，使用有界的进程内可用性缓存。
+- 根据账号区域选择 Amazon Q、CodeWhisperer 或 Kiro runtime，隔离 GovCloud 路由，使用有界缓存。
 - 动态模型发现，以及模型别名、替换、负载均衡和降级规则。
 - 通过 Unix socket 和 `kproxy` CLI 管理，不依赖浏览器界面。
 - TOML 热重载、结构化日志、Trace ID、统计、API Key 限额、TLS 和 Webhook 告警。
@@ -113,7 +114,7 @@ kproxy service create --name main
 kproxy service list
 ```
 
-发送生成请求前，至少导入一个受支持的 Kiro 企业 SSO 账号：
+发送生成请求前，至少导入一个受支持的 Kiro 企业 SSO 账号或 headless API key：
 
 ```bash
 kproxy account import --stdin < accounts.json
@@ -171,8 +172,11 @@ GET  /health
 同时支持 Claude 别名 `/messages`、`/anthropic/v1/messages`，以及 OpenAI 别名
 `/responses`、`/chat/completions`、`/models`。
 
-默认按协议检查客户端：Claude 路由（含 token 计数）仅允许 Claude Code；OpenAI 路由
-（含模型列表）仅允许 Codex。`server.enforce_user_agent_check = false` 可统一关闭
+默认按协议检查客户端：Claude 路由（含 token 计数）仅允许 Claude Code；OpenAI 生成路由
+仅允许 Codex。共享 `/v1/models` 接受两类客户端；Claude 列表包含 `display_name`、`description`，
+非 Claude 模型以可回传的 `anthropic.` 别名展示，Codex 保留原始 ID。
+Claude Code 需设置 `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` 启用发现。
+`server.enforce_user_agent_check = false` 可统一关闭
 User-Agent 检查，API key 认证和每个服务的 key 白名单仍生效。
 
 Responses 支持 Codex 无状态多轮对话、流式输出、function/custom 工具、命名空间工具、
@@ -269,7 +273,8 @@ clear_tool_inputs；`clear_thinking` 支持保留指定轮次或全部 thinking�
 
 兼容性以 jwadow/kiro-gateway、hj01857655/kiro-account-manager、chaogei/Kiro-account-manager
 的实际接入行为为基线，不要求完整复刻 Claude/OpenAI 官方语义。请求、消息、工具的附加字段，以及
-format/strict 提示不会额外触发网关拒绝。固定源码版本和范围见[兼容性基线](docs/compatibility-baseline.md)。
+工具 strict 和 OpenAI format 提示继续宽松接收；Claude 输出保证若无已验证的 Kiro 对应能力，
+会明确拒绝。固定源码版本和范围见[兼容性基线](docs/compatibility-baseline.md)。
 
 相邻同角色消息会合并。assistant prefill、`max_tokens=0` 缓存预热和 Anthropic Files API 的
 `file_id` 来源尚未接入对应的生成/数据获取链路，仍会拒绝。
@@ -286,7 +291,8 @@ format/strict 提示不会额外触发网关拒绝。固定源码版本和范围
 | Claude `top_k` | 接收但不发送，不因模型 schema 而开启；记录 debug 诊断。这是网关兼容策略，不代表断言 Kiro 全局不支持。 |
 | Claude `stop_sequences` | 在流式 / 非流式响应中本地执行，不发送原生 `stopSequences`；不保证上游生成量或费用也因此受限。 |
 | thinking / effort | 有可识别的 effort 元数据时使用 `thinking: adaptive` + `output_config.effort`，或 `reasoning.effort`；元数据缺失、不完整或不可识别时，完全省略 `additionalModelRequestFields`，不发送 `{}`、`null` 或猜测的 adaptive thinking。 |
-| Claude `output_config` | 宽松接收并忽略，包括 `format`、`effort` 和未来附加键；不单独启用 thinking，也不覆盖预算映射值或默认 effort。 |
+| Claude `output_config.effort` | 显式 effort 优先于 thinking budget，按实际模型元数据映射；system 消息中的 effort 从下一条 user 消息开始生效，压缩和内部续写后保留。映射为 Kiro 的请求级 effort，不保证 Anthropic 的逐消息缓存语义。 |
+| Claude `output_config.format` / `task_budget` | 非 null 值返回含字段路径的 `400`，避免默默丢弃输出保证；null、未提供及未知附加提示仍接收。 |
 | OpenAI `response_format` / Responses `text.format` | 接收但不放入 Kiro 输入，沿用参考项目的宽松行为；不新增 JSON/Schema 保证或基于 Schema 的生成重试。 |
 | 工具 `strict`、Claude `eager_input_streaming` | 接收为提示，保留正常 Kiro 工具 schema 和既有流式行为。 |
 | 服务等级、附加字段、未使用的流式提示 | 接收但不猜测为 Kiro 字段发送；实际使用的 `include_usage` 等值仍校验类型。 |
@@ -340,10 +346,9 @@ XDG 目录：
 外部修改账号文件也会自动载入，损坏的账号数据不会替换内存中的有效快照。账号数较多时，
 可根据存储配置使用 gzip envelope 和增量 sidecar。
 
-## 导入企业 SSO 账号
+## 导入上游凭证
 
-只能导入由组织 SSO 签发给 Kiro 企业账号的凭证。导入操作不会让个人账号、社交登录账号或
-其他账号类型变为可用。从 JSON 文件或 stdin 导入受支持的凭证：
+从 JSON 文件或 stdin 导入企业 SSO 凭证：
 
 ```bash
 kproxy account import --file accounts.json
@@ -368,6 +373,34 @@ cat accounts.json | kproxy account import --stdin
   }
 ]
 ```
+
+### Kiro headless API key 与区域 runtime
+
+先在 CLI 环境中安全设置 `KIRO_API_KEY`，再导入；也可从标准输入读取，避免把密钥写进命令参数：
+
+```bash
+kproxy account add-api-key --email ci@example.com --region us-east-1
+kproxy account add-api-key --email ci@example.com --region eu-central-1 --key-stdin < /secure/kiro-key
+```
+
+密钥保存为 `credentials.access_token`，`auth_method` 为 `api_key`，`expires_at` 为 0。
+不可附带 OAuth refresh/client secret 或 profile ARN。此类账号使用区域 runtime 和
+`TokenType: API_KEY`，不执行 OAuth 刷新，也不产生 Token 刷新失败告警；密钥撤销后需手动更换，
+重复导入不会覆盖已有账号。由于 management API
+要求 OAuth profile，API key 使用静态模型目录；无发现到的 effort 元数据时仍按保守策略省略
+thinking 控制。只在 daemon 环境中设置 `KIRO_API_KEY` 不会自动导入账号。
+错误清理和上游错误格式化（包括后台诊断）会遮蔽回显的 Kiro key，但仍不可分享原始凭证。
+
+OAuth 默认保留区域 Q/CodeWhisperer 路由，可设置 `upstream.preferred_endpoint = "runtime"`
+优先使用 Kiro runtime/management RPC。GovCloud 与 API key 只使用 runtime，不回退到旧端点；
+GovCloud 缺少 profile 时不会替换为商业区 Builder ID profile。测试/部署覆盖项
+`KPROXY_RUNTIME_URL`、`KPROXY_MANAGEMENT_URL` 支持 `{region}` 占位符。
+
+Claude Code system 中的 `<env>` 会转换为 Kiro `envState`（工作目录、操作系统），并在内部
+续写中保留，不使用代理宿主机环境替代。XML 工具调用恢复仅处理行首、代码围栏/缩进代码及
+thinking 标签之外、属于本轮已声明工具的完整合法调用；行内示例、未知工具及畸形 XML
+保留为普通文本。恢复的字符串参数保留 Schema 声明的类型和首尾空白，支持本地引用与组合
+Schema；无法解析或超过遍历预算时保留原 XML，不等同于完整 Schema 校验。
 
 账号导出默认包含凭证。分享诊断结果前应使用 `--redact`：
 

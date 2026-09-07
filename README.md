@@ -8,10 +8,10 @@ multi-account scheduling, automatic token refresh, endpoint failover, model
 mapping, API-key quotas, TLS, webhooks, statistics, and an operations CLI.
 
 > [!IMPORTANT]
-> Account support is limited to Kiro enterprise accounts authenticated through
-> the enterprise's SSO integration (AWS IAM Identity Center/IdC). All other
-> account and authentication types, including personal and social-login
-> accounts, are not supported.
+> Supported credentials are Kiro enterprise SSO (AWS IAM Identity Center/IdC)
+> and explicitly imported Kiro headless API keys (`ksk_...`). Personal/social
+> OAuth login flows are not supported. Upstream Kiro keys are separate from
+> the proxy's client-facing API keys.
 
 This repository intentionally does not include a GUI, MITM support, or
 local Kiro application configuration changes.
@@ -23,8 +23,8 @@ local Kiro application configuration changes.
 - Weighted multi-account scheduling with per-account concurrency limits,
   cooldowns, quota tracking, and model compatibility checks.
 - Automatic enterprise IdC/SSO token refresh with per-account singleflight.
-- Account-aware Amazon Q and CodeWhisperer endpoint selection with bounded,
-  in-memory availability caches.
+- Regional Amazon Q, CodeWhisperer, and Kiro runtime endpoint selection with
+  bounded, in-memory availability caches and isolated GovCloud routing.
 - Dynamic model discovery, model aliases, replacements, load balancing, and
   fallback rules.
 - Unix-socket administration through the `kproxy` CLI; no browser UI is required.
@@ -133,7 +133,7 @@ kproxy service create --name main
 kproxy service list
 ```
 
-Import at least one supported Kiro enterprise SSO account before sending
+Import at least one supported Kiro enterprise SSO account or headless API key before sending
 generation requests:
 
 ```bash
@@ -197,7 +197,11 @@ Claude aliases `/messages` and `/anthropic/v1/messages` are also available.
 OpenAI aliases `/responses`, `/chat/completions`, and `/models` are supported as well.
 
 Client checks are enabled by default: Claude routes (including token counting)
-accept Claude Code; OpenAI routes (including models) accept Codex. The shared
+accept Claude Code; OpenAI generation routes accept Codex. The shared `/v1/models`
+endpoint accepts both clients. Claude discovery includes `display_name` and
+`description`; non-Claude Kiro IDs receive an `anthropic.` alias that is removed
+before upstream routing. Enable it with `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`.
+The shared
 `server.enforce_user_agent_check = false` setting disables these User-Agent checks.
 API key authentication and each service's key allowlist still apply.
 
@@ -343,7 +347,8 @@ remaining remote attachments.
 Compatibility follows the practical behavior of jwadow/kiro-gateway,
 hj01857655/kiro-account-manager, and chaogei/Kiro-account-manager rather than
 requiring exact Claude/OpenAI feature equivalence. Additive request/message/tool
-fields and format/strict hints do not cause an extra gateway rejection. See the
+fields, tool strict hints, and OpenAI format hints remain permissive. Claude
+output guarantees without a verified Kiro equivalent are explicitly rejected. See the
 [compatibility baseline](docs/compatibility-baseline.md) for pinned sources and scope.
 
 Adjacent same-role messages are merged. Assistant prefill, `max_tokens=0` cache
@@ -357,7 +362,7 @@ request history without disabling current-generation thinking; Responses plainte
 reasoning summaries are preserved in assistant history. Document context
 is preserved as separate JSON-labelled message text rather than a document field.
 Generation controls use the explicit mapping in
-[chaogei/Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager/blob/447adcdb468157312621b1f09448278bd9bca748/Kiro-account-manager/src/main/proxy/translator.ts), except for its speculative missing-metadata thinking fallback:
+[chaogei/Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager/blob/447adcdb468157312621b1f09448278bd9bca748/Kiro-account-manager/src/main/proxy/translator.ts), with explicit Claude effort support and without its speculative missing-metadata thinking fallback:
 
 | Client control | Kiro/proxy handling |
 | --- | --- |
@@ -366,7 +371,8 @@ Generation controls use the explicit mapping in
 | Claude `top_k` | Accepted but omitted with a debug diagnostic, regardless of model metadata. This is a gateway compatibility policy, not a claim that Kiro universally rejects it. |
 | Claude `stop_sequences` | Enforced locally in streaming and non-streaming responses; no native `stopSequences` is sent. This does not guarantee a server-side generation/cost limit. |
 | Thinking / effort | Recognized effort metadata chooses `thinking: adaptive` + `output_config.effort`, or `reasoning.effort`. Missing, incomplete, or unrecognized metadata omits the entire `additionalModelRequestFields` field, never sending `{}`, `null`, or speculative adaptive thinking. |
-| Claude `output_config` | Accepted but ignored, including `format`, `effort`, and future keys. It neither enables thinking nor overrides the budget-derived/default effort. |
+| Claude `output_config.effort` | Explicit effort takes precedence over the thinking budget and is mapped through the selected model's Kiro metadata. Effort-only system messages apply from the next user turn and survive compaction and internal continuations. Kiro receives the effective request-level effort; Anthropic's per-message cache semantics are not guaranteed. |
+| Claude `output_config.format` / `task_budget` | Non-null values return a field-specific `400`: Kiro has no verified equivalent for these output guarantees. Null/omitted fields and unknown additive hints remain accepted. |
 | OpenAI `response_format` / Responses `text.format` | Accepted but omitted from Kiro input, matching the permissive reference behavior; no JSON/Schema guarantee or schema-driven retries are added. |
 | Tool `strict`, Claude `eager_input_streaming` | Accepted as hints; normal Kiro tool schemas and existing streaming behavior are retained. |
 | Service tier, additive fields, unused stream hints | Accepted without forwarding them as speculative Kiro fields. Used values such as `include_usage` retain type validation. |
@@ -388,6 +394,16 @@ The debug decision reason is `ModelControlsUnavailable`. This concerns parameter
 support, not whether the underlying model can reason. In an AmazonQ Haiku 4.5
 probe, even an empty extension was rejected, while omission succeeded. No model-name
 blacklist, prompt-tag simulation, or field-removal retry is used for this fallback.
+
+Claude Code's system `<env>` block supplies Kiro `envState` (working directory
+and operating system). It is preserved across internal continuations; the
+proxy never substitutes its own host environment. XML tool-call recovery only
+accepts complete, valid calls to tools declared in the current round, at a line
+start outside Markdown code fences/indented code and tagged thinking. Inline
+examples, unknown tools, and malformed XML remain ordinary response text.
+Recovered string parameters retain their schema-declared type and whitespace,
+including local references and composed schemas. Unresolved or over-budget
+schema references leave the XML as text; recovery is not a full schema validator.
 
 Alignment covers outbound generation parameters. Request validation, local stop
 filtering, bounded internal continuations, and response protection remain:
@@ -435,12 +451,9 @@ External account-file changes are also reloaded. Corrupt account data never
 replaces the valid in-memory snapshot. Large account stores can use a gzip
 envelope plus incremental sidecar updates according to the storage settings.
 
-## Import enterprise SSO accounts
+## Import upstream credentials
 
-Only credentials issued to a Kiro enterprise account through its organization
-SSO may be imported. Importing a credential does not make personal, social-login,
-or any other account type compatible. Import supported credentials from a JSON
-file or stdin:
+Import enterprise SSO credentials from a JSON file or stdin:
 
 ```bash
 kproxy account import --file accounts.json
@@ -465,6 +478,37 @@ cat accounts.json | kproxy account import --stdin
   }
 ]
 ```
+
+### Kiro headless API keys and regional runtime
+
+Set `KIRO_API_KEY` securely in the CLI's environment, then import it without
+putting the secret in a command argument:
+
+```bash
+kproxy account add-api-key --email ci@example.com --region us-east-1
+# Alternatively read the key from standard input:
+kproxy account add-api-key --email ci@example.com --region eu-central-1 --key-stdin < /secure/kiro-key
+```
+
+The key is stored as `credentials.access_token` with `auth_method: "api_key"`
+and `expires_at: 0`. Do not attach OAuth refresh/client secrets or a profile ARN.
+Keys use the regional `runtime.{region}.kiro.dev` service, `TokenType: API_KEY`,
+and no OAuth refresh or token-refresh alerts. Revoked keys require manual rotation;
+re-importing does not overwrite an existing account. API-key model discovery
+uses the static catalog because the management API requires an OAuth profile.
+Without discovered effort metadata, thinking controls retain the conservative
+omission policy described above.
+
+Kiro key echoes are redacted from normalized errors and upstream error formatting,
+including background diagnostics; raw credentials must still not be shared.
+
+OAuth defaults retain the existing regional Q/CodeWhisperer routes; set
+`upstream.preferred_endpoint = "runtime"` to prefer regional Kiro runtime and
+management RPC. GovCloud and API-key credentials use runtime without a legacy
+endpoint fallback. GovCloud profile discovery cannot substitute a commercial
+Builder ID profile. Test/deployment overrides `KPROXY_RUNTIME_URL` and
+`KPROXY_MANAGEMENT_URL` accept `{region}`. Setting `KIRO_API_KEY` on the daemon
+alone does not import an account.
 
 Account exports contain credentials by default. Use `--redact` before sharing
 diagnostic output:
