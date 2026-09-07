@@ -1,5 +1,7 @@
 //! Async tokenizer with a bounded content-hash LRU.
 
+mod compaction;
+
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
 

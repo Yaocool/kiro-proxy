@@ -1044,8 +1044,13 @@ mod tests {
                 let models = path.ends_with("models");
                 for (client, agent) in [
                     ("claude", Some("claude-cli/2.1.235 (external, test)")),
+                    ("claude", Some("claude-code/2.1.263")),
                     ("codex", Some("codex_cli_rs/0.147.0 (test)")),
                     ("other", Some("curl/8.0 codex_cli_rs/0.147.0")),
+                    ("other", Some("curl/8.0 claude-code/2.1.263")),
+                    ("other", Some("claude-code/")),
+                    ("other", Some("claude-code/invalid")),
+                    ("other", Some("claude-code/2.1.263 impersonator")),
                     ("missing", None),
                 ] {
                     let mut request = Request::builder()
@@ -1149,6 +1154,7 @@ mod tests {
                 "claude-cli/2.1.235 (external, test)",
                 "anthropic.deepseek-3.2",
             ),
+            ("claude-code/2.1.263", "anthropic.deepseek-3.2"),
             ("codex_cli_rs/0.147.0 (test)", "deepseek-3.2"),
         ] {
             let response = router(Arc::clone(&state))
@@ -1169,7 +1175,7 @@ mod tests {
                 .iter()
                 .find(|entry| entry["id"] == expected)
                 .expect("model alias");
-            if agent.starts_with("claude-cli/") {
+            if agent.starts_with("claude-") {
                 assert_eq!(entry["display_name"], "DeepSeek 3.2");
                 assert!(entry["description"].is_string());
                 assert_eq!(body["has_more"], false);

@@ -945,7 +945,7 @@ async fn mapped_overflow_decision_uses_the_mapped_safe_window() {
 }
 
 #[tokio::test]
-async fn summary_input_is_preprocessed_before_semantic_compaction() {
+async fn summary_input_is_partitioned_without_losing_source_before_semantic_compaction() {
     let directory = tempfile::tempdir().expect("tempdir");
     let paths = kproxy_core::paths::Paths::from_env_values(
         Some(directory.path().to_str().expect("utf8")),
@@ -1020,8 +1020,10 @@ async fn summary_input_is_preprocessed_before_semantic_compaction() {
         .await
         .expect("source tokens") as u64;
     let summary_tokens = run.summary_input_tokens.expect("summary tokens");
-    assert!(summary_tokens <= 9_900);
-    assert!(summary_tokens < source_tokens);
+    // Diagnostics describe the full source transcript, not a lossy pre-excerpt.
+    // Each independently dispatched part is checked against the model window.
+    assert!(summary_tokens > 9_900);
+    assert!(summary_tokens >= source_tokens);
     assert!(run.stats.compacted_tokens <= decision.target_tokens as usize);
     assert!(matches!(
         run.artifact,

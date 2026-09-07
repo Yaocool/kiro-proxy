@@ -30,6 +30,9 @@ mod claude_gateway;
 #[path = "end_to_end/warning_regressions.rs"]
 mod warning_regressions;
 
+#[path = "end_to_end/compaction_fidelity.rs"]
+mod compaction_fidelity;
+
 struct Daemon {
     child: Child,
     socket: PathBuf,
@@ -1894,7 +1897,7 @@ async fn claude_compaction_uses_a_separate_semantic_kiro_request() {
 }
 
 #[tokio::test]
-async fn upstream_context_rejection_preprocesses_compacts_and_retries_once() {
+async fn upstream_context_rejection_partitions_compacts_and_retries_once() {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;
     mount_context_alignment_models(&mock).await;
@@ -1945,7 +1948,7 @@ async fn upstream_context_rejection_preprocesses_compacts_and_retries_once() {
     assert!(summary_bytes > 0);
     assert!(
         summary_bytes < first_main_bytes,
-        "summary request was not preprocessed: {summary_bytes} >= {first_main_bytes}"
+        "summary request was not bounded: {summary_bytes} >= {first_main_bytes}"
     );
 
     let requests = mock.received_requests().await.expect("received requests");
@@ -1954,8 +1957,8 @@ async fn upstream_context_rejection_preprocesses_compacts_and_retries_once() {
             .iter()
             .filter(|request| request.url.path() == "/generateAssistantResponse")
             .count(),
-        3,
-        "expected first main request, bounded summary request, and one main retry"
+        4,
+        "expected first main request, two bounded summary parts, and one main retry"
     );
 
     daemon.stop().await;
@@ -2048,22 +2051,29 @@ priority = 10
         .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
         .filter(|payload| payload.get("conversationState").is_some())
         .collect::<Vec<_>>();
-    assert_eq!(payloads.len(), 2, "one summary plus one main generation");
-    let summary = payloads
+    assert_eq!(
+        payloads.len(),
+        3,
+        "two summary parts plus one main generation"
+    );
+    let summaries = payloads
         .iter()
-        .find(|payload| {
+        .filter(|payload| {
             payload["conversationState"]["currentMessage"]["userInputMessage"]["content"]
                 .as_str()
                 .is_some_and(|content| content.contains("durable conversation checkpoint"))
         })
-        .expect("summary request");
-    assert_eq!(
-        summary["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
-        "summary-large"
-    );
-    assert!(!summary
-        .to_string()
-        .contains("Never lose this governing instruction."));
+        .collect::<Vec<_>>();
+    assert_eq!(summaries.len(), 2);
+    for summary in summaries {
+        assert_eq!(
+            summary["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
+            "summary-large"
+        );
+        assert!(!summary
+            .to_string()
+            .contains("Never lose this governing instruction."));
+    }
     let main = payloads
         .iter()
         .find(|payload| {
@@ -2185,11 +2195,20 @@ priority = 10
     assert!(!body.contains("produced complete JSON"), "{body}");
     assert!(body.contains("\"type\":\"compaction\""), "{body}");
     assert!(!body.contains("\"type\":\"compaction_delta\""), "{body}");
+    let checkpoints = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| {
+            event["type"] == "content_block_start" && event["content_block"]["type"] == "compaction"
+        })
+        .count();
+    assert_eq!(checkpoints, 1, "retry must emit only one checkpoint block");
     assert_eq!(
         body.matches("Task Overview: preserve the compacted stream across a retry.")
             .count(),
-        1,
-        "the retry must preserve exactly one complete Claude Code checkpoint"
+        2,
+        "the single checkpoint must contain both chronological part summaries"
     );
     assert!(
         body.contains("main request completed after retry"),
@@ -2368,13 +2387,25 @@ priority = 10
         body["content"][1]["text"],
         "main request completed after the failed summary was accounted"
     );
-    assert_eq!(body["usage"]["iterations"][0]["input_tokens"], 100);
-    assert_eq!(body["usage"]["iterations"][0]["output_tokens"], 20);
-
     let stats = expect_ok(
         daemon
             .call("stats", serde_json::json!({"detail":true,"recent":20}))
             .await,
+    );
+    let compacts = stats["stats"]["recent_requests"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|request| request["path"] == "/internal/compact")
+        .collect::<Vec<_>>();
+    assert!(!compacts.is_empty() && compacts.len() <= 2);
+    assert_eq!(
+        body["usage"]["iterations"][0]["input_tokens"],
+        compacts.len() as u64 * 100
+    );
+    assert_eq!(
+        body["usage"]["iterations"][0]["output_tokens"],
+        compacts.len() as u64 * 20
     );
     let compact = stats["stats"]["recent_requests"]
         .as_array()
@@ -2560,7 +2591,7 @@ priority = 10
         .filter_map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).ok())
         .filter(|payload| payload.get("conversationState").is_some())
         .collect::<Vec<_>>();
-    assert_eq!(payloads.len(), 2, "one summary plus one main request");
+    assert_eq!(payloads.len(), 3, "two summary parts plus one main request");
     assert_eq!(
         payloads
             .iter()
@@ -2571,8 +2602,8 @@ priority = 10
                     .is_some_and(|content| content.contains("durable conversation checkpoint"))
             )
             .count(),
-        1,
-        "resolved-window replanning must reuse the first summary"
+        2,
+        "resolved-window replanning must reuse both original summary parts"
     );
     let main = payloads
         .iter()

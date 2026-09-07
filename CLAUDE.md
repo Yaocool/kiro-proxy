@@ -108,7 +108,7 @@ Kiro 没有原生 Tool Search / Web Search server tool，代理在本地补齐�
 
 压缩已是**语义摘要**而非纯截断，主逻辑在 `handlers/compaction.rs`：
 
-- 触发后先用本地 tokenizer 预处理成有界 checkpoint，再转成一个**无 tools 的普通 Kiro 对话请求**让模型产出 `<summary>`；原始超长会话不直接发给摘要模型。
+- 摘要输入先转换为无 tools 的完整可读历史。能装下时直接生成 `<summary>`，超长时无损分段，每段独立摘要并按原顺序合成一个 checkpoint；禁止先用 extractive 摘录丢弃中间事实。最多 16 段、并发最多 2（服从账号并发配置），共用一次总超时。
 - 摘要子请求独立走 `AccountPool`、额度预留与 stats，内部统计路径 `/internal/compact`，不混入主响应顶层 usage。
 - 超时/额度不足/上游失败/摘要非法时恢复原 payload 并退回 extractive fallback，日志 `compaction_mode` 区分 `semantic` 与 `extractive_fallback`。
 - 相关配置：`context.auto_compact_on_overflow`（默认开）、`compaction_summary_model`、`compaction_summary_timeout_ms`（默认 60000；保留已有显式配置）、`compaction_preserve_recent_turns`（默认 3，上限 64）。
