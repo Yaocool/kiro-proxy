@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use kproxy_kiro::{KiroCitation, KiroEvent, UsageInfo};
 use kproxy_translate::{
@@ -88,6 +88,7 @@ pub struct ThinkingContentFilter {
     omit_summary: bool,
     pending: String,
     in_tagged_thinking: bool,
+    position: MarkdownPosition,
 }
 
 impl ThinkingContentFilter {
@@ -97,6 +98,7 @@ impl ThinkingContentFilter {
             omit_summary: false,
             pending: String::new(),
             in_tagged_thinking: false,
+            position: MarkdownPosition::default(),
         }
     }
 
@@ -116,7 +118,7 @@ impl ThinkingContentFilter {
                 signature,
                 redacted_content,
             } => {
-                let mut output = self.drain(true);
+                let mut output = self.drain(false);
                 if self.omit_summary {
                     // Claude display:omitted hides text, not the native
                     // signature needed to preserve multi-turn continuity.
@@ -134,7 +136,10 @@ impl ThinkingContentFilter {
                 output
             }
             event => {
-                let mut output = self.drain(true);
+                // Metadata and native content events can be interleaved with
+                // text fragments, including fragments of either thinking tag.
+                // Only actual text delimiters or EOF end tagged reasoning.
+                let mut output = self.drain(false);
                 output.push(event);
                 output
             }
@@ -150,15 +155,28 @@ impl ThinkingContentFilter {
         loop {
             if self.in_tagged_thinking {
                 if let Some(end) = self.pending.find(THINKING_END_TAG) {
-                    let content = take_prefix(&mut self.pending, end);
-                    self.pending.drain(..THINKING_END_TAG.len());
-                    self.push_tagged_reasoning(&mut output, content, true);
+                    let content = take_prefix(&mut self.pending, end + THINKING_END_TAG.len());
+                    if self.enabled && !self.omit_summary {
+                        push_text(&mut output, content);
+                    }
                     self.in_tagged_thinking = false;
+                    self.position = MarkdownPosition::default();
+                    self.position.advance(THINKING_END_TAG);
                     continue;
                 }
+                // Retain only a possible closing-tag suffix, never the entire
+                // reasoning body. Visible reasoning remains ordinary tagged
+                // text; streaming must not invent native thinking signatures.
+                let split = if finish {
+                    self.pending.len()
+                } else {
+                    safe_prefix_len(&self.pending, THINKING_END_TAG)
+                };
+                let content = take_prefix(&mut self.pending, split);
+                if self.enabled && !self.omit_summary {
+                    push_text(&mut output, content);
+                }
                 if finish {
-                    let content = std::mem::take(&mut self.pending);
-                    self.push_tagged_reasoning(&mut output, content, false);
                     self.in_tagged_thinking = false;
                 }
                 break;
@@ -166,9 +184,18 @@ impl ThinkingContentFilter {
 
             if let Some(start) = self.pending.find(THINKING_START_TAG) {
                 let content = take_prefix(&mut self.pending, start);
-                self.pending.drain(..THINKING_START_TAG.len());
+                self.position.advance(&content);
                 push_text(&mut output, content);
-                self.in_tagged_thinking = true;
+                let tag = take_prefix(&mut self.pending, THINKING_START_TAG.len());
+                self.position.advance(&tag);
+                if self.position.in_code() {
+                    push_text(&mut output, tag);
+                } else {
+                    self.in_tagged_thinking = true;
+                    if self.enabled && !self.omit_summary {
+                        push_text(&mut output, tag);
+                    }
+                }
                 continue;
             }
             let split = if finish {
@@ -178,23 +205,12 @@ impl ThinkingContentFilter {
             };
             if split > 0 {
                 let content = take_prefix(&mut self.pending, split);
+                self.position.advance(&content);
                 push_text(&mut output, content);
             }
             break;
         }
         output
-    }
-
-    fn push_tagged_reasoning(&self, output: &mut Vec<KiroEvent>, content: String, closed: bool) {
-        if self.enabled && !self.omit_summary && !content.is_empty() {
-            output.push(KiroEvent::AssistantResponse {
-                content: if closed {
-                    format!("{THINKING_START_TAG}{content}{THINKING_END_TAG}")
-                } else {
-                    format!("{THINKING_START_TAG}{content}")
-                },
-            });
-        }
     }
 }
 
@@ -376,19 +392,46 @@ const MAX_CUMULATIVE_TOOL_INPUT_BYTES: usize = 16 * 1024 * 1024;
 #[derive(Debug)]
 pub struct ToolLeakFilter {
     enabled: bool,
+    known_tools: HashSet<String>,
+    tool_schemas: BTreeMap<String, Value>,
+    position: MarkdownPosition,
+    in_tagged_thinking: bool,
     pending: String,
     recovered: Vec<KiroEvent>,
     structured: BTreeMap<String, (String, String)>,
 }
 
 impl ToolLeakFilter {
-    pub fn new(enabled: bool) -> Self {
+    pub fn new(enabled: bool, known_tools: impl IntoIterator<Item = String>) -> Self {
         Self {
             enabled,
+            known_tools: known_tools.into_iter().collect(),
+            tool_schemas: BTreeMap::new(),
+            position: MarkdownPosition::default(),
+            in_tagged_thinking: false,
             pending: String::new(),
             recovered: Vec::new(),
             structured: BTreeMap::new(),
         }
+    }
+
+    pub fn for_payload(enabled: bool, payload: &kproxy_translate::KiroPayload) -> Self {
+        let mut filter = Self::new(enabled, std::iter::empty());
+        for tool in payload
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .iter()
+            .flat_map(|context| &context.tools)
+            .filter_map(kproxy_translate::KiroTool::specification)
+        {
+            filter.known_tools.insert(tool.name.clone());
+            filter
+                .tool_schemas
+                .insert(tool.name.clone(), tool.input_schema.json.clone());
+        }
+        filter
     }
 
     pub fn push(&mut self, event: KiroEvent) -> Vec<KiroEvent> {
@@ -446,6 +489,13 @@ impl ToolLeakFilter {
     fn push_text(&mut self, content: String) -> Vec<KiroEvent> {
         self.pending.push_str(&content);
         if self.pending.len() > 1024 * 1024 {
+            // A bounded fallback must not forget that the following chunks
+            // are still inside a code fence or in the middle of a line.
+            // Do not resume speculative recovery after bypassing the tagged
+            // thinking parser. Native tool events still pass through/deduplicate.
+            self.known_tools.clear();
+            self.tool_schemas.clear();
+            self.position.advance(&self.pending);
             return vec![KiroEvent::AssistantResponse {
                 content: std::mem::take(&mut self.pending),
             }];
@@ -456,10 +506,43 @@ impl ToolLeakFilter {
                 let keep = marker_prefix_suffix(&self.pending);
                 let split = self.pending.len().saturating_sub(keep);
                 visible.push_str(&self.pending[..split]);
+                self.position.advance(&self.pending[..split]);
                 self.pending = self.pending[split..].into();
                 break;
             };
             visible.push_str(&self.pending[..open]);
+            self.position.advance(&self.pending[..open]);
+            self.position.finish_tick_run();
+            if matches!(marker, THINKING_START_TAG | THINKING_END_TAG) {
+                let end = open + marker.len();
+                visible.push_str(&self.pending[open..end]);
+                if marker == THINKING_END_TAG && self.in_tagged_thinking {
+                    // Markdown inside reasoning must not carry code/inline
+                    // state into the assistant's subsequent answer.
+                    self.position = MarkdownPosition::default();
+                }
+                self.position.advance(&self.pending[open..end]);
+                if marker == THINKING_END_TAG {
+                    self.in_tagged_thinking = false;
+                } else if !self.position.in_code() {
+                    // Literal tags in Markdown examples do not open reasoning.
+                    // Always accept the closing tag once reasoning has begun:
+                    // its content can itself contain unfinished Markdown.
+                    self.in_tagged_thinking = true;
+                }
+                self.pending = self.pending[end..].into();
+                continue;
+            }
+            if self.in_tagged_thinking || self.position.in_code() {
+                // Display-only XML is not a candidate: waiting for its close
+                // could swallow the end of a code/thinking block and a later
+                // real call when the example intentionally omits that close.
+                let end = open + marker.len();
+                visible.push_str(&self.pending[open..end]);
+                self.position.advance(&self.pending[open..end]);
+                self.pending = self.pending[end..].into();
+                continue;
+            }
             let close = if marker == "<function_calls" {
                 "</function_calls>"
             } else {
@@ -472,7 +555,18 @@ impl ToolLeakFilter {
             };
             let end = open + relative + close.len();
             let xml = self.pending[open..end].to_string();
-            self.recover(&xml);
+            let recovered = (self.position.can_recover() && !self.in_tagged_thinking)
+                .then(|| self.recover(&xml))
+                .flatten();
+            if let Some(events) = recovered {
+                self.recovered.extend(events);
+                // Arguments are data, not Markdown in the assistant answer.
+                // The opaque call still occupies the current line.
+                self.position.advance(marker);
+            } else {
+                visible.push_str(&xml);
+                self.position.advance(&xml);
+            }
             self.pending = self.pending[end..].into();
         }
         if visible.is_empty() {
@@ -482,69 +576,203 @@ impl ToolLeakFilter {
         }
     }
 
-    fn recover(&mut self, xml: &str) {
+    // Recovery is atomic: malformed or unknown invocations preserve the whole
+    // block as text, including any valid invocation that precedes them.
+    fn recover(&self, xml: &str) -> Option<Vec<KiroEvent>> {
+        let mut events = Vec::new();
+        let outer_end = xml.find('>')?;
+        let attributes = xml_attributes(&xml[..=outer_end])?;
+        let function_calls = xml.to_ascii_lowercase().starts_with("<function_calls");
+        let closing = if function_calls {
+            "</function_calls>"
+        } else {
+            "</tool_use>"
+        };
+        let inner = xml.get(outer_end + 1..xml.len().checked_sub(closing.len())?)?;
+        if !function_calls {
+            let mut names = ["name", "tool", "function"]
+                .into_iter()
+                .filter_map(|key| attributes.get(key));
+            let name = names.next()?.clone();
+            if names.next().is_some() {
+                return None;
+            }
+            if !self.known_tools.contains(&name) {
+                return None;
+            }
+            let input = serde_json::from_str::<Value>(&decode_xml(inner.trim()))
+                .ok()
+                .filter(Value::is_object)?;
+            return Some(vec![KiroEvent::ToolUse {
+                id: format!("recovered_tool_{}", uuid::Uuid::new_v4().simple()),
+                name,
+                input_delta: input.to_string(),
+                stop: true,
+            }]);
+        }
         let mut cursor = 0;
-        while let Some(open) = find_insensitive_from(xml, "<invoke", cursor) {
-            let Some(tag_end) = xml[open..].find('>').map(|index| open + index) else {
-                break;
-            };
-            let Some(close) = find_insensitive_from(xml, "</invoke>", tag_end) else {
-                break;
-            };
-            if let Some(name) = attribute(&xml[open..=tag_end], "name") {
-                let input = parse_parameters(&xml[tag_end + 1..close]);
-                self.recovered.push(KiroEvent::ToolUse {
-                    id: format!("recovered_tool_{}", self.recovered.len() + 1),
+        while let Some(open) = find_insensitive_from(inner, "<invoke", cursor) {
+            if !inner[cursor..open].trim().is_empty()
+                || !inner
+                    .as_bytes()
+                    .get(open + "<invoke".len())
+                    .is_some_and(u8::is_ascii_whitespace)
+            {
+                return None;
+            }
+            let tag_end = inner[open..].find('>').map(|index| open + index)?;
+            let close = find_insensitive_from(inner, "</invoke>", tag_end)?;
+            let name = xml_attributes(&inner[open..=tag_end])?.remove("name")?;
+            if self.known_tools.contains(&name) {
+                let input =
+                    parse_parameters(&inner[tag_end + 1..close], self.tool_schemas.get(&name))?;
+                events.push(KiroEvent::ToolUse {
+                    id: format!("recovered_tool_{}", uuid::Uuid::new_v4().simple()),
                     name,
                     input_delta: input.to_string(),
                     stop: true,
                 });
+            } else {
+                return None;
             }
             cursor = close + "</invoke>".len();
         }
-        if cursor > 0 {
+        (!events.is_empty() && inner[cursor..].trim().is_empty()).then_some(events)
+    }
+}
+
+/// Tracks only the start of each Markdown line, with bounded memory even for
+/// very long code blocks. Fence runs and newlines may arrive in different SSE chunks.
+#[derive(Debug)]
+struct MarkdownPosition {
+    fence: Option<(u8, usize)>,
+    inline_ticks: Option<usize>,
+    pending_ticks: usize,
+    indent: usize,
+    whitespace: bool,
+    run: Option<(u8, usize)>,
+    run_ended: bool,
+    trailer_whitespace: bool,
+}
+
+impl Default for MarkdownPosition {
+    fn default() -> Self {
+        Self {
+            fence: None,
+            inline_ticks: None,
+            pending_ticks: 0,
+            indent: 0,
+            whitespace: true,
+            run: None,
+            run_ended: false,
+            trailer_whitespace: true,
+        }
+    }
+}
+
+impl MarkdownPosition {
+    fn in_code(&self) -> bool {
+        self.fence.is_some()
+            || self.inline_ticks.is_some()
+            || self.indent > 3
+            || self.run.is_some_and(|(_, length)| length >= 3)
+    }
+
+    fn can_recover(&self) -> bool {
+        !self.in_code() && self.whitespace
+    }
+
+    fn finish_tick_run(&mut self) {
+        let length = std::mem::take(&mut self.pending_ticks);
+        if length == 0 {
             return;
         }
-        let Some(open) = find_insensitive_from(xml, "<tool_use", 0) else {
-            return;
-        };
-        let Some(tag_end) = xml[open..].find('>').map(|index| open + index) else {
-            return;
-        };
-        let Some(close) = find_insensitive_from(xml, "</tool_use>", tag_end) else {
-            return;
-        };
-        let tag = &xml[open..=tag_end];
-        let Some(name) = attribute(tag, "name")
-            .or_else(|| attribute(tag, "tool"))
-            .or_else(|| attribute(tag, "function"))
-        else {
-            return;
-        };
-        let body = decode_xml(xml[tag_end + 1..close].trim());
-        let input = serde_json::from_str::<Value>(&body).unwrap_or_else(|_| json!({"value":body}));
-        self.recovered.push(KiroEvent::ToolUse {
-            id: attribute(tag, "id")
-                .unwrap_or_else(|| format!("recovered_tool_{}", self.recovered.len() + 1)),
-            name,
-            input_delta: input.to_string(),
-            stop: true,
-        });
+        let fence_start = self.run == Some((b'`', length)) && length >= 3 && !self.run_ended;
+        if !fence_start {
+            match self.inline_ticks {
+                Some(open) if open == length => self.inline_ticks = None,
+                None => self.inline_ticks = Some(length),
+                _ => {}
+            }
+        }
+    }
+
+    fn advance(&mut self, text: &str) {
+        for byte in text.bytes() {
+            if byte == b'`' && self.fence.is_none() {
+                self.pending_ticks = self.pending_ticks.saturating_add(1);
+            } else {
+                self.finish_tick_run();
+            }
+            if byte == b'\n' {
+                if let Some((marker, length)) = self.run.filter(|(_, length)| *length >= 3) {
+                    match self.fence {
+                        None => self.fence = Some((marker, length)),
+                        Some((open, count))
+                            if open == marker && length >= count && self.trailer_whitespace =>
+                        {
+                            self.fence = None
+                        }
+                        _ => {}
+                    }
+                }
+                *self = Self {
+                    fence: self.fence,
+                    inline_ticks: self.inline_ticks,
+                    ..Self::default()
+                };
+            } else if self.whitespace && matches!(byte, b' ' | b'\t' | b'\r') {
+                self.indent = self
+                    .indent
+                    .saturating_add(if byte == b'\t' { 4 } else { 1 });
+            } else if self.whitespace {
+                self.whitespace = false;
+                if self.indent <= 3 && self.inline_ticks.is_none() && matches!(byte, b'`' | b'~') {
+                    self.run = Some((byte, 1));
+                }
+            } else if let Some((marker, length)) = &mut self.run {
+                if !self.run_ended && byte == *marker {
+                    *length = length.saturating_add(1);
+                } else {
+                    self.run_ended = true;
+                    self.trailer_whitespace &= byte.is_ascii_whitespace();
+                }
+            }
+        }
     }
 }
 
 fn first_marker(text: &str) -> Option<(usize, &'static str)> {
     let lower = text.to_ascii_lowercase();
-    ["<function_calls", "<tool_use"]
-        .into_iter()
-        .filter_map(|marker| lower.find(marker).map(|index| (index, marker)))
-        .min_by_key(|(index, _)| *index)
+    [
+        "<function_calls",
+        "<tool_use",
+        THINKING_START_TAG,
+        THINKING_END_TAG,
+    ]
+    .into_iter()
+    .filter_map(|marker| {
+        lower.match_indices(marker).find_map(|(index, _)| {
+            (marker.ends_with('>')
+                || lower
+                    .as_bytes()
+                    .get(index + marker.len())
+                    .is_none_or(|byte| byte.is_ascii_whitespace() || *byte == b'>'))
+            .then_some((index, marker))
+        })
+    })
+    .min_by_key(|(index, _)| *index)
 }
 
 fn marker_prefix_suffix(text: &str) -> usize {
     let lower = text.to_ascii_lowercase();
     let mut longest = 0;
-    for marker in ["<function_calls", "<tool_use"] {
+    for marker in [
+        "<function_calls",
+        "<tool_use",
+        THINKING_START_TAG,
+        THINKING_END_TAG,
+    ] {
         for length in 1..marker.len() {
             if lower.ends_with(&marker[..length]) {
                 longest = longest.max(length);
@@ -561,67 +789,225 @@ fn find_insensitive_from(text: &str, needle: &str, from: usize) -> Option<usize>
         .map(|index| from + index)
 }
 
-fn attribute(tag: &str, name: &str) -> Option<String> {
-    let lower = tag.to_ascii_lowercase();
-    let mut cursor = 0;
-    while let Some(index) = lower[cursor..].find(name) {
-        let index = cursor + index;
-        let before_ok = index == 0 || !lower.as_bytes()[index - 1].is_ascii_alphanumeric();
-        let mut equals = index + name.len();
-        while lower
-            .as_bytes()
-            .get(equals)
-            .is_some_and(u8::is_ascii_whitespace)
-        {
-            equals += 1;
+fn xml_attributes(tag: &str) -> Option<BTreeMap<String, String>> {
+    let inner = tag.strip_prefix('<')?.strip_suffix('>')?;
+    let element_end = inner.find(char::is_whitespace).unwrap_or(inner.len());
+    let mut rest = &inner[element_end..];
+    let mut attributes = BTreeMap::new();
+    while !rest.trim().is_empty() {
+        // Consume attributes as quoted tokens, never by searching inside
+        // another attribute's value. Duplicate/malformed attributes fail closed.
+        if !rest.starts_with(char::is_whitespace) {
+            return None;
         }
-        if before_ok && lower.as_bytes().get(equals) == Some(&b'=') {
-            equals += 1;
-            while lower
-                .as_bytes()
-                .get(equals)
-                .is_some_and(u8::is_ascii_whitespace)
-            {
-                equals += 1;
-            }
-            let quote = *tag.as_bytes().get(equals)?;
-            if quote == b'\'' || quote == b'"' {
-                let start = equals + 1;
-                let end = tag[start..].find(quote as char)? + start;
-                return Some(decode_xml(&tag[start..end]));
-            }
+        rest = rest.trim_start();
+        let end = rest.find(|character: char| {
+            !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | ':' | '.'))
+        })?;
+        if end == 0 {
+            return None;
         }
-        cursor = index + name.len();
+        let name = rest[..end].to_ascii_lowercase();
+        rest = rest[end..].trim_start().strip_prefix('=')?.trim_start();
+        let quote = rest
+            .chars()
+            .next()
+            .filter(|character| matches!(character, '\'' | '"'))?;
+        rest = &rest[1..];
+        let end = rest.find(quote)?;
+        if attributes.insert(name, decode_xml(&rest[..end])).is_some() {
+            return None;
+        }
+        rest = &rest[end + 1..];
     }
-    None
+    Some(attributes)
 }
 
-fn parse_parameters(xml: &str) -> Value {
+fn parse_parameters(xml: &str, schema: Option<&Value>) -> Option<Value> {
     let mut map = serde_json::Map::new();
     let mut cursor = 0;
     while let Some(open) = find_insensitive_from(xml, "<parameter", cursor) {
-        let Some(tag_end) = xml[open..].find('>').map(|index| open + index) else {
-            break;
-        };
-        let Some(close) = find_insensitive_from(xml, "</parameter>", tag_end) else {
-            break;
-        };
-        if let Some(name) = attribute(&xml[open..=tag_end], "name") {
-            let value = decode_xml(xml[tag_end + 1..close].trim());
-            map.insert(name, coerce(&value));
+        if !xml[cursor..open].trim().is_empty() {
+            return None;
+        }
+        if !xml
+            .as_bytes()
+            .get(open + "<parameter".len())
+            .is_some_and(u8::is_ascii_whitespace)
+        {
+            return None;
+        }
+        let tag_end = xml[open..].find('>').map(|index| open + index)?;
+        let close = find_insensitive_from(xml, "</parameter>", tag_end)?;
+        let name = xml_attributes(&xml[open..=tag_end])?.remove("name")?;
+        if !map.contains_key(&name) {
+            let value = decode_xml(&xml[tag_end + 1..close]);
+            let string_parameter = match schema {
+                Some(schema) => parameter_preserves_string(schema, Some(&name), schema, &mut 128)?,
+                None => false,
+            };
+            map.insert(
+                name,
+                if string_parameter {
+                    Value::String(value)
+                } else {
+                    coerce(&value)
+                },
+            );
+        } else {
+            return None;
         }
         cursor = close + "</parameter>".len();
     }
-    Value::Object(map)
+    xml[cursor..]
+        .trim()
+        .is_empty()
+        .then_some(Value::Object(map))
+}
+
+/// Reads type hints, not a complete JSON Schema validator. References stay
+/// local and traversal is bounded; unresolved/cyclic schemas fail recovery
+/// closed instead of guessing a potentially destructive tool argument type.
+fn parameter_preserves_string(
+    schema: &Value,
+    property: Option<&str>,
+    root: &Value,
+    remaining: &mut usize,
+) -> Option<bool> {
+    let hint = parameter_types(schema, property, root, remaining)?;
+    (hint.string || hint.other).then_some(hint.specified && hint.string)
+}
+
+#[derive(Clone, Copy)]
+struct XmlParameterTypes {
+    string: bool,
+    other: bool,
+    specified: bool,
+}
+
+impl XmlParameterTypes {
+    const ANY: Self = Self {
+        string: true,
+        other: true,
+        specified: false,
+    };
+    const NONE: Self = Self {
+        string: false,
+        other: false,
+        specified: true,
+    };
+
+    fn value(value: &Value) -> Self {
+        Self {
+            string: value.is_string(),
+            other: !value.is_string(),
+            specified: true,
+        }
+    }
+
+    fn intersect(&mut self, hint: Self) {
+        self.string &= hint.string;
+        self.other &= hint.other;
+        self.specified |= hint.specified;
+    }
+
+    fn union(&mut self, hint: Self) {
+        self.string |= hint.string;
+        self.other |= hint.other;
+        self.specified |= hint.specified;
+    }
+}
+
+fn parameter_types(
+    schema: &Value,
+    property: Option<&str>,
+    root: &Value,
+    remaining: &mut usize,
+) -> Option<XmlParameterTypes> {
+    *remaining = remaining.checked_sub(1)?;
+    if let Some(allowed) = schema.as_bool() {
+        return Some(if allowed {
+            XmlParameterTypes::ANY
+        } else {
+            XmlParameterTypes::NONE
+        });
+    }
+    schema.as_object()?;
+    let mut hint = if let Some(name) = property {
+        match schema
+            .get("properties")
+            .and_then(|properties| properties.get(name))
+            .or_else(|| schema.get("additionalProperties"))
+        {
+            Some(schema) => parameter_types(schema, None, root, remaining)?,
+            None => XmlParameterTypes::ANY,
+        }
+    } else {
+        let mut hint = XmlParameterTypes::ANY;
+        if let Some(kind) = schema.get("type") {
+            let kinds = kind
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or_else(|| std::slice::from_ref(kind));
+            let mut declared = XmlParameterTypes::NONE;
+            for kind in kinds {
+                match kind.as_str()? {
+                    "string" => declared.string = true,
+                    "null" | "boolean" | "number" | "integer" | "array" | "object" => {
+                        declared.other = true
+                    }
+                    _ => return None,
+                }
+            }
+            hint.intersect(declared);
+        }
+        if let Some(values) = schema.get("enum") {
+            let mut enumerated = XmlParameterTypes::NONE;
+            for value in values.as_array()? {
+                enumerated.union(XmlParameterTypes::value(value));
+            }
+            hint.intersect(enumerated);
+        }
+        if let Some(value) = schema.get("const") {
+            hint.intersect(XmlParameterTypes::value(value));
+        }
+        hint
+    };
+    if let Some(reference) = schema.get("$ref") {
+        let pointer = reference.as_str()?.strip_prefix('#')?;
+        hint.intersect(parameter_types(
+            root.pointer(pointer)?,
+            property,
+            root,
+            remaining,
+        )?);
+    }
+    for keyword in ["allOf", "anyOf", "oneOf"] {
+        if let Some(branches) = schema.get(keyword) {
+            let mut combined = if keyword == "allOf" {
+                XmlParameterTypes::ANY
+            } else {
+                XmlParameterTypes {
+                    specified: false,
+                    ..XmlParameterTypes::NONE
+                }
+            };
+            for branch in branches.as_array()? {
+                let branch = parameter_types(branch, property, root, remaining)?;
+                if keyword == "allOf" {
+                    combined.intersect(branch);
+                } else {
+                    combined.union(branch);
+                }
+            }
+            hint.intersect(combined);
+        }
+    }
+    Some(hint)
 }
 
 fn coerce(value: &str) -> Value {
-    match value {
-        "true" => Value::Bool(true),
-        "false" => Value::Bool(false),
-        "null" => Value::Null,
-        _ => serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.into())),
-    }
+    serde_json::from_str(value).unwrap_or_else(|_| Value::String(value.into()))
 }
 
 fn decode_xml(value: &str) -> String {
@@ -652,7 +1038,10 @@ impl DecodedResponse {
     pub fn push(&mut self, event: KiroEvent) -> Result<(), String> {
         match event {
             KiroEvent::AssistantResponse { content } => {
-                self.text.push_str(&sanitize_text(&content))
+                // Shared filters already classified this text. A second
+                // string replacement here corrupts literal XML/code examples
+                // and makes buffered output disagree with the SSE deltas.
+                self.text.push_str(&content)
             }
             KiroEvent::Reasoning {
                 content,
@@ -1368,18 +1757,265 @@ fn normalize_partial_json(input: &str) -> String {
     output
 }
 
-fn sanitize_text(text: &str) -> String {
-    text.replace('\0', "")
-        .replace("<tool_use>", "")
-        .replace("</tool_use>", "")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn replay_codec() -> WebSearchReplayCodec {
         WebSearchReplayCodec::from_key([0x5A; 32])
+    }
+
+    fn assistant_text(events: &[KiroEvent]) -> String {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                KiroEvent::AssistantResponse { content } => Some(content.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn audit_decoded_text_preserves_literal_markup_at_every_chunk_boundary() {
+        let text = "```xml\n<tool_use>示例</tool_use>\n```\nraw\0text";
+        for split in text
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain([text.len()])
+        {
+            let mut decoded = DecodedResponse::default();
+            for chunk in [&text[..split], &text[split..]] {
+                decoded
+                    .push(KiroEvent::AssistantResponse {
+                        content: chunk.into(),
+                    })
+                    .unwrap();
+            }
+            assert_eq!(decoded.text, text, "split={split}");
+        }
+    }
+
+    #[test]
+    fn audit_thinking_state_survives_interleaved_metadata_at_every_boundary() {
+        let text = "before <thinking>private reasoning</thinking>after";
+        for (enabled, omitted) in [(false, false), (true, false), (true, true)] {
+            for split in 0..=text.len() {
+                let mut filter = ThinkingContentFilter::new(enabled).with_omitted_summary(omitted);
+                let mut events = filter.push(KiroEvent::AssistantResponse {
+                    content: text[..split].into(),
+                });
+                events.extend(filter.push(KiroEvent::Usage {
+                    usage: json!({"inputTokens":1}),
+                }));
+                events.extend(filter.push(KiroEvent::AssistantResponse {
+                    content: text[split..].into(),
+                }));
+                events.extend(filter.finish());
+                assert_eq!(
+                    assistant_text(&events),
+                    if enabled && !omitted {
+                        text
+                    } else {
+                        "before after"
+                    },
+                    "enabled={enabled}, omitted={omitted}, split={split}"
+                );
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, KiroEvent::Usage { .. }))
+                        .count(),
+                    1
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn audit_thinking_filter_preserves_markdown_examples_at_every_boundary() {
+        for literal in ["`<thinking>`", "```xml\n<thinking>\n```", "    <thinking>"] {
+            let text = format!("{literal}\nanswer <thinking>private</thinking>done");
+            for split in 0..=text.len() {
+                let mut filter = ThinkingContentFilter::new(false);
+                let mut events = filter.push(KiroEvent::AssistantResponse {
+                    content: text[..split].into(),
+                });
+                events.extend(filter.push(KiroEvent::AssistantResponse {
+                    content: text[split..].into(),
+                }));
+                events.extend(filter.finish());
+                assert_eq!(
+                    assistant_text(&events),
+                    format!("{literal}\nanswer done"),
+                    "split={split}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn audit_thinking_filter_bounds_pending_reasoning_and_streams_visible_text() {
+        for enabled in [false, true] {
+            let mut filter = ThinkingContentFilter::new(enabled);
+            let mut events = filter.push(KiroEvent::AssistantResponse {
+                content: "<thinking>".into(),
+            });
+            for _ in 0..32 {
+                events.extend(filter.push(KiroEvent::AssistantResponse {
+                    content: "x".repeat(1024),
+                }));
+                assert!(
+                    filter.pending.len() < THINKING_END_TAG.len(),
+                    "reasoning retained without bound"
+                );
+            }
+            if enabled {
+                assert_eq!(
+                    assistant_text(&events),
+                    format!("<thinking>{}", "x".repeat(32 * 1024))
+                );
+            }
+            events.extend(filter.push(KiroEvent::AssistantResponse {
+                content: "</thinking>answer".into(),
+            }));
+            events.extend(filter.finish());
+            assert_eq!(
+                assistant_text(&events),
+                if enabled {
+                    format!("<thinking>{}</thinking>answer", "x".repeat(32 * 1024))
+                } else {
+                    "answer".into()
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn audit_tool_recovery_ignores_markdown_inside_tool_arguments() {
+        let text = concat!(
+            "<function_calls><invoke name=\"write_file\">",
+            "<parameter name=\"content\">\n```xml\n</parameter></invoke></function_calls>\n",
+            "<tool_use name=\"lookup\">{}</tool_use>"
+        );
+        for split in 0..=text.len() {
+            let mut filter = ToolLeakFilter::new(true, ["write_file".into(), "lookup".into()]);
+            let mut events = filter.push(KiroEvent::AssistantResponse {
+                content: text[..split].into(),
+            });
+            events.extend(filter.push(KiroEvent::AssistantResponse {
+                content: text[split..].into(),
+            }));
+            events.extend(filter.finish());
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| matches!(event, KiroEvent::ToolUse { .. }))
+                    .count(),
+                2,
+                "argument opened a Markdown fence at split={split}"
+            );
+            assert_eq!(assistant_text(&events), "\n");
+        }
+    }
+
+    #[test]
+    fn audit_tool_recovery_resumes_after_incomplete_xml_examples() {
+        for prefix in [
+            "```xml\n<tool_use name=\"lookup\">\n```\n",
+            "<thinking>\n<tool_use name=\"lookup\">example\n</thinking>\n",
+        ] {
+            let text = format!("{prefix}<tool_use name=\"lookup\">{{}}</tool_use>");
+            for split in 0..=text.len() {
+                let mut filter = ToolLeakFilter::new(true, ["lookup".into()]);
+                let mut events = filter.push(KiroEvent::AssistantResponse {
+                    content: text[..split].into(),
+                });
+                events.extend(filter.push(KiroEvent::AssistantResponse {
+                    content: text[split..].into(),
+                }));
+                events.extend(filter.finish());
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, KiroEvent::ToolUse { .. }))
+                        .count(),
+                    1,
+                    "example swallowed a real call at split={split}"
+                );
+                assert_eq!(assistant_text(&events), prefix);
+            }
+        }
+    }
+
+    #[test]
+    fn audit_xml_parameters_preserve_strings_in_composed_schemas() {
+        for property in [
+            json!({"type":"string"}),
+            json!({"type":["string","null"]}),
+            json!({"enum":["true"]}),
+            json!({"const":"true"}),
+            json!({"anyOf":[{"type":"string"},{"type":"null"}]}),
+            json!({"oneOf":[{"type":"string"},{"type":"boolean"}]}),
+            json!({"allOf":[{"type":"string"},{"minLength":1}]}),
+            json!({"$ref":"#/$defs/text"}),
+        ] {
+            let schema = json!({"type":"object", "$defs":{"text":{"type":"string"}},
+                "properties":{"content":property}});
+            let parsed = parse_parameters(
+                "<parameter name=\"content\">true</parameter>",
+                Some(&schema),
+            )
+            .unwrap();
+            assert_eq!(parsed["content"], json!("true"), "{schema}");
+        }
+    }
+
+    #[test]
+    fn audit_xml_schema_resolution_is_local_bounded_and_handles_root_composition() {
+        let xml =
+            "<parameter name=\"content\">42</parameter><parameter name=\"count\">42</parameter>";
+        let object = json!({"properties":{
+            "content":{"$ref":"#/$defs/text"}, "count":{"type":"integer"}
+        }});
+        for schema in [
+            json!({"$ref":"#/$defs/request", "$defs":{"request":object,"text":{"type":"string"}}}),
+            json!({"allOf":[object], "$defs":{"text":{"type":"string"}}}),
+        ] {
+            assert_eq!(
+                parse_parameters(xml, Some(&schema)),
+                Some(json!({"content":"42","count":42}))
+            );
+        }
+        for schema in [
+            json!({"properties":{"content":{"$ref":"https://example.invalid/schema"}}}),
+            json!({"properties":{"content":{"$ref":"#/$defs/missing"}}}),
+            json!({"properties":{"content":{"$ref":"#/$defs/cycle"}}, "$defs":{
+                "cycle":{"anyOf":[{"$ref":"#/$defs/cycle"},{"$ref":"#/$defs/cycle"}]}
+            }}),
+        ] {
+            assert!(parse_parameters(xml, Some(&schema)).is_none());
+        }
+    }
+
+    #[test]
+    fn audit_xml_string_hints_respect_schema_intersections() {
+        let xml = "<parameter name=\"content\">42</parameter>";
+        for property in [
+            json!({"type":"integer", "enum":["42",42]}),
+            json!({"allOf":[{"type":["string","integer"]},{"type":"integer"}]}),
+            json!({"$ref":"#/$defs/numeric", "anyOf":[{"type":"string"},{"type":"integer"}]}),
+        ] {
+            let schema =
+                json!({"properties":{"content":property}, "$defs":{"numeric":{"type":"integer"}}});
+            assert_eq!(
+                parse_parameters(xml, Some(&schema)),
+                Some(json!({"content":42})),
+                "{schema}"
+            );
+        }
+        let contradictory =
+            json!({"properties":{"content":{"allOf":[{"type":"string"},{"type":"integer"}]}}});
+        assert!(parse_parameters(xml, Some(&contradictory)).is_none());
     }
 
     #[test]
@@ -1397,19 +2033,12 @@ mod tests {
         events.extend(filter.finish());
 
         assert_eq!(
-            events,
-            vec![
-                KiroEvent::AssistantResponse {
-                    content: "before ".into()
-                },
-                KiroEvent::AssistantResponse {
-                    content: "<thinking>hidden</thinking>".into()
-                },
-                KiroEvent::AssistantResponse {
-                    content: "after".into()
-                }
-            ]
+            assistant_text(&events),
+            "before <thinking>hidden</thinking>after"
         );
+        assert!(events
+            .iter()
+            .all(|event| matches!(event, KiroEvent::AssistantResponse { .. })));
     }
 
     #[test]
@@ -1493,10 +2122,11 @@ mod tests {
 
     #[test]
     fn recovers_split_function_calls_and_keeps_visible_text() {
-        let mut filter = ToolLeakFilter::new(true);
+        let mut filter = ToolLeakFilter::new(true, ["write_file".into()]);
         let first = filter.push(KiroEvent::AssistantResponse {
-            content: "Before <function_calls><invoke name=\"write_file\"><parameter name=\"path\">"
-                .into(),
+            content:
+                "Before\n<function_calls><invoke name=\"write_file\"><parameter name=\"path\">"
+                    .into(),
         });
         let second = filter.push(KiroEvent::AssistantResponse {
             content: "/tmp/a.txt</parameter><parameter name=\"overwrite\">true</parameter>".into(),
@@ -1507,7 +2137,7 @@ mod tests {
         assert_eq!(
             first,
             vec![KiroEvent::AssistantResponse {
-                content: "Before ".into()
+                content: "Before\n".into()
             }]
         );
         assert!(second.is_empty());
@@ -1533,13 +2163,187 @@ mod tests {
 
     #[test]
     fn flushes_incomplete_marker_as_literal_text() {
-        let mut filter = ToolLeakFilter::new(true);
+        let mut filter = ToolLeakFilter::new(true, ["write_file".into()]);
         let visible = filter.push(KiroEvent::AssistantResponse {
             content: "Use <function_calls as literal text".into(),
         });
         assert_eq!(visible.len(), 1);
         let tail = filter.finish();
         assert_eq!(tail.len(), 1);
+    }
+
+    #[test]
+    fn tool_leak_recovery_preserves_display_text_and_invalid_blocks_at_every_chunk_boundary() {
+        let call = "<function_calls><invoke name=\"lookup\"><parameter name=\"query\">weather</parameter></invoke></function_calls>";
+        for text in [
+            format!("Example: {call}"),
+            format!("`inline\n{call}\ncode`"),
+            format!("Some ``inline\n{call}\ncode``"),
+            format!("```xml\n{call}\n```"),
+            format!("~~~~xml\n```\n{call}\n~~~~"),
+            format!("    {call}"),
+            call.replace("lookup", "undeclared"),
+            call.replace("</parameter>", ""),
+            call.replace("</function_calls>", "unparsed text</function_calls>"),
+            "<function_calls>example only</function_calls>".into(),
+            "<tool_use name=\"lookup\">invalid json</tool_use>".into(),
+            "<tool_use name=\"lookup\">[]</tool_use>".into(),
+            "<tool_use_example name=\"lookup\">{}</tool_use>".into(),
+            "<tool_use description='example name=\"lookup\"'>{}</tool_use>".into(),
+            "<tool_use name=\"lookup\" name=\"other\">{}</tool_use>".into(),
+            "<tool_use name=\"lookup\" tool=\"other\">{}</tool_use>".into(),
+            "<tool_use name=\"lookup\"invalid>{}</tool_use>".into(),
+        ] {
+            for split in 0..=text.len() {
+                let mut filter = ToolLeakFilter::new(true, ["lookup".into()]);
+                let mut events = Vec::new();
+                for chunk in [&text[..split], &text[split..]] {
+                    events.extend(filter.push(KiroEvent::AssistantResponse {
+                        content: chunk.into(),
+                    }));
+                }
+                events.extend(filter.finish());
+                let visible: String = events
+                    .into_iter()
+                    .map(|event| match event {
+                        KiroEvent::AssistantResponse { content } => content,
+                        other => panic!("display text produced {other:?}: {text}, split={split}"),
+                    })
+                    .collect();
+                assert_eq!(visible, text, "split={split}");
+            }
+        }
+    }
+
+    #[test]
+    fn tool_leak_recovery_resumes_after_split_fence_and_requires_declared_tools() {
+        let text = "```xml\n<tool_use name=\"lookup\">{}</tool_use>\n```\n  <tool_use name=\"lookup\">{\"q\":1}</tool_use>";
+        for known in [vec![], vec!["lookup".into()]] {
+            let mut filter = ToolLeakFilter::new(true, known.clone());
+            let mut events = Vec::new();
+            for character in text.chars() {
+                events.extend(filter.push(KiroEvent::AssistantResponse {
+                    content: character.to_string(),
+                }));
+            }
+            events.extend(filter.finish());
+            let tools = events
+                .iter()
+                .filter(|event| matches!(event, KiroEvent::ToolUse { .. }))
+                .count();
+            assert_eq!(tools, known.len());
+            let visible = events
+                .into_iter()
+                .filter_map(|event| match event {
+                    KiroEvent::AssistantResponse { content } => Some(content),
+                    _ => None,
+                })
+                .collect::<String>();
+            assert_eq!(
+                visible,
+                if known.is_empty() {
+                    text
+                } else {
+                    "```xml\n<tool_use name=\"lookup\">{}</tool_use>\n```\n  "
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn tool_leak_recovery_never_executes_xml_inside_tagged_thinking() {
+        let text = "<thinking>\n<tool_use name=\"lookup\">{\"q\":\"example\"}</tool_use>\n</thinking>\nDone.";
+        for split in 0..=text.len() {
+            let mut filter = ToolLeakFilter::new(true, ["lookup".into()]);
+            let mut events = Vec::new();
+            for chunk in [&text[..split], &text[split..]] {
+                events.extend(filter.push(KiroEvent::AssistantResponse {
+                    content: chunk.into(),
+                }));
+            }
+            events.extend(filter.finish());
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, KiroEvent::ToolUse { .. })),
+                "thinking became executable at split {split}"
+            );
+            let visible: String = events
+                .into_iter()
+                .filter_map(|event| match event {
+                    KiroEvent::AssistantResponse { content } => Some(content),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(visible, text);
+        }
+    }
+
+    #[test]
+    fn tool_recovery_resumes_after_thinking_and_literal_tags() {
+        for example in [
+            "```xml\n<thinking>\n```\n",
+            "`<thinking>`\n",
+            "    <thinking>\n",
+            "<thinking>\n```xml\n<tool_use name=\"lookup\">{}</tool_use>\n</thinking>\n",
+            "<thinking>\n`unfinished inline\n</thinking>\n",
+        ] {
+            let text = format!("{example}<tool_use name=\"lookup\">{{}}</tool_use>");
+            for split in 0..=text.len() {
+                let mut filter = ToolLeakFilter::new(true, ["lookup".into()]);
+                let mut events = Vec::new();
+                for chunk in [&text[..split], &text[split..]] {
+                    events.extend(filter.push(KiroEvent::AssistantResponse {
+                        content: chunk.into(),
+                    }));
+                }
+                events.extend(filter.finish());
+                assert_eq!(
+                    events
+                        .iter()
+                        .filter(|event| matches!(event, KiroEvent::ToolUse { .. }))
+                        .count(),
+                    1,
+                    "recovery disabled by preceding text {example:?} at split {split}"
+                );
+                let visible: String = events
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        KiroEvent::AssistantResponse { content } => Some(content),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(visible, example);
+            }
+        }
+    }
+
+    #[test]
+    fn tool_leak_recovery_preserves_declared_string_parameters_and_whitespace() {
+        let request: kproxy_translate::ClaudeRequest = serde_json::from_value(json!({
+            "model":"claude-opus-5", "max_tokens":1024,
+            "messages":[{"role":"user","content":"write file"}],
+            "tools":[{"name":"write_file", "input_schema":{"type":"object","properties":{
+                "content":{"type":"string"}, "overwrite":{"type":"boolean"}
+            }}}]
+        }))
+        .unwrap();
+        let payload = kproxy_translate::claude_to_kiro(
+            &request,
+            &kproxy_translate::TranslationOptions::new("claude-opus-5", "AI_EDITOR"),
+        );
+        for content in ["true", "42", "  indented\n", "\n", "{\"text\":true}"] {
+            let mut filter = ToolLeakFilter::for_payload(true, &payload);
+            filter.push(KiroEvent::AssistantResponse { content: format!(
+                "<function_calls><invoke name=\"write_file\"><parameter name=\"content\">{content}</parameter><parameter name=\"overwrite\">true</parameter></invoke></function_calls>") });
+            let events = filter.finish();
+            let KiroEvent::ToolUse { input_delta, .. } = &events[0] else {
+                panic!("call not recovered");
+            };
+            let input: Value = serde_json::from_str(input_delta).unwrap();
+            assert_eq!(input["content"], json!(content));
+            assert_eq!(input["overwrite"], true);
+        }
     }
 
     #[test]

@@ -262,16 +262,16 @@ fn unsigned_tagged_thinking_streams_as_literal_text() {
     let joined = output.join("");
     let values = streamed_values(&output);
 
-    assert!(joined.contains("<thinking>hidden</thinking>"));
     assert!(!joined.contains("thinking_delta"));
     assert!(!joined.contains("signature_delta"));
-    assert!(values.iter().any(|value| {
-        value["delta"]["type"] == "text_delta"
-            && value["delta"]["text"] == "<thinking>hidden</thinking>"
-    }));
-    assert!(values.iter().any(|value| {
-        value["delta"]["type"] == "text_delta" && value["delta"]["text"] == "Hello"
-    }));
+    // Tagged text now streams incrementally instead of buffering an entire
+    // reasoning block. SSE fragment boundaries are not part of its content.
+    let text: String = values
+        .iter()
+        .filter(|value| value["delta"]["type"] == "text_delta")
+        .filter_map(|value| value["delta"]["text"].as_str())
+        .collect();
+    assert_eq!(text, "<thinking>hidden</thinking>Hello");
 }
 
 #[test]

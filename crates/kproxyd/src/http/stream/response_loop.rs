@@ -132,7 +132,7 @@ pub fn response(
                 )));
                 break 'rounds;
             }
-            let mut leak_filter = ToolLeakFilter::new(context.enable_tool_leak_filter);
+            let mut leak_filter = ToolLeakFilter::for_payload(context.enable_tool_leak_filter, &payload);
             let mut upstream_tool_names = std::collections::HashMap::new();
             let mut thinking_filter = ThinkingContentFilter::new(context.thinking_enabled && effective_thinking)
                 .with_omitted_summary(payload.thinking_summary_omitted());
