@@ -1,4 +1,4 @@
-//! `.env` 必须在 Clap 读取环境参数前加载。
+//! `.env` 必须在业务参数的正式 Clap 解析前加载。
 
 use std::process::Command;
 

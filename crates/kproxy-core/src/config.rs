@@ -1689,7 +1689,7 @@ start_url = ""
 # [[webhook]]
 # 可读名称；必须唯一。
 # name = "运维群"
-# 通知平台；对应 CLI 的 --platform（旧名 --kind）。
+# 通知平台；对应 CLI 的 --platform。
 # 可选 "dingtalk"、"wechat-work"、"telegram"、"discord"、"feishu"、"custom"。
 # kind = "dingtalk"
 # Webhook 接收地址；启用时必须使用 http:// 或 https://。

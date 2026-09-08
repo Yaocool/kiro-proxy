@@ -37,6 +37,7 @@ tokio-util = { version = "=0.7.11", features = ["rt"] }
 tracing = "=0.1.40"
 tracing-subscriber = { version = "=0.3.18", features = ["env-filter", "json"] }
 clap = { version = "=4.5.16", features = ["derive", "env"] }
+clap_complete = "=4.5.24"
 dotenvy = "=0.15.7"
 chromiumoxide = { version = "=0.9.1", default-features = false }
 notify = "=6.1.1"

@@ -108,21 +108,6 @@ pub enum AccountCommand {
         #[arg(long)]
         headful: bool,
     },
-    /// 从两列 CSV（email,password）批量执行 SSO 登录。
-    #[command(hide = true)]
-    AddSsoBatch {
-        #[arg(long, value_name = "PATH")]
-        file: String,
-        #[arg(long)]
-        start_url: Option<String>,
-        #[arg(long, default_value = "us-east-1")]
-        region: String,
-        /// 同时启动的登录数；默认串行，降低提供商风控概率。
-        #[arg(short = 'c', long, default_value_t = 1)]
-        concurrency: usize,
-        #[arg(long)]
-        headful: bool,
-    },
     /// 删除一个或多个账号。
     #[command(
         visible_alias = "delete",
@@ -469,25 +454,6 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             } else {
                 println!("已添加 {}（{}）", result.email, result.id);
             }
-        }
-        AccountCommand::AddSsoBatch {
-            file,
-            start_url,
-            region,
-            concurrency,
-            headful,
-        } => {
-            let start_url = resolve_start_url(client, start_url.as_deref()).await?;
-            run_sso_batch(
-                client,
-                &file,
-                &start_url,
-                &region,
-                concurrency,
-                headful,
-                json,
-            )
-            .await?;
         }
         AccountCommand::Rm { ids } => {
             if !crate::commands::confirm(&remove_confirmation_prompt(&ids)).await? {
