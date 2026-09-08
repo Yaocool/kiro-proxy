@@ -46,9 +46,11 @@ Copy the example before starting a local daemon:
 cp .env.example .env
 ```
 
-Both `kproxyd` and `kproxy` load `.env` before parsing CLI arguments on every startup.
-They search from the current directory upward, which lets commands launched from
-a workspace subdirectory reuse the repository-level file.
+`kproxyd` loads `.env` before parsing startup arguments. `kproxy` first parses
+local navigation such as help, guides, completion, and version; it loads `.env`
+before reparsing and running any business command. Both search from the current
+directory upward, which lets commands launched from a workspace subdirectory
+reuse the repository-level file.
 
 Environment precedence is:
 
@@ -58,7 +60,8 @@ Environment precedence is:
 4. Built-in application defaults.
 
 An existing process variable is never overwritten by `.env`. A missing `.env`
-is allowed; a malformed or unreadable file fails startup with an error.
+is allowed; a malformed or unreadable file fails daemon startup and business
+commands, while local CLI navigation remains available.
 
 The example uses `KPROXY_HOME=.kproxy-dev` to isolate development files. The most
 important process-level variables are:
@@ -104,6 +107,22 @@ cargo run -p kproxy -- config path
 cargo run -p kproxy -- config show --effective
 cargo run -p kproxy -- account list
 ```
+
+CLI navigation does not require a daemon or a valid `.env`. A bare command group
+shows its available actions; nested help, guides, and static completion use the
+same command definition:
+
+```bash
+cargo run -p kproxy -- logs
+cargo run -p kproxy -- help logs trace
+cargo run -p kproxy -- help --all
+cargo run -p kproxy -- guide logs
+cargo run -p kproxy -- completions zsh > /tmp/_kproxy
+```
+
+Use explicit actions in scripts: `logs show`, `models list`, `tasks list`, and
+`diagnose all`. `--json` with a bare group is an argument error so automation
+does not receive help text as successful data output.
 
 To run compiled binaries instead:
 
@@ -161,7 +180,7 @@ importing, inspect and probe the accounts:
 ```bash
 cargo run -p kproxy -- account list
 cargo run -p kproxy -- account probe --all
-cargo run -p kproxy -- models
+cargo run -p kproxy -- models list
 ```
 
 The default build includes IAM Identity Center login. First set the global start
@@ -310,8 +329,8 @@ subscribe to multiple events by repeating `--event` or by passing a
 comma-separated list; `alert edit --event ...` replaces the target's complete
 subscription list.
 `kproxy alert platforms` explains the notification platform selected by
-`--platform` and lists platform-specific options. The former `--kind` and
-`--url` spellings remain available as compatibility aliases. For a DingTalk
+`--platform` and lists platform-specific options. Use `--platform` and
+`--webhook-url` when creating or editing a target. For a DingTalk
 robot with signing enabled, pass its `SEC...` secret through `--dingtalk-sign`;
 the proxy generates a fresh `timestamp` and `sign` for every delivery.
 Each account or service incident emits one Markdown alert and stays suppressed
@@ -408,13 +427,13 @@ cargo run -p kproxy -- stats --start 2026-08-27T10:00:00+08:00 --end 2026-08-27T
 cargo run -p kproxy -- stats --detail --since 1h --by endpoint
 ```
 
-The legacy `kproxy logs --tail ...` and `kproxy logs -f` forms remain supported.
+Log query options must follow an explicit action such as `logs show` or `logs follow`.
 
 `kproxy status` reports request metrics for the current daemon session, while
 `kproxy stats` defaults to persisted cumulative metrics across restarts. Both
 accept `--since` or a timezone-aware `--start`/`--end` range at one-minute
 aggregation resolution. `--detail` adds recent requests and grouping by
-model/account/endpoint. Use `kproxy logs` and trace IDs for individual failures.
+model/account/endpoint. Use `kproxy logs show` and trace IDs for individual failures.
 
 For more detail, set `RUST_LOG` or `log.level` to `debug` or `trace`. Logs do not
 record prompts, generated response bodies, or API-key values.
@@ -430,7 +449,7 @@ kproxy health
 
 This command validates Compose, pulls the new image while the old container is
 still running, replaces the service, waits for health, rolls back to the old
-image on failure, and installs the host `kproxy` command. It targets
+image on failure, and then atomically replaces the host `kproxy` wrapper. It targets
 `/usr/local/bin/kproxy` by default; without sudo access, use
 `--target "$HOME/.local/bin/kproxy"`. The equivalent manual commands are useful
 for debugging:
@@ -523,6 +542,11 @@ entry. The image includes full Vim and extended terminfo, and
 `kproxy config edit` uses Vim by default so cursor keys work correctly. This
 keeps the admin Unix socket private and avoids host/container binary
 compatibility problems.
+
+When the daemon container is stopped, command help remains available from its
+exact image without starting the service or mounting its data. This includes
+bare command groups, `help`, `guide`, `completions`, `version`, and lifecycle
+`--help`; business commands still require `kproxy restart` first.
 
 Update both the wrapper and the container image for an existing deployment:
 
