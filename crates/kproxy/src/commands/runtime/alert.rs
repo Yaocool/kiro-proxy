@@ -240,9 +240,7 @@ pub fn show_alert_platforms(json: bool) -> Result<()> {
         "{}",
         render_table(&["PLATFORM", "通知平台", "平台专用参数"], &rows)
     );
-    println!(
-        "\n所有平台都需要 --webhook-url；旧参数 --url 和 --kind 继续兼容，建议新命令使用 --webhook-url 和 --platform。"
-    );
+    println!("\n所有平台都需要 --webhook-url，并通过 --platform 选择通知平台。");
     Ok(())
 }
 

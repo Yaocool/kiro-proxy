@@ -466,6 +466,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "clap_complete"
+version = "4.5.24"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d7db6eca8c205649e8d3ccd05aa5042b1800a784e56bc7c43524fde8abbfa9b"
+dependencies = [
+ "clap",
+]
+
+[[package]]
 name = "clap_derive"
 version = "4.5.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1074,6 +1083,7 @@ version = "0.2.4"
 dependencies = [
  "anyhow",
  "clap",
+ "clap_complete",
  "futures",
  "kproxy-core",
  "kproxy-ipc",

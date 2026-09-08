@@ -1,12 +1,14 @@
 //! kiro-proxy 命令行客户端。
 
+mod cli;
 mod client;
 mod commands;
 mod output;
 
 use anyhow::Result;
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use kproxy_ipc::protocol::{method, ConfigPathResult, ConfigReloadResult, StatusResult};
+use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
 
 use crate::client::{resolve_socket, AdminClient};
@@ -18,13 +20,14 @@ use crate::output::{format_relative, format_timestamp, print_json};
     version,
     disable_help_subcommand = true,
     about = "kiro-proxy 管理工具",
-    long_about = "查看服务状态，管理服务生命周期、账号与配置。\n\n示例：\n  kproxy status\n  kproxy restart\n  kproxy account list --tag prod\n  kproxy config show --effective"
+    long_about = "查看服务状态，管理服务生命周期、账号与配置。\n\n示例：\n  kproxy status\n  kproxy restart\n  kproxy account list --tag prod\n  kproxy config show --effective",
+    after_help = "常用查询：status、health、ready、stats、pool、subscriptions\n命令组：account、config、apikey、service、alert、logs、models、model-map、tasks、diagnose\n宿主机操作：restart、stop、uninstall\n帮助与补全：help、guide、completions"
 )]
 struct Cli {
     /// 管理面 socket 路径，默认读取配置文件。
     #[arg(long, global = true, value_name = "PATH", env = "KPROXY_ADMIN_SOCKET")]
     socket: Option<String>,
-    /// 以 JSON 输出。
+    /// 以 JSON 输出业务数据。
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -91,11 +94,21 @@ enum Command {
         delete_backup: bool,
     },
     /// 配置查看、编辑、重载与重置。
-    #[command(subcommand)]
-    Config(ConfigCommand),
+    #[command(
+        after_help = "示例：\n  kproxy config list\n  kproxy config show --effective\n  kproxy config validate\n\n操作说明：kproxy guide config"
+    )]
+    Config {
+        #[command(subcommand)]
+        command: Option<ConfigCommand>,
+    },
     /// 账号管理。
-    #[command(subcommand)]
-    Account(crate::commands::account::AccountCommand),
+    #[command(
+        after_help = "示例：\n  kproxy account list\n  kproxy account show user@example.com\n  kproxy account probe --all\n\n操作说明：kproxy guide account 或 kproxy guide sso"
+    )]
+    Account {
+        #[command(subcommand)]
+        command: Option<crate::commands::account::AccountCommand>,
+    },
     /// 查看账号池调度评分。
     #[command(
         after_help = "示例：\n  kproxy pool --explain\n  kproxy pool --model claude-sonnet-4 --watch"
@@ -112,7 +125,9 @@ enum Command {
         explain: bool,
     },
     /// 上游网络与账号诊断。
-    #[command(after_help = "示例：\n  kproxy diagnose endpoints\n  kproxy diagnose account --all")]
+    #[command(
+        after_help = "示例：\n  kproxy diagnose all\n  kproxy diagnose endpoints\n  kproxy diagnose account --all\n\n操作说明：kproxy guide diagnose"
+    )]
     Diagnose {
         #[command(subcommand)]
         command: Option<DiagnoseCommand>,
@@ -121,7 +136,9 @@ enum Command {
     #[command(after_help = "示例：\n  kproxy subscriptions\n  kproxy subscriptions acc_7f3a2b1c")]
     Subscriptions { id: Option<String> },
     /// 显示或手动运行周期任务。
-    #[command(after_help = "示例：\n  kproxy tasks\n  kproxy tasks run status_check")]
+    #[command(
+        after_help = "示例：\n  kproxy tasks list\n  kproxy tasks run status_check\n\n操作说明：kproxy guide tasks"
+    )]
     Tasks {
         #[command(subcommand)]
         command: Option<TaskCommand>,
@@ -144,35 +161,98 @@ enum Command {
     },
     /// 查看请求日志，发现 daemon 日志文件及其路径。
     #[command(
-        args_conflicts_with_subcommands = true,
-        after_help = "兼容旧用法：`kproxy logs --tail 100` 和 `kproxy logs -f` 仍然可用。\n\n示例：\n  kproxy logs show --tail 100\n  kproxy logs follow --level error\n  kproxy logs files\n  kproxy logs path"
+        after_help = "示例：\n  kproxy logs show --tail 100\n  kproxy logs follow --level error\n  kproxy logs files\n  kproxy logs path\n\n操作说明：kproxy guide logs"
     )]
     Logs {
         #[command(subcommand)]
         command: Option<LogsCommand>,
-        #[command(flatten)]
-        query: RequestLogArgs,
-        /// 兼容旧用法；等价于 `kproxy logs follow`。
-        #[arg(short = 'f', long)]
-        follow: bool,
     },
     /// API key 管理。
-    #[command(name = "apikey", subcommand)]
-    ApiKey(crate::commands::runtime::ApiKeyCommand),
+    #[command(
+        name = "apikey",
+        after_help = "示例：\n  kproxy apikey list\n  kproxy apikey show production\n  kproxy apikey usage production\n\n操作说明：kproxy guide apikey"
+    )]
+    ApiKey {
+        #[command(subcommand)]
+        command: Option<crate::commands::runtime::ApiKeyCommand>,
+    },
     /// API 代理服务管理。
-    #[command(name = "service", subcommand)]
-    Service(crate::commands::runtime::ServiceCommand),
+    #[command(
+        name = "service",
+        after_help = "示例：\n  kproxy service list\n  kproxy service show main\n  kproxy service create --name main\n\n操作说明：kproxy guide service"
+    )]
+    Service {
+        #[command(subcommand)]
+        command: Option<crate::commands::runtime::ServiceCommand>,
+    },
     /// 告警策略与通知目标管理。
-    #[command(name = "alert", subcommand)]
-    Alert(crate::commands::runtime::AlertCommand),
+    #[command(
+        name = "alert",
+        after_help = "示例：\n  kproxy alert events\n  kproxy alert list\n  kproxy alert logs\n\n操作说明：kproxy guide alert"
+    )]
+    Alert {
+        #[command(subcommand)]
+        command: Option<crate::commands::runtime::AlertCommand>,
+    },
     /// 显示上游动态模型。
     #[command(
-        args_conflicts_with_subcommands = true,
-        after_help = "示例：\n  kproxy models\n  kproxy models --mapped\n  kproxy models --refresh\n  kproxy models resolve opus5"
+        after_help = "示例：\n  kproxy models list\n  kproxy models list --mapped\n  kproxy models list --refresh\n  kproxy models resolve opus5\n\n操作说明：kproxy guide models"
     )]
     Models {
         #[command(subcommand)]
         command: Option<ModelsCommand>,
+    },
+    /// 模型映射规则。
+    #[command(
+        name = "model-map",
+        after_help = "示例：\n  kproxy model-map list\n  kproxy model-map test opus5\n\n操作说明：kproxy guide model-map"
+    )]
+    ModelMap {
+        #[command(subcommand)]
+        command: Option<ModelMapCommand>,
+    },
+    /// 查看命令帮助。
+    #[command(
+        after_help = "示例：\n  kproxy help\n  kproxy help logs\n  kproxy help logs trace\n  kproxy help --all"
+    )]
+    Help {
+        /// 递归列出全部公开命令。
+        #[arg(long, conflicts_with = "path")]
+        all: bool,
+        /// 要查看的命令路径，例如 logs trace。
+        #[arg(value_name = "COMMAND", num_args = 0..)]
+        path: Vec<String>,
+    },
+    /// 查看原理与操作指南。
+    #[command(
+        after_help = "示例：\n  kproxy guide\n  kproxy guide balance\n  kproxy guide docker"
+    )]
+    Guide {
+        #[arg(value_enum)]
+        topic: Option<crate::cli::guide::Topic>,
+    },
+    /// 生成 Shell 补全脚本。
+    #[command(
+        after_help = "示例：\n  kproxy completions bash\n  kproxy completions zsh\n  kproxy completions fish"
+    )]
+    Completions { shell: CompletionShell },
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "lowercase")]
+enum CompletionShell {
+    Bash,
+    Zsh,
+    Fish,
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelsCommand {
+    /// 列出账号自动探测到的 Kiro 模型。
+    #[command(
+        after_help = "示例：\n  kproxy models list\n  kproxy models list --mapped\n  kproxy models list --refresh"
+    )]
+    List {
         /// 同时显示每个模型经过映射规则后的结果。
         #[arg(long)]
         mapped: bool,
@@ -180,16 +260,6 @@ enum Command {
         #[arg(long)]
         refresh: bool,
     },
-    /// 模型映射规则。
-    #[command(name = "model-map", subcommand)]
-    ModelMap(ModelMapCommand),
-    /// 查看主题帮助。不指定主题时列出全部主题。
-    #[command(after_help = "示例：\n  kproxy help\n  kproxy help stats\n  kproxy help model-map")]
-    Help { topic: Option<String> },
-}
-
-#[derive(Debug, Subcommand)]
-enum ModelsCommand {
     /// 查询一个客户端 model ID 最终会解析成哪个 Kiro 模型。
     #[command(
         after_help = "示例：\n  kproxy models resolve opus5\n  kproxy models resolve claude-4.6-sonnet --refresh\n  kproxy --json models resolve opus5 --api-key production"
@@ -208,8 +278,8 @@ enum ModelsCommand {
 
 #[derive(Debug, Args)]
 struct RequestLogArgs {
-    /// 最多显示多少条最近请求。
-    #[arg(long, default_value_t = 50)]
+    /// 最多显示多少条最近请求（1～1000）。
+    #[arg(long, default_value_t = 50, value_parser = parse_log_tail)]
     tail: usize,
     /// 只显示指定级别，例如 error。
     #[arg(long)]
@@ -259,7 +329,7 @@ enum LogsCommand {
         /// 响应头 x-trace-id 或 request-id 中的 trace ID。
         trace_id: String,
         /// 最多显示最近多少条匹配记录（1～1000）。
-        #[arg(long, default_value_t = 200)]
+        #[arg(long, default_value_t = 200, value_parser = parse_log_tail)]
         tail: usize,
         /// 只查询一个精确级别的物理分片。
         #[arg(long, value_enum)]
@@ -358,6 +428,9 @@ enum ModelMapCommand {
 
 #[derive(Debug, Subcommand)]
 enum TaskCommand {
+    /// 显示周期任务及其运行状态。
+    #[command(after_help = "示例：\n  kproxy tasks list\n  kproxy --json tasks list")]
+    List,
     /// 立即运行一个任务。
     #[command(
         after_help = "示例：\n  kproxy tasks run status_check\n  kproxy tasks run model_cache_refresh\n  kproxy tasks run proxy_service_reconcile"
@@ -367,6 +440,21 @@ enum TaskCommand {
 
 #[derive(Debug, Subcommand)]
 enum DiagnoseCommand {
+    /// 检查所有上游端点，并对全部账号发起真实推理诊断。
+    #[command(
+        after_help = "该命令会对全部账号发起真实推理。\n\n示例：\n  kproxy diagnose all\n  kproxy diagnose all --region us-west-2 --timeout 30s --concurrency 4"
+    )]
+    All {
+        /// 上游端点所在区域。
+        #[arg(long, default_value = "us-east-1")]
+        region: String,
+        /// 单账号真实推理探测超时，范围 1s..5m。
+        #[arg(long, default_value = "45s", value_parser = parse_diagnose_timeout)]
+        timeout: u64,
+        /// 账号探测并发数，范围 1..8。
+        #[arg(short = 'c', long, default_value_t = 1, value_parser = parse_diagnose_concurrency)]
+        concurrency: usize,
+    },
     /// 探测 CodeWhisperer、AmazonQ 与 OIDC 网络连通性。
     #[command(
         after_help = "示例：\n  kproxy diagnose endpoints\n  kproxy diagnose endpoints --region us-west-2"
@@ -380,16 +468,57 @@ enum DiagnoseCommand {
         after_help = "示例：\n  kproxy diagnose account acc_7f3a2b1c\n  kproxy diagnose account --all --concurrency 4"
     )]
     Account {
-        id: Option<String>,
-        #[arg(long, conflicts_with = "id")]
-        all: bool,
-        /// 单账号真实推理探测超时，例如 30s、2m。
-        #[arg(long, default_value = "45s")]
-        timeout: String,
+        #[command(flatten)]
+        target: DiagnoseAccountTarget,
+        /// 单账号真实推理探测超时，范围 1s..5m。
+        #[arg(long, default_value = "45s", value_parser = parse_diagnose_timeout)]
+        timeout: u64,
         /// `--all` 时的探测并发数，范围 1..8。
-        #[arg(short = 'c', long, default_value_t = 1)]
+        #[arg(short = 'c', long, default_value_t = 1, value_parser = parse_diagnose_concurrency)]
         concurrency: usize,
     },
+}
+
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false)]
+struct DiagnoseAccountTarget {
+    /// 账号 ID。
+    id: Option<String>,
+    /// 检查全部账号。
+    #[arg(long)]
+    all: bool,
+}
+
+fn parse_diagnose_timeout(value: &str) -> std::result::Result<u64, String> {
+    let seconds =
+        crate::commands::runtime::parse_duration(value).map_err(|error| error.to_string())?;
+    if (1..=300).contains(&seconds) {
+        Ok(seconds)
+    } else {
+        Err("超时必须在 1 秒到 300 秒（5 分钟）之间".to_owned())
+    }
+}
+
+fn parse_diagnose_concurrency(value: &str) -> std::result::Result<usize, String> {
+    let concurrency = value
+        .parse::<usize>()
+        .map_err(|_| "并发数必须是整数".to_owned())?;
+    if (1..=8).contains(&concurrency) {
+        Ok(concurrency)
+    } else {
+        Err("并发数必须在 1..=8 之间".to_owned())
+    }
+}
+
+fn parse_log_tail(value: &str) -> std::result::Result<usize, String> {
+    let tail = value
+        .parse::<usize>()
+        .map_err(|_| "日志条数必须是整数".to_owned())?;
+    if (1..=1_000).contains(&tail) {
+        Ok(tail)
+    } else {
+        Err("日志条数必须在 1..=1000 之间".to_owned())
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -439,18 +568,21 @@ enum ConfigCommand {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    kproxy_store::environment::load_dotenv()?;
-    let cli = Cli::parse();
-    let Some(command) = cli.command else {
-        Cli::command().print_help()?;
-        println!();
-        return Ok(());
-    };
-    if let Command::Help { topic } = &command {
-        crate::commands::runtime::print_topic(topic.as_deref())?;
+    let raw_args: Vec<OsString> = std::env::args_os().collect();
+    let preliminary = crate::cli::parse_or_exit(raw_args.clone());
+    if crate::cli::handle_local(&preliminary)? {
         return Ok(());
     }
-    if let Command::Alert(alert_command) = &command {
+
+    kproxy_store::environment::load_dotenv()?;
+    let cli = crate::cli::parse_or_exit(raw_args);
+    let Some(command) = cli.command else {
+        unreachable!("local navigation returned before runtime setup")
+    };
+    if let Command::Alert {
+        command: Some(alert_command),
+    } = &command
+    {
         match alert_command {
             crate::commands::runtime::AlertCommand::Events => {
                 crate::commands::runtime::show_alert_events(cli.json)?;
@@ -529,32 +661,18 @@ async fn main() -> Result<()> {
                 anyhow::bail!("business proxy is not ready");
             }
         }
-        Command::Version => {
-            let value = serde_json::json!({
-                "version":env!("CARGO_PKG_VERSION"),
-                "rust":env!("CARGO_PKG_RUST_VERSION"),
-                "codewhisperer":kproxy_kiro::endpoint::CODEWHISPERER_URL,
-                "amazonq":kproxy_kiro::endpoint::AMAZONQ_URL
-            });
-            if cli.json {
-                print_json(&value)?;
-            } else {
-                println!(
-                    "kproxy {} (Rust {})",
-                    env!("CARGO_PKG_VERSION"),
-                    env!("CARGO_PKG_RUST_VERSION")
-                );
-                println!("CodeWhisperer {}", kproxy_kiro::endpoint::CODEWHISPERER_URL);
-                println!("AmazonQ        {}", kproxy_kiro::endpoint::AMAZONQ_URL);
-            }
-        }
+        Command::Version => unreachable!("version returned before runtime setup"),
         Command::Restart | Command::Stop | Command::Uninstall { .. } => {
             unreachable!("host lifecycle commands returned before connecting to the daemon")
         }
-        Command::Config(ConfigCommand::List) => {
+        Command::Config {
+            command: Some(ConfigCommand::List),
+        } => {
             crate::commands::runtime::list_config_modules(cli.json)?;
         }
-        Command::Config(ConfigCommand::Show { module, effective }) => {
+        Command::Config {
+            command: Some(ConfigCommand::Show { module, effective }),
+        } => {
             crate::commands::runtime::show_config(
                 &mut client,
                 module.as_deref(),
@@ -563,7 +681,9 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        Command::Config(ConfigCommand::Path) => {
+        Command::Config {
+            command: Some(ConfigCommand::Path),
+        } => {
             let paths: ConfigPathResult = client
                 .call(method::CONFIG_PATH, serde_json::json!({}))
                 .await?;
@@ -579,7 +699,9 @@ async fn main() -> Result<()> {
                 println!("管理 socket {}", paths.admin_socket);
             }
         }
-        Command::Config(ConfigCommand::Reload) => {
+        Command::Config {
+            command: Some(ConfigCommand::Reload),
+        } => {
             let result: ConfigReloadResult =
                 crate::commands::runtime::reload_config(&mut client).await?;
             if cli.json {
@@ -596,10 +718,14 @@ async fn main() -> Result<()> {
                 );
             }
         }
-        Command::Config(ConfigCommand::Edit { module }) => {
+        Command::Config {
+            command: Some(ConfigCommand::Edit { module }),
+        } => {
             crate::commands::runtime::edit_config(&mut client, module.as_deref()).await?;
         }
-        Command::Config(ConfigCommand::Reset { module }) => {
+        Command::Config {
+            command: Some(ConfigCommand::Reset { module }),
+        } => {
             if let Some(result) =
                 crate::commands::runtime::reset_config(&mut client, module.as_deref()).await?
             {
@@ -630,10 +756,14 @@ async fn main() -> Result<()> {
                 println!("已取消");
             }
         }
-        Command::Config(ConfigCommand::Validate { file }) => {
+        Command::Config {
+            command: Some(ConfigCommand::Validate { file }),
+        } => {
             crate::commands::runtime::validate_config(file.as_deref()).await?;
         }
-        Command::Account(command) => {
+        Command::Account {
+            command: Some(command),
+        } => {
             crate::commands::account::run(&mut client, command, cli.json).await?;
         }
         Command::Pool {
@@ -658,6 +788,31 @@ async fn main() -> Result<()> {
             }
         }
         Command::Diagnose { command } => match command {
+            Some(DiagnoseCommand::All {
+                region,
+                timeout,
+                concurrency,
+            }) => {
+                let endpoints: serde_json::Value = client
+                    .call(
+                        method::DIAGNOSE_ENDPOINTS,
+                        serde_json::json!({"region":region}),
+                    )
+                    .await?;
+                let accounts: serde_json::Value = client
+                    .call(
+                        method::DIAGNOSE_ACCOUNT,
+                        serde_json::json!({
+                            "all":true,
+                            "timeout_secs":timeout,
+                            "concurrency":concurrency
+                        }),
+                    )
+                    .await?;
+                print_json(&serde_json::json!({
+                    "endpoints":endpoints,"accounts":accounts
+                }))?;
+            }
             Some(DiagnoseCommand::Endpoints { region }) => {
                 crate::commands::runtime::simple_rpc(
                     &mut client,
@@ -668,47 +823,24 @@ async fn main() -> Result<()> {
                 .await?;
             }
             Some(DiagnoseCommand::Account {
-                id,
-                all,
+                target: DiagnoseAccountTarget { id, all },
                 timeout,
                 concurrency,
             }) => {
-                if id.is_none() && !all {
-                    anyhow::bail!("需指定账号 ID 或 --all");
-                }
-                let timeout_secs = crate::commands::runtime::parse_duration(&timeout)?;
                 crate::commands::runtime::simple_rpc(
                     &mut client,
                     method::DIAGNOSE_ACCOUNT,
                     serde_json::json!({
                         "id":id,
                         "all":all,
-                        "timeout_secs":timeout_secs,
+                        "timeout_secs":timeout,
                         "concurrency":concurrency
                     }),
                     cli.json,
                 )
                 .await?;
             }
-            None => {
-                let endpoints: serde_json::Value = client
-                    .call(
-                        method::DIAGNOSE_ENDPOINTS,
-                        serde_json::json!({"region":"us-east-1"}),
-                    )
-                    .await?;
-                let accounts: serde_json::Value = client
-                    .call(
-                        method::DIAGNOSE_ACCOUNT,
-                        serde_json::json!({
-                            "all":true,"timeout_secs":45,"concurrency":1
-                        }),
-                    )
-                    .await?;
-                print_json(&serde_json::json!({
-                    "endpoints":endpoints,"accounts":accounts
-                }))?;
-            }
+            None => unreachable!("empty diagnose group returned before runtime setup"),
         },
         Command::Subscriptions { id } => {
             crate::commands::runtime::simple_rpc(
@@ -721,10 +853,11 @@ async fn main() -> Result<()> {
         }
         Command::Tasks { command } => {
             let (method_name, params) = match command {
+                Some(TaskCommand::List) => (method::TASKS, serde_json::json!({})),
                 Some(TaskCommand::Run { name }) => {
                     (method::TASK_RUN, serde_json::json!({"name":name}))
                 }
-                None => (method::TASKS, serde_json::json!({})),
+                None => unreachable!("empty tasks group returned before runtime setup"),
             };
             crate::commands::runtime::simple_rpc(&mut client, method_name, params, cli.json)
                 .await?;
@@ -746,11 +879,7 @@ async fn main() -> Result<()> {
             )
             .await?;
         }
-        Command::Logs {
-            command,
-            query,
-            follow,
-        } => match command {
+        Command::Logs { command } => match command {
             Some(LogsCommand::Show(query)) => {
                 crate::commands::runtime::show_logs(
                     &mut client,
@@ -799,32 +928,27 @@ async fn main() -> Result<()> {
             Some(LogsCommand::Path) => {
                 crate::commands::runtime::show_log_files(&mut client, None, true, cli.json).await?;
             }
-            None => {
-                crate::commands::runtime::show_logs(
-                    &mut client,
-                    query.tail,
-                    follow,
-                    query.level.as_deref(),
-                    query.account.as_deref(),
-                    cli.json,
-                )
-                .await?;
-            }
+            None => unreachable!("empty logs group returned before runtime setup"),
         },
-        Command::ApiKey(command) => {
+        Command::ApiKey {
+            command: Some(command),
+        } => {
             crate::commands::runtime::run_apikey(&mut client, command, cli.json).await?;
         }
-        Command::Service(command) => {
+        Command::Service {
+            command: Some(command),
+        } => {
             crate::commands::runtime::run_service(&mut client, command, cli.json).await?;
         }
-        Command::Alert(command) => {
+        Command::Alert {
+            command: Some(command),
+        } => {
             crate::commands::runtime::run_alert(&mut client, command, cli.json).await?;
         }
-        Command::Models {
-            command,
-            mapped,
-            refresh,
-        } => match command {
+        Command::Models { command } => match command {
+            Some(ModelsCommand::List { mapped, refresh }) => {
+                show_models(&mut client, mapped, refresh, cli.json).await?;
+            }
             Some(ModelsCommand::Resolve {
                 model,
                 api_key,
@@ -846,24 +970,43 @@ async fn main() -> Result<()> {
                 )
                 .await?;
             }
-            None => {
-                if refresh {
-                    let _: serde_json::Value = client
-                        .call(
-                            method::TASK_RUN,
-                            serde_json::json!({"name":"model_cache_refresh"}),
-                        )
-                        .await?;
-                }
-                crate::commands::runtime::show_models(&mut client, mapped, cli.json).await?;
-            }
+            None => unreachable!("empty models group returned before runtime setup"),
         },
-        Command::ModelMap(command) => {
+        Command::ModelMap {
+            command: Some(command),
+        } => {
             crate::commands::runtime::run_model_map(&mut client, command, cli.json).await?;
         }
-        Command::Help { .. } => unreachable!("help exits before connecting to kproxyd"),
+        Command::Config { command: None }
+        | Command::Account { command: None }
+        | Command::ApiKey { command: None }
+        | Command::Service { command: None }
+        | Command::Alert { command: None }
+        | Command::ModelMap { command: None }
+        | Command::Help { .. }
+        | Command::Guide { .. }
+        | Command::Completions { .. } => {
+            unreachable!("local navigation returned before runtime setup")
+        }
     }
     Ok(())
+}
+
+async fn show_models(
+    client: &mut AdminClient,
+    mapped: bool,
+    refresh: bool,
+    json: bool,
+) -> Result<()> {
+    if refresh {
+        let _: serde_json::Value = client
+            .call(
+                method::TASK_RUN,
+                serde_json::json!({"name":"model_cache_refresh"}),
+            )
+            .await?;
+    }
+    crate::commands::runtime::show_models(client, mapped, json).await
 }
 
 fn parse_time_range_args(range: &TimeRangeArgs) -> Result<(Option<u64>, Option<i64>, Option<i64>)> {
@@ -980,16 +1123,20 @@ mod tests {
         let cli = Cli::try_parse_from(["kproxy", "config", "reset"]).expect("config reset");
         assert!(matches!(
             cli.command,
-            Some(Command::Config(ConfigCommand::Reset { module: None }))
+            Some(Command::Config {
+                command: Some(ConfigCommand::Reset { module: None })
+            })
         ));
 
         let scoped = Cli::try_parse_from(["kproxy", "config", "reset", "pool"])
             .expect("scoped config reset");
         assert!(matches!(
             scoped.command,
-            Some(Command::Config(ConfigCommand::Reset {
-                module: Some(module),
-            })) if module == "pool"
+            Some(Command::Config {
+                command: Some(ConfigCommand::Reset {
+                    module: Some(module),
+                })
+            }) if module == "pool"
         ));
     }
 
@@ -998,33 +1145,41 @@ mod tests {
         let list = Cli::try_parse_from(["kproxy", "config", "list"]).expect("config list");
         assert!(matches!(
             list.command,
-            Some(Command::Config(ConfigCommand::List))
+            Some(Command::Config {
+                command: Some(ConfigCommand::List)
+            })
         ));
 
         let show = Cli::try_parse_from(["kproxy", "config", "show", "server", "--effective"])
             .expect("config show module");
         assert!(matches!(
             show.command,
-            Some(Command::Config(ConfigCommand::Show {
-                module: Some(module),
-                effective: true,
-            })) if module == "server"
+            Some(Command::Config {
+                command: Some(ConfigCommand::Show {
+                    module: Some(module),
+                    effective: true,
+                })
+            }) if module == "server"
         ));
 
         let edit =
             Cli::try_parse_from(["kproxy", "config", "edit", "pool"]).expect("config edit module");
         assert!(matches!(
             edit.command,
-            Some(Command::Config(ConfigCommand::Edit {
-                module: Some(module),
-            })) if module == "pool"
+            Some(Command::Config {
+                command: Some(ConfigCommand::Edit {
+                    module: Some(module),
+                })
+            }) if module == "pool"
         ));
 
         let full_edit =
             Cli::try_parse_from(["kproxy", "config", "edit"]).expect("full config edit");
         assert!(matches!(
             full_edit.command,
-            Some(Command::Config(ConfigCommand::Edit { module: None }))
+            Some(Command::Config {
+                command: Some(ConfigCommand::Edit { module: None })
+            })
         ));
     }
 
@@ -1034,9 +1189,9 @@ mod tests {
             .expect("single account remove");
         assert!(matches!(
             single.command,
-            Some(Command::Account(
-                crate::commands::account::AccountCommand::Rm { ids }
-            )) if ids == ["acc_00000001"]
+            Some(Command::Account {
+                command: Some(crate::commands::account::AccountCommand::Rm { ids })
+            }) if ids == ["acc_00000001"]
         ));
 
         let multiple =
@@ -1044,9 +1199,9 @@ mod tests {
                 .expect("batch account remove");
         assert!(matches!(
             multiple.command,
-            Some(Command::Account(
-                crate::commands::account::AccountCommand::Rm { ids }
-            )) if ids == ["acc_00000001", "a@example.com"]
+            Some(Command::Account {
+                command: Some(crate::commands::account::AccountCommand::Rm { ids })
+            }) if ids == ["acc_00000001", "a@example.com"]
         ));
 
         assert!(Cli::try_parse_from(["kproxy", "account", "rm"]).is_err());
@@ -1088,6 +1243,19 @@ mod tests {
 
     #[test]
     fn models_supports_resolution_without_breaking_list_flags() {
+        let explicit_list =
+            Cli::try_parse_from(["kproxy", "models", "list", "--mapped", "--refresh"])
+                .expect("explicit model list");
+        assert!(matches!(
+            explicit_list.command,
+            Some(Command::Models {
+                command: Some(ModelsCommand::List {
+                    mapped: true,
+                    refresh: true,
+                })
+            })
+        ));
+
         let resolve = Cli::try_parse_from([
             "kproxy",
             "models",
@@ -1105,50 +1273,50 @@ mod tests {
                     api_key,
                     refresh: true,
                 }),
-            mapped: false,
-            refresh: false,
         }) = resolve.command
         else {
             panic!("expected models resolve command");
         };
         assert_eq!(model, "opus5");
         assert_eq!(api_key.as_deref(), Some("production"));
+    }
 
-        let list = Cli::try_parse_from(["kproxy", "models", "--mapped", "--refresh"])
-            .expect("legacy models flags");
+    #[test]
+    fn task_list_and_full_diagnosis_have_explicit_actions() {
+        let tasks = Cli::try_parse_from(["kproxy", "tasks", "list"]).expect("task list");
         assert!(matches!(
-            list.command,
-            Some(Command::Models {
-                command: None,
-                mapped: true,
-                refresh: true,
+            tasks.command,
+            Some(Command::Tasks {
+                command: Some(TaskCommand::List)
             })
+        ));
+
+        let diagnose = Cli::try_parse_from([
+            "kproxy",
+            "diagnose",
+            "all",
+            "--region",
+            "us-west-2",
+            "--timeout",
+            "30s",
+            "--concurrency",
+            "4",
+        ])
+        .expect("full diagnosis");
+        assert!(matches!(
+            diagnose.command,
+            Some(Command::Diagnose {
+                command: Some(DiagnoseCommand::All {
+                    region,
+                    timeout,
+                    concurrency: 4,
+                })
+            }) if region == "us-west-2" && timeout == 30
         ));
     }
 
     #[test]
-    fn logs_support_legacy_flags_and_discovery_subcommands() {
-        let legacy = Cli::try_parse_from([
-            "kproxy",
-            "logs",
-            "--tail",
-            "25",
-            "--follow",
-            "--account",
-            "alice@example.com",
-        ])
-        .expect("legacy logs syntax");
-        let Some(Command::Logs {
-            command: None,
-            query,
-            follow: true,
-        }) = legacy.command
-        else {
-            panic!("expected legacy logs command");
-        };
-        assert_eq!(query.tail, 25);
-        assert_eq!(query.account.as_deref(), Some("alice@example.com"));
-
+    fn logs_support_discovery_subcommands() {
         let files = Cli::try_parse_from(["kproxy", "logs", "files", "--level", "error"])
             .expect("log files command");
         assert!(matches!(
@@ -1176,7 +1344,10 @@ mod tests {
                 ..
             }) if parsed == trace_id
         ));
-        assert!(Cli::try_parse_from(["kproxy", "logs", "--tail", "10", "files"]).is_err());
+        assert!(Cli::try_parse_from(["kproxy", "logs", "--tail", "10"]).is_err());
+        assert!(Cli::try_parse_from(["kproxy", "logs", "-f"]).is_err());
+        assert!(Cli::try_parse_from(["kproxy", "models", "--mapped"]).is_err());
+        assert!(Cli::try_parse_from(["kproxy", "account", "add-sso-batch"]).is_err());
     }
 
     #[test]
@@ -1192,12 +1363,15 @@ mod tests {
             "ci,team",
         ])
         .expect("service edit");
-        let Some(Command::Service(crate::commands::runtime::ServiceCommand::Edit {
-            service,
-            port,
-            add_api_key,
-            ..
-        })) = service.command
+        let Some(Command::Service {
+            command:
+                Some(crate::commands::runtime::ServiceCommand::Edit {
+                    service,
+                    port,
+                    add_api_key,
+                    ..
+                }),
+        }) = service.command
         else {
             panic!("expected service edit command");
         };
@@ -1209,13 +1383,13 @@ mod tests {
             .expect("clear API key limit");
         assert!(matches!(
             limit.command,
-            Some(Command::ApiKey(
-                crate::commands::runtime::ApiKeyCommand::Limit {
+            Some(Command::ApiKey {
+                command: Some(crate::commands::runtime::ApiKeyCommand::Limit {
                     clear: true,
                     credits: None,
                     ..
-                }
-            ))
+                })
+            })
         ));
     }
 
@@ -1232,11 +1406,9 @@ mod tests {
                 "sk-original-key",
             ])
             .expect("API key restore command");
-            let Some(Command::ApiKey(crate::commands::runtime::ApiKeyCommand::Add {
-                name,
-                key,
-                ..
-            })) = cli.command
+            let Some(Command::ApiKey {
+                command: Some(crate::commands::runtime::ApiKeyCommand::Add { name, key, .. }),
+            }) = cli.command
             else {
                 panic!("expected API key add command");
             };
@@ -1248,7 +1420,9 @@ mod tests {
     #[test]
     fn alert_command_replaces_the_webhook_entrypoint() {
         let cli = Cli::try_parse_from(["kproxy", "alert", "config"]).expect("alert command");
-        let Some(Command::Alert(crate::commands::runtime::AlertCommand::Config)) = cli.command
+        let Some(Command::Alert {
+            command: Some(crate::commands::runtime::AlertCommand::Config),
+        }) = cli.command
         else {
             panic!("expected alert config command");
         };
@@ -1275,12 +1449,15 @@ mod tests {
             "token-refresh-failed",
         ])
         .expect("multi-event alert target");
-        let Some(Command::Alert(crate::commands::runtime::AlertCommand::Add {
-            webhook_url,
-            events,
-            dingtalk_sign,
-            ..
-        })) = cli.command
+        let Some(Command::Alert {
+            command:
+                Some(crate::commands::runtime::AlertCommand::Add {
+                    webhook_url,
+                    events,
+                    dingtalk_sign,
+                    ..
+                }),
+        }) = cli.command
         else {
             panic!("expected alert add command");
         };
@@ -1298,30 +1475,49 @@ mod tests {
     }
 
     #[test]
-    fn alert_add_accepts_legacy_kind_and_url_aliases() {
-        let cli = Cli::try_parse_from([
+    fn alert_rejects_removed_parameter_aliases() {
+        assert!(Cli::try_parse_from([
             "kproxy",
             "alert",
             "add",
             "--name",
             "ops",
             "--kind",
-            "wechat",
+            "wechat-work",
+            "--webhook-url",
+            "https://example.com/hook",
+            "--event",
+            "token-refresh-failed",
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "kproxy",
+            "alert",
+            "add",
+            "--name",
+            "ops",
+            "--platform",
+            "dingtalk",
             "--url",
             "https://example.com/hook",
             "--event",
             "token-refresh-failed",
         ])
-        .expect("legacy --kind and --url aliases");
-        let Some(Command::Alert(crate::commands::runtime::AlertCommand::Add { platform, .. })) =
-            cli.command
-        else {
-            panic!("expected alert add command");
-        };
-        assert_eq!(
-            platform,
-            crate::commands::runtime::AlertPlatform::WechatWork
-        );
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "kproxy",
+            "alert",
+            "add",
+            "--name",
+            "ops",
+            "--platform",
+            "wechat",
+            "--webhook-url",
+            "https://example.com/hook",
+            "--event",
+            "token-refresh-failed",
+        ])
+        .is_err());
     }
 
     #[test]
@@ -1337,12 +1533,15 @@ mod tests {
             "token-refresh-failed",
         ])
         .expect("positional alert target");
-        let Some(Command::Alert(crate::commands::runtime::AlertCommand::Edit {
-            target,
-            name,
-            webhook_url,
-            ..
-        })) = positional.command
+        let Some(Command::Alert {
+            command:
+                Some(crate::commands::runtime::AlertCommand::Edit {
+                    target,
+                    name,
+                    webhook_url,
+                    ..
+                }),
+        }) = positional.command
         else {
             panic!("expected alert edit command");
         };
@@ -1360,12 +1559,15 @@ mod tests {
             "feishu",
         ])
         .expect("named alert target");
-        let Some(Command::Alert(crate::commands::runtime::AlertCommand::Edit {
-            target,
-            name,
-            platform,
-            ..
-        })) = named.command
+        let Some(Command::Alert {
+            command:
+                Some(crate::commands::runtime::AlertCommand::Edit {
+                    target,
+                    name,
+                    platform,
+                    ..
+                }),
+        }) = named.command
         else {
             panic!("expected alert edit command");
         };
