@@ -17,6 +17,9 @@ case "$1" in
     [ "$*" != 'inspect --format {{.Image}} test-container' ] || {
       echo sha256:test-old; exit 0
     }
+    [ "$*" != 'inspect --format {{.State.Status}} test-container' ] || {
+      echo running; exit 0
+    }
     ;;
   image)
     [ "$*" != 'image tag sha256:test-old kiro-proxy-rollback:kiro-proxy' ] || exit 0

@@ -7,73 +7,239 @@ fail() {
   exit 1
 }
 
+usage_error() {
+  echo "kproxy: $*" >&2
+  exit 2
+}
+
 lifecycle_action=""
+navigation_only=0
 uninstall_yes=0
 uninstall_backup_dir=""
 uninstall_retention="ask"
-case "${1:-}" in
-  restart|stop)
-    case "$#:${2:-}" in
-      2:-h|2:--help)
-        echo "Usage: kproxy $1"
-        exit 0
+top_level_command=""
+expect_socket_value=0
+help_requested=0
+for argument in "$@"; do
+  if [ "$expect_socket_value" -eq 1 ]; then
+    expect_socket_value=0
+    continue
+  fi
+  case "$argument" in
+    -h|--help)
+      # Clap stops parsing at an explicit help flag. Leave everything after it
+      # to the container CLI so that root-vs-command help stays authoritative.
+      help_requested=1
+      break
+      ;;
+    --json)
+      ;;
+    --socket)
+      expect_socket_value=1
+      ;;
+    --socket=*)
+      ;;
+    *)
+      if [ -z "$top_level_command" ]; then
+        top_level_command="$argument"
+      fi
+      ;;
+  esac
+done
+
+validate_simple_lifecycle_args() {
+  expected_action="$1"
+  shift
+  seen_action=0
+  seen_json=0
+  seen_socket=0
+  expect_socket_value=0
+  options_ended=0
+  for argument in "$@"; do
+    if [ "$expect_socket_value" -eq 1 ]; then
+      case "$argument" in
+        -) ;;
+        -?*) usage_error "--socket requires a path" ;;
+      esac
+      expect_socket_value=0
+      continue
+    fi
+    if [ "$options_ended" -eq 1 ]; then
+      usage_error "usage: kproxy $expected_action"
+    fi
+    case "$argument" in
+      -h|--help)
+        navigation_only=1
+        return 0
+        ;;
+      --json)
+        [ "$seen_json" -eq 0 ] || usage_error "--json cannot be used multiple times"
+        seen_json=1
+        ;;
+      --socket)
+        [ "$seen_socket" -eq 0 ] || usage_error "--socket cannot be used multiple times"
+        seen_socket=1
+        expect_socket_value=1
+        ;;
+      --socket=*)
+        [ "$seen_socket" -eq 0 ] || usage_error "--socket cannot be used multiple times"
+        seen_socket=1
+        ;;
+      --)
+        [ "$seen_action" -eq 1 ] || usage_error "usage: kproxy $expected_action"
+        options_ended=1
+        ;;
+      "$expected_action")
+        [ "$seen_action" -eq 0 ] || usage_error "usage: kproxy $expected_action"
+        seen_action=1
+        ;;
+      *)
+        usage_error "usage: kproxy $expected_action"
         ;;
     esac
-    [ "$#" -eq 1 ] || fail "usage: kproxy $1"
-    lifecycle_action="$1"
+  done
+  [ "$expect_socket_value" -eq 0 ] || usage_error "--socket requires a path"
+  [ "$seen_action" -eq 1 ] || usage_error "usage: kproxy $expected_action"
+}
+
+validate_uninstall_args() {
+  seen_action=0
+  seen_json=0
+  seen_socket=0
+  seen_yes=0
+  seen_backup_dir=0
+  seen_keep_backup=0
+  seen_delete_backup=0
+  expect_socket_value=0
+  expect_backup_dir=0
+  options_ended=0
+
+  for argument in "$@"; do
+    if [ "$expect_socket_value" -eq 1 ]; then
+      case "$argument" in
+        -) ;;
+        -?*) usage_error "--socket requires a path" ;;
+      esac
+      expect_socket_value=0
+      continue
+    fi
+    if [ "$expect_backup_dir" -eq 1 ]; then
+      case "$argument" in
+        -) ;;
+        -?*) usage_error "--backup-dir requires a path" ;;
+      esac
+      [ -n "$argument" ] || usage_error "--backup-dir cannot be empty"
+      uninstall_backup_dir="$argument"
+      expect_backup_dir=0
+      continue
+    fi
+    if [ "$options_ended" -eq 1 ]; then
+      usage_error "usage: kproxy uninstall"
+    fi
+
+    case "$argument" in
+      -h|--help)
+        navigation_only=1
+        return 0
+        ;;
+      --json)
+        [ "$seen_json" -eq 0 ] || usage_error "--json cannot be used multiple times"
+        seen_json=1
+        ;;
+      --socket)
+        [ "$seen_socket" -eq 0 ] || usage_error "--socket cannot be used multiple times"
+        seen_socket=1
+        expect_socket_value=1
+        ;;
+      --socket=*)
+        [ "$seen_socket" -eq 0 ] || usage_error "--socket cannot be used multiple times"
+        seen_socket=1
+        ;;
+      uninstall)
+        [ "$seen_action" -eq 0 ] || usage_error "usage: kproxy uninstall"
+        seen_action=1
+        ;;
+      --yes|-y)
+        [ "$seen_yes" -eq 0 ] || usage_error "--yes cannot be used multiple times"
+        seen_yes=1
+        uninstall_yes=1
+        ;;
+      --backup-dir)
+        [ "$seen_backup_dir" -eq 0 ] || usage_error "--backup-dir cannot be used multiple times"
+        seen_backup_dir=1
+        expect_backup_dir=1
+        ;;
+      --backup-dir=*)
+        [ "$seen_backup_dir" -eq 0 ] || usage_error "--backup-dir cannot be used multiple times"
+        seen_backup_dir=1
+        uninstall_backup_dir="${argument#*=}"
+        [ -n "$uninstall_backup_dir" ] || usage_error "--backup-dir cannot be empty"
+        ;;
+      --keep-backup)
+        [ "$seen_keep_backup" -eq 0 ] || usage_error "--keep-backup cannot be used multiple times"
+        [ "$seen_delete_backup" -eq 0 ] || \
+          usage_error "--keep-backup conflicts with --delete-backup"
+        seen_keep_backup=1
+        uninstall_retention="keep"
+        ;;
+      --delete-backup)
+        [ "$seen_delete_backup" -eq 0 ] || usage_error "--delete-backup cannot be used multiple times"
+        [ "$seen_keep_backup" -eq 0 ] || \
+          usage_error "--delete-backup conflicts with --keep-backup"
+        seen_delete_backup=1
+        uninstall_retention="delete"
+        ;;
+      --)
+        [ "$seen_action" -eq 1 ] || usage_error "usage: kproxy uninstall"
+        options_ended=1
+        ;;
+      *)
+        usage_error "unknown uninstall option: $argument"
+        ;;
+    esac
+  done
+
+  [ "$expect_socket_value" -eq 0 ] || usage_error "--socket requires a path"
+  [ "$expect_backup_dir" -eq 0 ] || usage_error "--backup-dir requires a path"
+  [ "$seen_action" -eq 1 ] || usage_error "usage: kproxy uninstall"
+}
+
+case "$top_level_command" in
+  restart|stop)
+    validate_simple_lifecycle_args "$top_level_command" "$@"
+    if [ "$navigation_only" -eq 0 ]; then
+      lifecycle_action="$top_level_command"
+    fi
     ;;
   uninstall)
-    lifecycle_action="$1"
-    shift
-    while [ "$#" -gt 0 ]; do
-      case "$1" in
-        --yes|-y)
-          uninstall_yes=1
-          shift
-          ;;
-        --backup-dir)
-          [ "$#" -ge 2 ] || fail "--backup-dir requires a path"
-          [ -n "$2" ] || fail "--backup-dir cannot be empty"
-          uninstall_backup_dir="$2"
-          shift 2
-          ;;
-        --backup-dir=*)
-          uninstall_backup_dir="${1#*=}"
-          [ -n "$uninstall_backup_dir" ] || fail "--backup-dir cannot be empty"
-          shift
-          ;;
-        --keep-backup)
-          [ "$uninstall_retention" != "delete" ] || \
-            fail "--keep-backup conflicts with --delete-backup"
-          uninstall_retention="keep"
-          shift
-          ;;
-        --delete-backup)
-          [ "$uninstall_retention" != "keep" ] || \
-            fail "--delete-backup conflicts with --keep-backup"
-          uninstall_retention="delete"
-          shift
-          ;;
-        --help|-h)
-          echo 'Usage: kproxy uninstall [--yes] [--backup-dir PATH] [--keep-backup|--delete-backup]'
-          echo '删除 Docker 服务前必定备份数据；默认备份到 ~/.kproxy/backups，源码目录保留。'
-          exit 0
-          ;;
-        *) fail "unknown uninstall option: $1" ;;
-      esac
-    done
+    validate_uninstall_args "$@"
+    if [ "$navigation_only" -eq 0 ]; then
+      lifecycle_action="$top_level_command"
+    fi
     ;;
 esac
 
-command -v docker >/dev/null 2>&1 || fail "docker command not found"
+if ! command -v docker >/dev/null 2>&1; then
+  if [ "$navigation_only" -eq 1 ]; then
+    case "$top_level_command" in
+      restart|stop)
+        echo "Usage: kproxy $top_level_command [--help]"
+        ;;
+      uninstall)
+        echo 'Usage: kproxy uninstall [--yes] [--backup-dir PATH] [--keep-backup|--delete-backup]'
+        echo '删除 Docker 服务前必定备份数据；默认备份到 ~/.kproxy/backups，源码目录保留。'
+        ;;
+    esac
+    echo 'Docker 当前不可用；启动 Docker 后可查看完整命令帮助。'
+    exit 0
+  fi
+  fail "docker command not found"
+fi
 
 if [ -n "${KPROXY_DOCKER_CONTAINER:-}" ]; then
   container_id="$KPROXY_DOCKER_CONTAINER"
 else
-  include_stopped=""
-  if [ -n "$lifecycle_action" ]; then
-    include_stopped="--all"
-  fi
+  include_stopped="--all"
   if [ -n "${KPROXY_COMPOSE_PROJECT:-}" ]; then
     containers="$(docker ps $include_stopped \
       --filter 'label=io.kiro-proxy.role=daemon' \
@@ -88,10 +254,7 @@ else
   container_count="$(printf '%s\n' "$containers" | awk 'NF { count++ } END { print count + 0 }')"
   case "$container_count" in
     0)
-      if [ -n "$lifecycle_action" ]; then
-        fail "no kiro-proxy daemon container found"
-      fi
-      fail "no running kiro-proxy daemon container found"
+      fail "no kiro-proxy daemon container found"
       ;;
     1)
       container_id="$(printf '%s\n' "$containers" | awk 'NF { print; exit }')"
@@ -313,6 +476,33 @@ case "$lifecycle_action" in
     ;;
 esac
 
+if [ "$(container_state)" != "running" ]; then
+  [ "$navigation_only" -eq 1 ] || [ -z "$lifecycle_action" ] || \
+    fail "cannot run lifecycle action against container $container_id"
+  image_id="$(docker inspect --format '{{.Image}}' "$container_id" 2>/dev/null || true)"
+  [ -n "$image_id" ] || fail "cannot resolve the image for stopped container $container_id"
+  if ! docker run \
+    --rm \
+    --pull never \
+    --network none \
+    --read-only \
+    --no-healthcheck \
+    -e KPROXY_WRAPPER_LOCAL_ONLY=1 \
+    --entrypoint /usr/local/bin/kproxy \
+    "$image_id" help --all >/dev/null 2>&1; then
+    fail "cannot use stopped container image $image_id for offline CLI navigation; the image is unavailable or too old, so restart the service or deploy a matching image and wrapper"
+  fi
+  exec docker run \
+    --rm \
+    --pull never \
+    --network none \
+    --read-only \
+    --no-healthcheck \
+    -e KPROXY_WRAPPER_LOCAL_ONLY=1 \
+    --entrypoint /usr/local/bin/kproxy \
+    "$image_id" "$@"
+fi
+
 # Tell log path commands where the persistent data directory is mounted on the
 # Docker host. Avoid an extra inspect call for unrelated commands.
 KPROXY_WRAPPER_HOST_DATA_DIR=""
@@ -329,17 +519,32 @@ export KPROXY_WRAPPER_HOST_DATA_DIR
 # to consume that stream. Container paths continue to work when no host file
 # with the supplied name exists.
 is_sso_batch=0
-previous_argument=""
+top_level_command=""
+account_command=""
+expect_socket_value=0
 for argument in "$@"; do
-  if [ "$previous_argument" = "account" ] && [ "$argument" = "add-sso" ]; then
-    is_sso_batch=1
+  if [ "$expect_socket_value" -eq 1 ]; then
+    expect_socket_value=0
+    continue
+  fi
+  case "$argument" in
+    --json) continue ;;
+    --socket) expect_socket_value=1; continue ;;
+    --socket=*) continue ;;
+  esac
+  if [ -z "$top_level_command" ]; then
+    top_level_command="$argument"
+  elif [ -z "$account_command" ]; then
+    account_command="$argument"
     break
   fi
-  previous_argument="$argument"
 done
+if [ "$top_level_command" = "account" ] && [ "$account_command" = "add-sso" ]; then
+  is_sso_batch=1
+fi
 
 host_batch_file=""
-if [ "$is_sso_batch" -eq 1 ]; then
+if [ "$is_sso_batch" -eq 1 ] && [ "$help_requested" -eq 0 ]; then
   expect_batch_file=0
   for argument in "$@"; do
     if [ "$expect_batch_file" -eq 1 ]; then

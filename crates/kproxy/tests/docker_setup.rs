@@ -10,6 +10,8 @@ struct Deployment {
     output: Output,
     calls: String,
     saved_image: Option<String>,
+    installed_wrapper: bool,
+    wrapper_contents: Option<String>,
 }
 
 impl Deployment {
@@ -45,6 +47,10 @@ fn executable(path: &Path, contents: &str) {
 }
 
 fn deploy(scenario: &str, build: bool) -> Deployment {
+    deploy_with_wrapper(scenario, build, None)
+}
+
+fn deploy_with_wrapper(scenario: &str, build: bool, existing_wrapper: Option<&str>) -> Deployment {
     let workspace = tempfile::tempdir().unwrap();
     let bin = workspace.path().join("bin");
     fs::create_dir(&bin).unwrap();
@@ -59,12 +65,16 @@ fn deploy(scenario: &str, build: bool) -> Deployment {
     let image_state = workspace.path().join("image-state");
     fs::write(&image_state, "kiro-proxy:test-old\n").unwrap();
     let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let wrapper = workspace.path().join("kproxy");
+    if let Some(contents) = existing_wrapper {
+        fs::write(&wrapper, contents).unwrap();
+    }
     let output = Command::new("/bin/sh")
         .arg(repo.join("deploy/docker-setup.sh"))
         .args(["--image", "kiro-proxy:test-new"])
         .arg(if build { "--build" } else { "--no-pull" })
         .args(["--timeout", "1", "--target"])
-        .arg(workspace.path().join("kproxy"))
+        .arg(&wrapper)
         .env_clear()
         .env(
             "PATH",
@@ -83,6 +93,8 @@ fn deploy(scenario: &str, build: bool) -> Deployment {
         output,
         calls,
         saved_image: fs::read_to_string(image_state).ok(),
+        installed_wrapper: wrapper.is_file(),
+        wrapper_contents: fs::read_to_string(wrapper).ok(),
     }
 }
 
@@ -91,7 +103,16 @@ fn healthy_deployment_uses_supported_exec_flag_without_rollback() {
     for build in [false, true] {
         let result = deploy("healthy", build);
         result.assert_success();
+        assert!(result.installed_wrapper);
         assert_eq!(result.health_calls(), 1);
+        let stdout = String::from_utf8_lossy(&result.output.stdout);
+        let health_position = stdout
+            .find("Waiting for kproxyd to become healthy")
+            .expect("health wait output");
+        let install_position = stdout
+            .find("Installing the host kproxy command")
+            .expect("wrapper install output");
+        assert!(health_position < install_position, "{stdout}");
         assert_eq!(
             result.saved_image.as_deref(),
             Some(if build {
@@ -117,6 +138,7 @@ fn unhealthy_deployment_reports_the_error_and_restores_previous_image() {
     for build in [false, true] {
         let result = deploy("unhealthy", build);
         assert!(!result.output.status.success());
+        assert!(!result.installed_wrapper);
         let stderr = result.stderr();
         assert!(
             stderr.contains("Health check failed after 1s (exit 7)"),
@@ -143,6 +165,7 @@ fn unhealthy_rollback_reports_its_own_health_error() {
     for build in [false, true] {
         let result = deploy("rollback-unhealthy", build);
         assert!(!result.output.status.success());
+        assert!(!result.installed_wrapper);
         let stderr = result.stderr();
         assert_eq!(
             stderr
@@ -165,4 +188,19 @@ fn unhealthy_rollback_reports_its_own_health_error() {
         assert_eq!(result.health_calls(), 4);
         assert_eq!(result.saved_image.as_deref(), Some("kiro-proxy:test-old\n"));
     }
+}
+
+#[test]
+fn unrelated_wrapper_is_rejected_before_replacing_the_container() {
+    let original = "#!/bin/sh\necho unrelated\n";
+    let result = deploy_with_wrapper("healthy", false, Some(original));
+
+    assert!(!result.output.status.success());
+    assert!(result.stderr().contains("is not managed by this project"));
+    assert_eq!(result.wrapper_contents.as_deref(), Some(original));
+    assert!(!result
+        .calls
+        .lines()
+        .any(|line| line.contains(" up --detach")));
+    assert_eq!(result.saved_image.as_deref(), Some("kiro-proxy:test-old\n"));
 }
