@@ -1362,13 +1362,13 @@ fn upstream_bad_request_is_actionable(message: &str) -> bool {
 
 struct ApiError {
     status: StatusCode,
-    message: String,
+    message: Box<str>,
     format: ErrorFormat,
     allow: Option<&'static str>,
     authenticate: bool,
     retry_after: bool,
     suppress_model_stats: bool,
-    request_id: Option<String>,
+    request_id: Option<Box<str>>,
     log_context: Box<RequestLogContext>,
     error_code: &'static str,
     error_stage: &'static str,
@@ -1383,7 +1383,7 @@ impl ApiError {
         let (error_code, error_stage) = classify_api_error(status, &message);
         Self {
             status,
-            message,
+            message: message.into_boxed_str(),
             format,
             allow: None,
             authenticate: false,
@@ -1428,7 +1428,7 @@ impl ApiError {
     }
 
     fn with_request_id(mut self, request_id: &str) -> Self {
-        self.request_id = Some(request_id.to_owned());
+        self.request_id = Some(request_id.into());
         self
     }
 
