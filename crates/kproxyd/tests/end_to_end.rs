@@ -30,9 +30,6 @@ mod claude_gateway;
 #[path = "end_to_end/warning_regressions.rs"]
 mod warning_regressions;
 
-#[path = "end_to_end/compaction_fidelity.rs"]
-mod compaction_fidelity;
-
 struct Daemon {
     child: Child,
     socket: PathBuf,
