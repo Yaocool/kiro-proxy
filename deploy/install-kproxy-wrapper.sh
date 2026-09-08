@@ -3,13 +3,14 @@ set -eu
 
 target="/usr/local/bin/kproxy"
 force=0
+check_only=0
 
 usage() {
   cat <<'EOF'
-Usage: install-kproxy-wrapper.sh [--force] [--target PATH]
+Usage: install-kproxy-wrapper.sh [--check] [--force] [--target PATH]
 
 Installs the Docker-backed kproxy wrapper. Run with sudo when the target directory
-requires administrator privileges.
+requires administrator privileges. --check validates the target without writing it.
 EOF
 }
 
@@ -17,6 +18,10 @@ while [ "$#" -gt 0 ]; do
   case "$1" in
     --force)
       force=1
+      shift
+      ;;
+    --check)
+      check_only=1
       shift
       ;;
     --target)
@@ -38,6 +43,15 @@ while [ "$#" -gt 0 ]; do
       ;;
   esac
 done
+
+[ -n "$target" ] || {
+  echo "install-kproxy-wrapper.sh: --target must not be empty" >&2
+  exit 2
+}
+[ ! -d "$target" ] || {
+  echo "install-kproxy-wrapper.sh: target must be a file path, not a directory: $target" >&2
+  exit 1
+}
 
 script_dir="$(CDPATH= cd "$(dirname "$0")" && pwd)"
 source_file="$script_dir/kproxy-docker"
@@ -71,6 +85,23 @@ if [ -e "$target" ]; then
   fi
 fi
 
-install -m 0755 "$source_file" "$target"
+if [ "$check_only" -eq 1 ]; then
+  exit 0
+fi
+
+target_dir="$(dirname "$target")"
+target_name="$(basename "$target")"
+temp_target=""
+cleanup_temp() {
+  [ -z "$temp_target" ] || rm -f -- "$temp_target"
+}
+trap cleanup_temp EXIT
+trap 'exit 1' HUP INT TERM
+
+temp_target="$(mktemp "$target_dir/.${target_name}.tmp.XXXXXX")"
+install -m 0755 "$source_file" "$temp_target"
+mv -f "$temp_target" "$target"
+temp_target=""
+trap - EXIT HUP INT TERM
 echo "installed Docker-backed kproxy wrapper at $target"
 echo "run 'kproxy health' after the Compose service is running"

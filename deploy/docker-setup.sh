@@ -129,6 +129,32 @@ command -v docker >/dev/null 2>&1 || fail "docker command not found"
 docker compose version >/dev/null 2>&1 || fail "Docker Compose v2 is required (docker compose)"
 docker info >/dev/null 2>&1 || fail "cannot connect to Docker; start Docker and check your permissions"
 
+installer="$script_dir/install-kproxy-wrapper.sh"
+[ -x "$installer" ] || fail "wrapper installer is not executable: $installer"
+target_dir="$(dirname "$target")"
+
+invoke_wrapper_installer() {
+  check_mode="$1"
+  set -- "$installer" --target "$target"
+  if [ "$force" -eq 1 ]; then
+    set -- "$@" --force
+  fi
+  if [ "$check_mode" = "check" ]; then
+    set -- "$@" --check
+  fi
+
+  if [ ! -d "$target_dir" ] || [ -w "$target_dir" ] || [ "$(id -u)" -eq 0 ]; then
+    "$@"
+  else
+    command -v sudo >/dev/null 2>&1 || \
+      fail "$target_dir is not writable and sudo is unavailable; use --target with a writable path"
+    sudo "$@"
+  fi
+}
+
+echo "==> Checking the host kproxy command target $target"
+invoke_wrapper_installer check
+
 compose_base() {
   if [ -n "$project_name" ]; then
     docker compose \
@@ -312,37 +338,23 @@ data_volume_name="$(printf '%s\n' "$resolved_config" | awk '
 [ -n "$data_volume_name" ] || fail "could not resolve the kproxy-data Docker volume name"
 prepare_data_volume
 
-installer="$script_dir/install-kproxy-wrapper.sh"
-[ -x "$installer" ] || fail "wrapper installer is not executable: $installer"
-target_dir="$(dirname "$target")"
-if [ ! -d "$target_dir" ]; then
-  echo "==> Creating host command directory $target_dir"
-  if mkdir -p "$target_dir" 2>/dev/null; then
-    :
-  elif [ "$(id -u)" -eq 0 ]; then
-    install -d -m 0755 "$target_dir"
-  else
-    command -v sudo >/dev/null 2>&1 || \
-      fail "cannot create $target_dir and sudo is unavailable; use --target with a writable path"
-    sudo install -d -m 0755 "$target_dir"
+install_host_command() {
+  if [ ! -d "$target_dir" ]; then
+    echo "==> Creating host command directory $target_dir"
+    if mkdir -p "$target_dir" 2>/dev/null; then
+      :
+    elif [ "$(id -u)" -eq 0 ]; then
+      install -d -m 0755 "$target_dir"
+    else
+      command -v sudo >/dev/null 2>&1 || \
+        fail "cannot create $target_dir and sudo is unavailable; use --target with a writable path"
+      sudo install -d -m 0755 "$target_dir"
+    fi
   fi
-fi
 
-set -- "$installer" --target "$target"
-if [ "$force" -eq 1 ]; then
-  set -- "$@" --force
-fi
-
-echo "==> Installing the host kproxy command at $target"
-if [ -w "$target_dir" ]; then
-  "$@"
-elif [ "$(id -u)" -eq 0 ]; then
-  "$@"
-else
-  command -v sudo >/dev/null 2>&1 || \
-    fail "$target_dir is not writable and sudo is unavailable; use --target with a writable path"
-  sudo "$@"
-fi
+  echo "==> Installing the host kproxy command at $target"
+  invoke_wrapper_installer install
+}
 
 wait_for_health() {
   elapsed=0
@@ -422,6 +434,10 @@ if [ "$deployment_failed" -ne 0 ]; then
   fail "deployment failed and no previous image was available for rollback"
 fi
 
+# Keep the existing wrapper untouched until the matching image has passed its
+# health check. The installer replaces it atomically.
+install_host_command
+
 echo "==> Verifying the host command"
 KPROXY_COMPOSE_PROJECT="$selected_project" "$target" health
 
@@ -455,6 +471,7 @@ kiro-proxy is ready.
   Persistent data is stored in the kproxy-data Docker volume.
 
 Next steps:
+  $host_command help
   $host_command status
   $host_command service create --name main
   $host_command account import --stdin < accounts.json
