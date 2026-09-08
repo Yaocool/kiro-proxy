@@ -1,49 +1,30 @@
-# Setup, startup, and debugging guide
+# Deployment, operations and CLI migration
 
-[English](startup-and-debugging.md) | [简体中文](startup-and-debugging.zh-CN.md)
+[English](startup-and-debugging.md) | [简体中文](startup-and-debugging.zh-CN.md) | [Project overview](../README.md)
 
-This guide covers first-time setup, local development, release binaries, Docker
-Compose, systemd, logs, trace IDs, LLDB, tests, upgrades, and common startup
-failures. Unless noted otherwise, run commands from the repository root.
+This guide follows current source, including unreleased changes after `v0.2.4`.
+Start with the project README for initial setup. This reference covers environment,
+accounts, persisted state, Docker/systemd, CLI migration and recovery. Run commands
+from the repository root; `kproxy` means a matching native binary or the installed Docker wrapper.
+
+- [Environment](#2-environment-loading), [accounts](#4-add-or-import-accounts), [configuration](#6-configuration-and-hot-reload)
+- [Docker](#8-docker-compose), [systemd](#9-systemd), [backup and recovery](#back-up-and-restore)
+- [CLI migration](#migration-from-the-old-cli), [logs](#7-logs-and-trace-ids), [troubleshooting](#troubleshooting)
 
 ## 1. Prerequisites
 
-The repository pins Rust 1.97.1 and requests `rustfmt`, `clippy`, and
-`rust-analyzer` in `rust-toolchain.toml`. With rustup installed, entering the
-repository selects the correct toolchain automatically.
-
-Choose the prerequisites for the deployment path:
-
-- Docker deployment: Docker Engine and the Compose v2 plugin. Host networking
-  is supported directly on Linux; Docker Desktop requires version 4.34 or newer
-  with host networking enabled.
-- Native build or development: rustup plus a C toolchain and linker.
-
-```bash
-rustup show active-toolchain
-rustc --version
-cargo --version
-```
-
-The default build enables all features, including Chromium SSO:
-
-```bash
-cargo build --workspace --locked
-```
-
-Disable default features only when browser login is explicitly unnecessary and
-a smaller binary is preferred:
-
-```bash
-cargo build --workspace --no-default-features --locked
-```
+Native builds need rustup, a C toolchain and a linker; the repository pins Rust 1.97.1.
+Docker deployments need Engine and the Compose plugin, with host networking enabled
+when using Docker Desktop. Default builds include Chromium SSO; `--no-default-features`
+disables browser login. Build/test commands are in [CONTRIBUTING.md](../CONTRIBUTING.md);
+editor debugging settings are in [.vscode](../.vscode).
 
 ## 2. Environment loading
 
 Copy the example before starting a local daemon:
 
 ```bash
-cp .env.example .env
+cp .env.example .env  # First setup only; preserve an existing .env
 ```
 
 `kproxyd` loads `.env` before parsing startup arguments. `kproxy` first parses
@@ -77,114 +58,102 @@ important process-level variables are:
 | `RUST_LOG` | Sets tracing filters for console and application diagnostics. |
 | `RUST_BACKTRACE` | Enables Rust backtraces when set to `1` or `full`. |
 
+Use an absolute `KPROXY_HOME` when launching from different directories. Loading
+the same `.env` does not rebase relative paths: `.kproxy-dev` is relative to the
+process working directory. CLI socket precedence is `--socket`, process environment,
+`.env`, then configuration/defaults. The [environment template](../.env.example)
+also documents MCP/runtime/management overrides and CLI credential input.
+
 Use `config.toml` instead of `.env` for persistent service, pool, model, API-key,
 TLS, notification, and logging configuration.
 
 ## 3. Start locally with native binaries
 
-Run the daemon in development mode:
-
 ```bash
+cargo build --workspace --locked
 cargo run -p kproxyd
 ```
 
-On first startup with the example `.env`, `.kproxy-dev/` contains:
-
-- `config.toml`: daemon configuration;
-- `accounts.json`: accounts and credentials, mode `0600` on Unix;
-- `daily.json`: daily credit accounting;
-- `stats.json`: aggregate request statistics;
-- `admin.sock`: local administration socket;
-- `logs/`: logs split by UTC date and severity.
-
-Use another terminal for the CLI. It loads the same `.env` automatically:
-
-```bash
-cargo run -p kproxy -- status
-cargo run -p kproxy -- health
-cargo run -p kproxy -- service list
-cargo run -p kproxy -- config path
-cargo run -p kproxy -- config show --effective
-cargo run -p kproxy -- account list
-```
-
-CLI navigation does not require a daemon or a valid `.env`. A bare command group
-shows its available actions; nested help, guides, and static completion use the
-same command definition:
-
-```bash
-cargo run -p kproxy -- logs
-cargo run -p kproxy -- help logs trace
-cargo run -p kproxy -- help --all
-cargo run -p kproxy -- guide logs
-cargo run -p kproxy -- completions zsh > /tmp/_kproxy
-```
-
-Use explicit actions in scripts: `logs show`, `models list`, `tasks list`, and
-`diagnose all`. `--json` with a bare group is an argument error so automation
-does not receive help text as successful data output.
-
-To run compiled binaries instead:
-
-```bash
-cargo build --release --locked
-./target/release/kproxyd
-./target/release/kproxy status
-```
-
-Only one daemon may own a given administration socket. A stale socket left by a
-crashed process is removed automatically; a socket accepting connections is not
-deleted by a second daemon.
-
-A fresh daemon intentionally starts with no business API proxy. `kproxy health`
-still returns success because daemon health is independent of account and proxy
-service availability. Use `kproxy ready` (or a proxy listener's `/ready`
-endpoint) when monitoring business readiness; it reports unavailable accounts,
-failed listeners, metering recovery, and stale background tasks without stopping
-the daemon. Create a service explicitly when it is needed:
-
-```bash
-cargo run -p kproxy -- service create --name main
-```
-
-The command creates the service's first scoped API key and prints the plaintext
-key. Use `kproxy service apikeys main` to inspect key metadata without secrets, or
-add `--show-secret` to retrieve plaintext keys bound only to that service. The
-default listener is `0.0.0.0`; use `--host 127.0.0.1` when only local access is
-required.
-
-### Administration-only mode
-
-Prevent all configured proxy services from listening while keeping account and
-configuration administration available:
-
-```bash
-KPROXY_DISABLE_HTTP=1 cargo run -p kproxyd
-```
-
-This is useful for storage maintenance and CLI-only tests. It does not disable
-`admin.sock`.
+In another terminal at the same root, run `cargo run -p kproxy -- health`.
+For later commands, use `./target/debug/kproxy` or put that directory in `PATH`.
+Use `cargo build --release --locked` for optimized binaries. Only one daemon may
+own a socket: stale sockets are cleaned up, but reachable sockets are preserved.
+`KPROXY_DISABLE_HTTP=1` disables business listeners while retaining their configuration and the admin socket.
 
 ## 4. Add or import accounts
 
-Import existing credentials from JSON:
+Import enterprise SSO credentials from a JSON file or stdin:
 
 ```bash
-cargo run -p kproxy -- account import --file accounts.json
-cat accounts.json | cargo run -p kproxy -- account import --stdin
+kproxy account import --file accounts.json
+cat accounts.json | kproxy account import --stdin
 ```
 
-The CLI can generate missing `id`, `machine_id`, and `created_at` fields. After
-importing, inspect and probe the accounts:
+`id`, `machine_id`, and `created_at` may be omitted; the CLI generates them.
+
+The JSON below is a shape example, not usable credentials. Replace tokens and
+`expires_at` (Unix seconds) with values issued by the upstream provider.
+
+```json
+[
+  {
+    "email": "user@example.com",
+    "credentials": {
+      "access_token": "...",
+      "refresh_token": "...",
+      "client_id": "...",
+      "client_secret": "...",
+      "region": "us-east-1",
+      "expires_at": 1893456000,
+      "auth_method": "idc"
+    }
+  }
+]
+```
+
+### Kiro headless API keys and regional runtime
+
+Set `KIRO_API_KEY` securely in the CLI's environment, then import it without
+putting the secret in a command argument:
 
 ```bash
-cargo run -p kproxy -- account list
-cargo run -p kproxy -- account probe --all
-cargo run -p kproxy -- models list
+kproxy account add-api-key --email ci@example.com --region us-east-1
+# Alternatively read the key from standard input:
+kproxy account add-api-key --email ci@example.com --region eu-central-1 --key-stdin < /secure/kiro-key
 ```
 
-The default build includes IAM Identity Center login. First set the global start
-URL in `config.toml` (for example through `kproxy config edit`):
+The key is stored as `credentials.access_token` with `auth_method: "api_key"`
+and `expires_at: 0`. Do not attach OAuth refresh/client secrets or a profile ARN.
+Keys use the regional `runtime.{region}.kiro.dev` service, `TokenType: API_KEY`,
+and no OAuth refresh or token-refresh alerts. Revoked keys require manual rotation;
+re-importing does not overwrite an existing account. API-key model discovery
+uses the static catalog because the management API requires an OAuth profile.
+Without discovered effort metadata, thinking controls retain the conservative
+omission policy in the [protocol reference](protocol-compatibility.md).
+
+Kiro key echoes are redacted from normalized errors and upstream error formatting,
+including background diagnostics; raw credentials must still not be shared.
+
+OAuth defaults retain the existing regional Q/CodeWhisperer routes; set
+`upstream.preferred_endpoint = "runtime"` to prefer regional Kiro runtime and
+management RPC. GovCloud and API-key credentials use runtime without a legacy
+endpoint fallback. GovCloud profile discovery cannot substitute a commercial
+Builder ID profile. Test/deployment overrides `KPROXY_RUNTIME_URL` and
+`KPROXY_MANAGEMENT_URL` accept `{region}`. Setting `KIRO_API_KEY` on the daemon
+alone does not import an account.
+
+Account exports contain credentials by default. Use `--redact` before sharing
+diagnostic output:
+
+```bash
+kproxy --json account export --redact
+```
+
+### Enterprise SSO authentication
+
+The default `kproxyd` build and Docker Compose enable all features, including the
+Chromium-based enterprise IAM Identity Center login. First set a global start
+URL with `kproxy config edit`:
 
 ```toml
 [sso]
@@ -194,471 +163,196 @@ start_url = "https://example.awsapps.com/start"
 Manual account additions can then omit `--start-url`:
 
 ```bash
-printf '%s\n' "$PASSWORD" | cargo run -p kproxy -- account add-sso \
+printf '%s\n' "$PASSWORD" | kproxy account add-sso \
   --email user@example.com \
   --password-stdin
+
+kproxy account add-sso --batch accounts.csv -c 1
+
+# Read explicitly from stdin for pipelines and automation:
+kproxy account add-sso --batch - -c 1 < accounts.csv
 ```
 
-Use `--start-url` to override the global value for one login. `kproxy` sends the
-administration request to `kproxyd`, so browser login is unavailable if the daemon
-was explicitly built with `--no-default-features`. Use `--headful` for MFA or
-manual verification. Only organization SSO for Kiro enterprise accounts is
-supported; personal, social-login, and other authentication types are not.
+Use `--start-url` to override the global value for one login. When a smaller
+binary without browser SSO is explicitly desired, build with
+`cargo build --workspace --no-default-features` or select Docker's
+`runtime-slim` target.
+The Docker host wrapper automatically recognizes a readable host CSV and
+streams it into the container through stdin, without copying or retaining a
+password file. A container path is still read normally when no host file with
+the same name exists. Passwords are accepted only from stdin or a two-column
+CSV file. Add
+`--headful` when MFA or an upstream page change requires manual interaction.
+Every login uses a dedicated incognito Chromium context and temporary profile,
+which are destroyed before the next account is processed. Before saving an
+account, kproxy records Kiro's stable user ID and refuses to register that same
+identity under another email. Kiro display names are diagnostic only because
+IAM Identity Center names do not always match login email addresses.
+This flow does not add support for non-enterprise or non-SSO accounts.
 
 ## 5. Create and verify a proxy service
 
-If one has not been created yet, create a proxy and save the returned API key:
+A new daemon creates no business listener. `health` checks liveness; `ready` checks
+accounts, listeners, meter recovery and background-task heartbeats. Neither proves
+that upstream generation works. Save the client API key returned by service creation:
 
 ```bash
-kproxy service create --name main --port 5580
+kproxy service create --name main --host 127.0.0.1 --port 5580
 kproxy service list
-kproxy service show main
-kproxy service apikeys main --show-secret
+kproxy service apikeys main
+kproxy ready
+kproxy models list
 ```
 
-The service now binds to `0.0.0.0:5580`; its local business address is
-`http://127.0.0.1:5580`.
-
-```bash
-curl -i http://127.0.0.1:5580/health
-
-curl -i http://127.0.0.1:5580/v1/messages/count_tokens \
-  -H 'authorization: Bearer <key>' \
-  -H 'content-type: application/json' \
-  -H 'user-agent: claude-cli/1.0 (external, debug)' \
-  -d '{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hello"}]}'
-```
-
-`GET /health` returns `status: ok` even before an upstream account is available;
-account counts are diagnostics, not application-health criteria. It reports
-`total_accounts` plus the health-state counts. `used_credits` and
-`total_credits` sum the latest upstream usage snapshots for every configured
-account in the shared pool; accounts without a usage snapshot contribute zero
-to both credit sums. Local token counting still requires the service API key. A
-generation request returning `503` is expected when no account is schedulable.
-
-Every newly created service requires its generated API key:
-
-```bash
-curl -i http://127.0.0.1:5580/v1/models \
-  -H 'authorization: Bearer <key>'
-```
-
-Creating or configuring a service on a non-loopback address is rejected unless
-that service references at least one enabled API key. This prevents accidental
-unauthenticated public exposure.
-
-Service listeners and API-key bindings can be changed without editing TOML:
-
-```bash
-kproxy service edit main --host 127.0.0.1 --port 5581
-kproxy service edit main --add-api-key ci --remove-api-key old-key
-kproxy service edit main --skip-user-agent-check true
-kproxy apikey edit ci --skip-user-agent-check true
-kproxy service disable main
-kproxy service enable main
-```
-
-API-key arguments accept either an ID or a name. Use `kproxy apikey show ci` for
-one key, and `kproxy apikey limit ci --clear` to remove a previously configured
-credit limit. A limit of zero intentionally blocks new credit consumption.
-
-Every business HTTP response includes `x-trace-id`. Save that value when
-investigating an error.
-
-Stop and remove a service when it is no longer needed. API keys used only by
-that service are deleted with it. Keys shared with another proxy service are
-retained.
-
-```bash
-kproxy service delete main
-```
-
-Destructive commands such as deletion and usage reset have no `--yes` bypass;
-enter `y` or `yes` in an interactive terminal to confirm them.
+Omitting `--host` defaults to `0.0.0.0`. Key listings expose metadata unless
+`--show-secret` is supplied. Services accept only bound API keys. Messages defaults
+to Claude Code admission; Chat/Responses default to Codex. To allow another client,
+use `service edit` or `apikey edit` with `--skip-user-agent-check true`. Key authentication,
+quota and concurrency limits still apply. Request examples are in the [README](../README.md)
+and [Responses guide](openai-responses.md).
 
 ## 6. Configuration and hot reload
 
-Print the active paths and validate the current configuration:
+### Files and persistence
+
+Use `.env` for startup-path selection and temporary process overrides. Use
+`config.toml` for persistent service, pool, model, API-key, TLS, logging, and
+notification settings. See [`.env.example`](../.env.example) for every supported
+example variable and its purpose.
+
+Set `KPROXY_HOME` to place configuration, data, logs, and the administration socket
+under one directory. Without `KPROXY_HOME`, XDG locations are used:
+
+| File | Default location | Notes |
+| --- | --- | --- |
+| `config.toml` | `${XDG_CONFIG_HOME:-~/.config}/kproxy/` | Human-edited daemon configuration. |
+| `accounts.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | Contains credentials; created with mode `0600`. |
+| `daily.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | Daily credit accounting, reset on UTC boundaries. |
+| `stats.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | Persisted aggregate request statistics. |
+| `stats-history/` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | One-minute request aggregates split into bounded UTC hourly shards. |
+| `alert-incidents.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | Persisted alert incident suppression; include it in backups. |
+| `web-search-replay.key` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | AES-256-GCM replay key; created with mode `0600` and never overwritten. |
+| `admin.sock` | `${XDG_RUNTIME_DIR}/kproxy/` or `/run/kproxy/` | Local administration plane. |
+| Logs | `${XDG_DATA_HOME:-~/.local/share}/kproxy/logs/` | Split by UTC date and severity. |
+
+On first startup, missing files are created without overwriting existing data.
+Valid configuration changes are hot-reloaded. Invalid TOML or validation
+failures leave the last valid configuration active. `server.host` and
+`server.port` are defaults for newly created proxy services. Changes to
+`admin.socket` or the shared HTTP/HTTPS listening mode require a daemon restart;
+most other fields, including the proxy service list, apply without one.
+
+External account-file changes are also reloaded. Corrupt account data never
+replaces the valid in-memory snapshot. Large account stores can use a gzip
+envelope plus incremental sidecar updates according to the storage settings.
+
+### Configuration commands
 
 ```bash
-cargo run -p kproxy -- config path
-cargo run -p kproxy -- config validate
+kproxy config path
+kproxy config show --effective
+kproxy config validate
+kproxy config edit
+kproxy config reload
+kproxy models resolve claude-sonnet-4.5
 ```
 
-The daemon watches `config.toml` with a short debounce. Valid changes are applied
-automatically; invalid TOML or values leave the previous configuration active.
-You can also trigger reload explicitly:
-
-```bash
-cargo run -p kproxy -- config reload
-```
-
-`server.host` and `server.port` are defaults used by `kproxy service create`; they
-do not create a listener themselves. Proxy service additions and address changes
-are reconciled at runtime. The following changes require a daemon restart:
-
-- `admin.socket`;
-- switching the shared listener mode between HTTP and HTTPS.
-
-Log filters, formatting, output paths, pool behavior, model rules, notification
-settings, and TLS certificate contents can otherwise be updated at runtime.
-
-The alert policy, notification targets, and model mappings can be managed
-directly from the CLI. Each command validates the result, writes it atomically,
-and hot reloads the daemon:
-
-```bash
-kproxy alert events
-kproxy alert platforms
-kproxy alert config
-kproxy alert add --name alerts --platform dingtalk \
-  --webhook-url 'https://oapi.dingtalk.com/robot/send?access_token=replace-me' \
-  --dingtalk-sign 'SEC-replace-me' \
-  --event token-refresh-failed,account-credit-protected,account-quota-exhausted,service-quota-exhausted
-kproxy alert edit --name alerts --event token-refresh-failed --event service-quota-exhausted
-kproxy alert delete alerts
-
-kproxy model-map add --name low-credit --source 'claude-opus-*' \
-  --target claude-sonnet-4.6 --below-credits-percent 10
-kproxy model-map edit low-credit --below-credits-percent 15
-kproxy model-map test claude-opus-4.6 --remaining-credits-percent 8
-kproxy model-map delete low-credit
-```
-
-`kproxy alert events` explains when each event is emitted. Alert targets can
-subscribe to multiple events by repeating `--event` or by passing a
-comma-separated list; `alert edit --event ...` replaces the target's complete
-subscription list.
-`kproxy alert platforms` explains the notification platform selected by
-`--platform` and lists platform-specific options. Use `--platform` and
-`--webhook-url` when creating or editing a target. For a DingTalk
-robot with signing enabled, pass its `SEC...` secret through `--dingtalk-sign`;
-the proxy generates a fresh `timestamp` and `sign` for every delivery.
-Each account or service incident emits one Markdown alert and stays suppressed
-until that incident recovers.
-Account-scoped events of the same kind that reach one target within a short
-window are combined into one message, avoiding webhook floods. The
-`account-credit-protected` event uses the scheduler's
-`pool.low_credit_min_remaining` rule: the account still has credits but is
-removed from scheduling to preserve its final usable allowance.
-
-A mapping with `--below-credits-percent` is evaluated against each selected
-account's remaining credits. With no schedule it is active all day: it matches
-below the threshold and stops matching automatically after the monthly quota
-recovers above that threshold.
-
-Automatic model discovery is separate from explicit model mapping. It runs once
-at daemon startup, is triggered again after account changes, and then follows
-`models.cache_ttl_ms`. The account `status_check` task refreshes usage data only;
-it does not issue a second set of model-list requests.
-
-Use `kproxy models resolve <MODEL_ID>` to query the final model against the
-active configuration and each account's model cache. The output separates
-explicit model-map routing from automatic alias resolution. Add `--api-key
-<ID_OR_NAME>` for API-key-scoped rules or `--refresh` to refresh model caches
-first.
-
-Bootstrap never overwrites an existing `config.toml`. A data directory created
-by an older release may therefore retain `server.host = "127.0.0.1"`. Inspect
-the effective value with `kproxy config show --effective` and use `kproxy config edit`
-when the current default of `0.0.0.0` is desired.
-
-`KPROXY_HTTP_PORT` is a process override. Changing `server.port` does not supersede
-that environment variable until the variable is removed and the daemon is
-restarted.
+Configuration edits and service/apikey/alert/model-map mutations share validation,
+transaction locks, atomic writes and hot reload. Change process overrides in the
+environment and restart. Upgrades retain existing values instead of replacing them
+with new defaults. Model discovery runs at startup, after account changes and on
+cache expiry; account status tasks only refresh credits. Conditional model maps use
+the selected account's credits; `--below-credits-percent` rules without a schedule apply all day.
+Alerts use `--platform` and `--webhook-url`; see `kproxy alert platforms` for platform
+options. `alert edit --event` replaces subscriptions. Ongoing incidents are deduplicated
+until recovery; same-kind account incidents are briefly aggregated.
+Use `kproxy help --all` and `kproxy guide` for the complete command tree and topics.
 
 ## 7. Logs and trace IDs
 
-With `KPROXY_HOME=.kproxy-dev`, logs are written below `.kproxy-dev/logs/`. Files are
-named like:
-
-```text
-kproxyd-2026-08-10-info.log
-kproxyd-2026-08-10-warn.log
-kproxyd-2026-08-10-error.1.log
-```
-
-Logs are split by exact severity and UTC date: `info.log` contains INFO events
-only and does not duplicate WARN or ERROR events; those are stored in `warn.log`
-and `error.log`. The default maximum is 100 MB per shard, and the default
-retention period is three days. `log.file_path` controls the base path; an empty
-value uses the data directory's `logs/kproxyd.log` base.
-
-Use the response `x-trace-id` header (`request-id` contains the same value) to
-search the complete request chain across severities and dates:
-
 ```bash
-kproxy logs trace trace_0123456789abcdef0123456789abcdef
-kproxy logs trace trace_0123456789abcdef0123456789abcdef --level error --tail 500
-```
-
-The command scans all retained trace/debug/info/warn/error physical shards by
-default and orders matches by timestamp. File-count, byte, match, and output
-limits protect the daemon. You can also search the physical files directly:
-
-```bash
-rg 'trace_f028' .kproxy-dev/logs/
-```
-
-Inspect the active log destination and discover physical shards through the
-administration API:
-
-```bash
+kproxy logs show --tail 100
+kproxy logs follow --level warn
+kproxy logs trace <TRACE_ID>
 kproxy logs path
-kproxy logs files
 kproxy logs files --level error
+kproxy status --since 30m
+kproxy stats --detail --since 1h --by endpoint
 ```
 
-`logs files` preserves complete paths from the daemon's filesystem. When invoked
-through the host wrapper, the wrapper resolves the `/var/lib/kproxy` data volume's
-actual mount on the Docker host, additionally reports the host directory and base
-path, and uses host paths in the file table. JSON keeps the container `path` and
-adds `host_path`, `host_directory`, and `host_base_path`. A custom log destination
-outside the data volume cannot be mapped and therefore remains container-only.
+Response headers `x-trace-id` and `request-id` identify a request across dates and
+levels. Files are split by exact level and UTC date, with a default 100 MB shard
+size and three-day retention; `info.log` excludes WARN/ERROR. Trace queries have
+scan/output limits. The Docker wrapper adds host paths for logs within the data
+volume. Use `RUST_LOG` or `log.level` for more detail; application logs omit prompt,
+response and key values.
 
-View or follow structured request records:
-
-```bash
-cargo run -p kproxy -- logs show --tail 100
-cargo run -p kproxy -- logs follow --level warn
-cargo run -p kproxy -- logs trace trace_0123456789abcdef0123456789abcdef
-cargo run -p kproxy -- status --since 30m
-cargo run -p kproxy -- stats --since 1h
-cargo run -p kproxy -- stats --start 2026-08-27T10:00:00+08:00 --end 2026-08-27T12:00:00+08:00
-cargo run -p kproxy -- stats --detail --since 1h --by endpoint
-```
-
-Log query options must follow an explicit action such as `logs show` or `logs follow`.
-
-`kproxy status` reports request metrics for the current daemon session, while
-`kproxy stats` defaults to persisted cumulative metrics across restarts. Both
-accept `--since` or a timezone-aware `--start`/`--end` range at one-minute
-aggregation resolution. `--detail` adds recent requests and grouping by
-model/account/endpoint. Use `kproxy logs show` and trace IDs for individual failures.
-
-For more detail, set `RUST_LOG` or `log.level` to `debug` or `trace`. Logs do not
-record prompts, generated response bodies, or API-key values.
+`status` covers the current daemon run; `stats` defaults to persisted totals.
+Both accept `--since` or timezone-qualified `--start/--end`. Minute aggregates are
+stored in UTC hourly shards under `stats-history/` and retained indefinitely, so
+monitor disk growth. History already pruned by older releases cannot be recovered.
+Use logs for individual failures; `stats --detail` is not a complete request audit.
 
 ## 8. Docker Compose
 
-Pull and start the prebuilt full image with all features and Chromium SSO:
+Published images currently target Linux amd64 full. `v0.2.4` is a version-selection
+example; check registry availability before use. Build current source to validate
+unreleased features. Setup pulls first, replaces the container, waits for health,
+then installs the matching host wrapper:
 
 ```bash
-./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
-kproxy health
+./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.2.4
+kproxy version
+kproxy ready
 ```
 
-This command validates Compose, pulls the new image while the old container is
-still running, replaces the service, waits for health, rolls back to the old
-image on failure, and then atomically replaces the host `kproxy` wrapper. It targets
-`/usr/local/bin/kproxy` by default; without sudo access, use
-`--target "$HOME/.local/bin/kproxy"`. The equivalent manual commands are useful
-for debugging:
+The default wrapper destination is `/usr/local/bin/kproxy`; use
+`--target "$HOME/.local/bin/kproxy"` for a user-owned path. Later,
+`./deploy/docker-upgrade.sh` follows `latest`; retain `--image` for version pinning.
+`./deploy/install-kproxy-wrapper.sh` installs only the wrapper and refuses to replace unrelated commands by default.
+
+Compose uses host networking, supported directly on Linux Engine; Docker Desktop
+4.34+ needs it enabled in settings. Services bind host ports directly and default
+to `0.0.0.0`; choose `127.0.0.1` for local-only access. The `kproxy-data` volume mounts
+at `/var/lib/kproxy`. Do not mount development `.kproxy-dev` or `.env.example` into it.
+Existing bridge deployments need container recreation to adopt the new network mode;
+the volume is retained. Inspect deployment or deliberately build source with:
 
 ```bash
 docker compose config --quiet
-KPROXY_IMAGE=ghcr.io/yaocool/kiro-proxy:v0.1.3 docker compose pull kproxyd
-KPROXY_IMAGE=ghcr.io/yaocool/kiro-proxy:v0.1.3 docker compose up -d --no-build
 docker compose ps
-docker compose exec kproxyd kproxy health
 docker compose logs -f kproxyd
-```
-
-On Linux Docker Engine, `failed to populate volume` together with a missing
-`.../volumes/kiro-proxy_kproxy-data/_data` path means Docker retained the named
-volume metadata while its data directory disappeared. The setup script checks
-for this before changing the container. It asks before repairing in an
-interactive terminal; CI and other non-interactive environments can opt in
-explicitly:
-
-```bash
-./deploy/docker-setup.sh --no-pull --repair-volume
-```
-
-Repair applies only to a volume labeled for the current Compose project whose
-data path is already missing. If Docker's volume root, disk mount, or a symlink
-is unsafe, the script stops and requires storage recovery instead of deleting
-anything.
-
-Compose uses `network_mode: host`. A proxy listener created inside the container
-therefore binds directly in the Docker host's network namespace. Arbitrary
-service ports become available immediately without editing Compose or recreating
-the container. This mode is supported directly by Docker Engine on Linux. On
-Docker Desktop 4.34 or newer, enable host networking under Settings > Resources
-> Network before starting the stack.
-
-The image sets `KPROXY_HOME=/var/lib/kproxy`; Compose mounts the `kproxy-data` named
-volume there. Do not copy the development `.env.example` into the container or
-bind-mount `.kproxy-dev`. Change persistent settings through `config.toml` with
-`kproxy config edit`, or add an explicit Compose environment entry when a
-process-level override is required.
-
-When upgrading an existing bridge-network deployment, recreate this project
-container once so the new network mode takes effect. The named data volume is
-preserved:
-
-```bash
-docker compose up -d --force-recreate
-```
-
-For normal production upgrades, deploy the CI-built release image and keep the
-named volume:
-
-```bash
-./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
-docker compose exec kproxyd kproxy version
-docker compose exec kproxyd kproxy config show --effective
-```
-
-To pull and deploy whichever stable release currently owns the `latest` tag:
-
-```bash
-./deploy/docker-upgrade.sh
-```
-
-Use the build override only for an intentional local source build:
-
-```bash
+# Source build only:
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
-### Use `kproxy` directly on the Docker host
+Full pairs Chromium `r1566079` with `chromiumoxide 0.9.1` and sets the container
+no-sandbox option. Changing the build override target to `runtime-slim` removes
+browser SSO; CI currently does not publish this target. Local builds default to
+`CARGO_BUILD_JOBS=1`. The image includes vim; `EDITOR` may select another installed editor.
 
-Docker cannot safely install files into the host's `/usr/local/bin` from a
-Dockerfile or Compose service. The one-step script installs the provided wrapper
-on the host and brings the Compose service to a healthy state:
+The wrapper requires a working Docker engine and an identifiable deployment. Select
+among multiple deployments with `KPROXY_COMPOSE_PROJECT` or `KPROXY_DOCKER_CONTAINER`.
+Stopped-container navigation uses the exact local image without network or business
+mounts. Missing images, ambiguous targets and old images without local navigation
+fail explicitly. Business commands need a running daemon. The wrapper preserves
+exit codes/stdin, allocates a TTY for interactive use, and passes or falls back from `TERM`.
 
-```bash
-./deploy/docker-setup.sh
-kproxy health
-kproxy status
-kproxy service list
-```
+`kproxy restart` waits for health; `kproxy stop` retains the deployment.
+`kproxy uninstall` stops service, backs up state, then deletes the container, volume,
+unshared image and wrapper. Backups default to `~/.kproxy/backups`. Failed backup
+restarts the container and preserves data. `uninstall --yes` retains the backup;
+only explicit `--delete-backup` removes it. `docker compose down` retains volumes;
+`down -v` deletes them.
 
-The wrapper locates the running daemon by the `io.kiro-proxy.role=daemon`
-container label, preserves command exit codes, forwards stdin, and allocates a
-TTY only for interactive use. Interactive commands receive the host `TERM`
-value and fall back to `xterm-256color` when the image has no matching terminfo
-entry. The image includes full Vim and extended terminfo, and
-`kproxy config edit` uses Vim by default so cursor keys work correctly. This
-keeps the admin Unix socket private and avoids host/container binary
-compatibility problems.
-
-When the daemon container is stopped, command help remains available from its
-exact image without starting the service or mounting its data. This includes
-bare command groups, `help`, `guide`, `completions`, `version`, and lifecycle
-`--help`; business commands still require `kproxy restart` first.
-
-Update both the wrapper and the container image for an existing deployment:
-
-```bash
-./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
-kproxy config edit
-```
-
-You can also explicitly select an editor installed in the container, for
-example `EDITOR=vim kproxy config edit` on the host.
-
-For batch SSO imports, the wrapper recognizes a readable host file passed to
-`--batch` and streams it directly to the container through stdin. No `docker cp`
-step or container-side CSV remains:
-
-```bash
-kproxy account add-sso --batch ./accounts.csv --start-url 'https://example.awsapps.com/start'
-```
-
-The CLI also accepts `-` as stdin, so both host and container invocations can
-explicitly use `kproxy account add-sso --batch - < accounts.csv`. When the named
-file does not exist on the host, the wrapper leaves the argument unchanged for
-the container filesystem to resolve.
-
-To install only the wrapper, invoke the low-level installer directly. It updates
-a wrapper managed by this project but refuses to overwrite other commands by
-default:
-
-```bash
-sudo ./deploy/install-kproxy-wrapper.sh
-./deploy/install-kproxy-wrapper.sh --target "$HOME/.local/bin/kproxy"
-# Use this only when intentionally replacing another command with the same name:
-sudo ./deploy/install-kproxy-wrapper.sh --force
-```
-
-The current host user must be allowed to access Docker. When more than one
-kiro-proxy stack is running, select one by Compose project or container:
-
-```bash
-export KPROXY_COMPOSE_PROJECT=kiro-proxy
-# Or: export KPROXY_DOCKER_CONTAINER=<container-name-or-id>
-kproxy status
-```
-
-The host wrapper also manages the Docker service lifecycle directly:
-
-```bash
-kproxy restart
-kproxy stop
-kproxy uninstall
-kproxy uninstall --backup-dir /srv/kproxy-backups
-```
-
-`restart` waits for the container health check, and a stopped service remains
-available to `restart`. `uninstall` stops the daemon and backs up
-`/var/lib/kproxy` to the host before removing the container, persistent data
-volume, unshared image, and installed wrapper. The default backup root is
-`~/.kproxy/backups`; use `--backup-dir` or `KPROXY_BACKUP_DIR` to override it.
-A failed backup aborts the uninstall and restarts the original container.
-Interactive use asks whether to retain the backup; `--yes` keeps it unless
-`--delete-backup` is also explicit. The source checkout is always retained.
-
-On a fresh volume, explicitly create the proxy and save the API key printed by
-the command:
-
-```bash
-docker compose exec kproxyd kproxy status
-docker compose exec -T kproxyd kproxy account import --stdin < accounts.json
-docker compose exec kproxyd kproxy account probe --all
-docker compose exec kproxyd kproxy service create --name main
-docker compose exec kproxyd kproxy service create --name secondary --port 6000
-docker compose exec kproxyd kproxy service list
-docker compose exec kproxyd kproxy service apikeys main --show-secret
-docker compose exec kproxyd kproxy config show --effective
-docker compose exec kproxyd sh -c 'ls -lh /var/lib/kproxy/logs'
-curl -i http://127.0.0.1:5580/health
-curl -i http://127.0.0.1:6000/health
-```
-
-Remove a proxy listener when it is no longer needed. Its exclusive API keys are
-deleted with it, while keys shared with another service are retained:
-
-```bash
-docker compose exec kproxyd kproxy service delete secondary
-```
-
-The default host is `0.0.0.0`, so these listeners are reachable through the
-Docker host's network interfaces. Restrict the ports with the host firewall or
-cloud security group, or create a host-only listener with `--host 127.0.0.1`.
-Every created service still requires its scoped API key for business requests.
-Host networking removes network isolation between the container and the host,
-so use the provided bridge compatibility forwarder instead when that is
-unacceptable.
-
-`docker compose down` keeps the named volume. `docker compose down -v` deletes
-configuration, accounts, statistics, and logs and should be used only when an
-intentional reset is required.
-
-The default Docker target is `runtime-full`; it installs the official Chromium
-snapshot `r1566079`, enables all features, and sets the container-specific
-no-sandbox flag. The snapshot is the exact revision used by the CDP definitions
-in `chromiumoxide 0.9.1`; update and test both pins together instead of allowing
-an OS package upgrade to change CDP independently. Change the Compose target to
-`runtime-slim` and rebuild only when browser SSO is explicitly not needed.
-
-BuildKit keeps Cargo registry and target caches between builds. The full target
-builds only the all-features binaries and waits for that release build before
-performing an uncached Chromium installation, which bounds peak memory and disk
-pressure on smaller hosts. Compose defaults `CARGO_BUILD_JOBS` to `1`; increase
-it only on a builder with sufficient memory.
+For stale volume metadata with a confirmed missing directory, setup offers
+`--repair-volume` only for a volume labeled for this project; interactive use asks
+for confirmation. Restore broken data mounts or Docker storage roots first.
+Failed deployment health triggers an attempt to restore the old image. Missing old
+images or failed rollback health require operator recovery. **Image rollback reuses
+the volume and does not undo writes or migrations.** [Back up full state](#back-up-and-restore)
+before upgrading. Restart also clears Responses state. Check version, readiness,
+accounts, services, effective configuration, statistics and a generation request after upgrading.
 
 ## 9. systemd
 
@@ -667,7 +361,7 @@ Build release binaries and install them with the provided unit:
 ```bash
 cargo build --release --locked
 
-sudo useradd --system --home-dir /var/lib/kproxy --shell /usr/sbin/nologin kproxy
+sudo useradd --system --user-group --home-dir /var/lib/kproxy --shell /usr/sbin/nologin kproxy
 sudo install -m 0755 target/release/kproxyd target/release/kproxy /usr/local/bin/
 sudo install -m 0644 deploy/kproxyd.service /etc/systemd/system/kproxyd.service
 sudo systemctl daemon-reload
@@ -697,125 +391,93 @@ prefer enabling them. As a last-resort compatibility override, set
 Chromium's own sandbox and should only be used after reviewing the host's
 isolation boundary.
 
-## 10. VS Code and LLDB
+## Navigation and scripting
 
-Install rust-analyzer and CodeLLDB, then add a launch configuration such as:
+`kproxy`, `kproxy help`, and bare groups such as `kproxy logs` display help.
+Use `kproxy help logs trace` for nested options, `kproxy help --all` for the public
+command tree, and `kproxy guide` for operational topics. These commands and
+`completions`/`version` work without a daemon or a valid `.env`.
 
-```json
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "type": "lldb",
-      "request": "launch",
-      "name": "Debug kproxyd",
-      "cargo": {
-        "args": ["build", "-p", "kproxyd"],
-        "filter": { "name": "kproxyd", "kind": "bin" }
-      },
-      "cwd": "${workspaceFolder}",
-      "env": {
-        "KPROXY_HOME": "${workspaceFolder}/.kproxy-dev",
-        "RUST_LOG": "kproxyd=debug,kproxy_kiro=debug,kproxy_pool=debug",
-        "RUST_BACKTRACE": "1"
-      }
-    }
-  ]
-}
-```
+Business output supports global `--json`. A bare group with `--json` exits 2,
+leaves stdout empty, and asks for an explicit action on stderr. Explicit help
+still prints text and exits 0. Success normally exits 0, argument errors exit 2,
+and connection/execution failures exit 1; `ready` also fails when not ready.
 
-Command-line LLDB is also available:
+Examples below are independent operations, not a script to run from top to bottom.
+Replace IDs, names, paths and secrets with your own values. `diagnose all` and
+`diagnose account` perform real upstream inference and consume quota; use `health`,
+`ready`, `account list`, and `logs show` for initial inspection.
 
-```bash
-cargo build -p kproxyd
-rust-lldb target/debug/kproxyd
-```
+## Migration from the old CLI
 
-Inside LLDB, set process variables with
-`settings set target.env-vars KPROXY_HOME=... RUST_LOG=debug`, add breakpoints with
-`breakpoint set --name <function>`, and run the process. For asynchronous
-requests, correlate breakpoints and logs with `x-trace-id` rather than thread ID.
+| Previous form | Current form |
+| --- | --- |
+| `kproxy logs --tail 100` | `kproxy logs show --tail 100` |
+| `kproxy logs -f` / `--follow` | `kproxy logs follow` |
+| `kproxy models --refresh --mapped` | `kproxy models list --refresh --mapped` |
+| `kproxy tasks` (data query) | `kproxy tasks list` |
+| `kproxy diagnose` (full diagnosis) | `kproxy diagnose all` |
+| `kproxy help balance` | `kproxy guide balance` |
+| `account add-sso-batch --file FILE` | `account add-sso --batch FILE` |
+| `alert add --kind ... --url ...` | `alert add --platform ... --webhook-url ...` |
+| Alert platform `wechat` | `wechat-work` (check `alert platforms` for platform-specific options) |
 
-## 11. Tests and static checks
+Removed options fail before business initialization. Bare `logs`, `models`,
+`tasks`, and `diagnose` now show group help, including in redirected output.
+`logs show` and `logs follow` already existed before the migration; the change
+removes the parent-level shortcuts. See the [changelog](../CHANGELOG.md).
 
-Run the full validation set before submitting changes:
+Daemon resource deletion requires interactive `y` or `yes`; it has no general `--yes` switch. Docker uninstall has separate options.
 
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-features --locked
-docker compose config --quiet
-```
+## Back up and restore
 
-Narrow the scope while debugging:
+Record the source version/commit, actual image ID/digest, Compose project and
+configuration/data paths. Back up **both** configuration and data directories
+when using separate XDG paths. A backup must include:
 
-```bash
-cargo test -p kproxy-kiro
-cargo test -p kproxyd http::tests::every_response_has_a_unique_trace_id
-cargo test -p kproxy-pool refresh::tests::successful_refresh_preserves_cooling_and_exhausted_health
-```
+- `config.toml` and accounts storage, including any incremental/compressed sidecars;
+- `daily.json`, `stats.json`, `stats-history/` and `alert-incidents.json`;
+- `web-search-replay.key`, so existing proxy-owned search replay remains readable;
+- retained logs needed for incident review.
 
-Wiremock and end-to-end tests bind temporary loopback ports. Sandboxed CI runners
-must allow local port binding.
-
-## 12. Troubleshooting
-
-### `Address already in use`
-
-Choose a free port when creating the service, or use the process override for a
-service configured with the default port:
+For the standard Docker volume, use a maintenance window and stop writes before
+copying. Example (run each step after verifying the previous result):
 
 ```bash
-kproxy service create --name main --port 5581
-KPROXY_HTTP_PORT=5581 cargo run -p kproxyd
+umask 077
+backup_dir="$HOME/kproxy-backups/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$backup_dir"
+docker compose stop kproxyd
+docker compose cp kproxyd:/var/lib/kproxy/. "$backup_dir/"
+docker compose start kproxyd
 ```
 
-### Cannot connect to `admin.sock`
+Check the copy exit status and inspect required files before treating it as a
+backup. Restart the original service if copying fails; do not proceed with an
+upgrade until a valid backup exists. Native deployments should stop the daemon
+and copy their resolved configuration/data roots with permissions preserved.
 
-Confirm `kproxyd` and `kproxy` load the same `KPROXY_HOME`. Use `kproxy config path` when the
-daemon is reachable, or pass the socket explicitly:
+For recovery, retain the failed deployment's data for diagnosis, restore the
+pre-upgrade backup into a separate empty data directory/volume, preserve the
+service account's ownership and restrictive permissions (the Docker image uses
+UID/GID 10001), and start the original image against that restored state. Avoid
+merging old snapshots with files written by a newer version. Recheck config,
+accounts, key bindings, counters, readiness and a test request before switching
+traffic. The admin socket is recreated by the daemon and is not backup state.
 
-```bash
-kproxy --socket /path/to/admin.sock status
-```
+There is no general downgrade compatibility guarantee yet. An account export
+alone is not a full backup. `docker compose down -v` deletes the named volume;
+the wrapper's `uninstall` is also destructive even though it first creates a backup.
 
-Remember that `KPROXY_ADMIN_SOCKET` changes the CLI target only. Set
-`admin.socket` in `config.toml` and restart `kproxyd` to move the daemon socket.
+## Troubleshooting
 
-### Configuration changes do not apply
-
-Run `kproxy config validate`, inspect warn/error logs, and check whether the changed
-field requires restart. Also check for a process-level `KPROXY_HTTP_PORT` override.
-
-### Protocol routes return access denied
-
-Client User-Agent checks are enabled by default: use Claude Code for Claude
-routes and Codex for OpenAI Responses, Chat Completions, and model-list routes.
-To allow other clients everywhere, set `server.enforce_user_agent_check = false`
-and reload the configuration. To exempt only one service or API key, run
-`kproxy service edit <service> --skip-user-agent-check true` or
-`kproxy apikey edit <key> --skip-user-agent-check true`. Set the value back to
-`false` to remove the exemption. API key authentication and service key
-allowlists remain enabled. See
-[Codex setup and Responses support](openai-responses.md).
-
-### Generation returns `503`
-
-Run `kproxy account list` and `kproxy account probe --all`. There may be no Available
-account, the requested model may be incompatible, or all accounts may be in
-cooldown or out of credit.
-
-### A stream stops unexpectedly
-
-Search warn/error logs using `x-trace-id`. Check upstream authentication refresh,
-endpoint attempts, account switching, model fallback, client disconnects, and
-downstream write timeouts.
-
-### Docker still uses an old layer
-
-```bash
-docker compose build --pull --no-cache
-docker compose up -d
-```
-
-Return to the [main README](../README.md).
+| Symptom | Check |
+| --- | --- |
+| Port already in use | Compare `service list` with actual listeners; change the service port, not just the default for new services. |
+| Cannot connect to `admin.sock` | Check daemon, user, absolute `KPROXY_HOME`, `config path` and `--socket`. |
+| Configuration unchanged | Run `config validate` and `config show --effective`; check environment overrides, retained defaults and restart-only settings. |
+| 401 / client rejected | Check the service's bound key, product User-Agent and exemptions. |
+| 503 | Inspect `ready`, credits/protection thresholds, concurrency, background tasks and `logs trace`. |
+| Stream interrupted | Inspect the protocol's final event and Trace ID; HTTP 200 does not establish success. |
+| Context overflow | Use `models resolve` and `error.context`; see [compaction boundaries](protocol-compatibility.md#automatic-compaction-and-model-windows). |
+| Old container version | Compare actual image ID and `kproxy version`; pull the intended release or deliberately build source. |

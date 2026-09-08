@@ -1,803 +1,175 @@
 # kiro-proxy
 
-[English](README.md) | [简体中文](README.zh-CN.md)
+[English](README.md) | [简体中文](README.zh-CN.md) | [Documentation](#documentation)
 
-`kiro-proxy` is a headless Rust service that exposes Claude Messages and OpenAI
-Chat Completions compatible APIs on top of Kiro upstream services. It includes
-multi-account scheduling, automatic token refresh, endpoint failover, model
-mapping, API-key quotas, TLS, webhooks, statistics, and an operations CLI.
+`kiro-proxy` exposes Claude Messages, OpenAI Chat Completions, and OpenAI Responses
+compatible APIs over Kiro. The Rust daemon `kproxyd` handles generation and account
+scheduling; `kproxy` manages it through a local Unix socket.
 
-> [!IMPORTANT]
-> Supported credentials are Kiro enterprise SSO (AWS IAM Identity Center/IdC)
-> and explicitly imported Kiro headless API keys (`ksk_...`). Personal/social
-> OAuth login flows are not supported. Upstream Kiro keys are separate from
-> the proxy's client-facing API keys.
+It supports enterprise SSO credentials (AWS IAM Identity Center/IdC) and explicitly
+imported Kiro headless API keys (`ksk_...`). Personal/social OAuth login is not
+supported. Upstream credentials and the proxy's client API keys are separate.
+The project has no GUI, MITM, or local Kiro application configuration rewriting.
 
-This repository intentionally does not include a GUI, MITM support, or
-local Kiro application configuration changes.
+> Documentation follows the current source, whose workspace version is `0.2.4`.
+> It includes **unreleased changes after the `v0.2.4` tag**, including the CLI
+> migration. A prebuilt `v0.2.4` image does not include those changes. See the
+> [changelog](CHANGELOG.md) and [1.0.0 assessment](docs/release-readiness-1.0.0.zh-CN.md).
 
-## Highlights
+## Capabilities and limits
 
-- Claude-compatible `/v1/messages` and `/v1/messages/count_tokens` endpoints.
-- OpenAI-compatible `/v1/responses`, `/v1/chat/completions`, and `/v1/models` endpoints.
-- Weighted multi-account scheduling with per-account concurrency limits,
-  cooldowns, quota tracking, and model compatibility checks.
-- Automatic enterprise IdC/SSO token refresh with per-account singleflight.
-- Regional Amazon Q, CodeWhisperer, and Kiro runtime endpoint selection with
-  bounded, in-memory availability caches and isolated GovCloud routing.
-- Dynamic model discovery, model aliases, replacements, load balancing, and
-  fallback rules.
-- Unix-socket administration through the `kproxy` CLI; no browser UI is required.
-- Hot-reloaded TOML configuration, structured logs, trace IDs, statistics,
-  API-key limits, TLS, and webhook notifications.
-- Automatic `.env` loading by both `kproxyd` and `kproxy` on every startup.
-
-## Workspace layout
-
-| Component | Purpose |
+| Area | Current behavior |
 | --- | --- |
-| `kproxyd` | Long-running proxy daemon and administration server. |
-| `kproxy` | Headless administration CLI. |
-| `kproxy-core` | Domain models, defaults, and configuration validation. |
-| `kproxy-store` | Atomic persistence, `.env` loading, bootstrap, and hot reload. |
-| `kproxy-ipc` | Line-delimited JSON-RPC protocol shared by daemon and CLI. |
-| `kproxy-translate` | Claude/OpenAI/Kiro translation, validation, and token estimation. |
-| `kproxy-kiro` | Kiro HTTP client, Event Stream decoding, endpoint state, and model discovery. |
-| `kproxy-pool` | Account health, credit reservation, concurrency, and weighted scheduling. |
-| `kproxy-notify` | Webhook delivery, retries, suppression, and credit alerts. |
+| APIs | Messages, token counting, Chat Completions, Responses, model discovery; JSON and SSE generation. |
+| Accounts | Weighted scheduling, per-account concurrency, cooldowns, quota protection, enterprise token refresh. |
+| Upstream routing | Regional Q/CodeWhisperer/Kiro runtime, endpoint failover, isolated GovCloud routing. |
+| Models and tools | Dynamic discovery, aliases and conditional mappings, tool replay, Claude Tool Search and Web Search. |
+| Operations | Hot-reloaded TOML, API-key quotas, TLS, webhooks, trace logs, persisted statistics, Docker and systemd. |
+| Compatibility limits | Format/strict hints do not guarantee structured output. Responses state expires and is lost on restart. Hosted tools and automatic compaction differ by protocol. |
 
-The CLI source is located in [`crates/kproxy`](crates/kproxy), and the daemon source
-is located in [`crates/kproxyd`](crates/kproxyd).
+The default client policy accepts Claude Code on Claude routes and Codex on
+OpenAI generation routes; model discovery accepts both. Other clients can use a
+service or API-key exemption. Authentication and service key allowlists still
+apply. Read the [protocol reference](docs/protocol-compatibility.md) and
+[Responses support matrix](docs/openai-responses.md) before integrating a client.
 
-## Setup
+## Quick start
 
-### Docker Compose (recommended for a Linux server)
+Run commands from a checkout of this repository. Native operation uses Unix
+sockets; Linux and macOS are the intended native environments. The published
+Docker workflow targets **Linux amd64** with the full SSO image.
 
-Docker Engine with the Compose v2 plugin is the shortest production setup. The
-Compose stack pulls the prebuilt full image with all features and Chromium,
-runs `kproxyd` with host networking, and keeps all state in the `kproxy-data`
-named volume. Run the one-step setup from the repository root. It validates the
-environment, pulls the image before replacing the container, waits for health,
-rolls back automatically on failure, and then atomically installs the matching
-`kproxy` wrapper on the host:
+### Docker on a Linux server
+
+With Docker Engine and a working `docker compose` command:
 
 ```bash
 ./deploy/docker-setup.sh
 kproxy health
-kproxy status
 ```
 
-The default target is `/usr/local/bin/kproxy`; the script invokes `sudo` when
-needed. Without sudo access, install it in a user-owned directory:
+The setup script pulls the image before replacing the container, checks daemon
+health, attempts image rollback on deployment failure, and installs the matching
+host CLI wrapper. State lives in the `kproxy-data` volume. The default wrapper
+path is `/usr/local/bin/kproxy`; use `--target "$HOME/.local/bin/kproxy"` for a
+user-owned location and include that directory in `PATH`.
 
-```bash
-./deploy/docker-setup.sh --target "$HOME/.local/bin/kproxy"
-```
+Fresh setup uses `latest`; subsequent setup reuses the saved image reference.
+Use `./deploy/docker-upgrade.sh` to follow `latest`, or `--image` to choose a
+published tag/digest. Use `./deploy/docker-setup.sh --build` to run the current
+checkout, including unreleased features. Private GHCR packages require login.
 
-The host command is a small wrapper that runs the matching CLI inside the
-container. This avoids Linux-container binary incompatibility on hosts such as
-macOS and keeps the administration Unix socket private. Deploy an immutable
-release tag explicitly; the successful image reference is saved locally for
-subsequent restarts:
-
-```bash
-./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
-```
-
-To automatically follow the newest stable image published as `latest`, run:
-
-```bash
-./deploy/docker-upgrade.sh
-```
-
-It checks the registry even when an older image reference was saved by a
-previous deployment, and retains the same health-check and rollback behavior.
-
-Use `--no-pull` for an offline restart of the saved image. Use `--build` only
-when a deliberate local source build is required. GHCR packages are private by
-default unless their visibility is changed; private deployments must run
-`docker login ghcr.io` with an account/token that can read the package.
-
-The wrapper also manages the Docker service lifecycle from the host:
-
-```bash
-kproxy restart     # Restart and wait until the health check passes
-kproxy stop        # Stop; restart remains available afterwards
-kproxy uninstall   # Completely uninstall the service
-kproxy uninstall --backup-dir /srv/kproxy-backups
-```
-
-`uninstall` first stops the daemon gracefully, copies all of `/var/lib/kproxy`
-to the host, and verifies that `config.toml` exists before removing the
-container, persistent data volume, unshared image, and installed wrapper. A
-backup failure aborts the uninstall and starts the original container again.
-The default backup root is `~/.kproxy/backups`; override it with `--backup-dir`
-or `KPROXY_BACKUP_DIR`. Interactive use asks whether to retain the backup.
-`--yes` retains it by default, and only an explicit `--delete-backup` removes it
-after a successful uninstall. The source checkout is always retained.
-
-On Linux, the script also checks the named volume before changing the container.
-If Docker retains the volume metadata but its host data directory is gone, an
-interactive run offers to recreate it; automation can opt in with
-`--repair-volume`. Repair is allowed only when the volume belongs to this
-Compose project, Docker's volume root is available, and the data path is truly
-missing. A missing disk mount or unsafe symlink stops the setup instead of
-hiding potentially recoverable data.
-
-A fresh daemon exposes only its Unix administration socket. Create the first
-business proxy explicitly and save the API key printed by the command:
-
-```bash
-kproxy status
-kproxy service create --name main
-kproxy service list
-```
-
-Import at least one supported Kiro enterprise SSO account or headless API key before sending
-generation requests:
-
-```bash
-kproxy account import --stdin < accounts.json
-kproxy account probe --all
-```
-
-The default listener is `0.0.0.0:5580`. Restrict that port with the host
-firewall or cloud security group; use `--host 127.0.0.1` when the proxy should
-only be reachable from the Docker host. Do not run `docker compose down -v`
-unless the persisted configuration, accounts, usage, and logs should be erased.
+Compose uses host networking. Linux supports it directly; Docker Desktop needs
+host networking enabled. A newly created service defaults to `0.0.0.0:5580`;
+restrict its port or choose loopback as shown below. Deployment health alone does
+not prove that generation works. See the [deployment guide](docs/startup-and-debugging.md#8-docker-compose)
+for platform requirements, upgrades, backup, rollback, and uninstall behavior.
 
 ### Native build
 
-The pinned Rust 1.97.1 toolchain is selected automatically through
-`rust-toolchain.toml`.
+Install rustup and a C toolchain/linker. `rust-toolchain.toml` selects Rust 1.97.1
+(edition 2021). The default build includes browser SSO; native SSO login also
+requires an installed Chrome/Chromium.
 
 ```bash
-cp .env.example .env
+cp .env.example .env             # First setup only; keep an existing .env
 cargo build --release --locked
-
-# First startup creates config.toml, accounts.json, daily.json, and stats.json.
 ./target/release/kproxyd
 ```
 
-In another terminal:
+In another terminal at the repository root:
 
 ```bash
-./target/release/kproxy health
-./target/release/kproxy status
-./target/release/kproxy service create --name main
-./target/release/kproxy config path
-./target/release/kproxy account list
+export PATH="$PWD/target/release:$PATH"
+kproxy health
+kproxy config path
 ```
 
-`kproxy service create` creates and starts a proxy, creates its first scoped API
-key, and prints the plaintext key. You can retrieve that service's keys later
-with `kproxy service apikeys main --show-secret`.
+The example `.env` stores development state under `.kproxy-dev`. The daemon and
+CLI business commands load the nearest `.env` upward from the working directory;
+existing environment variables win. CLI help, guides, completion, and version
+work without `.env` or a daemon. Use an absolute `KPROXY_HOME` when invoking the
+programs from different directories. See [environment and paths](docs/startup-and-debugging.md#2-environment-loading).
 
-`kproxyd` and `kproxy` search for `.env` from the current directory upward. Existing
-process environment variables take precedence over values in `.env`, so a
-one-off override remains possible:
+### Add credentials and create a service
+
+A fresh daemon has no business listener. Choose one credential import method:
 
 ```bash
-KPROXY_HTTP_PORT=5581 ./target/release/kproxyd
-```
-
-After creating `main` with the default settings, its business API binds to
-`0.0.0.0:5580`; use `http://127.0.0.1:5580` from the same host:
-
-```text
-POST /v1/messages
-POST /v1/messages/count_tokens
-POST /v1/chat/completions
-POST /v1/responses
-GET  /v1/models
-GET  /health
-```
-
-Claude aliases `/messages` and `/anthropic/v1/messages` are also available.
-OpenAI aliases `/responses`, `/chat/completions`, and `/models` are supported as well.
-
-Client checks are enabled by default: Claude routes (including token counting)
-accept Claude Code; OpenAI generation routes accept Codex. The shared `/v1/models`
-endpoint accepts both clients. Claude discovery includes `display_name` and
-`description`; non-Claude Kiro IDs receive an `anthropic.` alias that is removed
-before upstream routing. Enable it with `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`.
-The shared `server.enforce_user_agent_check = false` setting disables these
-User-Agent checks globally. While the global check is enabled, set
-`skip_user_agent_check = true` on one `[[proxy_service]]` or `[[api_key]]` to
-exempt that service or key. API key authentication and each service's key
-allowlist still apply.
-
-Responses stores Codex conversations by default and supports explicit `store: false` stateless
-requests, streaming, top-level or Responses Lite `additional_tools` catalogs, function/custom tools,
-namespaced tools, image inputs, and tool-result replay. Configure Codex with
-`wire_api = "responses"` and the service's `/v1` base URL. See
-[Responses compatibility and Codex setup](docs/openai-responses.md) for configuration,
-protocol coverage, and explicit unsupported controls.
-
-### Tool call arguments
-
-Native upstream tool calls, including MCP calls, share the same JSON validation
-rules in Claude/OpenAI, streaming/non-streaming, and buffered/unbuffered responses.
-Tool names are not used to infer read or write operations. Empty arguments become
-`{}`; valid JSON is accepted even when the upstream omits the tool stop event.
-Non-empty malformed JSON fails explicitly instead of guessing missing arguments.
-
-### Claude Code MCP Tool Search
-
-Claude Code loads every MCP schema up front when `ANTHROPIC_BASE_URL` points to
-a third-party proxy unless Tool Search is explicitly enabled. For large MCP
-catalogs, start Claude Code with:
-
-```bash
-ANTHROPIC_BASE_URL=http://127.0.0.1:5580 ENABLE_TOOL_SEARCH=auto claude
-```
-
-`kiro-proxy` accepts Anthropic `defer_loading`, regex/BM25 Tool Search, and
-`tool_reference` history blocks. Because Kiro has no native Tool Search server
-tool, the proxy executes the search locally and continues the same response.
-The official Tool Search input contains `pattern` or `query` plus an optional
-`limit` from 1 to 10,000 (default 5). `kiro-proxy` honors that requested limit
-and then packs results against the remaining tool-count, tool-token, context,
-and payload-byte budgets; there is no fixed five-tool working set. Deferred
-definitions remain outside the Kiro context and payload until discovered. The
-catalog index and searches run on blocking workers rather than HTTP runtime
-threads.
-
-The generated `[context]` configuration also bounds the loaded working set with
-`max_loaded_tools` (default and proxy ceiling 512), deferred Tool
-Search working-set definitions with `max_tool_input_tokens`, and the serialized
-Kiro request with `max_upstream_payload_bytes`. Ordinary requests without Tool
-Search are not subject to that 32k working-set budget: their definitions remain
-part of the model's total input-token estimate and are still bounded by the
-context window, tool count, and payload size. Truly oversized requests fail
-locally instead of producing an opaque upstream error. HTTP
-`413/request_too_large` is reserved for an actual inbound body over 50 MiB;
-tool, context, and translated-payload budget errors use 400 so Claude Code does
-not misreport them as a 32 MB attachment failure.
-
-Mapping-aware context compaction for Claude Messages is enabled by default with
-`context.auto_compact_on_overflow`. Before deciding whether to compact or reject
-input, the proxy selects an account and resolves its actual model, including
-account-dependent mappings, weighted choices, aliases, and defaults. It uses that
-model's safe window and reuses the selection when no compaction is needed. If upstream still
-returns `prompt is too long` or `context length exceeded`, the proxy compacts
-against a conservative window and retries only once. A semantic-summary request
-never receives the original oversized conversation directly: the local
-tokenizer first creates a bounded checkpoint for the summary model. Checkpoint
-truncation preserves valid UTF-8 and verifies the final token count. The account
-slot is released before summarization so a single-concurrency account cannot
-block its own summary request. The same compaction artifact may also be reapplied
-once if dispatch after summarization resolves to a smaller window. OpenAI Chat
-Completions and context growth after a Tool Search response has started retain
-hard context-limit errors because they cannot safely return a leading Claude
-`compaction` boundary. A summary timeout releases the main request immediately;
-late accounting is allowed only for a bounded grace period, after which the
-summary stream is canceled and any already decoded usage is settled.
-
-Summary waiting defaults to 60 seconds (`context.compaction_summary_timeout_ms`);
-upgrades preserve explicit settings, including an existing `30000`. Claude Code
-receives a complete compaction start block because its accumulator can ignore
-compaction deltas; other SDKs retain the standard delta stream. A timeout emits
-one fallback warning, with subsequent accounting at INFO under the same trace.
-`credits_source=estimated` identifies a local estimate, not confirmed upstream
-charges. Daily logs persist in the data volume across container replacements.
-
-`features.tool_search_max_rounds` defaults to 4 and is hard-clamped to 8. If
-that per-request server loop is exhausted, the response uses Claude's
-`pause_turn` continuation state instead of converting a valid server call into
-an HTTP 5xx. `features.tool_search_max_operations` defaults to 32 (valid range
-1–256) and bounds aggregate searches across resumed calls and all internal
-rounds; excess calls receive an in-band `unavailable` Tool Search result.
-`features.enable_tool_search=false` is a rollback switch: native Tool Search
-requests are then rejected explicitly instead of expanding deferred tools into
-the upstream payload. Request logs retain catalog/working-set sizes, search
-limits and truncation, client/upstream status, and a stable error code. Error
-responses keep the normal Claude/OpenAI body and expose diagnostics through
-`request-id`, `x-kproxy-error-code`, `x-kproxy-error-stage`,
-`x-kproxy-upstream-status`, and `x-kproxy-account-error` headers.
-
-### Web Search
-
-For Claude's native `web_search` server tool, Kiro first decides whether to
-search and chooses the query. The proxy then calls Kiro's `/mcp` JSON-RPC
-`web_search`, returns the real result as a tool result to the same model turn,
-and lets Kiro synthesize the final answer. It does not search the first user
-message eagerly or present a raw search summary as model output. Streaming and
-non-streaming Claude responses use `server_tool_use` and
-`web_search_tool_result`; search failures are in-band tool errors and do not
-cool down or ban the account. Parallel searches are preserved. In mixed
-server/client-tool turns the server call remains pending until the client tool
-results are returned, matching Anthropic's continuation protocol. Results carry
-proxy-owned AES-256-GCM replay content so later turns can restore snippets;
-modified records are rejected before entering model context. Anthropic-owned
-opaque values remain accepted but are not decrypted locally. Final text carries
-a structured `web_search_result_location` citation only when it actually
-includes the exact result URL. The proxy
-safety limit defaults to 20 searches; an explicit `max_uses` above that
-configured limit is rejected instead of being silently clamped. Claude Web
-Fetch is rejected explicitly until a compatible server-side executor is
-implemented.
-
-The default MCP URL is `https://runtime.{region}.kiro.dev/mcp`. Override it with
-`upstream.web_search_endpoint` (the `{region}` placeholder is supported) or the
-temporary `KPROXY_MCP_URL` environment variable. The default
-`upstream.web_search_timeout_ms` is 60,000. Every MCP request carries Kiro's
-required `x-amzn-kiro-profile-arn` header. When an imported account has no
-profile ARN, the proxy discovers it through `ListAvailableProfiles`, collapses
-concurrent discovery for the same token, and persists the result. Builder ID
-and Social accounts use Kiro's compatible fixed-profile fallback.
-Domain/location filters and code-execution callers still require compatible
-executor support. Strict and eager-streaming flags are accepted as ignored
-compatibility hints. The
-proxy-generated encrypted fields
-are explicitly proxy-owned and are not claimed to be interoperable with
-Anthropic's hosted-search ciphertext.
-
-### Documents, context editing, and compatibility boundaries
-
-Claude `document` blocks support `base64`, `text`, HTTP(S) `url`, and `content`
-sources, including documents inside tool results. Custom content is flattened
-in order into a text document; embedded images are hoisted to the same Kiro
-message's image list with numbered markers. This does not preserve Anthropic's
-custom citation-chunk semantics. Each request accepts at most five documents
-(4,500,000 decoded bytes each) and twenty images (5 MiB each). Remote media is
-restricted to public addresses, revalidates DNS on every redirect, ignores
-environment proxies, and checks file signatures against media types. Kiro
-citations, web sources, and license details remain visible as References rather
-than fabricating Claude source-document character, page, or block coordinates.
-
-`clear_tool_uses` honors trigger, keep, clear_at_least, exclude_tools, and either
-a boolean or tool-name list for clear_tool_inputs. `clear_thinking` can retain
-the selected number of turns or all thinking. Generation reports executed edits
-in `context_management.applied_edits`; activation and cleared-token statistics
-use local estimates, while `count_tokens` reports estimated input sizes before
-and after editing. Generation clears discarded history before fetching the
-remaining remote attachments.
-
-Compatibility follows the practical behavior of jwadow/kiro-gateway,
-hj01857655/kiro-account-manager, and chaogei/Kiro-account-manager rather than
-requiring exact Claude/OpenAI feature equivalence. Additive request/message/tool
-fields, tool strict hints, and Claude/OpenAI format hints remain permissive.
-Accepted format hints do not provide native structured-output guarantees. See the
-[compatibility baseline](docs/compatibility-baseline.md) for pinned sources and scope.
-
-Adjacent same-role messages are merged. Assistant prefill, `max_tokens=0` cache
-warming, and Anthropic Files API `file_id` sources remain outside the implemented
-generation/data-resolution paths and are still rejected.
-Protocol compatibility is resolved before
-the first upstream call, without a time-based rejection cache or field-removal
-probes. Cache markers contain only `type: default`; Claude cache TTL preferences
-do not control Kiro's cache lifetime. Claude historical thinking is omitted from Kiro
-request history without disabling current-generation thinking; Responses plaintext
-reasoning summaries are preserved in assistant history. Document context
-is preserved as separate JSON-labelled message text rather than a document field.
-Generation controls use the explicit mapping in
-[chaogei/Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager/blob/447adcdb468157312621b1f09448278bd9bca748/Kiro-account-manager/src/main/proxy/translator.ts), with explicit Claude effort support and without its speculative missing-metadata thinking fallback:
-
-| Client control | Kiro/proxy handling |
-| --- | --- |
-| `max_tokens`, `temperature`, `top_p` | Map to `inferenceConfig.maxTokens/temperature/topP`; explicit zero sampling values survive. An omitted OpenAI `max_tokens` stays omitted; no 8192 default is sent. Model-specific rejection is still possible. |
-| OpenAI `max_completion_tokens` | Accepted/validated but ignored, matching the reference; use `max_tokens` for an upstream limit. |
-| Claude `top_k` | Accepted but omitted with a debug diagnostic, regardless of model metadata. This is a gateway compatibility policy, not a claim that Kiro universally rejects it. |
-| Claude `stop_sequences` | Enforced locally in streaming and non-streaming responses; no native `stopSequences` is sent. This does not guarantee a server-side generation/cost limit. |
-| Thinking / effort | Recognized effort metadata chooses `thinking: adaptive` + `output_config.effort`, or `reasoning.effort`. Missing, incomplete, or unrecognized metadata omits the entire `additionalModelRequestFields` field, never sending `{}`, `null`, or speculative adaptive thinking. |
-| Claude `output_config.effort` | Explicit effort takes precedence over the thinking budget and is mapped through the selected model's Kiro metadata. Effort-only system messages apply from the next user turn and survive compaction and internal continuations. Kiro receives the effective request-level effort; Anthropic's per-message cache semantics are not guaranteed. |
-| Claude `output_config.format` / `task_budget` | Accepted but omitted from Kiro input, with a debug diagnostic containing only field names. No JSON/Schema or task-budget guarantee is added; `output_config.effort` is still mapped independently. |
-| OpenAI `response_format` / Responses `text.format` | Accepted but omitted from Kiro input, matching the permissive reference behavior; no JSON/Schema guarantee or schema-driven retries are added. |
-| Tool `strict`, Claude `eager_input_streaming` | Accepted as hints; normal Kiro tool schemas and existing streaming behavior are retained. |
-| Service tier, additive fields, unused stream hints | Accepted without forwarding them as speculative Kiro fields. Used values such as `include_usage` retain type validation. |
-| OpenAI `reasoning_effort` | Takes precedence over `thinking.budget_tokens`; otherwise the default is high. Unsupported values select the last advertised effort, without sorting or nearest-rank matching. |
-| `thinking.display` | The output_config dialect always sends summarized; the reasoning dialect omits display. Without recognized metadata, the entire extension is omitted. Client display does not override these upstream shapes. |
-| `thinking.budget_tokens` | Maps directly to low (≤4000), medium (≤16000), high (≤64000), or xhigh; it is not an exact native thinking-token cap. |
-| `thinking: disabled` | Omits thinking controls and suppresses returned reasoning; omission does not guarantee that a model with thinking enabled by default stops thinking internally. |
-
-Unspecified effort defaults to `high`, not the JSON Schema default, matching the
-reference's runtime metadata extraction. Thinking is no longer automatically
-disabled on tool-result or control follow-ups. Both legacy `adaptive_thinking`
-and `max_thinking_budget_tokens` settings remain readable but no longer affect
-generation controls. An explicitly configured operator `model_thinking_mode`
-deny rule remains enforced; an allow rule cannot create upstream parameter support.
-
-Unsupported thinking controls degrade to the upstream model's default behavior;
-the request still runs, but its requested thinking mode/budget is not guaranteed.
-The debug decision reason is `ModelControlsUnavailable`. This concerns parameter
-support, not whether the underlying model can reason. In an AmazonQ Haiku 4.5
-probe, even an empty extension was rejected, while omission succeeded. No model-name
-blacklist, prompt-tag simulation, or field-removal retry is used for this fallback.
-
-Claude Code's system `<env>` block supplies Kiro `envState` (working directory
-and operating system). It is preserved across internal continuations; the
-proxy never substitutes its own host environment. XML tool-call recovery only
-accepts complete, valid calls to tools declared in the current round, at a line
-start outside Markdown code fences/indented code and tagged thinking. Inline
-examples, unknown tools, and malformed XML remain ordinary response text.
-Recovered string parameters retain their schema-declared type and whitespace,
-including local references and composed schemas. Unresolved or over-budget
-schema references leave the XML as text; recovery is not a full schema validator.
-
-Alignment covers outbound generation parameters. Request validation, local stop
-filtering, bounded internal continuations, and response protection remain:
-`display: omitted` still hides returned reasoning text locally while retaining
-native signatures, without changing the reference's upstream display strategy.
-Original controls are kept in non-serialized metadata and rebuilt for each actual
-model, including HTTP/stream fallbacks and internal continuations. When OpenAI
-`max_tokens` is omitted, 8192 is used only for credit estimation; it neither
-limits internal continuations nor causes a `length` finish reason. Explicit
-output limits remain enforced, and no default `maxTokens` is sent upstream.
-Ordinary validation failures and
-invalid signatures are returned without learning or probing protocol capabilities;
-the existing authentication, transient-failure, and context-overflow handling is
-unchanged.
-
-## Configuration and files
-
-Use `.env` for startup-path selection and temporary process overrides. Use
-`config.toml` for persistent service, pool, model, API-key, TLS, logging, and
-notification settings. See [`.env.example`](.env.example) for every supported
-example variable and its purpose.
-
-Set `KPROXY_HOME` to place configuration, data, logs, and the administration socket
-under one directory. Without `KPROXY_HOME`, XDG locations are used:
-
-| File | Default location | Notes |
-| --- | --- | --- |
-| `config.toml` | `${XDG_CONFIG_HOME:-~/.config}/kproxy/` | Human-edited daemon configuration. |
-| `accounts.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | Contains credentials; created with mode `0600`. |
-| `daily.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | Daily credit accounting, reset on UTC boundaries. |
-| `stats.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | Persisted aggregate request statistics. |
-| `stats-history/` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | One-minute request aggregates split into bounded UTC hourly shards. |
-| `web-search-replay.key` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | AES-256-GCM replay key; created with mode `0600` and never overwritten. |
-| `admin.sock` | `${XDG_RUNTIME_DIR}/kproxy/` or `/run/kproxy/` | Local administration plane. |
-| Logs | `${XDG_DATA_HOME:-~/.local/share}/kproxy/logs/` | Split by UTC date and severity. |
-
-On first startup, missing files are created without overwriting existing data.
-Valid configuration changes are hot-reloaded. Invalid TOML or validation
-failures leave the last valid configuration active. `server.host` and
-`server.port` are defaults for newly created proxy services. Changes to
-`admin.socket` or the shared HTTP/HTTPS listening mode require a daemon restart;
-most other fields, including the proxy service list, apply without one.
-
-External account-file changes are also reloaded. Corrupt account data never
-replaces the valid in-memory snapshot. Large account stores can use a gzip
-envelope plus incremental sidecar updates according to the storage settings.
-
-## Import upstream credentials
-
-Import enterprise SSO credentials from a JSON file or stdin:
-
-```bash
-kproxy account import --file accounts.json
-cat accounts.json | kproxy account import --stdin
-```
-
-`id`, `machine_id`, and `created_at` may be omitted; the CLI generates them.
-
-```json
-[
-  {
-    "email": "user@example.com",
-    "credentials": {
-      "access_token": "...",
-      "refresh_token": "...",
-      "client_id": "...",
-      "client_secret": "...",
-      "region": "us-east-1",
-      "expires_at": 1767225600,
-      "auth_method": "idc"
-    }
-  }
-]
-```
-
-### Kiro headless API keys and regional runtime
-
-Set `KIRO_API_KEY` securely in the CLI's environment, then import it without
-putting the secret in a command argument:
-
-```bash
+kproxy account import --stdin < /secure/accounts.json
+# Alternative: reads KIRO_API_KEY from the CLI environment
 kproxy account add-api-key --email ci@example.com --region us-east-1
-# Alternatively read the key from standard input:
-kproxy account add-api-key --email ci@example.com --region eu-central-1 --key-stdin < /secure/kiro-key
 ```
 
-The key is stored as `credentials.access_token` with `auth_method: "api_key"`
-and `expires_at: 0`. Do not attach OAuth refresh/client secrets or a profile ARN.
-Keys use the regional `runtime.{region}.kiro.dev` service, `TokenType: API_KEY`,
-and no OAuth refresh or token-refresh alerts. Revoked keys require manual rotation;
-re-importing does not overwrite an existing account. API-key model discovery
-uses the static catalog because the management API requires an OAuth profile.
-Without discovered effort metadata, thinking controls retain the conservative
-omission policy described above.
-
-Kiro key echoes are redacted from normalized errors and upstream error formatting,
-including background diagnostics; raw credentials must still not be shared.
-
-OAuth defaults retain the existing regional Q/CodeWhisperer routes; set
-`upstream.preferred_endpoint = "runtime"` to prefer regional Kiro runtime and
-management RPC. GovCloud and API-key credentials use runtime without a legacy
-endpoint fallback. GovCloud profile discovery cannot substitute a commercial
-Builder ID profile. Test/deployment overrides `KPROXY_RUNTIME_URL` and
-`KPROXY_MANAGEMENT_URL` accept `{region}`. Setting `KIRO_API_KEY` on the daemon
-alone does not import an account.
-
-Account exports contain credentials by default. Use `--redact` before sharing
-diagnostic output:
+Then create a service and save its printed client key:
 
 ```bash
-kproxy --json account export --redact
+kproxy service create --name main --host 127.0.0.1 --port 5580
+kproxy account list
+kproxy models list
+kproxy ready
 ```
 
-## Common CLI commands
+Do not reuse a `ksk_...` upstream key as the proxy client key. Import schemas,
+SSO login and credential handling are covered in [account setup](docs/startup-and-debugging.md#4-add-or-import-accounts).
+`health` checks daemon liveness; `ready` checks business prerequisites. A real
+generation request additionally verifies the upstream route and consumes quota.
+
+## Connect a client
+
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /v1/messages` | Claude Messages; aliases `/messages` and `/anthropic/v1/messages`. |
+| `POST /v1/messages/count_tokens` | Local token estimates; the Claude aliases also support `/count_tokens`. |
+| `POST /v1/chat/completions` | OpenAI Chat Completions; alias `/chat/completions`. |
+| `POST /v1/responses` | OpenAI Responses; alias `/responses`. |
+| `GET /v1/models` | Model discovery for both clients; alias `/models`. |
+| `GET /health`, `GET /ready` | Liveness and readiness on an existing service listener. |
+
+For Claude Code, set `ANTHROPIC_BASE_URL` to `http://127.0.0.1:5580` and
+`ANTHROPIC_AUTH_TOKEN` to the service's client key. Large MCP catalogs can use
+`ENABLE_TOOL_SEARCH=auto`; gateway model discovery uses
+`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`.
+
+For Codex, use `http://127.0.0.1:5580/v1` and `wire_api = "responses"`. The
+[Codex setup guide](docs/openai-responses.md) includes the provider configuration,
+state limits, unsupported controls, and stream errors. Select an available model
+from `kproxy models list`; aliases do not enlarge an actual model's input window.
+
+## Daily operations
 
 ```bash
 kproxy status
-kproxy health
-kproxy service list
-kproxy service show main
-kproxy service create --name main --port 5580
-kproxy service edit main --port 5581 --add-api-key ci
-kproxy service edit main --skip-user-agent-check true
-kproxy service disable main
-kproxy service enable main
-kproxy service apikeys main
-kproxy service apikeys main --show-secret
-kproxy service delete main
-kproxy account list
-kproxy account show <id|email>
-kproxy account tag <id|email> --add prod
-kproxy account disable <id|email>
-kproxy account refresh <id|email>
-kproxy account refresh --all
-kproxy account probe --all
-kproxy account regen-machine-id <id|email>
-kproxy account rm <id|email> [<id|email> ...]
-
-kproxy config list
-kproxy config show server
-kproxy config show pool --effective
-kproxy config edit pool          # edits only one module; bare edit still opens the full file
-kproxy config reset pool         # resets only one module and preserves every other module
-kproxy config path
-kproxy config validate
-kproxy config reload
-kproxy config reset              # resets general settings, preserves API keys/services and alerts
-
-kproxy pool --watch --explain
-kproxy diagnose all
-kproxy diagnose endpoints
-kproxy diagnose account --all -c 4 --timeout 45s
-kproxy subscriptions
-kproxy models list --refresh --mapped
-kproxy models resolve opus5       # show model-map and final per-account Kiro model
-kproxy model-map add --name low-credit --source 'claude-opus-*' --target claude-sonnet-4.6 --below-credits-percent 10
-kproxy model-map edit low-credit --below-credits-percent 15
-kproxy model-map delete low-credit
-kproxy model-map test claude-opus-4
-
-kproxy apikey list
-kproxy apikey list --detail
-kproxy apikey show ci
-kproxy apikey add --name ci
-kproxy apikey edit ci --skip-user-agent-check true
-kproxy apikey add --name recovered --key 'sk-original-key'  # restore a deleted key
-kproxy apikey limit ci --credits 100
-kproxy apikey limit ci --clear
-kproxy alert events
-kproxy alert platforms
-kproxy alert config
-kproxy alert add --name alerts --platform dingtalk --webhook-url 'https://oapi.dingtalk.com/robot/send?access_token=replace-me' --dingtalk-sign 'SEC-replace-me' --event token-refresh-failed,account-credit-protected,account-quota-exhausted,service-quota-exhausted
-kproxy alert edit --name alerts --event token-refresh-failed --event service-quota-exhausted
-kproxy alert delete alerts
-kproxy status --since 30m
 kproxy stats --since 1h
-kproxy stats --start 2026-08-27T10:00:00+08:00 --end 2026-08-27T12:00:00+08:00
-kproxy stats --detail --since 1h --by endpoint
 kproxy logs show --tail 100
-kproxy logs follow --level warn
-kproxy logs trace trace_0123456789abcdef0123456789abcdef
-kproxy logs files
-kproxy logs files --level error
-kproxy logs path
-kproxy tasks list
-kproxy tasks run status_check
-kproxy help
-kproxy help logs trace
+kproxy logs trace <TRACE_ID>
+kproxy config show --effective
+kproxy service list
 kproxy help --all
+kproxy help logs trace
 kproxy guide balance
 ```
 
-All commands support the global `--json` option. Run `kproxy --help` or a
-subcommand's `--help` for the authoritative option list.
-Every `config.toml` mutation performed through `kproxy` or the daemon holds the
-same cross-process file lock across the complete read, update, atomic write,
-runtime reload, and rollback transaction. Later concurrent mutations wait,
-including while `kproxy config edit` has an editor open. Direct edits made by a
-third-party editor do not voluntarily honor this advisory lock, so prefer
-`kproxy config edit`.
-`kproxy apikey add` generates a random secret by default. With `--key`, it
-preserves the supplied secret verbatim and derives the same stable ID as the
-original key, allowing accidental deletion recovery without changing callers.
-The value may remain in shell history and process listings, so clean up those
-records as appropriate for the environment.
-Subscribe to `account-credit-protected` when accounts should alert after reaching
-the scheduler's remaining-credit protection threshold. Same-kind account events
-for one target are batched into one message while retaining per-account
-once-until-recovery suppression.
-Destructive daemon-resource commands have no `--yes` bypass and require an
-interactive `y` or `yes` confirmation. Bare `kproxy` and `kproxy help` print the main help. A bare
-command group such as `kproxy logs`, `kproxy models`, `kproxy tasks`, or
-`kproxy diagnose` prints that group's actions. Use `kproxy help logs trace` for
-nested command help, `kproxy help --all` for the full public tree, and
-`kproxy guide` for operational topics.
+Bare command groups show help. Scripts must use explicit actions such as
+`logs show`, `models list`, `tasks list`, and `diagnose all`; the last command
+performs real inference on all accounts. Read the [CLI migration](docs/startup-and-debugging.md#migration-from-the-old-cli)
+before updating scripts. Use [startup and troubleshooting](docs/startup-and-debugging.md)
+for configuration, log retention, Docker lifecycle commands and systemd.
 
-Data-producing forms require explicit actions: use `logs show`, `models list`,
-`tasks list`, and `diagnose all`. Their options belong to those actions; the old
-parent-level forms are rejected. Generate static completion without a running
-daemon:
+## Documentation
 
-```bash
-source <(kproxy completions bash)  # Bash
-source <(kproxy completions zsh)   # Zsh
-kproxy completions fish | source  # Fish
-```
-
-`kproxy account list` sorts by email by default so batch imports are easy to
-audit. Use `--sort credit` or `--sort id` when those views are needed. Service,
-API key, alert-target, and model lists also use stable name or identifier
-ordering; logs, recent requests, and pool scores retain their semantic time or
-priority order.
-
-`kproxy logs show` and `follow` read structured request records retained by the
-daemon. `kproxy logs trace <TRACE_ID>` searches all retained physical severity
-and date shards and orders the matching request-chain events by timestamp; add
-`--level error` to restrict it to one exact severity. Physical files use exact
-severity partitions: `info.log` contains only INFO events, while WARN and ERROR
-events are stored in `warn.log` and `error.log`. `kproxy logs files` discovers
-these shards and prints their sizes and complete paths; `kproxy logs path` prints
-the active directory, base path, format, and filter. When invoked through the
-Docker host wrapper, both path commands also report the named volume's real path
-on the Docker host.
-
-`kproxy status` reports request, success, credit, and average-latency metrics for
-the current daemon session. `kproxy stats` defaults to persisted cumulative
-metrics across restarts. Both commands accept `--since 1h` or an explicit
-timezone-aware RFC 3339 `--start`/`--end` range. Time-series aggregates are kept
-at one-minute resolution without the previous seven-day eviction. History that
-was already evicted before upgrading cannot be recovered; the CLI reports the
-earliest available time. The cumulative summary stays compact in `stats.json`;
-minute history is stored in bounded UTC hourly files under `stats-history/`, and
-range parsing/aggregation runs outside the proxy request lock. Use
-`kproxy stats --detail` for recent requests and
-grouped counters, and `kproxy logs show` plus trace IDs for individual failures.
-
-Dynamic model discovery runs immediately at daemon startup, again when accounts
-change, and thereafter when the model-cache TTL expires. The one-minute account
-status task refreshes usage only and does not duplicate model-list requests.
-
-## Enterprise SSO authentication
-
-The default `kproxyd` build and Docker Compose enable all features, including the
-Chromium-based enterprise IAM Identity Center login. First set a global start
-URL with `kproxy config edit`:
-
-```toml
-[sso]
-start_url = "https://example.awsapps.com/start"
-```
-
-Manual account additions can then omit `--start-url`:
-
-```bash
-printf '%s\n' "$PASSWORD" | kproxy account add-sso \
-  --email user@example.com \
-  --password-stdin
-
-kproxy account add-sso --batch accounts.csv -c 1
-
-# Read explicitly from stdin for pipelines and automation:
-kproxy account add-sso --batch - -c 1 < accounts.csv
-```
-
-Use `--start-url` to override the global value for one login. When a smaller
-binary without browser SSO is explicitly desired, build with
-`cargo build --workspace --no-default-features` or select Docker's
-`runtime-slim` target.
-The Docker host wrapper automatically recognizes a readable host CSV and
-streams it into the container through stdin, without copying or retaining a
-password file. A container path is still read normally when no host file with
-the same name exists. Passwords are accepted only from stdin or a two-column
-CSV file. Add
-`--headful` when MFA or an upstream page change requires manual interaction.
-Every login uses a dedicated incognito Chromium context and temporary profile,
-which are destroyed before the next account is processed. Before saving an
-account, kproxy records Kiro's stable user ID and refuses to register that same
-identity under another email. Kiro display names are diagnostic only because
-IAM Identity Center names do not always match login email addresses.
-This flow does not add support for non-enterprise or non-SSO accounts.
-
-## Docker and systemd
-
-```bash
-# Production: pull while the old container is still serving, then replace it.
-KPROXY_IMAGE=ghcr.io/yaocool/kiro-proxy:v0.1.3 docker compose pull kproxyd
-KPROXY_IMAGE=ghcr.io/yaocool/kiro-proxy:v0.1.3 docker compose up -d --no-build
-
-# Local source build through the explicit build override:
-docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
-
-# The standalone default is also the full image:
-docker build -t kiro-proxy:latest .
-# Select slim only when browser SSO is not needed:
-docker build --target runtime-slim -t kiro-proxy:slim .
-docker build --target runtime-full -t kiro-proxy:full .
-```
-
-Compose uses host networking so every manually created proxy service is
-available on the Docker host immediately, including custom ports; no Compose
-edit or container restart is needed. Services bind to `0.0.0.0` by default, so
-restrict proxy ports with the host firewall or cloud security group. Use
-`--host 127.0.0.1` when host-only access is desired. Docker Engine on Linux
-supports host networking directly; Docker Desktop 4.34+ requires it to be
-enabled in Settings. State persists in the `kproxy-data` volume. The full image
-adds Chromium for enterprise SSO authentication. Its browser is pinned to the
-official `r1566079` snapshot used by the CDP definitions in `chromiumoxide
-0.9.1`, so a routine image rebuild cannot silently upgrade the protocol. Update
-and test both pins together when adopting browser security updates.
-
-Local and CI builds reuse persistent Cargo registry and target caches. Full-image
-builds compile the all-features binaries only once and serialize that release
-build with the initial Chromium installation. Local Cargo parallelism defaults
-to one job; override it only when the build host has enough memory, for example
-`CARGO_BUILD_JOBS=4 docker compose -f docker-compose.yml -f docker-compose.build.yml build`.
-
-The `Build and publish Docker image` GitHub Actions workflow runs only when a
-`v*` tag is pushed. A version tag such as `v0.1.3` publishes `v0.1.3`, `v0.1`,
-and `latest`; the tag must match the Cargo workspace version. After bumping that
-version and merging the release commit, publish it with
-`git tag v0.1.3 && git push origin v0.1.3`. Production upgrades pull the new image
-before replacing the container and keep the named volume:
-
-```bash
-./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
-docker compose exec kproxyd kproxy config show --effective
-```
-
-Alternatively, follow the newest stable release automatically with
-`./deploy/docker-upgrade.sh`. Set `KPROXY_UPGRADE_IMAGE` to use a different
-registry image.
-
-The script retains the previous local image under a rollback tag. If container
-creation or the health check fails, it recreates the service from that image.
-With host networking, the old and new containers cannot bind the same proxy
-ports concurrently, so the final container switch still has a short restart
-window; image download and compilation no longer consume production downtime.
-
-Existing `config.toml` files are never overwritten. A volume created by an
-older version may still contain `server.host = "127.0.0.1"`; change it with
-`kproxy config edit` if the new `0.0.0.0` default is desired.
-
-Pull, start, and install the Docker-backed wrapper in one step:
-
-```bash
-./deploy/docker-setup.sh
-kproxy health
-kproxy service list
-```
-
-The wrapper discovers the running daemon through its Compose label and always
-uses the CLI version bundled with that container. It requires permission to use
-Docker. Set `KPROXY_COMPOSE_PROJECT` when multiple kiro-proxy Compose projects are
-running. To reinstall only the wrapper, run
-`sudo ./deploy/install-kproxy-wrapper.sh`.
-
-A hardened service template is available at
-[`deploy/kproxyd.service`](deploy/kproxyd.service). Install `kproxyd` and `kproxy` under
-`/usr/local/bin`, create the `kproxy` system user and group, install the unit, and
-then enable the service. Browser SSO additionally requires Chrome or Chromium on
-the host; the provided unit keeps user namespaces and executable JIT memory
-available for Chromium while retaining the other process hardening controls.
+| Topic | Reference |
+| --- | --- |
+| Deployment, CLI migration, logs and recovery | [English](docs/startup-and-debugging.md) · [中文](docs/startup-and-debugging.zh-CN.md) |
+| Protocol limits, model controls and compaction | [English](docs/protocol-compatibility.md) · [中文](docs/protocol-compatibility.zh-CN.md) |
+| Responses, Codex and stateful continuation | [Integration guide (中文)](docs/openai-responses.md) |
+| 1.0 readiness, remediation and release procedure | [Release plan (中文)](docs/release-readiness-1.0.0.zh-CN.md) |
 
 ## Development
+
+The nine workspace crates separate domain/configuration, storage, IPC,
+translation, upstream access, scheduling, notifications, the daemon and the CLI.
+See [contributor guidance](CONTRIBUTING.md) and [architecture notes](CLAUDE.md).
 
 ```bash
 cargo fmt --all -- --check
@@ -805,11 +177,7 @@ cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 cargo test --workspace --all-features --locked
 ```
 
-The project uses Rust edition 2021 with MSRV 1.97.1.
-
-For complete setup, startup, deployment, logging, LLDB, and troubleshooting
-guidance, see [Setup, startup, and debugging](docs/startup-and-debugging.md).
-
-## License
-
-MIT
+These are required checks, not a claim that the current checkout passes them.
+The [release assessment](docs/release-readiness-1.0.0.zh-CN.md) records the audited
+results and remaining gates; its [release checklist](docs/release-readiness-1.0.0.zh-CN.md#发布执行清单) explains tag
+and image behavior. The project is licensed under [MIT](LICENSE).
