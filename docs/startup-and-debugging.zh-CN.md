@@ -1,45 +1,28 @@
-# 安装、启动与调试指南
+# 部署、运维与 CLI 迁移
 
-[English](startup-and-debugging.md) | [简体中文](startup-and-debugging.zh-CN.md)
+[English](startup-and-debugging.md) | [简体中文](startup-and-debugging.zh-CN.md) | [项目说明](../README.zh-CN.md)
 
-本文覆盖首次安装、本地开发、release 二进制、Docker Compose、systemd、日志、Trace ID、
-LLDB、测试、升级和常见启动故障。除非特别说明，所有命令都在仓库根目录执行。
+本文对应当前源码，包含 `v0.2.4` 之后的未发布改动。首次接入见项目 README；
+这里维护环境、账号、持久化、Docker/systemd、CLI 迁移和恢复流程。命令在仓库根目录执行，
+`kproxy` 指匹配版本的原生二进制或已安装的 Docker 包装器。
+
+- [环境与路径](#2-环境变量加载)、[账号](#4-添加或导入账号)、[配置](#6-配置与热重载)
+- [Docker](#8-docker-compose)、[systemd](#9-systemd)、[备份与恢复](#备份与恢复)
+- [CLI 迁移](#旧命令迁移)、[日志](#7-日志与-trace-id)、[排障](#常见问题)
 
 ## 1. 环境要求
 
-仓库在 `rust-toolchain.toml` 中固定 Rust 1.97.1，并声明安装 `rustfmt`、`clippy` 和
-`rust-analyzer`。安装 rustup 后，进入仓库就会自动选择正确的工具链。
-
-根据部署方式准备环境：
-
-- Docker 部署：Docker Engine 和 Compose v2 插件。Linux 原生支持 host network；Docker
-  Desktop 需要 4.34 或更高版本，并在设置中启用 host networking。
-- 本地构建或开发：rustup，以及 C 工具链和链接器。
-
-```bash
-rustup show active-toolchain
-rustc --version
-cargo --version
-```
-
-默认构建启用全部 feature，其中包括 Chromium SSO：
-
-```bash
-cargo build --workspace --locked
-```
-
-只有明确不需要浏览器登录并希望缩小二进制时，才关闭默认 feature：
-
-```bash
-cargo build --workspace --no-default-features --locked
-```
+原生构建需要 rustup、C 工具链和链接器；仓库固定 Rust 1.97.1。
+Docker 部署需要 Engine 和 Compose 插件；使用 host network，Docker Desktop 需启用对应设置。
+默认构建包含 Chromium SSO，`--no-default-features` 关闭浏览器登录。构建、测试和调试入口见
+[贡献指南](../CONTRIBUTING.md)及仓库内的 [VS Code 配置](../.vscode)。
 
 ## 2. 环境变量加载
 
 本地启动前复制示例文件：
 
 ```bash
-cp .env.example .env
+cp .env.example .env  # First setup only; preserve an existing .env
 ```
 
 `kproxyd` 会在解析启动参数前读取 `.env`。`kproxy` 会先解析帮助、指南、补全和版本等本地
@@ -69,509 +52,254 @@ daemon 启动和业务命令会失败并返回错误，本地 CLI 导航仍然�
 | `RUST_LOG` | 设置控制台和应用诊断的 tracing 过滤器。 |
 | `RUST_BACKTRACE` | 设置为 `1` 或 `full` 时启用 Rust 调用栈。 |
 
+从不同目录启动时应使用绝对路径 `KPROXY_HOME`。加载同一份 `.env` 不会重定位相对路径：
+`.kproxy-dev` 仍相对于进程工作目录。CLI socket 优先级为 `--socket`、已有进程环境、
+`.env`、配置/默认值。[环境模板](../.env.example)另列出 MCP/runtime/management 覆盖项与 CLI 凭证输入。
+
 持久化的服务、账号池、模型、API Key、TLS、通知和日志配置应写入 `config.toml`，而不是
 `.env`。
 
 ## 3. 使用本地二进制启动
 
-以开发模式启动 daemon：
-
 ```bash
+cargo build --workspace --locked
 cargo run -p kproxyd
 ```
 
-使用示例 `.env` 时，首次启动会在 `.kproxy-dev/` 下创建：
-
-- `config.toml`：daemon 配置；
-- `accounts.json`：账号和凭证，Unix 权限为 `0600`；
-- `daily.json`：每日额度记录；
-- `stats.json`：请求聚合统计；
-- `admin.sock`：本地管理 socket；
-- `logs/`：按 UTC 日期和级别拆分的日志。
-
-在另一个终端运行 CLI，它会自动读取同一份 `.env`：
-
-```bash
-cargo run -p kproxy -- status
-cargo run -p kproxy -- health
-cargo run -p kproxy -- service list
-cargo run -p kproxy -- config path
-cargo run -p kproxy -- config show --effective
-cargo run -p kproxy -- account list
-```
-
-CLI 导航不需要 daemon，也不依赖有效的 `.env`。无参命令组会展示可用动作；嵌套帮助、指南
-和静态补全都来自同一份命令定义：
-
-```bash
-cargo run -p kproxy -- logs
-cargo run -p kproxy -- help logs trace
-cargo run -p kproxy -- help --all
-cargo run -p kproxy -- guide logs
-cargo run -p kproxy -- completions zsh > /tmp/_kproxy
-```
-
-脚本中应使用显式动作：`logs show`、`models list`、`tasks list` 和 `diagnose all`。无参命令组
-与 `--json` 同时使用时会返回参数错误，避免自动化把帮助文本当成成功的业务数据。
-
-也可以使用编译后的二进制：
-
-```bash
-cargo build --release --locked
-./target/release/kproxyd
-./target/release/kproxy status
-```
-
-同一个管理 socket 只能由一个 daemon 占用。进程崩溃留下的失效 socket 会自动删除；如果
-socket 仍能接受连接，第二个 daemon 不会删除它。
-
-全新 daemon 默认不创建业务 API 代理服务。即使没有账号或代理服务，`kproxy health` 仍会
-成功，因为应用健康与账号、代理服务的可用性相互独立。业务可用性监控请使用
-`kproxy ready`（或代理监听器的 `/ready`）：它会报告账号不可用、监听失败、计量恢复模式和
-后台任务心跳过期，但不会停止 daemon。需要业务 API 时显式创建：
-
-```bash
-cargo run -p kproxy -- service create --name main
-```
-
-该命令会创建服务的首个专属 API Key 并返回明文。使用 `kproxy service apikeys main` 可查看
-不含明文的 Key 元数据，增加 `--show-secret` 后只返回该服务绑定的明文 Key。默认监听
-`0.0.0.0`；只需本机访问时使用 `--host 127.0.0.1`。
-
-### 仅管理面模式
-
-阻止所有已配置代理服务监听，同时保留账号和配置管理：
-
-```bash
-KPROXY_DISABLE_HTTP=1 cargo run -p kproxyd
-```
-
-这种方式适合存储维护和只使用 CLI 的测试，不会关闭 `admin.sock`。
+另一个终端在相同目录运行 `cargo run -p kproxy -- health`。后续命令可使用
+`./target/debug/kproxy`，或将编译目录加入 `PATH`。发布构建使用 `cargo build --release --locked`。
+同一个 socket 只能运行一个 daemon；崩溃遗留的失效 socket 会自动清理，仍可连接的 socket 不会被删除。
+`KPROXY_DISABLE_HTTP=1` 可阻止业务监听，同时保留配置和管理 socket。
 
 ## 4. 添加或导入账号
 
-从 JSON 导入已有凭证：
+从 JSON 文件或 stdin 导入企业 SSO 凭证：
 
 ```bash
-cargo run -p kproxy -- account import --file accounts.json
-cat accounts.json | cargo run -p kproxy -- account import --stdin
+kproxy account import --file accounts.json
+cat accounts.json | kproxy account import --stdin
 ```
 
-CLI 可以生成缺失的 `id`、`machine_id` 和 `created_at`。导入后检查并探测账号：
+`id`、`machine_id` 和 `created_at` 可以省略，CLI 会自动生成。
+
+下面只展示 JSON 结构，不能直接作为可用凭证导入。Token 和 `expires_at`（Unix 秒）
+必须替换为上游签发的实际值。
+
+```json
+[
+  {
+    "email": "user@example.com",
+    "credentials": {
+      "access_token": "...",
+      "refresh_token": "...",
+      "client_id": "...",
+      "client_secret": "...",
+      "region": "us-east-1",
+      "expires_at": 1893456000,
+      "auth_method": "idc"
+    }
+  }
+]
+```
+
+### Kiro headless API key 与区域 runtime
+
+先在 CLI 环境中安全设置 `KIRO_API_KEY`，再导入；也可从标准输入读取，避免把密钥写进命令参数：
 
 ```bash
-cargo run -p kproxy -- account list
-cargo run -p kproxy -- account probe --all
-cargo run -p kproxy -- models list
+kproxy account add-api-key --email ci@example.com --region us-east-1
+kproxy account add-api-key --email ci@example.com --region eu-central-1 --key-stdin < /secure/kiro-key
 ```
 
-默认构建已经包含 IAM Identity Center 登录。先在 `config.toml` 中设置全局 start URL
-（可用 `kproxy config edit`）：
+密钥保存为 `credentials.access_token`，`auth_method` 为 `api_key`，`expires_at` 为 0。
+不可附带 OAuth refresh/client secret 或 profile ARN。此类账号使用区域 runtime 和
+`TokenType: API_KEY`，不执行 OAuth 刷新，也不产生 Token 刷新失败告警；密钥撤销后需手动更换，
+重复导入不会覆盖已有账号。由于 management API
+要求 OAuth profile，API key 使用静态模型目录；无发现到的 effort 元数据时仍按保守策略省略
+thinking 控制。只在 daemon 环境中设置 `KIRO_API_KEY` 不会自动导入账号。
+错误清理和上游错误格式化（包括后台诊断）会遮蔽回显的 Kiro key，但仍不可分享原始凭证。
+
+OAuth 默认保留区域 Q/CodeWhisperer 路由，可设置 `upstream.preferred_endpoint = "runtime"`
+优先使用 Kiro runtime/management RPC。GovCloud 与 API key 只使用 runtime，不回退到旧端点；
+GovCloud 缺少 profile 时不会替换为商业区 Builder ID profile。测试/部署覆盖项
+`KPROXY_RUNTIME_URL`、`KPROXY_MANAGEMENT_URL` 支持 `{region}` 占位符。
+
+账号导出默认包含凭证。分享诊断结果前应使用 `--redact`：
+
+```bash
+kproxy --json account export --redact
+```
+
+### 企业 SSO 认证
+
+`kproxyd` 的默认构建和 Docker Compose 都启用全部 feature，包含企业 IAM Identity Center
+登录所需的 SSO 支持。先用 `kproxy config edit` 设置全局 start URL：
 
 ```toml
 [sso]
 start_url = "https://example.awsapps.com/start"
 ```
 
-之后手动添加账号时可省略 `--start-url`：
+然后手动添加账号时无需重复传 `--start-url`：
 
 ```bash
-printf '%s\n' "$PASSWORD" | cargo run -p kproxy -- account add-sso \
+printf '%s\n' "$PASSWORD" | kproxy account add-sso \
   --email user@example.com \
   --password-stdin
+
+kproxy account add-sso --batch accounts.csv -c 1
+
+# 显式从 stdin 读取，适合管道和自动化：
+kproxy account add-sso --batch - -c 1 < accounts.csv
 ```
 
-单次登录仍可用 `--start-url` 覆盖全局值。`kproxy` 会把管理请求发送给 `kproxyd`，所以若显式
-使用 `--no-default-features` 构建 daemon，浏览器登录不可用。遇到 MFA 或需要手工验证时
-增加 `--headful`。只支持 Kiro 企业账号的组织 SSO，个人账号、社交登录和其他认证类型均
-不支持。
+单次登录仍可用 `--start-url` 覆盖全局值。若明确需要更小且不含浏览器 SSO 的二进制，可用
+`cargo build --workspace --no-default-features` 或 Docker 的 `runtime-slim` target。
+Docker 宿主机 wrapper 会自动识别可读的宿主机 CSV，并通过 stdin 流式传入容器，不复制或
+残留密码文件；容器内路径在宿主机没有同名文件时仍按原样读取。密码只从 stdin 或两列 CSV
+文件读取。遇到 MFA 或上游页面变化需要手工操作时，增加
+`--headful`。每个账号都会使用独立的 Chromium 无痕 context 和临时 profile，并在处理下一个
+账号前销毁；写入账号前会记录 Kiro 返回的稳定用户 ID，并拒绝把同一真实身份重复登记到
+其他邮箱。IAM Identity Center 的显示名不一定与登录邮箱一致，因此显示名仅用于诊断，不作为
+拒绝入库的条件。该流程不会增加对非企业账号或非 SSO 认证方式的支持。
 
 ## 5. 创建并验证代理服务
 
-如果尚未创建服务，先创建代理并保存返回的 API Key：
+全新 daemon 不创建业务监听。`health` 只检查存活；`ready` 检查账号、监听、计量恢复模式和
+后台任务心跳，不能代替真实生成验证。创建服务后保存返回的客户端 API Key：
 
 ```bash
-kproxy service create --name main --port 5580
+kproxy service create --name main --host 127.0.0.1 --port 5580
 kproxy service list
-kproxy service show main
-kproxy service apikeys main --show-secret
+kproxy service apikeys main
+kproxy ready
+kproxy models list
 ```
 
-此时服务绑定 `0.0.0.0:5580`，本机业务地址为 `http://127.0.0.1:5580`。
-
-```bash
-curl -i http://127.0.0.1:5580/health
-
-curl -i http://127.0.0.1:5580/v1/messages/count_tokens \
-  -H 'authorization: Bearer <key>' \
-  -H 'content-type: application/json' \
-  -H 'user-agent: claude-cli/1.0 (external, debug)' \
-  -d '{"model":"claude-sonnet-4","messages":[{"role":"user","content":"hello"}]}'
-```
-
-没有可用上游账号时，`GET /health` 仍返回 `status: ok`；账号数量只是诊断信息，不参与
-应用健康判断。响应包含 `total_accounts` 和各健康状态数量；`used_credits`、`total_credits`
-聚合共享账号池内全部已配置账号的最近一次上游用量快照，尚无用量快照的账号对两项 credits
-合计均按零处理。本地 Token 计数仍需使用服务 API Key。此时生成请求返回 `503` 属于预期行为。
-
-所有新建服务都必须使用创建时生成的 API Key：
-
-```bash
-curl -i http://127.0.0.1:5580/v1/models \
-  -H 'authorization: Bearer <key>'
-```
-
-创建或配置监听非回环地址的服务时，该服务必须引用至少一个已启用的 API Key，否则配置
-校验会拒绝，以避免意外对公网暴露未鉴权服务。
-
-无需编辑 TOML 即可调整服务监听和 API Key 绑定：
-
-```bash
-kproxy service edit main --host 127.0.0.1 --port 5581
-kproxy service edit main --add-api-key ci --remove-api-key old-key
-kproxy service edit main --skip-user-agent-check true
-kproxy apikey edit ci --skip-user-agent-check true
-kproxy service disable main
-kproxy service enable main
-```
-
-API Key 参数可使用 ID 或名称。`kproxy apikey show ci` 可查看单个 Key；已经设置过额度上限时，
-使用 `kproxy apikey limit ci --clear` 恢复为不限。上限设为零会有意阻止新的 Credits 消耗。
-
-每个业务 HTTP 响应都包含 `x-trace-id`，排查错误时应先保存这个值。
-
-不再需要某个服务时可停止并删除它。删除服务时会同时删除仅由该服务使用的
-API Key；仍被其他服务引用的共享 API Key 会保留。
-
-```bash
-kproxy service delete main
-```
-
-删除、重置用量等破坏性命令不支持 `--yes` 跳过确认，必须在交互终端输入 `y` 或 `yes`。
+省略 `--host` 时默认绑定 `0.0.0.0`。Key 元数据默认不含明文，显式 `--show-secret` 才显示。
+服务只接受已绑定的 API Key。默认 Messages 只接受 Claude Code，Chat/Responses 只接受 Codex；
+第三方客户端可通过 `service edit` 或 `apikey edit` 设置 `--skip-user-agent-check true`。
+这项豁免不关闭 Key 认证、额度和并发限制。请求示例见 [README](../README.zh-CN.md)和
+[Responses 接入](openai-responses.md)。
 
 ## 6. 配置与热重载
 
-打印实际路径并校验当前配置：
+### 文件与持久化
+
+`.env` 用于启动路径选择和临时进程级覆盖；`config.toml` 用于持久化服务、账号池、模型、
+API Key、TLS、日志和通知配置。所有示例环境变量及其作用见
+[`.env.example`](../.env.example)。
+
+设置 `KPROXY_HOME` 后，配置、数据、日志和管理 socket 会统一放到该目录。未设置时遵循
+XDG 目录：
+
+| 文件 | 默认位置 | 说明 |
+| --- | --- | --- |
+| `config.toml` | `${XDG_CONFIG_HOME:-~/.config}/kproxy/` | 人工维护的 daemon 配置。 |
+| `accounts.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | 包含凭证，创建权限为 `0600`。 |
+| `daily.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | 按 UTC 日期重置的每日额度记录。 |
+| `stats.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | 持久化请求聚合统计。 |
+| `stats-history/` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | 按 UTC 小时分片保存的分钟级请求聚合。 |
+| `alert-incidents.json` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | 持久化告警去重状态，应随数据目录备份。 |
+| `web-search-replay.key` | `${XDG_DATA_HOME:-~/.local/share}/kproxy/` | AES-256-GCM 回放密钥，以 `0600` 创建且永不覆盖。 |
+| `admin.sock` | `${XDG_RUNTIME_DIR}/kproxy/` 或 `/run/kproxy/` | 本地管理面。 |
+| 日志 | `${XDG_DATA_HOME:-~/.local/share}/kproxy/logs/` | 按 UTC 日期和级别拆分。 |
+
+首次启动只创建缺失文件，不覆盖已有数据。有效配置修改会自动热重载；TOML 格式错误或校验
+失败时继续使用上一份有效配置。`server.host` 和 `server.port` 是新建代理服务时使用的
+默认值。修改 `admin.socket` 或共享的 HTTP/HTTPS 监听模式需要重启 daemon；包括代理服务
+列表在内的其余大部分配置无需重启。
+
+外部修改账号文件也会自动载入，损坏的账号数据不会替换内存中的有效快照。账号数较多时，
+可根据存储配置使用 gzip envelope 和增量 sidecar。
+
+### 配置操作
 
 ```bash
-cargo run -p kproxy -- config path
-cargo run -p kproxy -- config validate
+kproxy config path
+kproxy config show --effective
+kproxy config validate
+kproxy config edit
+kproxy config reload
+kproxy models resolve claude-sonnet-4.5
 ```
 
-daemon 会使用短防抖监听 `config.toml`。有效修改自动应用，TOML 格式错误或配置值非法时继续
-使用上一份配置。也可以显式触发重载：
-
-```bash
-cargo run -p kproxy -- config reload
-```
-
-`server.host` 和 `server.port` 是 `kproxy service create` 使用的默认值，本身不会创建监听。
-代理服务的新增和地址修改会在运行时自动协调。以下配置修改需要重启 daemon：
-
-- `admin.socket`；
-- 在共享的 HTTP 与 HTTPS 监听模式之间切换。
-
-日志过滤、格式、输出路径、账号池行为、模型规则、通知配置和 TLS 证书内容可以在运行时更新。
-
-告警策略、钉钉/飞书等通知目标和模型映射均可通过 CLI 管理，命令会校验配置、原子写入并热重载：
-
-```bash
-kproxy alert events
-kproxy alert platforms
-kproxy alert config
-kproxy alert add --name alerts --platform dingtalk \
-  --webhook-url 'https://oapi.dingtalk.com/robot/send?access_token=replace-me' \
-  --dingtalk-sign 'SEC-replace-me' \
-  --event token-refresh-failed,account-credit-protected,account-quota-exhausted,service-quota-exhausted
-kproxy alert edit --name alerts --event token-refresh-failed --event service-quota-exhausted
-kproxy alert delete alerts
-
-kproxy model-map add --name low-credit --source 'claude-opus-*' \
-  --target claude-sonnet-4.6 --below-credits-percent 10
-kproxy model-map edit low-credit --below-credits-percent 15
-kproxy model-map test claude-opus-4.6 --remaining-credits-percent 8
-kproxy model-map delete low-credit
-```
-
-`kproxy alert events` 会说明每个事件的实际触发条件。一个告警目标可重复传入 `--event`，
-也可使用逗号分隔订阅多个事件；`alert edit --event ...` 会整体替换该目标原有的事件列表。
-`kproxy alert platforms` 会说明 `--platform` 选择的通知平台及平台专用参数；创建或编辑
-目标时使用 `--platform` 和 `--webhook-url`。钉钉机器人开启加签后，将机器人提供的
-`SEC...` 密钥传给 `--dingtalk-sign`；代理会在每次投递时动态生成 `timestamp` 和 `sign`。
-同一账号或服务在异常持续期间只发送一次 Markdown 告警，恢复后再次发生异常才会重新告警。
-同一告警目标在短时间内收到多个同类型账号事件时，会按账号聚合为一条消息，避免群机器人刷屏。
-`account-credit-protected` 使用与调度器相同的
-`pool.low_credit_min_remaining` 规则；账号仍有额度，但会暂停参与调度以保留最后可用额度。
-
-带 `--below-credits-percent` 的映射按每个选中账号的剩余 Credits 判断。未配置 schedule 时
-默认全天生效；剩余额度低于阈值时命中，次月额度恢复到阈值以上后自动停止命中。
-
-模型自动探测与显式模型映射彼此独立。自动探测在 daemon 启动时执行一次、账号变化后再次
-触发，之后遵循 `models.cache_ttl_ms`；账号 `status_check` 任务只刷新额度，不会再发起一轮
-模型列表请求。
-
-使用 `kproxy models resolve <MODEL_ID>` 可按当前配置和各账号模型缓存查询最终模型；输出会
-区分显式 model-map 与自动别名解析。映射规则依赖 API key 时传入 `--api-key <ID|名称>`，需要
-先更新模型缓存时增加 `--refresh`。
-
-首次初始化永远不会覆盖已有 `config.toml`，因此旧版本创建的数据目录可能仍保留
-`server.host = "127.0.0.1"`。可使用 `kproxy config show --effective` 检查实际值；需要采用
-当前的 `0.0.0.0` 默认值时，使用 `kproxy config edit` 修改。
-
-`KPROXY_HTTP_PORT` 是进程级覆盖。如果该变量仍然存在，修改 `server.port` 不会覆盖它；需要
-删除环境变量并重启 daemon。
+`config edit` 及 service/apikey/alert/model-map 等修改命令使用校验、事务锁、原子写入和热重载。
+启动环境覆盖项需要修改环境并重启。升级保留既有值，不会自动换成新默认值。
+模型探测在启动、账号变化时触发，之后遵循缓存 TTL；账号状态任务仅刷新额度。
+条件 model-map 按实际选中账号的额度判断；带 `--below-credits-percent` 的规则未设 schedule 时全天生效。
+告警使用 `--platform`、`--webhook-url`，平台专用字段见 `kproxy alert platforms`；
+`alert edit --event` 整体替换订阅。持续异常会去重，恢复后再次发生才重发，同类账号事件会短时聚合。
+完整命令和配置主题直接使用 `kproxy help --all` 与 `kproxy guide`。
 
 ## 7. 日志与 Trace ID
 
-设置 `KPROXY_HOME=.kproxy-dev` 后，日志写入 `.kproxy-dev/logs/`，文件名示例：
-
-```text
-kproxyd-2026-08-10-info.log
-kproxyd-2026-08-10-warn.log
-kproxyd-2026-08-10-error.1.log
-```
-
-日志按精确级别和 UTC 日期拆分：`info.log` **只包含 INFO**，不会重复写入 WARN 或 ERROR；
-WARN 和 ERROR 分别写入 `warn.log`、`error.log`。默认每个分片最大 100 MB，保留三天。
-`log.file_path` 控制基础路径；留空时使用数据目录下的 `logs/kproxyd.log` 作为基础路径。
-
-使用响应头 `x-trace-id`（`request-id` 也返回同一个值）跨级别、跨日期查询完整请求链路：
-
 ```bash
-kproxy logs trace trace_0123456789abcdef0123456789abcdef
-kproxy logs trace trace_0123456789abcdef0123456789abcdef --level error --tail 500
-```
-
-该命令默认扫描所有保留的 trace/debug/info/warn/error 物理分片，并按时间排序；为避免影响
-daemon，请求带有文件数、扫描字节数、命中数和输出条数上限。也可以直接搜索物理文件：
-
-```bash
-rg 'trace_f028' .kproxy-dev/logs/
-```
-
-通过管理 API 查看当前日志目标并发现实际分片文件：
-
-```bash
+kproxy logs show --tail 100
+kproxy logs follow --level warn
+kproxy logs trace <TRACE_ID>
 kproxy logs path
-kproxy logs files
 kproxy logs files --level error
+kproxy status --since 30m
+kproxy stats --detail --since 1h --by endpoint
 ```
 
-`logs files` 保留 daemon 文件系统中的完整路径。通过宿主机 wrapper 执行时，wrapper 会解析
-`/var/lib/kproxy` 数据卷在 Docker 宿主机上的实际挂载位置，额外输出宿主机目录和基础路径，
-并在文件表中直接显示宿主机文件路径。JSON 输出保留容器内的 `path`，同时增加
-`host_path`、`host_directory` 和 `host_base_path`。自定义日志路径不在数据卷内时无法映射，
-因此只显示容器路径。
+响应头 `x-trace-id` 和 `request-id` 可用于跨级别、跨日期追踪。日志按精确级别和 UTC 日期拆分，
+默认每片 100 MB、保留三天；`info.log` 不包含 WARN/ERROR。`logs trace` 有扫描和输出上限。
+Docker wrapper 会为卷内日志增加宿主机路径，卷外自定义路径无法映射。
+`RUST_LOG` 或 `log.level` 可提高诊断级别；应用日志不记录提示词、回复正文或 Key 值。
 
-查看或持续跟踪结构化请求记录：
-
-```bash
-cargo run -p kproxy -- logs show --tail 100
-cargo run -p kproxy -- logs follow --level warn
-cargo run -p kproxy -- logs trace trace_0123456789abcdef0123456789abcdef
-cargo run -p kproxy -- status --since 30m
-cargo run -p kproxy -- stats --since 1h
-cargo run -p kproxy -- stats --start 2026-08-27T10:00:00+08:00 --end 2026-08-27T12:00:00+08:00
-cargo run -p kproxy -- stats --detail --since 1h --by endpoint
-```
-
-日志查询参数必须放在 `logs show` 或 `logs follow` 等明确动作之后。
-
-`kproxy status` 显示本次 daemon 启动后的请求统计，`kproxy stats` 默认显示跨重启持久化的
-累计统计。两者都支持相对窗口 `--since`，或使用带时区的 `--start/--end` 查询起止时间；
-聚合时间分辨率为一分钟。`kproxy stats --detail` 才显示最近请求和按
-model/account/endpoint 的分组统计；逐条故障信息仍应使用 `kproxy logs show` 和 Trace ID。
-
-需要更多细节时，将 `RUST_LOG` 或 `log.level` 调整为 `debug` 或 `trace`。日志不会记录
-提示词、生成的回复正文或 API Key 值。
+`status` 统计本次启动以来的数据；`stats` 默认使用跨重启累计值。两者支持 `--since` 或带时区的
+`--start/--end`。分钟级历史按 UTC 小时写入 `stats-history/`，持续保留，应监控磁盘增长；
+旧版本已淘汰的历史不能恢复。逐条故障仍查日志，`stats --detail` 不是完整请求审计。
 
 ## 8. Docker Compose
 
-拉取并启动预构建的 full 镜像（启用全部 feature 并包含 Chromium SSO）：
+当前发布目标是 Linux amd64 full；`v0.2.4` 仅为版本选择示例，使用前确认仓库存在该镜像。
+验证未发布功能需构建当前源码。setup 脚本会先拉取，再替换容器、等待健康并安装匹配的 wrapper：
 
 ```bash
-./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
-kproxy health
+./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.2.4
+kproxy version
+kproxy ready
 ```
 
-该脚本会完成 Compose 配置校验，在旧容器继续运行时拉取镜像，然后替换服务、等待健康，失败
-时恢复原镜像；健康检查通过后再原子替换宿主机的 `kproxy` wrapper。
-默认目标是 `/usr/local/bin/kproxy`；无 sudo 权限时可使用
-`--target "$HOME/.local/bin/kproxy"`。以下是对应的手工命令，适合调试：
+默认安装到 `/usr/local/bin/kproxy`，也可传 `--target "$HOME/.local/bin/kproxy"`。
+后续 `./deploy/docker-upgrade.sh` 追踪 `latest`；固定版本继续用 `--image`。
+单独安装 wrapper 用 `./deploy/install-kproxy-wrapper.sh`，默认拒绝覆盖其他同名命令。
+
+Compose 使用 host network；Linux Engine 原生支持，Docker Desktop 4.34+ 需在设置中启用。
+服务监听直接使用宿主机端口。默认服务地址为 `0.0.0.0`，本机服务应显式绑定 `127.0.0.1`。
+数据卷 `kproxy-data` 挂到 `/var/lib/kproxy`，不要挂入开发用 `.kproxy-dev` 或 `.env.example`。
+原 bridge 部署需要重建容器以应用新网络模式；卷数据保留。日常排查和主动源码构建分别使用：
 
 ```bash
 docker compose config --quiet
-KPROXY_IMAGE=ghcr.io/yaocool/kiro-proxy:v0.1.3 docker compose pull kproxyd
-KPROXY_IMAGE=ghcr.io/yaocool/kiro-proxy:v0.1.3 docker compose up -d --no-build
 docker compose ps
-docker compose exec kproxyd kproxy health
 docker compose logs -f kproxyd
-```
-
-Linux Docker Engine 上如果出现 `failed to populate volume`，且错误指出
-`.../volumes/kiro-proxy_kproxy-data/_data` 不存在，说明 Docker 保留了 named volume 元数据，
-但实际目录已经丢失。新版一键脚本会在替换容器前检测这一状态：交互终端会请求确认后重建，CI
-或其他非交互环境可运行：
-
-```bash
-./deploy/docker-setup.sh --no-pull --repair-volume
-```
-
-修复只针对带有当前 Compose 项目标记且数据路径已经不存在的 volume。如果 Docker volume
-根目录、数据盘挂载或软链接本身异常，脚本会停止并要求先恢复 Docker 存储，不会自动删除。
-
-Compose 使用 `network_mode: host`，容器内创建的代理监听会直接进入 Docker 宿主机网络
-命名空间。因此任意服务端口创建后立即可用，不需要修改 Compose 或重建容器。Linux 上的
-Docker Engine 可直接使用；Docker Desktop 4.34 及以上版本需要先在 Settings > Resources
-> Network 中启用 host networking。
-
-镜像设置了 `KPROXY_HOME=/var/lib/kproxy`，Compose 将 `kproxy-data` named volume 挂载到该目录。
-不要把开发用 `.env.example` 复制进容器，也不要挂载 `.kproxy-dev`。持久化设置应通过
-`kproxy config edit` 修改 `config.toml`；确需进程级覆盖时，在 Compose 中显式增加环境变量。
-
-已有 bridge 网络部署升级后，需要重建一次本项目容器才能应用新网络模式；named volume
-中的数据会保留：
-
-```bash
-docker compose up -d --force-recreate
-```
-
-日常生产升级应部署 CI 构建的发布镜像，并保留 named volume：
-
-```bash
-./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
-docker compose exec kproxyd kproxy version
-docker compose exec kproxyd kproxy config show --effective
-```
-
-自动拉取并部署当前 `latest` 指向的最新稳定版本：
-
-```bash
-./deploy/docker-upgrade.sh
-```
-
-只有明确要在本机从源码构建时才加载 build override：
-
-```bash
+# Source build only:
 docker compose -f docker-compose.yml -f docker-compose.build.yml up -d --build
 ```
 
-### 在 Docker 宿主机直接使用 `kproxy`
+full 包含配对固定的 Chromium `r1566079` 和 `chromiumoxide 0.9.1`，容器设置了 no-sandbox。
+源码可将 build override 的 target 改为 `runtime-slim`；该目标没有浏览器 SSO，当前 CI 不发布它。
+本地构建默认 `CARGO_BUILD_JOBS=1`。镜像的编辑器为 vim，可用 `EDITOR` 选择已安装的其他编辑器。
 
-Dockerfile 或 Compose 服务无法安全地直接向宿主机 `/usr/local/bin` 安装文件。一键脚本会在
-宿主机安装项目提供的包装器，并将 Compose 服务拉起至健康状态：
+wrapper 需要可用的 Docker 引擎和可识别的部署。多部署时设置 `KPROXY_COMPOSE_PROJECT` 或
+`KPROXY_DOCKER_CONTAINER`。停服后导航命令使用精确本地镜像，以无网络、无业务卷方式运行；
+缺少镜像、目标不明确或旧镜像不支持本地导航会失败。业务动作需要运行中的 daemon。
+wrapper 保留退出码和 stdin，按交互场景分配 TTY，并传递或回退 `TERM`。
 
-```bash
-./deploy/docker-setup.sh
-kproxy health
-kproxy status
-kproxy service list
-```
+`kproxy restart` 等待健康，`kproxy stop` 保留部署；`kproxy uninstall` 会停服、先备份再删除
+容器、数据卷、未共享镜像和 wrapper。默认备份位于 `~/.kproxy/backups`，备份失败则恢复容器，
+不删除原数据。`uninstall --yes` 保留备份，只有显式 `--delete-backup` 才删除备份。
+`docker compose down` 保留卷，`down -v` 删除卷。
 
-包装器通过容器的 `io.kiro-proxy.role=daemon` 标签发现运行中的 daemon，保留命令退出码、
-透传 stdin，并且只在交互场景分配 TTY。交互命令会把宿主机的 `TERM` 传入容器；如果镜像
-不支持该终端类型，则自动回退为 `xterm-256color`。镜像内置完整的 `vim` 和扩展 terminfo，
-`kproxy config edit` 默认直接使用 `vim`，可正常处理方向键。这样既不需要暴露管理 Unix
-socket，也不存在宿主机与容器二进制兼容问题。
-
-daemon 容器停止后，wrapper 仍可通过该容器的精确镜像显示命令帮助，不会启动服务或挂载
-业务数据。可用入口包括无参命令组、`help`、`guide`、`completions`、`version` 和生命周期
-命令的 `--help`；业务命令仍需先执行 `kproxy restart`。
-
-升级已有部署时，wrapper 和容器镜像都需要更新：
-
-```bash
-./deploy/docker-setup.sh --image ghcr.io/yaocool/kiro-proxy:v0.1.3
-kproxy config edit
-```
-
-也可在宿主机显式选择容器内已安装的编辑器，例如 `EDITOR=vim kproxy config edit`。
-
-批量 SSO 导入时，wrapper 会识别 `--batch` 指向的可读宿主机文件，并通过 stdin 直接流式
-传入容器，不需要 `docker cp`，也不会在容器中留下 CSV：
-
-```bash
-kproxy account add-sso --batch ./accounts.csv --start-url 'https://example.awsapps.com/start'
-```
-
-CLI 也原生支持 `-` 表示 stdin，因此在宿主机和容器内都可显式使用
-`kproxy account add-sso --batch - < accounts.csv`。如果宿主机不存在指定文件，wrapper 会保留
-参数，由容器按自己的文件系统解析该路径。
-
-需要只安装包装器时可直接运行底层安装器。它会自动更新由本项目管理的包装器，并默认拒绝
-覆盖其他已有命令：
-
-```bash
-sudo ./deploy/install-kproxy-wrapper.sh
-./deploy/install-kproxy-wrapper.sh --target "$HOME/.local/bin/kproxy"
-# 只有明确要替换其他同名命令时才使用：
-sudo ./deploy/install-kproxy-wrapper.sh --force
-```
-
-当前宿主机用户必须具备 Docker 权限。同时运行多个 kiro-proxy 项目时，可以按 Compose
-项目名或容器选择目标：
-
-```bash
-export KPROXY_COMPOSE_PROJECT=kiro-proxy
-# 或：export KPROXY_DOCKER_CONTAINER=<容器名称或ID>
-kproxy status
-```
-
-宿主机包装器还可直接管理 Docker 服务生命周期：
-
-```bash
-kproxy restart
-kproxy stop
-kproxy uninstall
-kproxy uninstall --backup-dir /srv/kproxy-backups
-```
-
-`restart` 会等待容器健康检查通过，`stop` 后仍可用 `restart` 启动。`uninstall`
-会先停服并把 `/var/lib/kproxy` 备份到宿主机，默认位置为 `~/.kproxy/backups`。备份失败
-时原数据不会删除，原容器会重新启动。交互执行会询问是否保留备份；`--yes` 默认保留，
-使用 `--delete-backup` 才会在成功卸载后删除。容器、数据卷、未共享镜像和已安装的
-包装器会被删除，源码目录始终保留。
-
-全新 volume 需要显式创建代理服务，并保存命令返回的 API Key：
-
-```bash
-docker compose exec kproxyd kproxy status
-docker compose exec -T kproxyd kproxy account import --stdin < accounts.json
-docker compose exec kproxyd kproxy account probe --all
-docker compose exec kproxyd kproxy service create --name main
-docker compose exec kproxyd kproxy service create --name secondary --port 6000
-docker compose exec kproxyd kproxy service list
-docker compose exec kproxyd kproxy service apikeys main --show-secret
-docker compose exec kproxyd kproxy config show --effective
-docker compose exec kproxyd sh -c 'ls -lh /var/lib/kproxy/logs'
-curl -i http://127.0.0.1:5580/health
-curl -i http://127.0.0.1:6000/health
-```
-
-不再需要某个代理监听时可删除 service；其专用 API Key 会同时删除，被其他服务共享的
-API Key 则会保留：
-
-```bash
-docker compose exec kproxyd kproxy service delete secondary
-```
-
-服务默认绑定 `0.0.0.0`，可通过 Docker 宿主机的网络接口访问；应使用宿主机防火墙或云
-安全组限制端口，只需本机访问时可指定 `--host 127.0.0.1`。业务请求仍必须携带该服务绑定
-的 API Key。host network 会取消容器与宿主机之间的网络隔离；若无法接受，应改用入口
-脚本保留的 bridge 兼容转发方案。
-
-`docker compose down` 会保留 named volume；`docker compose down -v` 会删除配置、账号、
-统计和日志，只应在明确需要重置时使用。
-
-默认 Docker target 是 `runtime-full`，会安装固定的 Chromium 官方快照 `r1566079`、启用
-全部 feature，并设置容器专用的 no-sandbox 标志。该快照正是 `chromiumoxide 0.9.1` 的
-CDP 定义所使用的 revision；升级时应同时更新并测试二者，不能让操作系统包单独改变 CDP
-协议。只有明确不需要浏览器 SSO 时，才把 Compose target 改为 `runtime-slim` 后重新构建。
-
-BuildKit 会跨构建保留 Cargo registry 和 target 缓存。full target 只构建 all-features
-二进制，并在 release 构建完成后才执行未命中的 Chromium 安装层，从而限制小规格宿主机的
-峰值内存和磁盘压力。Compose 默认把 `CARGO_BUILD_JOBS` 设为 `1`；只有构建机内存充足时
-才应提高。
+若卷元数据存在但实际目录丢失，setup 仅对本项目标记且可确认目录缺失的卷提供
+`--repair-volume`；交互模式会确认。数据盘挂载或 Docker 根目录异常必须先恢复存储。
+部署健康失败会尝试回退旧镜像；旧镜像缺失或回退不健康仍需人工恢复。
+**镜像回退复用原卷，不撤销数据写入或迁移。** 升级前按[备份与恢复](#备份与恢复)留存完整状态，
+重启会丢失 Responses 进程内续轮。升级后核对版本、ready、账号、服务、配置、统计和生成请求。
 
 ## 9. systemd
 
@@ -580,7 +308,7 @@ BuildKit 会跨构建保留 Cargo registry 和 target 缓存。full target 只�
 ```bash
 cargo build --release --locked
 
-sudo useradd --system --home-dir /var/lib/kproxy --shell /usr/sbin/nologin kproxy
+sudo useradd --system --user-group --home-dir /var/lib/kproxy --shell /usr/sbin/nologin kproxy
 sudo install -m 0755 target/release/kproxyd target/release/kproxy /usr/local/bin/
 sudo install -m 0644 deploy/kproxyd.service /etc/systemd/system/kproxyd.service
 sudo systemctl daemon-reload
@@ -606,118 +334,75 @@ reload 会发送 `SIGHUP`。需要重启的配置仍要执行 `sudo systemctl re
 `KPROXY_CHROMIUM_NO_SANDBOX=1`。该选项会关闭 Chromium 自身的 sandbox，只应在评估宿主机
 隔离边界后使用。
 
-## 10. VS Code 与 LLDB
+## 导航与脚本
 
-安装 rust-analyzer 和 CodeLLDB，然后增加类似的启动配置：
+`kproxy`、`kproxy help` 和 `kproxy logs` 等无参命令组显示帮助。嵌套参数使用
+`kproxy help logs trace`，完整命令树使用 `kproxy help --all`，操作主题使用 `kproxy guide`。
+这些导航入口以及 `completions`、`version` 不要求 daemon 或有效的 `.env`。
 
-```json
-{
-  "version": "0.2.0",
-  "configurations": [
-    {
-      "type": "lldb",
-      "request": "launch",
-      "name": "Debug kproxyd",
-      "cargo": {
-        "args": ["build", "-p", "kproxyd"],
-        "filter": { "name": "kproxyd", "kind": "bin" }
-      },
-      "cwd": "${workspaceFolder}",
-      "env": {
-        "KPROXY_HOME": "${workspaceFolder}/.kproxy-dev",
-        "RUST_LOG": "kproxyd=debug,kproxy_kiro=debug,kproxy_pool=debug",
-        "RUST_BACKTRACE": "1"
-      }
-    }
-  ]
-}
-```
+业务输出支持全局 `--json`。无参命令组带 `--json` 时退出码为 2，stdout 为空，stderr 提示补充动作。
+显式 `--help` 仍输出文本并以 0 退出。通常成功为 0、参数错误为 2、连接或执行失败为 1；
+`ready` 在业务未就绪时也返回失败。TTY、管道和重定向不改变命令解析含义。
 
-也可以直接使用命令行 LLDB：
+下方命令是相互独立的操作示例，不应整段依次执行；ID、名称、路径和密钥需要替换。
+`diagnose all`、`diagnose account` 会向上游发起真实推理并消耗额度；初步检查可先用
+`health`、`ready`、`account list` 和 `logs show`。
 
-```bash
-cargo build -p kproxyd
-rust-lldb target/debug/kproxyd
-```
+## 旧命令迁移
 
-在 LLDB 中用 `settings set target.env-vars KPROXY_HOME=... RUST_LOG=debug` 设置进程变量，
-用 `breakpoint set --name <function>` 增加断点，然后运行进程。排查异步请求时，使用
-`x-trace-id` 关联断点和日志，不要依赖线程 ID。
+| 旧写法 | 当前写法 |
+| --- | --- |
+| `kproxy logs --tail 100` | `kproxy logs show --tail 100` |
+| `kproxy logs -f` / `--follow` | `kproxy logs follow` |
+| `kproxy models --refresh --mapped` | `kproxy models list --refresh --mapped` |
+| `kproxy tasks`（查询数据） | `kproxy tasks list` |
+| `kproxy diagnose`（完整诊断） | `kproxy diagnose all` |
+| `kproxy help balance` | `kproxy guide balance` |
+| `account add-sso-batch --file FILE` | `account add-sso --batch FILE` |
+| `alert add --kind ... --url ...` | `alert add --platform ... --webhook-url ...` |
+| 告警平台 `wechat` | `wechat-work`，平台专用选项见 `alert platforms` |
 
-## 11. 测试与静态检查
+旧参数在业务初始化前报错。裸 `logs`、`models`、`tasks`、`diagnose` 改为组帮助，重定向时也相同。
+`logs show` 和 `logs follow` 在改造前就已存在，这次移除的是父命令快捷写法。
+发布差异见[变更记录](../CHANGELOG.md)。
 
-提交修改前运行完整校验：
+删除 daemon 业务资源必须交互输入 `y` 或 `yes`，没有通用 `--yes`；Docker uninstall 的选项单独定义。
 
-```bash
-cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-cargo test --workspace --all-features --locked
-docker compose config --quiet
-```
+## 备份与恢复
 
-调试时可以缩小范围：
+记录源版本/commit、镜像 ID/digest、Compose 项目及实际配置/数据路径。分开使用 XDG 目录时，
+配置和数据必须同时备份。账号导出不是完整备份；至少保留 `config.toml`、账号文件及压缩/增量
+sidecar、`daily.json`、`stats.json`、`stats-history/`、`alert-incidents.json`、
+`web-search-replay.key` 和排障需要的日志。不要遗漏回放密钥，否则旧搜索回放无法解密。
+
+标准 Docker 部署在维护窗口停写后复制，逐步确认执行结果：
 
 ```bash
-cargo test -p kproxy-kiro
-cargo test -p kproxyd http::tests::every_response_has_a_unique_trace_id
-cargo test -p kproxy-pool refresh::tests::successful_refresh_preserves_cooling_and_exhausted_health
+umask 077
+backup_dir="$HOME/kproxy-backups/$(date -u +%Y%m%dT%H%M%SZ)"
+mkdir -p "$backup_dir"
+docker compose stop kproxyd
+docker compose cp kproxyd:/var/lib/kproxy/. "$backup_dir/"
+docker compose start kproxyd
 ```
 
-Wiremock 和端到端测试需要绑定临时回环端口，受限 CI 或沙箱环境必须允许本地端口绑定。
+检查复制退出状态及关键文件。复制失败应恢复原服务，获得有效备份后再升级。
+原生部署先停止 daemon，再保留权限复制其实际配置/数据目录。
 
-## 12. 常见问题
+恢复时保留故障数据供排查，把升级前备份放入**独立空目录或新卷**，保留服务账号所有权和限制性
+权限（Docker UID/GID 为 10001），使用原镜像启动。不要混合新版本写入的数据和旧备份。
+核对账号、Key 绑定、额度计数、统计、ready 和测试请求后再切回流量。管理 socket 由 daemon 重建。
+目前不保证任意原地降级；可支持的升级来源和恢复演练要求见[发布修复方案](release-readiness-1.0.0.zh-CN.md)。
 
-### `Address already in use`
+## 常见问题
 
-创建服务时选择未占用端口，或对配置为默认端口的服务使用进程级覆盖：
-
-```bash
-kproxy service create --name main --port 5581
-KPROXY_HTTP_PORT=5581 cargo run -p kproxyd
-```
-
-### 无法连接 `admin.sock`
-
-确认 `kproxyd` 与 `kproxy` 读取了同一个 `KPROXY_HOME`。daemon 可连接时运行 `kproxy config path`，
-或者显式传入 socket：
-
-```bash
-kproxy --socket /path/to/admin.sock status
-```
-
-注意 `KPROXY_ADMIN_SOCKET` 只修改 CLI 目标。要移动 daemon socket，需要修改
-`config.toml` 中的 `admin.socket` 并重启 `kproxyd`。
-
-### 配置修改未生效
-
-运行 `kproxy config validate`，检查 warn/error 日志，并确认修改字段是否需要重启。同时检查进程
-环境中是否存在 `KPROXY_HTTP_PORT` 覆盖。
-
-### 协议路由返回访问拒绝
-
-默认按协议校验客户端 User-Agent：Claude 路由使用 Claude Code，OpenAI Responses、
-Chat Completions 和模型列表路由使用 Codex。需要对全部客户端放开时，设置
-`server.enforce_user_agent_check = false` 并重载配置。只豁免单个服务或 API Key 时，使用
-`kproxy service edit <service> --skip-user-agent-check true` 或
-`kproxy apikey edit <key> --skip-user-agent-check true`；设回 `false` 即取消豁免。
-API key 认证和服务 Key 白名单始终生效。
-接入方法见 [Responses 与 Codex 配置](openai-responses.md)。
-
-### 生成接口返回 `503`
-
-运行 `kproxy account list` 和 `kproxy account probe --all`。可能没有 Available 账号、请求模型不
-兼容，或者所有账号都在冷却或额度耗尽状态。
-
-### 流式请求意外中断
-
-使用 `x-trace-id` 搜索 warn/error 日志，检查上游鉴权刷新、端点尝试、账号切换、模型降级、
-客户端断连和下游写超时。
-
-### Docker 仍然使用旧层
-
-```bash
-docker compose build --pull --no-cache
-docker compose up -d
-```
-
-返回 [中文 README](../README.zh-CN.md)。
+| 现象 | 核查动作 |
+| --- | --- |
+| 端口占用 | `service list` 对照实际进程监听；修改服务端口，而非仅修改新服务的默认端口。 |
+| 无法连接 `admin.sock` | 核对 daemon、运行用户、绝对 `KPROXY_HOME`、`config path` 和 `--socket`。 |
+| 配置未生效 | `config validate`、`config show --effective`，检查环境覆盖、保留的旧默认值及需重启项。 |
+| 401 / 客户端拒绝 | 核对服务绑定的 Key、客户端产品 User-Agent 和豁免配置。 |
+| 503 | `ready`、账号额度/保护阈值、并发、后台任务与 `logs trace`。 |
+| 流式中断 | 核对协议终止事件和 Trace ID；HTTP 200 不代表最终成功。 |
+| 上下文超限 | `models resolve` 查看实际模型，检查 `error.context`；见[压缩边界](protocol-compatibility.zh-CN.md#自动压缩与窗口)。 |
+| 容器仍为旧版本 | 核对实际镜像 ID 与 `kproxy version`；拉取目标发布镜像或主动构建源码。 |

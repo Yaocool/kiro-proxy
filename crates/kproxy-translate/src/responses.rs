@@ -1,6 +1,6 @@
 //! OpenAI Responses input, normalized into the shared OpenAI/Kiro path.
 //!
-//! Protocol reference: https://developers.openai.com/api/reference/resources/responses
+//! Protocol reference: [OpenAI Responses](https://developers.openai.com/api/reference/resources/responses).
 //! Hosted tools are rejected before upstream execution. Ephemeral state is handled
 //! at the HTTP boundary, after request authentication.
 

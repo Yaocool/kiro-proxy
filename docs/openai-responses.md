@@ -1,10 +1,18 @@
 # OpenAI Responses 与 Codex 接入
 
+[项目说明](../README.zh-CN.md) · [协议边界](protocol-compatibility.zh-CN.md) · [CLI 迁移](startup-and-debugging.zh-CN.md#旧命令迁移)
+
+本文对应当前源码，包含 `v0.2.4` 之后的未发布改动。**默认状态仅保存在当前进程中**；
+需要跨重启恢复的客户端应保留完整历史并能切换为 `store: false`。
+
 业务面提供 `POST /v1/responses` 和 `POST /responses`，支持非流式 JSON 与流式 SSE。
 请求复用现有 OpenAI → Kiro 翻译、账号池、模型映射、计费、预算、重试和工具参数校验。
 流式模式逐段转换上游输出；最终响应仍含完整 output 和 usage。
 
 ## Codex 配置
+
+先创建代理服务并导入可用账号，使用 `kproxy ready` 和 `kproxy models list` 核对服务与模型。
+base URL 必须包含 `/v1`；`KPROXY_API_KEY` 是代理服务允许的客户端 Key，不是上游 `ksk_...`。
 
 在用户级 `~/.codex/config.toml` 中配置 provider；请保留已有的其他配置：
 
@@ -23,6 +31,23 @@ requires_openai_auth = false
 将 `KPROXY_API_KEY` 设置为该代理服务生成或允许的 API key，然后启动 Codex。
 服务地址和 model 按实际部署及账号可用模型调整。配置字段见
 [Codex 官方配置参考](https://learn.chatgpt.com/docs/config-file/config-reference)。
+
+## 最小请求
+
+将 `KPROXY_API_KEY` 设置为客户端 Key 后，可用以下请求检查协议。示例携带 Codex 产品标识，
+用于冒烟检查；实际第三方客户端可配置单个服务或 Key 的 User-Agent 豁免。
+生成请求会调用真实上游并消耗额度；把 model 改为账号可用值。
+
+```bash
+curl -sS http://127.0.0.1:5580/v1/responses \
+  -H "authorization: Bearer $KPROXY_API_KEY" \
+  -H 'content-type: application/json' \
+  -H 'user-agent: codex_cli_rs/0.144.0' \
+  -d '{"model":"claude-sonnet-4.5","input":"Reply with hello.","store":false,"max_output_tokens":64}'
+```
+
+流式模式增加 `"stream": true`，curl 使用 `-N`。客户端应等待最终状态事件，不能仅凭 HTTP 200
+认为工具调用或整轮响应已成功。
 
 ## 客户端准入
 
@@ -124,12 +149,24 @@ session-affinity 请求头影响。
 显式传 `store: false` 时保持无状态：下一轮需把上一轮的 `output` 和对应工具执行结果追加到
 `input`。`function_call_output.call_id` 对应调用的 `call_id`，不是 `fc_...` 条目 ID。
 
-这是有边界的兼容实现，而非 OpenAI 的持久化存储服务：会话仅在进程存活期间可用，空闲 30 分钟
-过期，最多保留 256 个会话；单会话最大 2 MiB、总量最大 32 MiB。无法保存状态时，非流式请求
-返回服务端错误，流式请求以 `response.failed` 结束，避免成功返回一个无法续轮的 response。
-会话按代理 service 和已认证 API key 隔离，重启后全部清空；不提供
-response 的查询、删除或取消端点。按照官方语义，父 response 的 `instructions` 不会自动带入
-续轮，续轮可单独设置新的 `instructions`。
+这是有边界的进程内实现，不提供持久化存储服务：
+
+| 边界 | 当前值与行为 |
+| --- | --- |
+| 过期 | 已保存记录空闲 30 分钟后过期；读取会更新访问时间。 |
+| 数量 | 整个进程最多保留 256 条 response 状态快照，同一对话的多轮也分别占记录。 |
+| 大小 | 单条序列化状态最多 2 MiB，总量最多 32 MiB；不是整个进程的内存上限。 |
+| 淘汰 | 数量/总大小不足时淘汰最久未访问记录，因此 30 分钟内也可能失效。 |
+| 隔离 | 按代理 service 和已认证 API key 隔离；重启全部清空，多副本不共享。 |
+| 无效引用 | 未知、过期、淘汰或其他 service/key 的 `previous_response_id` 返回 HTTP 400。 |
+
+这些上限由[状态存储实现](../crates/kproxyd/src/http/responses.rs)固定，当前没有 TOML 调节项。
+无法保存新状态时，非流式请求返回服务端错误，流式请求以 `response.failed` 结束。
+客户端应保留可重放历史；引用失效后移除 `previous_response_id`，提交完整 input 并按需设置
+`store: false`。不能只删引用、仍只发送孤立的工具结果，否则缺少调用配对。
+
+不提供 response 的查询、删除或取消端点。父 response 的 `instructions` 不自动带入续轮，
+续轮需要单独设置新的 `instructions`。
 
 以下参数仍需要尚未实现的执行/数据链路，因此返回 HTTP 400：
 
@@ -165,30 +202,14 @@ Responses 不使用 Chat Completions 的 `[DONE]` 结束标记。
 协议结构依据 [Responses 官方参考](https://developers.openai.com/api/reference/resources/responses)
 和 [流式事件参考](https://developers.openai.com/api/reference/resources/responses/streaming-events)。
 
-## 参考项目核查
+## 回归验证
 
-2026-09-04 检查四个项目的默认分支快照：
+```bash
+cargo test -p kproxy-translate responses:: --locked
+cargo test -p kproxyd http::responses::tests --locked
+cargo test -p kproxyd --test end_to_end responses:: --locked
+cargo test -p kproxyd --test end_to_end compatibility_controls:: --locked
+```
 
-| 项目与快照 | Responses 实现 |
-| --- | --- |
-| [jwadow/kiro-gateway · a5292ca](https://github.com/jwadow/kiro-gateway/blob/a5292ca04c7c6231e0b47673ac3f981f5a706e1e/kiro/routes_openai.py) | 无；OpenAI 路由为 Chat Completions 和模型列表 |
-| [hj01857655/kiro-account-manager · c5c4776](https://github.com/hj01857655/kiro-account-manager/blob/c5c477647f8cba4c9b9f07e8fb41e403672adf36/src-tauri/src/gateway/mod.rs) | 有；gateway 路由、converter、proxy 中包含 Responses 转换和输出 |
-| [chaogei/Kiro-account-manager · 447adcd](https://github.com/chaogei/Kiro-account-manager/blob/447adcdb468157312621b1f09448278bd9bca748/Kiro-account-manager/src/main/proxy/proxyServer.ts) | 有；Responses 转 Chat，再输出 Responses JSON/SSE |
-| [ZyphrZero/kiro.rs · f357292](https://github.com/ZyphrZero/kiro.rs/blob/f3572929fbc2c0c090c29b13a7c285d1b2777dcd/src/anthropic/responses.rs) | 有；额外覆盖 Responses Lite `additional_tools`、function/custom/namespace 桥接、工具结果后空响应重试、Responses SSE 与服务端 WebSearch loop |
-
-hj01857655、chaogei 和 ZyphrZero 三个实现的许可分别为 CC BY-NC-SA 4.0、AGPL-3.0 与 MIT。
-本实现参考其能力拆分，按官方协议在本项目的 Rust 执行链中独立实现，未复制其源代码；本仓库继续使用 MIT 许可。
-
-2026-09-07 针对定时任务的 `call_id` 问题补充核查：
-[Colin3191/kiro-proxy · b00c4d8](https://github.com/Colin3191/kiro-proxy/blob/b00c4d8b15454f2394e16f8adf33b4b87d3a8602/responses-api.js#L179)
-直接把工具结果的 `call_id` 传入 `tool_use_id`；
-[ZyphrZero/kiro.rs · 22d2c2d](https://github.com/ZyphrZero/kiro.rs/blob/22d2c2d0695ba350890072c19990f54782827ae5/src/anthropic/responses.rs#L668)
-将缺失 ID 转为空字符串。这两处转换均没有针对 Codex 定时任务启动上下文的专门处理。
-本项目沿用已有 Responses → OpenAI → Kiro 转换结构，并依据 Codex 问题报告独立补充上述兼容分支。
-
-回归覆盖请求转换、可空参数、命名空间/自由文本工具、图片工具结果、协议准入矩阵、SSE 分片和错误，
-以及真实 daemon 对模拟 Kiro 上游的两轮工具交互（完整历史 replay 和 `store`/`previous_response_id`
-续轮）、空工具续轮的单次恢复与重复失败，涵盖两个别名、两种流模式和工具缓冲开关。
-工具分片用例包含交错的 function/custom 调用，以及只在首个片段发送工具名的上游输出。
-定时任务回归另覆盖启动上下文的缺省/null ID、文本数组、普通工具校验边界，以及真实 daemon 对模拟
-Kiro 上游的启动与工具续轮，确认任务上下文保留且没有额外的孤立工具结果。
+这些用例使用本地模拟上游，验证转换、状态隔离/过期、工具配对和 JSON/SSE 输出；
+生产客户端版本、上游可用性和长时间运行需另外验证。
