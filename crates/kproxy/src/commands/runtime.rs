@@ -36,7 +36,7 @@ pub enum ServiceCommand {
     },
     /// 创建并启动服务，同时生成首个 API key。
     #[command(
-        after_help = "示例：\n  kproxy service create --name main\n  kproxy service create --name team --host 127.0.0.1 --port 5581"
+        after_help = "示例：\n  kproxy service create --name main\n  kproxy service create --name team --host 127.0.0.1 --port 5581\n  kproxy service create --name compatible --skip-user-agent-check true"
     )]
     Create {
         #[arg(long)]
@@ -45,6 +45,14 @@ pub enum ServiceCommand {
         host: Option<String>,
         #[arg(long)]
         port: Option<u16>,
+        /// 是否允许该服务的已认证请求跳过客户端 User-Agent 校验。
+        #[arg(
+            long,
+            value_name = "BOOL",
+            action = clap::ArgAction::Set,
+            default_value_t = false
+        )]
+        skip_user_agent_check: bool,
         #[arg(long)]
         api_key_name: Option<String>,
         #[arg(long, default_value = "sk")]
@@ -52,7 +60,7 @@ pub enum ServiceCommand {
     },
     /// 修改服务名称、监听地址、端口或绑定的 API key。
     #[command(
-        after_help = "API key 参数接受 ID 或名称，可重复使用。\n\n示例：\n  kproxy service edit main --host 127.0.0.1 --port 5581\n  kproxy service edit main --add-api-key ci\n  kproxy service edit main --remove-api-key ak_ab12"
+        after_help = "API key 参数接受 ID 或名称，可重复使用。\n\n示例：\n  kproxy service edit main --host 127.0.0.1 --port 5581\n  kproxy service edit main --add-api-key ci\n  kproxy service edit main --remove-api-key ak_ab12\n  kproxy service edit main --skip-user-agent-check true"
     )]
     Edit {
         /// 当前服务 ID 或名称。
@@ -66,6 +74,9 @@ pub enum ServiceCommand {
         /// 新监听端口。
         #[arg(long)]
         port: Option<u16>,
+        /// 设置是否允许该服务的已认证请求跳过客户端 User-Agent 校验。
+        #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
+        skip_user_agent_check: Option<bool>,
         /// 增加绑定的 API key ID 或名称，可重复或逗号分隔。
         #[arg(long, value_delimiter = ',', value_name = "KEY")]
         add_api_key: Vec<String>,
@@ -128,7 +139,7 @@ pub enum ApiKeyCommand {
     /// 创建 API key；明文只在创建结果中显示一次。
     #[command(
         visible_alias = "create",
-        after_help = "默认随机生成密钥。使用 --key 可恢复误删的原密钥；注意命令行参数可能进入 shell 历史和进程列表。\n\n示例：\n  kproxy apikey add --name ci\n  kproxy apikey add --name team --credits-limit 100\n  kproxy apikey add --name recovered --key 'sk-original-key'"
+        after_help = "默认随机生成密钥。使用 --key 可恢复误删的原密钥；注意命令行参数可能进入 shell 历史和进程列表。\n\n示例：\n  kproxy apikey add --name ci\n  kproxy apikey add --name team --credits-limit 100\n  kproxy apikey add --name compatible --skip-user-agent-check true\n  kproxy apikey add --name recovered --key 'sk-original-key'"
     )]
     Add {
         #[arg(long)]
@@ -140,6 +151,24 @@ pub enum ApiKeyCommand {
         key: Option<String>,
         #[arg(long)]
         credits_limit: Option<f64>,
+        /// 是否允许该 key 在所有已绑定服务上跳过客户端 User-Agent 校验。
+        #[arg(
+            long,
+            value_name = "BOOL",
+            action = clap::ArgAction::Set,
+            default_value_t = false
+        )]
+        skip_user_agent_check: bool,
+    },
+    /// 修改 API key 配置。
+    #[command(
+        after_help = "参数接受 API key ID 或名称。\n\n示例：\n  kproxy apikey edit ci --skip-user-agent-check true\n  kproxy apikey edit ci --skip-user-agent-check false"
+    )]
+    Edit {
+        id: String,
+        /// 设置是否允许该 key 跳过客户端 User-Agent 校验。
+        #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
+        skip_user_agent_check: bool,
     },
     /// 删除 API key，执行前需输入 y 或 yes 确认。
     #[command(
@@ -705,6 +734,7 @@ pub async fn run_service(
             name,
             host,
             port,
+            skip_user_agent_check,
             api_key_name,
             api_key_format,
         } => {
@@ -715,6 +745,7 @@ pub async fn run_service(
                         "name":name,
                         "host":host,
                         "port":port,
+                        "skip_user_agent_check":skip_user_agent_check,
                         "api_key_name":api_key_name,
                         "api_key_format":api_key_format
                     }),
@@ -745,17 +776,19 @@ pub async fn run_service(
             rename,
             host,
             port,
+            skip_user_agent_check,
             add_api_key,
             remove_api_key,
         } => {
             if rename.is_none()
                 && host.is_none()
                 && port.is_none()
+                && skip_user_agent_check.is_none()
                 && add_api_key.is_empty()
                 && remove_api_key.is_empty()
             {
                 return Err(anyhow!(
-                    "没有指定修改项；请使用 --rename、--host、--port、--add-api-key 或 --remove-api-key"
+                    "没有指定修改项；请使用 --rename、--host、--port、--skip-user-agent-check、--add-api-key 或 --remove-api-key"
                 ));
             }
             let result_selector = rename.clone().unwrap_or_else(|| service.clone());
@@ -776,6 +809,9 @@ pub async fn run_service(
                 replace_optional_string(table, "host", host.as_deref());
                 if let Some(port) = port {
                     table.insert("port".into(), toml::Value::Integer(i64::from(port)));
+                }
+                if let Some(skip) = skip_user_agent_check {
+                    table.insert("skip_user_agent_check".into(), toml::Value::Boolean(skip));
                 }
                 let key_ids = table
                     .entry("api_key_ids")
@@ -881,6 +917,11 @@ pub async fn run_service(
                             key.name,
                             key.format,
                             if key.enabled { "enabled" } else { "disabled" }.into(),
+                            if key.user_agent_check_enforced {
+                                "enforced".into()
+                            } else {
+                                format!("skipped ({})", key.user_agent_check_reason)
+                            },
                             key.credits_limit
                                 .map(format_credits)
                                 .unwrap_or_else(|| "-".into()),
@@ -891,7 +932,15 @@ pub async fn run_service(
                 println!(
                     "{}",
                     render_table(
-                        &["ID", "名称", "格式", "状态", "Credits 上限", "API Key"],
+                        &[
+                            "ID",
+                            "名称",
+                            "格式",
+                            "状态",
+                            "User-Agent",
+                            "Credits 上限",
+                            "API Key",
+                        ],
                         &rows
                     )
                 );
@@ -919,6 +968,14 @@ async fn show_service(client: &mut AdminClient, selector: &str, json: bool) -> R
     println!("ID        {}", service.id);
     println!("名称      {}", service.name);
     println!("监听      {}:{}", service.host, service.port);
+    println!(
+        "UA 校验   {}",
+        if service.skip_user_agent_check {
+            "skipped for this service"
+        } else {
+            "inherits global/key policy"
+        }
+    );
     println!(
         "配置状态  {}",
         if service.enabled {

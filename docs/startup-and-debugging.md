@@ -253,6 +253,8 @@ Service listeners and API-key bindings can be changed without editing TOML:
 ```bash
 kproxy service edit main --host 127.0.0.1 --port 5581
 kproxy service edit main --add-api-key ci --remove-api-key old-key
+kproxy service edit main --skip-user-agent-check true
+kproxy apikey edit ci --skip-user-agent-check true
 kproxy service disable main
 kproxy service enable main
 ```
@@ -789,8 +791,12 @@ field requires restart. Also check for a process-level `KPROXY_HTTP_PORT` overri
 
 Client User-Agent checks are enabled by default: use Claude Code for Claude
 routes and Codex for OpenAI Responses, Chat Completions, and model-list routes.
-To allow other clients, set `server.enforce_user_agent_check = false` and reload
-the configuration. API key authentication remains enabled. See
+To allow other clients everywhere, set `server.enforce_user_agent_check = false`
+and reload the configuration. To exempt only one service or API key, run
+`kproxy service edit <service> --skip-user-agent-check true` or
+`kproxy apikey edit <key> --skip-user-agent-check true`. Set the value back to
+`false` to remove the exemption. API key authentication and service key
+allowlists remain enabled. See
 [Codex setup and Responses support](openai-responses.md).
 
 ### Generation returns `503`

@@ -37,13 +37,14 @@ pub(super) async fn handle_claude(
 ) -> Result<Response, ApiError> {
     let state = Arc::clone(&service.app);
     let started = Instant::now();
-    enforce_claude_user_agent(&state, &headers)?;
-    let key_id = authenticate(
+    let authenticated_key = authenticate(
         &state,
         &service.allowed_api_key_ids,
         &headers,
         ErrorFormat::Claude,
     )?;
+    enforce_claude_user_agent(&service, &headers, authenticated_key.as_ref())?;
+    let key_id = authenticated_key.map(|key| key.id);
     tracing::debug!(
         event = "proxy.authentication.completed",
         trace_id = %trace_id,
@@ -856,13 +857,14 @@ pub(super) async fn handle_openai(
 ) -> Result<Response, ApiError> {
     let state = Arc::clone(&service.app);
     let started = Instant::now();
-    let key_id = authenticate(
+    let authenticated_key = authenticate(
         &state,
         &service.allowed_api_key_ids,
         &headers,
         ErrorFormat::OpenAi,
     )?;
-    enforce_codex_user_agent(&state, &headers)?;
+    enforce_codex_user_agent(&service, &headers, authenticated_key.as_ref())?;
+    let key_id = authenticated_key.map(|key| key.id);
     tracing::debug!(
         event = "proxy.authentication.completed",
         trace_id = %trace_id,

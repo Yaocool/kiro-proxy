@@ -40,7 +40,10 @@ requires_openai_auth = false
 认证先于客户端检查；拒绝请求使用对应协议的错误格式，且不访问 Kiro 上游。
 健康检查及遥测路由保持原有行为。
 
-需要其他协议客户端接入时，可将此开关设为 `false` 并重载配置。
+需要对所有服务开放其他协议客户端时，可将此开关设为 `false` 并重载配置。只豁免一个
+服务或 API Key 时，分别在对应的 `[[proxy_service]]` 或 `[[api_key]]` 中设置
+`skip_user_agent_check = true`，也可以使用 `kproxy service edit` 或 `kproxy apikey edit`
+修改。全局关闭、service 豁免、API Key 豁免依次决定最终策略；任一层豁免都会跳过检查。
 API key 认证、服务级 key 白名单、额度和并发限制继续生效。
 
 ## 支持范围

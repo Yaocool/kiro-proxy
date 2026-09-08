@@ -345,6 +345,8 @@ pub struct ProxyServiceView {
     pub host: String,
     pub port: u16,
     pub enabled: bool,
+    #[serde(default)]
+    pub skip_user_agent_check: bool,
     pub running: bool,
     #[serde(default)]
     pub api_key_ids: Vec<String>,
@@ -367,6 +369,8 @@ pub struct ProxyServiceCreateParams {
     pub host: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub port: Option<u16>,
+    #[serde(default)]
+    pub skip_user_agent_check: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -425,11 +429,21 @@ pub struct ProxyServiceApiKeyView {
     pub name: String,
     pub format: String,
     pub enabled: bool,
+    #[serde(default)]
+    pub skip_user_agent_check: bool,
+    #[serde(default = "default_true")]
+    pub user_agent_check_enforced: bool,
+    #[serde(default)]
+    pub user_agent_check_reason: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits_limit: Option<f64>,
     /// 仅在显式请求明文时返回。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// `service.apikeys` 结果。

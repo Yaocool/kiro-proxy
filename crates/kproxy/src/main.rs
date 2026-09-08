@@ -1359,6 +1359,8 @@ mod tests {
             "main",
             "--port",
             "5581",
+            "--skip-user-agent-check",
+            "false",
             "--add-api-key",
             "ci,team",
         ])
@@ -1368,6 +1370,7 @@ mod tests {
                 Some(crate::commands::runtime::ServiceCommand::Edit {
                     service,
                     port,
+                    skip_user_agent_check,
                     add_api_key,
                     ..
                 }),
@@ -1377,7 +1380,27 @@ mod tests {
         };
         assert_eq!(service, "main");
         assert_eq!(port, Some(5581));
+        assert_eq!(skip_user_agent_check, Some(false));
         assert_eq!(add_api_key, vec!["ci", "team"]);
+
+        let key = Cli::try_parse_from([
+            "kproxy",
+            "apikey",
+            "edit",
+            "ci",
+            "--skip-user-agent-check",
+            "true",
+        ])
+        .expect("API key policy edit");
+        assert!(matches!(
+            key.command,
+            Some(Command::ApiKey {
+                command: Some(crate::commands::runtime::ApiKeyCommand::Edit {
+                    skip_user_agent_check: true,
+                    ..
+                })
+            })
+        ));
 
         let limit = Cli::try_parse_from(["kproxy", "apikey", "limit", "ci", "--clear"])
             .expect("clear API key limit");
@@ -1387,6 +1410,49 @@ mod tests {
                 command: Some(crate::commands::runtime::ApiKeyCommand::Limit {
                     clear: true,
                     credits: None,
+                    ..
+                })
+            })
+        ));
+    }
+
+    #[test]
+    fn user_agent_policy_creation_flags_accept_explicit_booleans() {
+        let service = Cli::try_parse_from([
+            "kproxy",
+            "service",
+            "create",
+            "--name",
+            "compatible",
+            "--skip-user-agent-check",
+            "true",
+        ])
+        .expect("service creation policy");
+        assert!(matches!(
+            service.command,
+            Some(Command::Service {
+                command: Some(crate::commands::runtime::ServiceCommand::Create {
+                    skip_user_agent_check: true,
+                    ..
+                })
+            })
+        ));
+
+        let key = Cli::try_parse_from([
+            "kproxy",
+            "apikey",
+            "add",
+            "--name",
+            "compatible",
+            "--skip-user-agent-check",
+            "true",
+        ])
+        .expect("API key creation policy");
+        assert!(matches!(
+            key.command,
+            Some(Command::ApiKey {
+                command: Some(crate::commands::runtime::ApiKeyCommand::Add {
+                    skip_user_agent_check: true,
                     ..
                 })
             })

@@ -386,7 +386,11 @@ async fn creating_first_proxy_service_returns_a_scoped_api_key() {
             Request::new(
                 1,
                 method::SERVICE_CREATE,
-                serde_json::json!({"name":"first","port":port}),
+                serde_json::json!({
+                    "name":"first",
+                    "port":port,
+                    "skip_user_agent_check":true
+                }),
             ),
         )
         .await,
@@ -395,6 +399,7 @@ async fn creating_first_proxy_service_returns_a_scoped_api_key() {
     assert!(created.service.running);
     assert_eq!(created.service.host, "0.0.0.0");
     assert_eq!(created.service.port, port);
+    assert!(created.service.skip_user_agent_check);
     assert_eq!(
         created.service.api_key_ids,
         vec![created.api_key.id.clone()]
@@ -428,6 +433,9 @@ async fn creating_first_proxy_service_returns_a_scoped_api_key() {
     .expect("hidden service API keys");
     assert_eq!(hidden.service_id, created.service.id);
     assert_eq!(hidden.api_keys.len(), 1);
+    assert!(!hidden.api_keys[0].skip_user_agent_check);
+    assert!(!hidden.api_keys[0].user_agent_check_enforced);
+    assert_eq!(hidden.api_keys[0].user_agent_check_reason, "service_bypass");
     assert!(hidden.api_keys[0].key.is_none());
     assert!(!serde_json::to_string(&hidden)
         .expect("serialize hidden keys")
@@ -559,6 +567,7 @@ fn service_key_cleanup_preserves_keys_shared_with_other_services() {
         key: "sk-exclusive".into(),
         format: ApiKeyFormat::Sk,
         enabled: true,
+        skip_user_agent_check: false,
         credits_limit: None,
     };
     let shared = ApiKeyConfig {
@@ -567,6 +576,7 @@ fn service_key_cleanup_preserves_keys_shared_with_other_services() {
         key: "sk-shared".into(),
         format: ApiKeyFormat::Sk,
         enabled: true,
+        skip_user_agent_check: false,
         credits_limit: None,
     };
     let removed = ProxyServiceConfig {
@@ -575,6 +585,7 @@ fn service_key_cleanup_preserves_keys_shared_with_other_services() {
         host: "127.0.0.1".into(),
         port: 5580,
         enabled: true,
+        skip_user_agent_check: false,
         api_key_ids: vec!["ak_exclusive".into(), "ak_shared".into()],
         created_at: 0,
     };
@@ -584,6 +595,7 @@ fn service_key_cleanup_preserves_keys_shared_with_other_services() {
         host: "127.0.0.1".into(),
         port: 5581,
         enabled: true,
+        skip_user_agent_check: false,
         api_key_ids: vec!["ak_shared".into()],
         created_at: 0,
     };
@@ -752,6 +764,7 @@ async fn administrative_lists_use_stable_name_order() {
         key: key.into(),
         format: ApiKeyFormat::Sk,
         enabled: true,
+        skip_user_agent_check: false,
         credits_limit: None,
     })
     .into();
@@ -765,6 +778,7 @@ async fn administrative_lists_use_stable_name_order() {
         host: "127.0.0.1".into(),
         port,
         enabled: false,
+        skip_user_agent_check: false,
         api_key_ids: vec!["ak_zulu".into(), "ak_alpha".into()],
         created_at: 0,
     })
@@ -1026,6 +1040,7 @@ async fn config_reload_rolls_back_when_proxy_listener_cannot_start() {
         key: "sk-reload".into(),
         format: ApiKeyFormat::Sk,
         enabled: true,
+        skip_user_agent_check: false,
         credits_limit: None,
     });
     next.proxy_service.push(ProxyServiceConfig {
@@ -1034,6 +1049,7 @@ async fn config_reload_rolls_back_when_proxy_listener_cannot_start() {
         host: "127.0.0.1".into(),
         port,
         enabled: true,
+        skip_user_agent_check: false,
         api_key_ids: vec!["ak_reload".into()],
         created_at: 0,
     });

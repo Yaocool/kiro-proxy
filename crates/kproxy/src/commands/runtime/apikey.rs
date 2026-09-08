@@ -33,6 +33,7 @@ pub async fn run_apikey(
             format,
             key,
             credits_limit,
+            skip_user_agent_check,
         } => {
             let key = resolve_api_key_value(&format, key.as_deref())?;
             let id = key_id(&key);
@@ -43,6 +44,10 @@ pub async fn run_apikey(
                 table.insert("key".into(), toml::Value::String(key.clone()));
                 table.insert("format".into(), toml::Value::String(format.clone()));
                 table.insert("enabled".into(), toml::Value::Boolean(true));
+                table.insert(
+                    "skip_user_agent_check".into(),
+                    toml::Value::Boolean(skip_user_agent_check),
+                );
                 if let Some(limit) = credits_limit {
                     table.insert("credits_limit".into(), toml::Value::Float(limit));
                 }
@@ -56,6 +61,19 @@ pub async fn run_apikey(
                 println!("已创建 {id} ({name})\n请立即保存密钥；之后列表不再显示：\n{key}");
             }
             Ok(())
+        }
+        ApiKeyCommand::Edit {
+            id,
+            skip_user_agent_check,
+        } => {
+            mutate_key_and_reload(
+                client,
+                &id,
+                "skip_user_agent_check",
+                toml::Value::Boolean(skip_user_agent_check),
+            )
+            .await?;
+            report_apikey_change(client, &id, "已更新 User-Agent 校验策略", json).await
         }
         ApiKeyCommand::Rm { id } => {
             if !crate::commands::confirm(&format!("确认删除 API key {id}？")).await? {
@@ -140,6 +158,8 @@ pub(super) struct ApiKeyListEntry {
     id: String,
     name: String,
     enabled: bool,
+    #[serde(default)]
+    skip_user_agent_check: bool,
     credits_limit: Option<f64>,
     #[serde(default)]
     reserved_credits: f64,
@@ -217,6 +237,11 @@ async fn show_key_list(client: &mut AdminClient, detail: bool, json: bool) -> Re
                 entry.id.clone(),
                 entry.name.clone(),
                 if entry.enabled { "enabled" } else { "disabled" }.into(),
+                if entry.skip_user_agent_check {
+                    "skip".into()
+                } else {
+                    "enforce".into()
+                },
                 entry
                     .credits_limit
                     .map(format_credits)
@@ -239,6 +264,7 @@ async fn show_key_list(client: &mut AdminClient, detail: bool, json: bool) -> Re
             "ID",
             "名称",
             "状态",
+            "User-Agent",
             "Credits 上限",
             "请求",
             "输入 Tokens",
@@ -247,7 +273,7 @@ async fn show_key_list(client: &mut AdminClient, detail: bool, json: bool) -> Re
             "预留 Credits",
         ]
     } else {
-        vec!["ID", "名称", "状态", "Credits 上限"]
+        vec!["ID", "名称", "状态", "User-Agent", "Credits 上限"]
     };
     println!("{}", render_table(&headers, &rows));
     if detail {
@@ -290,6 +316,7 @@ pub(super) fn apikey_list_json(
                 "id":entry.id,
                 "name":entry.name,
                 "enabled":entry.enabled,
+                "skip_user_agent_check":entry.skip_user_agent_check,
                 "credits_limit":entry.credits_limit,
             });
             if detail {

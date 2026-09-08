@@ -229,6 +229,8 @@ curl -i http://127.0.0.1:5580/v1/models \
 ```bash
 kproxy service edit main --host 127.0.0.1 --port 5581
 kproxy service edit main --add-api-key ci --remove-api-key old-key
+kproxy service edit main --skip-user-agent-check true
+kproxy apikey edit ci --skip-user-agent-check true
 kproxy service disable main
 kproxy service enable main
 ```
@@ -694,8 +696,11 @@ kproxy --socket /path/to/admin.sock status
 ### 协议路由返回访问拒绝
 
 默认按协议校验客户端 User-Agent：Claude 路由使用 Claude Code，OpenAI Responses、
-Chat Completions 和模型列表路由使用 Codex。需要其他客户端时，设置
-`server.enforce_user_agent_check = false` 并重载配置，API key 认证仍生效。
+Chat Completions 和模型列表路由使用 Codex。需要对全部客户端放开时，设置
+`server.enforce_user_agent_check = false` 并重载配置。只豁免单个服务或 API Key 时，使用
+`kproxy service edit <service> --skip-user-agent-check true` 或
+`kproxy apikey edit <key> --skip-user-agent-check true`；设回 `false` 即取消豁免。
+API key 认证和服务 Key 白名单始终生效。
 接入方法见 [Responses 与 Codex 配置](openai-responses.md)。
 
 ### 生成接口返回 `503`

@@ -711,6 +711,9 @@ pub struct ApiKeyConfig {
     /// 是否启用。
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 是否允许该 key 跳过客户端 User-Agent 校验。
+    #[serde(default)]
+    pub skip_user_agent_check: bool,
     /// credits 上限。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits_limit: Option<f64>,
@@ -730,12 +733,54 @@ pub struct ProxyServiceConfig {
     /// 是否启动监听。
     #[serde(default = "default_true")]
     pub enabled: bool,
+    /// 是否允许该服务的已认证请求跳过客户端 User-Agent 校验。
+    #[serde(default)]
+    pub skip_user_agent_check: bool,
     /// 允许访问此服务的 API key ID。
     #[serde(default)]
     pub api_key_ids: Vec<String>,
     /// 创建时间（Unix 秒）。
     #[serde(default)]
     pub created_at: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserAgentCheckPolicy {
+    Enforced,
+    GlobalDisabled,
+    ServiceBypass,
+    ApiKeyBypass,
+}
+
+impl UserAgentCheckPolicy {
+    pub fn enforced(self) -> bool {
+        matches!(self, Self::Enforced)
+    }
+
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Enforced => "enforced",
+            Self::GlobalDisabled => "global_disabled",
+            Self::ServiceBypass => "service_bypass",
+            Self::ApiKeyBypass => "api_key_bypass",
+        }
+    }
+}
+
+pub fn resolve_user_agent_check_policy(
+    globally_enforced: bool,
+    service_bypass: bool,
+    api_key_bypass: bool,
+) -> UserAgentCheckPolicy {
+    if !globally_enforced {
+        UserAgentCheckPolicy::GlobalDisabled
+    } else if service_bypass {
+        UserAgentCheckPolicy::ServiceBypass
+    } else if api_key_bypass {
+        UserAgentCheckPolicy::ApiKeyBypass
+    } else {
+        UserAgentCheckPolicy::Enforced
+    }
 }
 
 /// 顶层配置。
@@ -1614,6 +1659,8 @@ start_url = ""
 # format = "sk"
 # 是否允许该 key 认证请求。
 # enabled = true
+# 是否允许该 key 在所有已绑定服务上跳过客户端 User-Agent 校验。
+# skip_user_agent_check = false
 # 该 key 的累计 credits 上限；不配置表示不限，0 会禁止产生任何新消耗。
 # credits_limit = 5000.0
 
@@ -1629,6 +1676,8 @@ start_url = ""
 # port = 5580
 # 是否随 daemon 启动该监听实例。
 # enabled = true
+# 是否允许该服务的已认证请求跳过客户端 User-Agent 校验。
+# skip_user_agent_check = false
 # 允许访问该服务的 API key ID；至少一个，且都必须存在于 [[api_key]]。
 # api_key_ids = ["ak_example"]
 # 创建时间（Unix 秒）；由 CLI 创建时自动填写。

@@ -144,6 +144,7 @@ name = "keep"
 key = "sk-keep-secret"
 format = "sk"
 enabled = true
+skip_user_agent_check = true
 credits_limit = 12.5
 
 [[proxy_service]]
@@ -152,6 +153,7 @@ name = "keep"
 host = "127.0.0.1"
 port = 6201
 enabled = true
+skip_user_agent_check = true
 api_key_ids = ["ak_keep"]
 created_at = 123
 "#;
@@ -170,11 +172,13 @@ created_at = 123
     assert_eq!(reset.api_key[0].id.as_deref(), Some("ak_keep"));
     assert_eq!(reset.api_key[0].key, "sk-keep-secret");
     assert!(reset.api_key[0].enabled);
+    assert!(reset.api_key[0].skip_user_agent_check);
     assert_eq!(reset.api_key[0].credits_limit, Some(12.5));
     assert_eq!(reset.proxy_service.len(), 1);
     assert_eq!(reset.proxy_service[0].id, "svc_keep");
     assert_eq!(reset.proxy_service[0].port, 6201);
     assert!(reset.proxy_service[0].enabled);
+    assert!(reset.proxy_service[0].skip_user_agent_check);
     assert_eq!(reset.proxy_service[0].api_key_ids, ["ak_keep"]);
     assert!(output.contains("# kiro-proxy 配置文件"));
 }
