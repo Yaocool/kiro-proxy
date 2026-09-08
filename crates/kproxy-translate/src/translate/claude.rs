@@ -222,11 +222,7 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
                 push_assistant(
                     &mut history,
                     KiroAssistantMessage {
-                        content: if text.trim().is_empty() {
-                            "Using tools.".into()
-                        } else {
-                            text
-                        },
+                        content: text,
                         cache_point: message_cache_point(message, options.enable_prompt_cache),
                         tool_uses: uses,
                     },

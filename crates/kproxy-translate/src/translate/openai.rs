@@ -399,13 +399,10 @@ fn assistant_message(
             })
         })
         .collect::<Vec<_>>();
-    if content.trim().is_empty() {
-        content = if tool_uses.is_empty() {
-            "I understand."
-        } else {
-            "Using tools."
-        }
-        .into();
+    // Tool uses already represent the assistant turn. Invented prose here
+    // becomes model-visible history and can be echoed in later responses.
+    if content.trim().is_empty() && tool_uses.is_empty() {
+        content = "I understand.".into();
     }
     KiroAssistantMessage {
         content,

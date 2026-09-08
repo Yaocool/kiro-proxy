@@ -36,11 +36,7 @@ pub fn tool_search_continue_payload_batch(
     next.conversation_state.history.push(KiroHistoryMessage {
         user_input_message: None,
         assistant_response_message: Some(KiroAssistantMessage {
-            content: if assistant_content.trim().is_empty() {
-                "Searching for tools.".into()
-            } else {
-                tail_chars(assistant_content, 48_000)
-            },
+            content: tail_chars(assistant_content, 48_000),
             cache_point: None,
             tool_uses: searches
                 .iter()
@@ -184,11 +180,7 @@ pub fn auto_continue_payload(
     next.conversation_state.history.push(KiroHistoryMessage {
         user_input_message: None,
         assistant_response_message: Some(KiroAssistantMessage {
-            content: if assistant_content.trim().is_empty() {
-                "Using tools.".into()
-            } else {
-                tail_chars(assistant_content, 48_000)
-            },
+            content: tail_chars(assistant_content, 48_000),
             cache_point: None,
             tool_uses: tool_uses.clone(),
         }),
@@ -242,6 +234,51 @@ mod tests {
         KiroToolSpecification, KiroUserInputMessage, TranslationOptions,
     };
     use serde_json::json;
+
+    #[test]
+    fn tool_only_continuation_preserves_text_and_pairs() {
+        let request: ClaudeRequest = serde_json::from_value(json!({
+            "model":"model","max_tokens":128,
+            "messages":[{"role":"user","content":"Check progress."}],
+            "tools":[{"name":"poll","input_schema":{"type":"object"}}]
+        }))
+        .unwrap();
+        let payload = claude_to_kiro(&request, &TranslationOptions::new("model", "CLI"));
+        let tool = KiroToolUse {
+            tool_use_id: "call_poll".into(),
+            name: "poll".into(),
+            input: json!({"session_id":42}),
+        };
+        for text in ["", " \n", "继续检查进度。", "Using tools."] {
+            let mut next = auto_continue_payload(&payload, text, vec![tool.clone()]);
+            let repairs = crate::sanitize_kiro_tool_history(&mut next);
+            assert!(!repairs.has_structured_tool_repair());
+            crate::validate_kiro_tool_history(&next).expect("paired tool continuation");
+            let assistant = next
+                .conversation_state
+                .history
+                .last()
+                .unwrap()
+                .assistant_response_message
+                .as_ref()
+                .unwrap();
+            assert_eq!(assistant.content, text);
+            assert_eq!(
+                serde_json::to_value(&assistant.tool_uses).unwrap(),
+                json!([tool])
+            );
+            let results = &next
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .as_ref()
+                .unwrap()
+                .tool_results;
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].tool_use_id, tool.tool_use_id);
+        }
+    }
 
     #[test]
     fn preserves_conversation_and_adds_tool_results() {
@@ -489,7 +526,15 @@ mod tests {
             documentation: vec![],
             truncated: false,
         };
-        let next = tool_search_continue_payload(&payload, "searching", search_use, &outcome);
+        let next = tool_search_continue_payload(&payload, "", search_use, &outcome);
+        assert_eq!(
+            next.conversation_state.history[1]
+                .assistant_response_message
+                .as_ref()
+                .unwrap()
+                .content,
+            ""
+        );
         assert_eq!(
             next.conversation_state.history[0]
                 .user_input_message
