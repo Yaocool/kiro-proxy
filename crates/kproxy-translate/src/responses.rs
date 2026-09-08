@@ -111,7 +111,8 @@ pub fn responses_to_openai(
                 request
                     .reasoning
                     .as_ref()
-                    .is_some_and(|value| value.summary.is_some()),
+                    .and_then(|value| value.summary.as_deref())
+                    .is_some_and(|summary| summary != "none"),
             ),
             (
                 "reasoning.context",

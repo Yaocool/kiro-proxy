@@ -62,7 +62,7 @@ API key 认证、服务级 key 白名单、额度和并发限制继续生效。
 | `max_output_tokens` | 映射为 Kiro maxTokens；省略时不补默认生成上限 |
 | `temperature`、`top_p` | 复用现有参数校验和映射，保留零值 |
 | `reasoning.effort` | 复用现有 effort 映射；none 关闭本次推理 |
-| 推理输出与历史 | 返回 reasoning summary 事件/条目；回传的明文摘要保留在 assistant 上下文 |
+| 推理输出与历史 | 返回 reasoning summary 事件/条目；流式摘要按完整 Kiro 段落发布，避免 Codex 丢失增量后只显示空占位；回传的明文摘要保留在 assistant 上下文 |
 | `text.verbosity` | 转为回答详略的 system 提示；不提供硬性字数保证 |
 | `text.format`、工具 `strict` | 作为兼容提示接收并忽略；不因 JSON Schema 或 strict=true 拒绝请求 |
 | `metadata` | 回显为响应元数据，不作为客户端认证凭据 |
@@ -71,7 +71,8 @@ API key 认证、服务级 key 白名单、额度和并发限制继续生效。
 `custom.format` 的 grammar 定义会附加到 custom 工具描述中作为模型输入提示；Kiro 不提供原生语法约束，
 因此这不是服务端强校验。
 `reasoning.summary/context`、`include`、`service_tier` 和未使用的 `stream_options` 键宽松接收；
-输出使用 Kiro 可提供的数据，不按官方参数枚举额外拒绝。未知的 `text.verbosity` 不添加详略提示。
+`reasoning.summary: "none"` 不返回摘要，其他模式使用 Kiro 可提供的数据，不按官方参数枚举额外拒绝。
+空白、纯省略号及空 HTML 注释不会创建 reasoning 条目。未知的 `text.verbosity` 不添加详略提示。
 `prompt_cache_key` 用作 Kiro 会话/Prompt Cache 亲和提示，经 API key 隔离后哈希为 UUID，不原样传给
 Kiro。`prompt_cache_retention`、`safety_identifier`、`user` 和 `client_metadata` 作为客户端元数据
 接受，不传给 Kiro；缓存命中仍由既有缓存规则和上游决定。
