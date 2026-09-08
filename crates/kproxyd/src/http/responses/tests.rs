@@ -2,15 +2,8 @@ use super::*;
 use axum::body::to_bytes;
 use kproxy_translate::responses_to_openai;
 
-fn options() -> ResponsesOptions {
-    let request: ResponsesRequest = serde_json::from_value(json!({
-        "model":"claude-sonnet-4.5","input":"hello","store":false,
-        "tools":[{"type":"namespace","name":"functions","tools":[
-            {"type":"function","name":"read_file","parameters":{"type":"object"}},
-            {"type":"custom","name":"apply_patch"}
-        ]}]
-    }))
-    .unwrap();
+fn options_from_body(body: Value) -> ResponsesOptions {
+    let request: ResponsesRequest = serde_json::from_value(body).unwrap();
     let translated = responses_to_openai(&request).unwrap();
     ResponsesOptions::new(
         &request,
@@ -19,6 +12,16 @@ fn options() -> ResponsesOptions {
         None,
         None,
     )
+}
+
+fn options() -> ResponsesOptions {
+    options_from_body(json!({
+        "model":"claude-sonnet-4.5","input":"hello","store":false,
+        "tools":[{"type":"namespace","name":"functions","tools":[
+            {"type":"function","name":"read_file","parameters":{"type":"object"}},
+            {"type":"custom","name":"apply_patch"}
+        ]}]
+    }))
 }
 
 fn stored_options(
@@ -375,6 +378,112 @@ fn mixed_stream_has_stable_ids_order_complete_items_and_usage() {
     assert!(summary_done < text_delta);
     assert!(stream.finish().is_empty());
     assert!(stream.fail("late", "late error").is_empty());
+}
+
+#[test]
+fn stream_seeds_complete_reasoning_text_for_codex_rendering() {
+    let mut stream = ResponsesStream::new(options());
+    let mut frames = stream.start();
+    assert!(stream
+        .chunk(chunk(json!({"reasoning_content":"..."})))
+        .is_empty());
+    assert!(stream
+        .chunk(chunk(json!({"reasoning_content":"Read "})))
+        .is_empty());
+    assert!(stream
+        .chunk(chunk(json!({"reasoning_content":"first."})))
+        .is_empty());
+    frames.extend(stream.chunk(chunk(json!({"content":"Done."}))));
+    frames.extend(stream.chunk(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})));
+    frames.extend(stream.chunk(usage_chunk()));
+    frames.extend(stream.finish());
+
+    let events = events(&frames);
+    let added = events
+        .iter()
+        .find(|event| {
+            event["type"] == "response.output_item.added" && event["item"]["type"] == "reasoning"
+        })
+        .expect("reasoning item should be published");
+    assert_eq!(added["item"]["summary"][0]["text"], "Read first.");
+    let part = events
+        .iter()
+        .find(|event| event["type"] == "response.reasoning_summary_part.added")
+        .expect("reasoning summary part should be published");
+    assert_eq!(part["part"]["text"], "Read first.");
+    assert!(!events
+        .iter()
+        .any(|event| event["type"] == "response.reasoning_summary_text.delta"));
+    assert_eq!(
+        events.last().unwrap()["response"]["output"][0]["summary"][0]["text"],
+        "Read first."
+    );
+}
+
+#[test]
+fn hollow_reasoning_markers_do_not_create_output_items() {
+    let mut stream = ResponsesStream::new(options());
+    let mut frames = stream.start();
+    for marker in [" \n", "...", "…", "<!-- -->"] {
+        assert!(stream
+            .chunk(chunk(json!({"reasoning_content":marker})))
+            .is_empty());
+    }
+    frames.extend(stream.chunk(chunk(json!({"content":"Visible answer."}))));
+    frames.extend(stream.chunk(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})));
+    frames.extend(stream.chunk(usage_chunk()));
+    frames.extend(stream.finish());
+    let events = events(&frames);
+    assert!(!events.iter().any(|event| {
+        event["type"] == "response.output_item.added" && event["item"]["type"] == "reasoning"
+    }));
+    assert_eq!(
+        events.last().unwrap()["response"]["output"][0]["content"][0]["text"],
+        "Visible answer."
+    );
+
+    let response = json_response(
+        json!({"choices":[{"finish_reason":"stop","message":{
+            "reasoning_content":"<!-- -->\n…", "content":"Visible answer."
+        }}],"usage":usage_chunk()["usage"]}),
+        options(),
+    )
+    .expect("response should be encoded");
+    assert_eq!(response["output"].as_array().unwrap().len(), 1);
+    assert_eq!(response["output"][0]["type"], "message");
+}
+
+#[test]
+fn explicit_none_suppresses_reasoning_in_both_modes() {
+    let options_with_none = || {
+        options_from_body(json!({
+            "model":"claude-sonnet-4.5", "input":"hello", "store":false,
+            "reasoning":{"effort":"high","summary":"none"}
+        }))
+    };
+    let mut stream = ResponsesStream::new(options_with_none());
+    let mut frames = stream.start();
+    assert!(stream
+        .chunk(chunk(json!({"reasoning_content":"Hidden summary."})))
+        .is_empty());
+    frames.extend(stream.chunk(chunk(json!({"content":"Visible answer."}))));
+    frames.extend(stream.chunk(json!({"choices":[{"delta":{},"finish_reason":"stop"}]})));
+    frames.extend(stream.chunk(usage_chunk()));
+    frames.extend(stream.finish());
+    let events = events(&frames);
+    assert!(!events.iter().any(|event| {
+        event["type"] == "response.output_item.added" && event["item"]["type"] == "reasoning"
+    }));
+
+    let response = json_response(
+        json!({"choices":[{"finish_reason":"stop","message":{
+            "reasoning_content":"Hidden summary.", "content":"Visible answer."
+        }}],"usage":usage_chunk()["usage"]}),
+        options_with_none(),
+    )
+    .expect("response should be encoded");
+    assert_eq!(response["output"].as_array().unwrap().len(), 1);
+    assert_eq!(response["output"][0]["type"], "message");
 }
 
 #[test]

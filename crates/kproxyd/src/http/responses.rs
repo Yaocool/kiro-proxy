@@ -237,6 +237,7 @@ fn response_input_items(input: &Value) -> Vec<Value> {
 pub(super) struct ResponsesOptions {
     template: Value,
     tool_names: HashMap<String, ResponsesToolName>,
+    emit_reasoning_summary: bool,
     session: Option<(ResponsesSessionStore, StoredResponsesSession)>,
     inherited_conversation_id: Option<String>,
 }
@@ -289,6 +290,14 @@ impl ResponsesOptions {
                 "metadata":request.metadata.as_ref().unwrap_or(&json!({}))
             }),
             tool_names,
+            // `none` is used by Codex as its explicit turn-level opt-out. Keep
+            // accepting future summary modes loosely, but do not manufacture
+            // reasoning items after the client asked us to hide them.
+            emit_reasoning_summary: request
+                .reasoning
+                .as_ref()
+                .and_then(|reasoning| reasoning.summary.as_deref())
+                != Some("none"),
             session,
             inherited_conversation_id,
         }
@@ -368,11 +377,13 @@ impl ResponsesOptions {
 pub(super) fn json_response(chat: Value, options: ResponsesOptions) -> Result<Value, &'static str> {
     let message = &chat["choices"][0]["message"];
     let mut output = Vec::new();
-    if let Some(text) = message["reasoning_content"]
-        .as_str()
-        .filter(|text| !text.is_empty())
-    {
-        output.push(OutputItem::new(ItemContent::Reasoning(text.into())).json("completed"));
+    if options.emit_reasoning_summary {
+        if let Some(text) = message["reasoning_content"]
+            .as_str()
+            .filter(|text| has_substantive_reasoning_summary(text))
+        {
+            output.push(OutputItem::new(ItemContent::Reasoning(text.into())).json("completed"));
+        }
     }
     if let Some(text) = message["content"].as_str().filter(|text| !text.is_empty()) {
         output.push(OutputItem::new(ItemContent::Message(text.into())).json("completed"));
@@ -470,6 +481,21 @@ fn text_part(text: &str) -> Value {
     json!({"type":"output_text","text":text,"annotations":[],"logprobs":[]})
 }
 
+/// Kiro can emit empty summary markers while retaining private reasoning. A
+/// Responses reasoning item for those markers leaves Codex with a permanent
+/// `Reasoning summary: ...` shell, so only publish text with visible meaning.
+fn has_substantive_reasoning_summary(text: &str) -> bool {
+    let without_empty_comments = text.replace("<!-- -->", "");
+    let compact = without_empty_comments
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
+    !compact.is_empty()
+        && !compact
+            .chars()
+            .all(|character| matches!(character, '.' | '…'))
+}
+
 fn usage(chat: &Value) -> Value {
     let input = chat["prompt_tokens"].as_u64().unwrap_or_default();
     let output = chat["completion_tokens"].as_u64().unwrap_or_default();
@@ -484,7 +510,7 @@ struct ResponsesStream {
     options: ResponsesOptions,
     items: Vec<OutputItem>,
     active_text: Option<usize>,
-    active_reasoning: Option<usize>,
+    pending_reasoning: String,
     tool_indices: HashMap<u64, usize>,
     sequence: u64,
     usage: Value,
@@ -498,7 +524,7 @@ impl ResponsesStream {
             options,
             items: Vec::new(),
             active_text: None,
-            active_reasoning: None,
+            pending_reasoning: String::new(),
             tool_indices: HashMap::new(),
             sequence: 0,
             usage: Value::Null,
@@ -568,53 +594,66 @@ impl ResponsesStream {
     }
 
     fn close_text(&mut self, events: &mut Vec<String>) {
-        for index in [self.active_text.take(), self.active_reasoning.take()]
-            .into_iter()
-            .flatten()
-        {
+        if let Some(index) = self.active_text.take() {
             self.close(index, "completed", events);
         }
     }
 
-    fn text(&mut self, text: &str, reasoning: bool, events: &mut Vec<String>) {
+    fn reasoning(&mut self, text: &str) {
+        if !self.options.emit_reasoning_summary || text.is_empty() {
+            return;
+        }
+        // Do not retain an opening placeholder and later prefix real summary
+        // text with it. Once a real section has started, preserve whitespace
+        // and punctuation exactly as Kiro streamed them.
+        if self.pending_reasoning.is_empty() && !has_substantive_reasoning_summary(text) {
+            return;
+        }
+        self.pending_reasoning.push_str(text);
+    }
+
+    /// Materialize a complete summary section in the initial item event.
+    /// Codex versions affected by openai/codex#31216 can persist the final
+    /// summary while rendering only the empty item that arrived first. Kiro's
+    /// reasoning events are already section-sized, so buffering until the next
+    /// visible item preserves their ordering and gives those clients useful
+    /// content even if they miss every summary delta.
+    fn flush_reasoning(&mut self, events: &mut Vec<String>) {
+        let text = std::mem::take(&mut self.pending_reasoning);
+        if !has_substantive_reasoning_summary(&text) {
+            return;
+        }
+        self.close_text(events);
+        let index = self.add(ItemContent::Reasoning(text.clone()), events);
+        events.push(self.event(json!({
+            "type":"response.reasoning_summary_part.added",
+            "item_id":self.items[index].id,
+            "output_index":index,
+            "summary_index":0,
+            "part":{"type":"summary_text","text":text}
+        })));
+        self.close(index, "completed", events);
+    }
+
+    fn text(&mut self, text: &str, events: &mut Vec<String>) {
         if text.is_empty() {
             return;
         }
-        let active = if reasoning {
-            self.active_reasoning
-        } else {
-            self.active_text
-        };
-        let index = if let Some(index) = active {
+        self.flush_reasoning(events);
+        let index = if let Some(index) = self.active_text {
             index
         } else {
             self.close_text(events);
-            let content = if reasoning {
-                ItemContent::Reasoning(String::new())
-            } else {
-                ItemContent::Message(String::new())
-            };
-            let index = self.add(content, events);
-            if reasoning {
-                self.active_reasoning = Some(index);
-                events.push(self.event(json!({"type":"response.reasoning_summary_part.added","item_id":self.items[index].id,"output_index":index,"summary_index":0,"part":{"type":"summary_text","text":""}})));
-            } else {
-                self.active_text = Some(index);
-                events.push(self.event(json!({"type":"response.content_part.added","item_id":self.items[index].id,"output_index":index,"content_index":0,"part":text_part("")})));
-            }
+            let index = self.add(ItemContent::Message(String::new()), events);
+            self.active_text = Some(index);
+            events.push(self.event(json!({"type":"response.content_part.added","item_id":self.items[index].id,"output_index":index,"content_index":0,"part":text_part("")})));
             index
         };
         match &mut self.items[index].content {
-            ItemContent::Message(content) | ItemContent::Reasoning(content) => {
-                content.push_str(text)
-            }
+            ItemContent::Message(content) => content.push_str(text),
             _ => unreachable!("text item"),
         }
-        let value = if reasoning {
-            json!({"type":"response.reasoning_summary_text.delta","item_id":self.items[index].id,"output_index":index,"summary_index":0,"delta":text})
-        } else {
-            json!({"type":"response.output_text.delta","item_id":self.items[index].id,"output_index":index,"content_index":0,"delta":text,"logprobs":[]})
-        };
+        let value = json!({"type":"response.output_text.delta","item_id":self.items[index].id,"output_index":index,"content_index":0,"delta":text,"logprobs":[]});
         events.push(self.event(value));
     }
 
@@ -643,12 +682,13 @@ impl ResponsesStream {
             }
             let delta = &choice["delta"];
             if let Some(text) = delta["reasoning_content"].as_str() {
-                self.text(text, true, &mut events);
+                self.reasoning(text);
             }
             if let Some(text) = delta["content"].as_str() {
-                self.text(text, false, &mut events);
+                self.text(text, &mut events);
             }
             if let Some(calls) = delta["tool_calls"].as_array() {
+                self.flush_reasoning(&mut events);
                 self.close_text(&mut events);
                 for call in calls {
                     let Some(tool_index) = call["index"].as_u64() else {
@@ -725,6 +765,7 @@ impl ResponsesStream {
             "completed"
         };
         let mut events = Vec::new();
+        self.flush_reasoning(&mut events);
         if self.items.is_empty() {
             let index = self.add(ItemContent::Message(String::new()), &mut events);
             events.push(self.event(json!({"type":"response.content_part.added","item_id":self.items[index].id,"output_index":index,"content_index":0,"part":text_part("")})));
@@ -759,6 +800,7 @@ impl ResponsesStream {
         if self.terminal {
             return Vec::new();
         }
+        self.pending_reasoning.clear();
         self.terminal = true;
         let output = self
             .items
