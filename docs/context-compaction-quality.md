@@ -27,6 +27,42 @@
 `estimated`，估算值不是上游实际扣费凭据。完全没有输出/usage 的失败摘要不会按输入估算消耗 credits。
 空摘要/非法摘要也记录为失败，不再因 HTTP 200 而计入摘要成功数。
 
+2026-09-08 手动 `/compact` 的当前轮边界修复：Claude Code 会通过普通 Messages 请求追加摘要
+指令，不一定发送 `compact_*` edit。若紧前方是 user 消息（尤其是超大工具结果），客户端或
+代理的相邻同角色归并会把源数据与摘要指令合并进 `currentMessage`。普通压缩必须完整保留
+当前轮，所以 `compaction_operation_target` 的最小输入检查就可能返回
+`context_length_exceeded`，尚未进入分段摘要或上游调用；错误中的 token 数此时是不可压缩
+部分的估算量，不一定是整段会话的 token 数。
+
+对 Claude Code User-Agent，翻译层现在仅识别末尾独立 text block 中的已知摘要指令前缀
+（含 text-only 变体），把前面的完整源 blocks 还原为历史，摘要指令独立作为当前轮。
+超长源历史即可复用现有的完整输入分段语义摘要流程，随后继续生成客户端所需的普通摘要
+文本。system 和工具定义的额外处理见下文；普通当前消息、工具结果里引用的摘要指令，
+以及其他 SDK 请求继续使用原有边界。
+`count_tokens` 使用相同翻译边界并计入完整源数据，但不触发摘要。回归覆盖相邻 user 消息、
+已合并的 tool_result/text blocks、流式及非流式响应，并检查分段源文本完整性和输入窗口。
+
+2026-09-08 固定上下文溢出优化：对于经过校验、带 Claude Code User-Agent 和已知末尾摘要
+指令的请求，代理使用精简的摘要 system，将原 system（含 system messages）、完整已加载工具定义、
+schema 约束及示例转为带标签的完整 JSON 源记录，放入可压缩历史。历史工具调用和结果作为
+摘要材料，不执行待续的 Web Search 或 Tool Search，也不加载可执行工具定义。未发现的
+deferred 工具目录继续留在模型上下文之外。超长源记录
+复用现有分段摘要，最终返回客户端要求的普通摘要文本。源内容不会在分段前被截掉，语义摘要
+本身仍有信息损失；超时和失败仍遵循现有可观测的 fallback 与资源上限。
+
+明确的客户端摘要请求可以在 `auto_compact_on_overflow = false` 时使用这条有界分段路径，
+该开关继续控制普通生成请求的自动压缩。`count_tokens` 使用相同的摘要准备与历史渲染，计入
+完整源材料而不发起摘要。指定 `tool_choice: any/tool` 的请求不进入这个摘要模式。
+
+普通生成请求继续完整保留系统指令和工具 schema。若固定部分确实装不下，响应中的
+`error.context` 和请求日志中的 `diagnostics.context_overflow` 会给出同一份 token 估算明细：
+总量、受保护前缀、工具定义、当前消息、可压缩历史、结构开销、不可压缩最小量及模型上限。
+CLI 请求日志会显示 `context_tokens` 行。`protected_prefix_tokens` 包括 system 和被翻译层
+移入 system 的长工具文档，`current_message_tokens` 包括当前附件/工具结果，但不重复计算
+工具定义。明细只含数值，不回显提示词或 schema。一次 `/compact` 成功不会缩小客户端下轮
+重新发送的原 system/工具定义；普通请求的固定部分仍超限时，需要精简源配置或使用真实支持
+更大窗口的模型。
+
 ## 现状：截断拼接，不是摘要
 
 `kproxy-translate/src/tokenizer.rs` 的 `compact_kiro_payload` 分三步：

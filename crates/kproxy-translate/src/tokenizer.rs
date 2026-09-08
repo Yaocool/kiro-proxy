@@ -1,6 +1,8 @@
 //! Async tokenizer with a bounded content-hash LRU.
 
 mod compaction;
+mod context;
+pub use context::ContextTokenBreakdown;
 
 use std::num::NonZeroUsize;
 use std::sync::{Arc, Mutex};
@@ -728,6 +730,19 @@ fn starts_conversation_turn(message: &KiroHistoryMessage) -> bool {
             .as_ref()
             .is_some_and(|context| !context.tool_results.is_empty())
     })
+}
+
+/// In a client summary request, prior tool calls are source records, never
+/// executable continuations. Render them before ordinary tool-history repair
+/// so omitting active tool schemas does not look like a broken tool protocol.
+pub fn prepare_compaction_source_history(payload: &mut KiroPayload) {
+    let protected = payload.protected_history_len();
+    for message in &mut payload.conversation_state.history[protected..] {
+        if let Some(rendered) = summary_history_message(message) {
+            *message = rendered;
+        }
+    }
+    crate::sanitize_kiro_tool_history(payload);
 }
 
 fn summary_history_message(message: &KiroHistoryMessage) -> Option<KiroHistoryMessage> {

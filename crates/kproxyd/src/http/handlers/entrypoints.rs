@@ -378,6 +378,7 @@ pub(super) fn record_failed_request(
             error_code = error.error_code,
             error_stage = error.error_stage,
             account_error = error.account_error,
+            context_overflow = ?error.context_overflow,
             duration_ms,
             error = %safe_error,
             "client request failed"
@@ -407,6 +408,7 @@ pub(super) fn record_failed_request(
             error_code = error.error_code,
             error_stage = error.error_stage,
             account_error = error.account_error,
+            context_overflow = ?error.context_overflow,
             duration_ms,
             error = %safe_error,
             "client request rejected"
@@ -442,6 +444,7 @@ pub(super) fn record_failed_request(
             error_code: error.error_code.to_owned(),
             error_stage: error.error_stage.to_owned(),
             account_error: error.account_error,
+            context_overflow: error.context_overflow.as_deref().cloned(),
             ..RequestDiagnostics::default()
         },
     });

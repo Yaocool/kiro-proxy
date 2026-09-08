@@ -5,6 +5,10 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{matches_type_family, ClaudeRequest};
 
+mod claude_code;
+pub(crate) use claude_code::is_compaction_instruction;
+pub use claude_code::prepare_claude_code_compaction;
+
 pub const DEFAULT_COMPACT_TRIGGER_TOKENS: u64 = 150_000;
 pub const MIN_COMPACT_TRIGGER_TOKENS: u64 = 50_000;
 pub const DEFAULT_TOOL_CLEAR_TRIGGER_TOKENS: u64 = 100_000;

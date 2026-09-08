@@ -457,6 +457,14 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             "client token-count request validated"
         );
         let config = state.config.current();
+        let claude_code = headers
+            .get(header::USER_AGENT)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(is_claude_user_agent);
+        let client_compaction =
+            claude_code && kproxy_translate::prepare_claude_code_compaction(&mut request);
+        let original_client_compaction =
+            claude_code && kproxy_translate::prepare_claude_code_compaction(&mut original_request);
         if config.features.disable_tools {
             request.tools.clear();
             request.tool_choice = None;
@@ -499,8 +507,9 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             "",
         );
         let mut normal = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
-        normal.enhance_system_prompt = config.features.enhance_system_prompt;
+        normal.enhance_system_prompt = config.features.enhance_system_prompt && !client_compaction;
         normal.enable_prompt_cache = config.features.enable_prompt_cache;
+        normal.separate_compaction_instruction = client_compaction;
         let conversation_fingerprint = conversation_fingerprint(&request.messages);
         normal.conversation_id = stable_conversation_id(
             &headers,
@@ -513,6 +522,9 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             .resolved_model_info(&route.mapped)
             .and_then(|model| model.additional_model_request_fields_schema);
         let mut original_payload = claude_to_kiro(&original_request, &normal);
+        if original_client_compaction {
+            kproxy_translate::prepare_compaction_source_history(&mut original_payload);
+        }
         state.prepare_model_request(&mut original_payload);
         let original_input_tokens = state
             .tokenizer
@@ -531,6 +543,9 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             u64::try_from(original_input_tokens).unwrap_or(u64::MAX),
         );
         let mut effective_payload = claude_to_kiro(&effective_request, &normal);
+        if client_compaction {
+            kproxy_translate::prepare_compaction_source_history(&mut effective_payload);
+        }
         state.prepare_model_request(&mut effective_payload);
         let input_tokens = state
             .tokenizer
@@ -897,12 +912,13 @@ fn is_codex_user_agent(value: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'_'))
 }
 
-fn enforce_context(
+async fn enforce_context(
     state: &Arc<AppState>,
     input_tokens: u64,
     compact: bool,
     model: &str,
     format: ErrorFormat,
+    payload: &KiroPayload,
 ) -> Result<(), ApiError> {
     if let Err(limit) = check_context_limit(state, input_tokens, compact, model) {
         let mut error = ApiError::new(
@@ -916,7 +932,9 @@ fn enforce_context(
         error.log_context.mapped_model = limit.model.clone();
         error.log_context.kiro_model = limit.model.clone();
         error.log_context.model_path = vec![limit.model];
-        Err(error)
+        Err(error
+            .with_context_diagnostics(state, payload, limit.maximum)
+            .await)
     } else {
         Ok(())
     }
@@ -1356,6 +1374,7 @@ struct ApiError {
     error_stage: &'static str,
     upstream_status: Option<u16>,
     account_error: bool,
+    context_overflow: Option<Box<crate::stats::ContextOverflowDiagnostics>>,
 }
 
 impl ApiError {
@@ -1376,6 +1395,7 @@ impl ApiError {
             error_stage,
             upstream_status: None,
             account_error: false,
+            context_overflow: None,
         }
     }
 
@@ -1411,21 +1431,38 @@ impl ApiError {
         self.request_id = Some(request_id.to_owned());
         self
     }
+
+    async fn with_context_diagnostics(
+        mut self,
+        state: &Arc<AppState>,
+        payload: &KiroPayload,
+        maximum_input_tokens: u64,
+    ) -> Self {
+        // Diagnostics are best-effort and must never replace the original
+        // context error if the tokenizer worker is unavailable.
+        if let Ok(tokens) = state.tokenizer.context_token_breakdown(payload).await {
+            self.context_overflow = Some(Box::new(crate::stats::ContextOverflowDiagnostics {
+                tokens,
+                maximum_input_tokens,
+            }));
+        }
+        self
+    }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = self.status;
-        let mut response = (
-            status,
-            Json(error_envelope(
-                self.format,
-                status.as_u16(),
-                &self.message,
-                self.request_id.as_deref(),
-            )),
-        )
-            .into_response();
+        let mut envelope = error_envelope(
+            self.format,
+            status.as_u16(),
+            &self.message,
+            self.request_id.as_deref(),
+        );
+        if let Some(context) = &self.context_overflow {
+            envelope["error"]["context"] = json!(context);
+        }
+        let mut response = (status, Json(envelope)).into_response();
         if let Some(request_id) = self.request_id.as_deref() {
             if let Ok(value) = HeaderValue::from_str(request_id) {
                 response
