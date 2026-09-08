@@ -565,6 +565,24 @@ pub async fn show_logs(
                         println!("  hint: kproxy models resolve {}", models.original);
                     }
                 }
+                if let Some(context) = diagnostics["context_overflow"].as_object() {
+                    let tokens = |name: &str| {
+                        context
+                            .get(name)
+                            .and_then(serde_json::Value::as_u64)
+                            .unwrap_or_default()
+                    };
+                    println!(
+                        "  context_tokens total={} protected_prefix={} tools={} current={} history={} overhead={} minimum={} maximum={}",
+                        tokens("total_input_tokens"), tokens("protected_prefix_tokens"),
+                        tokens("tool_definition_tokens"), tokens("current_message_tokens"),
+                        tokens("history_tokens"), tokens("overhead_tokens"),
+                        tokens("minimum_input_tokens"), tokens("maximum_input_tokens"),
+                    );
+                    if tokens("minimum_input_tokens") > tokens("maximum_input_tokens") {
+                        println!("  hint: protected_prefix includes system instructions and long tool documentation; reduce that prefix, loaded tool definitions, or the current message to fit the model window");
+                    }
+                }
                 for attempt in request["attempts"].as_array().into_iter().flatten() {
                     let status = attempt["status"]
                         .as_u64()

@@ -100,6 +100,21 @@ pub(super) async fn handle_claude(
         "client request validated"
     );
     let config = state.config.current();
+    let original_tool_count = request.tools.len();
+    let claude_code = headers
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(is_claude_user_agent);
+    let client_compaction =
+        claude_code && kproxy_translate::prepare_claude_code_compaction(&mut request);
+    if client_compaction {
+        tracing::info!(
+            event = "proxy.compaction.client_summary_prepared",
+            trace_id = %trace_id,
+            declared_tool_count = original_tool_count,
+            "prepared a tool-free client summary with system and tool definitions as complete source history"
+        );
+    }
     if config.features.disable_tools {
         request.tools.clear();
         request.tool_choice = None;
@@ -127,7 +142,11 @@ pub(super) async fn handle_claude(
     }
     // Discover pending calls only from the already validated effective
     // history, so discarded calls cannot be executed again.
-    let pending_server_tools = claude_pending_server_tool_uses(&request);
+    let pending_server_tools = if client_compaction {
+        Vec::new()
+    } else {
+        claude_pending_server_tool_uses(&request)
+    };
     let web_search_tool = request.tools.iter().find(|tool| {
         tool.r#type
             .as_deref()
@@ -159,9 +178,10 @@ pub(super) async fn handle_claude(
         "",
     );
     let mut options = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
-    options.enhance_system_prompt = config.features.enhance_system_prompt;
+    options.enhance_system_prompt = config.features.enhance_system_prompt && !client_compaction;
     options.web_search_replay = Some(state.web_search_replay.clone());
     options.enable_prompt_cache = config.features.enable_prompt_cache;
+    options.separate_compaction_instruction = client_compaction;
     let conversation_fingerprint = super::conversation_fingerprint(&request.messages);
     options.conversation_id = super::stable_conversation_id(
         &headers,
@@ -174,7 +194,9 @@ pub(super) async fn handle_claude(
         .resolved_model_info(&route.mapped)
         .and_then(|model| model.additional_model_request_fields_schema);
     let mut payload = claude_to_kiro(&request, &options);
-    let original_tool_count = request.tools.len();
+    if client_compaction {
+        kproxy_translate::prepare_compaction_source_history(&mut payload);
+    }
     let catalog_bytes = request
         .tools
         .iter()
@@ -448,7 +470,7 @@ pub(super) async fn handle_claude(
         &resolved_model,
         input_tokens,
         compact_trigger,
-        config.context.auto_compact_on_overflow,
+        config.context.auto_compact_on_overflow || client_compaction,
     ) {
         // The summary may use this same single-concurrency account. Release
         // its slot first; dispatch rechecks any new target after compaction.
@@ -552,7 +574,9 @@ pub(super) async fn handle_claude(
         compacted,
         &resolved_model,
         ErrorFormat::Claude,
-    )?;
+        &payload,
+    )
+    .await?;
     let mut estimate = estimated_credits(input_tokens, request.max_tokens, &config.pool);
     let reservation = reserve_credits(&state, key_id.as_deref(), estimate, ErrorFormat::Claude)?;
     tracing::info!(
@@ -590,7 +614,7 @@ pub(super) async fn handle_claude(
     .await;
     let (execution, reservation) = match first_execution {
         Ok(execution) => (execution, reservation),
-        Err(error) if config.context.auto_compact_on_overflow => {
+        Err(error) if config.context.auto_compact_on_overflow || client_compaction => {
             let retry_plan = match &error {
                 ExecuteError::ContextLimit(limit) => {
                     Some((resolved_compaction_decision(limit), Vec::new(), false))
@@ -671,7 +695,9 @@ pub(super) async fn handle_claude(
                 true,
                 &decision.model,
                 ErrorFormat::Claude,
-            )?;
+                &payload,
+            )
+            .await?;
             diagnostics.tool_tokens = replanned_tool_tokens;
             diagnostics.payload_bytes = replanned_payload_bytes;
             diagnostics.loaded_tool_count = loaded_tool_count(&payload);

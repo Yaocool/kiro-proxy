@@ -701,7 +701,9 @@ pub(super) async fn compaction_operation_target(
                 maximum: decision.maximum_tokens,
             }),
             ErrorFormat::Claude,
-        ));
+        )
+        .with_context_diagnostics(state, source_payload, decision.maximum_tokens)
+        .await);
     }
     Ok(if minimum_tokens > decision.target_tokens {
         // The 75% target is desirable headroom, not a smaller model window.

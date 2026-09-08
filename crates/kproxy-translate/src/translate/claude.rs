@@ -173,7 +173,10 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
     // Anthropic combines adjacent messages with the same role into one turn.
     // Normalize that contract before projecting onto Kiro's strict alternating
     // history instead of inventing model-authored filler turns.
-    let non_system = normalized_non_system_messages(&request.messages);
+    let mut non_system = normalized_non_system_messages(&request.messages);
+    if options.separate_compaction_instruction {
+        separate_compaction_instruction(&mut non_system);
+    }
     let mut history = Vec::new();
     let mut current = KiroUserInputMessage {
         content: "Continue".into(),
@@ -595,6 +598,47 @@ fn merge_claude_content(current: &mut Value, addition: &Value) {
     *current = Value::Array(blocks);
 }
 
+/// Claude Code 2.1.260 appends a text-only summary task for /compact. Its wire
+/// normalizer (or ours) can merge that task with the previous user/tool-result
+/// turn. Leaving the source in currentMessage makes it indivisible, so even
+/// partitioned server compaction fails its minimum-context preflight.
+/// Only split a recognized terminal instruction block; never search within
+/// tool results or cut an arbitrary current user message into history.
+fn separate_compaction_instruction(messages: &mut Vec<crate::ClaudeMessage>) {
+    let Some(last) = messages.last_mut().filter(|message| message.role == "user") else {
+        return;
+    };
+    let Some(blocks) = last
+        .content
+        .as_array_mut()
+        .filter(|blocks| blocks.len() > 1)
+    else {
+        return;
+    };
+    let Some(text) = blocks.last().and_then(|block| {
+        (block.get("type").and_then(Value::as_str) == Some("text"))
+            .then(|| block.get("text").and_then(Value::as_str))
+            .flatten()
+    }) else {
+        return;
+    };
+    if !crate::context::is_compaction_instruction(text) {
+        return;
+    }
+    let instruction = crate::ClaudeMessage {
+        role: "user".into(),
+        content: Value::Array(vec![blocks.pop().expect("nonempty blocks")]),
+        cache_control: last.cache_control.take(),
+        output_config: last.output_config.clone(),
+        extra: last.extra.clone(),
+    };
+    tracing::debug!(
+        source_blocks = blocks.len(),
+        "separated Claude Code compaction instruction from its source context"
+    );
+    messages.push(instruction);
+}
+
 fn content_as_blocks(content: Value) -> Vec<Value> {
     match content {
         Value::String(text) => vec![serde_json::json!({"type":"text","text":text})],
@@ -894,6 +938,139 @@ fn random_id() -> String {
 mod tests {
     use super::*;
     use base64::Engine as _;
+
+    const COMPACT_PROMPT: &str = "Your task is to create a detailed summary of the conversation so far, paying close attention to the user's explicit requests and your previous actions.\nReturn only <summary>...</summary>.";
+
+    #[test]
+    fn claude_code_compaction_separates_source_blocks_and_preserves_tool_pairs() {
+        for merged in [false, true] {
+            for text_only_prefix in [false, true] {
+                let prompt = if text_only_prefix {
+                    format!("CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.\n\n- Do NOT use Read.\n\n{COMPACT_PROMPT}\n\nAdditional Instructions:\nKeep exact identifiers.")
+                } else {
+                    COMPACT_PROMPT.to_owned()
+                };
+                let source_blocks = serde_json::json!([
+                    {"type":"tool_result","tool_use_id":"read-1","content":"EARLY=cobalt\n雪☃\nMIDDLE=mango\nLATE=spruce"},
+                    {"type":"text","text":"Source user note"}
+                ]);
+                let mut value = serde_json::json!({
+                    "model":"source", "max_tokens":1024,
+                    "system":"Governing system instruction",
+                    "tools":[{"name":"Read","input_schema":{"type":"object"}}],
+                    "messages":[
+                        {"role":"user","content":"Read the records"},
+                        {"role":"assistant","content":[{"type":"tool_use","id":"read-1","name":"Read","input":{"path":"records.txt"}}]},
+                        {"role":"user","content":source_blocks}
+                    ]
+                });
+                let instruction = serde_json::json!({"type":"text","text":prompt,
+                    "cache_control":{"type":"ephemeral"}});
+                if merged {
+                    value["messages"][2]["content"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(instruction);
+                } else {
+                    value["messages"]
+                        .as_array_mut()
+                        .unwrap()
+                        .push(serde_json::json!({
+                            "role":"user", "content":[instruction]
+                        }));
+                }
+                let request: ClaudeRequest = serde_json::from_value(value).unwrap();
+                crate::validate_claude(&request).unwrap();
+                let mut options = TranslationOptions::new("target", "AI_EDITOR");
+                options.enhance_system_prompt = false;
+                options.enable_prompt_cache = true;
+                options.separate_compaction_instruction = true;
+                let mut payload = claude_to_kiro(&request, &options);
+                crate::sanitize_kiro_tool_history(&mut payload);
+                crate::validate_kiro_tool_history(&payload).unwrap();
+
+                assert_eq!(payload.protected_history_len(), 2);
+                let current = &payload
+                    .conversation_state
+                    .current_message
+                    .user_input_message;
+                assert_eq!(current.content, prompt);
+                assert!(current.cache_point.is_some());
+                let context = current.user_input_message_context.as_ref().unwrap();
+                assert_eq!(context.tools.len(), 1);
+                assert!(context.tool_results.is_empty());
+                let history = &payload.conversation_state.history;
+                assert_eq!(
+                    history[0].user_input_message.as_ref().unwrap().content,
+                    "Governing system instruction"
+                );
+                let source = history
+                    .iter()
+                    .filter_map(|message| message.user_input_message.as_ref())
+                    .find(|user| user.content == "Source user note")
+                    .unwrap();
+                let results = &source
+                    .user_input_message_context
+                    .as_ref()
+                    .unwrap()
+                    .tool_results;
+                assert_eq!(results.len(), 1);
+                assert_eq!(results[0].tool_use_id, "read-1");
+                assert_eq!(
+                    results[0].content[0].text,
+                    "EARLY=cobalt\n雪☃\nMIDDLE=mango\nLATE=spruce"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ordinary_current_turns_and_embedded_compaction_prompts_remain_indivisible() {
+        for (enabled, prompt) in [
+            (false, COMPACT_PROMPT.to_owned()),
+            (true, "/compact".into()),
+            (
+                true,
+                format!("Explain this quoted prompt: {COMPACT_PROMPT}"),
+            ),
+            (
+                true,
+                "Continue processing the tool result and output <summary>.".into(),
+            ),
+        ] {
+            let request: ClaudeRequest = serde_json::from_value(serde_json::json!({
+                "model":"source", "max_tokens":1024,
+                "tools":[{"name":"Read","input_schema":{"type":"object"}}],
+                "messages":[
+                    {"role":"user","content":"Read"},
+                    {"role":"assistant","content":[{"type":"tool_use","id":"read-1","name":"Read","input":{}}]},
+                    {"role":"user","content":[
+                        {"type":"tool_result","tool_use_id":"read-1","content":COMPACT_PROMPT},
+                        {"type":"text","text":prompt}
+                    ]}
+                ]
+            })).unwrap();
+            let mut options = TranslationOptions::new("target", "AI_EDITOR");
+            options.enhance_system_prompt = false;
+            options.separate_compaction_instruction = enabled;
+            let payload = claude_to_kiro(&request, &options);
+            let current = &payload
+                .conversation_state
+                .current_message
+                .user_input_message;
+            assert_eq!(current.content, prompt);
+            assert_eq!(
+                current
+                    .user_input_message_context
+                    .as_ref()
+                    .unwrap()
+                    .tool_results
+                    .len(),
+                1
+            );
+            assert_eq!(payload.conversation_state.history.len(), 2);
+        }
+    }
 
     #[test]
     fn adjacent_same_role_messages_are_merged_without_fabricated_turns() {

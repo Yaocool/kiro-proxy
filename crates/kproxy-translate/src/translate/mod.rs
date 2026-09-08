@@ -40,6 +40,9 @@ pub struct TranslationOptions {
     /// Retained for source compatibility. System prompts are now always
     /// represented by a protected history pair, independent of compaction.
     pub compact_mode: bool,
+    /// Keep a recognized Claude Code summary instruction separate from the
+    /// preceding user/tool-result blocks so that source context can compact.
+    pub separate_compaction_instruction: bool,
     pub web_search_replay: Option<WebSearchReplayCodec>,
     /// Stable, caller-namespaced upstream conversation identifier.
     pub conversation_id: Option<String>,
@@ -58,6 +61,7 @@ impl TranslationOptions {
             profile_arn: None,
             enhance_system_prompt: true,
             compact_mode: false,
+            separate_compaction_instruction: false,
             web_search_replay: None,
             conversation_id: None,
             enable_prompt_cache: false,
