@@ -49,7 +49,8 @@ CLI 源码位于 [`crates/kproxy`](crates/kproxy)，daemon 源码位于
 最简生产部署只需要 Docker Engine 和 Compose v2 插件。Compose 会拉取已在 CI 中构建、启用
 全部 feature 且包含 Chromium 的 full 镜像，使用 host network 启动 `kproxyd`，并将全部状态
 保存在 `kproxy-data` named volume 中。在仓库根目录执行一键脚本，它会校验环境、先拉取镜像
-再替换容器、等待健康、失败时自动回滚，并在宿主机安装 `kproxy` 命令：
+再替换容器、等待健康、失败时自动回滚，并在健康检查通过后原子安装匹配版本的 `kproxy`
+wrapper：
 
 ```bash
 ./deploy/docker-setup.sh
@@ -448,10 +449,11 @@ kproxy config reload
 kproxy config reset              # 重置通用配置，保留 API key、代理服务和告警配置
 
 kproxy pool --watch --explain
+kproxy diagnose all
 kproxy diagnose endpoints
 kproxy diagnose account --all -c 4 --timeout 45s
 kproxy subscriptions
-kproxy models --refresh --mapped
+kproxy models list --refresh --mapped
 kproxy models resolve opus5       # 显示显式映射和各账号最终调用的 Kiro 模型
 kproxy model-map add --name low-credit --source 'claude-opus-*' --target claude-sonnet-4.6 --below-credits-percent 10
 kproxy model-map edit low-credit --below-credits-percent 15
@@ -477,12 +479,16 @@ kproxy stats --start 2026-08-27T10:00:00+08:00 --end 2026-08-27T12:00:00+08:00
 kproxy stats --detail --since 1h --by endpoint
 kproxy logs show --tail 100
 kproxy logs follow --level warn
+kproxy logs trace trace_0123456789abcdef0123456789abcdef
 kproxy logs files
 kproxy logs files --level error
 kproxy logs path
-kproxy tasks
+kproxy tasks list
 kproxy tasks run status_check
 kproxy help
+kproxy help logs trace
+kproxy help --all
+kproxy guide balance
 ```
 
 所有命令都支持全局 `--json`，权威参数列表以 `kproxy --help` 和各子命令的 `--help` 为准。
@@ -495,8 +501,22 @@ kproxy help
 历史和进程列表，执行后应按使用环境清理相关记录。
 账号剩余额度达到调度保护阈值时可订阅 `account-credit-protected`；同一目标短时间内产生的
 同类型多账号告警会合并成一条消息，每个账号仍独立保持“恢复前只告警一次”的去重语义。
-破坏性操作不提供 `--yes` 跳过选项，执行时必须交互输入 `y` 或 `yes` 二次确认。直接执行
-`kproxy` 会显示总帮助，`kproxy help` 会列出可用的主题帮助。
+删除 daemon 业务资源的命令不提供 `--yes` 跳过选项，执行时必须交互输入 `y` 或 `yes`
+二次确认。直接执行
+`kproxy` 或 `kproxy help` 会显示总帮助。直接执行 `kproxy logs`、`kproxy models`、
+`kproxy tasks`、`kproxy diagnose` 等命令组会展示该组的可用动作。嵌套命令帮助使用
+`kproxy help logs trace`，完整公开命令树使用 `kproxy help --all`，原理和操作说明使用
+`kproxy guide`。
+
+产生业务数据必须明确指定动作：使用 `logs show`、`models list`、`tasks list` 和
+`diagnose all`。相关参数只属于这些动作，旧的父命令参数写法会直接返回参数错误。
+无需启动 daemon 即可生成静态补全：
+
+```bash
+source <(kproxy completions bash)  # Bash
+source <(kproxy completions zsh)   # Zsh
+kproxy completions fish | source  # Fish
+```
 
 `kproxy account list` 默认按邮箱排序，便于批量核对遗漏；需要查看额度或内部 ID 顺序时可使用
 `--sort credit` 或 `--sort id`。服务、API key、告警目标和模型等列表也会按各自的名称或标识
@@ -505,7 +525,7 @@ kproxy help
 `kproxy logs show` 和 `follow` 读取 daemon 保留的结构化请求记录；`kproxy logs files` 会发现
 按日期、级别和分片生成的实际日志文件，并显示大小和完整路径；`kproxy logs path` 显示当前
 日志目录、基础路径、格式和过滤规则。通过 Docker 宿主机 wrapper 执行时，这两个路径命令
-还会显示 named volume 在宿主机上的真实路径。旧的 `kproxy logs --tail ...` 与 `-f` 用法继续兼容。
+还会显示 named volume 在宿主机上的真实路径。
 
 `kproxy status` 的请求量、成功率、Credits 和平均延迟只统计本次 daemon 启动后的数据；
 `kproxy stats` 默认查看跨重启持久化的累计数据。两个命令都支持 `--since 1h`，也支持使用
@@ -515,7 +535,7 @@ kproxy help
 命令会明确提示可查询的最早时间。累计汇总以紧凑格式保存在 `stats.json`，分钟历史按 UTC 小时
 拆分到 `stats-history/`；时间范围的文件读取和聚合不会占用 API 请求统计锁。
 `kproxy stats --detail` 仍只输出最近请求和分组统计，逐条
-故障追踪应使用 `kproxy logs` 和 Trace ID。
+故障追踪应使用 `kproxy logs show` 和 Trace ID。
 
 动态模型探测会在 daemon 启动时立即执行、账号变化时再次触发，之后按模型缓存 TTL 刷新。
 每分钟的账号状态任务只刷新额度信息，不再重复请求模型列表。

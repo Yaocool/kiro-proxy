@@ -58,8 +58,8 @@ Compose stack pulls the prebuilt full image with all features and Chromium,
 runs `kproxyd` with host networking, and keeps all state in the `kproxy-data`
 named volume. Run the one-step setup from the repository root. It validates the
 environment, pulls the image before replacing the container, waits for health,
-rolls back automatically on failure, and installs the `kproxy` command on the
-host:
+rolls back automatically on failure, and then atomically installs the matching
+`kproxy` wrapper on the host:
 
 ```bash
 ./deploy/docker-setup.sh
@@ -560,10 +560,11 @@ kproxy config reload
 kproxy config reset              # resets general settings, preserves API keys/services and alerts
 
 kproxy pool --watch --explain
+kproxy diagnose all
 kproxy diagnose endpoints
 kproxy diagnose account --all -c 4 --timeout 45s
 kproxy subscriptions
-kproxy models --refresh --mapped
+kproxy models list --refresh --mapped
 kproxy models resolve opus5       # show model-map and final per-account Kiro model
 kproxy model-map add --name low-credit --source 'claude-opus-*' --target claude-sonnet-4.6 --below-credits-percent 10
 kproxy model-map edit low-credit --below-credits-percent 15
@@ -593,9 +594,12 @@ kproxy logs trace trace_0123456789abcdef0123456789abcdef
 kproxy logs files
 kproxy logs files --level error
 kproxy logs path
-kproxy tasks
+kproxy tasks list
 kproxy tasks run status_check
 kproxy help
+kproxy help logs trace
+kproxy help --all
+kproxy guide balance
 ```
 
 All commands support the global `--json` option. Run `kproxy --help` or a
@@ -615,9 +619,23 @@ Subscribe to `account-credit-protected` when accounts should alert after reachin
 the scheduler's remaining-credit protection threshold. Same-kind account events
 for one target are batched into one message while retaining per-account
 once-until-recovery suppression.
-Destructive commands have no `--yes` bypass and require an interactive `y` or
-`yes` confirmation. Running bare `kproxy` prints the main help; `kproxy help` lists
-the available topic guides.
+Destructive daemon-resource commands have no `--yes` bypass and require an
+interactive `y` or `yes` confirmation. Bare `kproxy` and `kproxy help` print the main help. A bare
+command group such as `kproxy logs`, `kproxy models`, `kproxy tasks`, or
+`kproxy diagnose` prints that group's actions. Use `kproxy help logs trace` for
+nested command help, `kproxy help --all` for the full public tree, and
+`kproxy guide` for operational topics.
+
+Data-producing forms require explicit actions: use `logs show`, `models list`,
+`tasks list`, and `diagnose all`. Their options belong to those actions; the old
+parent-level forms are rejected. Generate static completion without a running
+daemon:
+
+```bash
+source <(kproxy completions bash)  # Bash
+source <(kproxy completions zsh)   # Zsh
+kproxy completions fish | source  # Fish
+```
 
 `kproxy account list` sorts by email by default so batch imports are easy to
 audit. Use `--sort credit` or `--sort id` when those views are needed. Service,
@@ -634,8 +652,7 @@ events are stored in `warn.log` and `error.log`. `kproxy logs files` discovers
 these shards and prints their sizes and complete paths; `kproxy logs path` prints
 the active directory, base path, format, and filter. When invoked through the
 Docker host wrapper, both path commands also report the named volume's real path
-on the Docker host. The legacy `kproxy logs --tail ...` and `-f` forms remain
-supported.
+on the Docker host.
 
 `kproxy status` reports request, success, credit, and average-latency metrics for
 the current daemon session. `kproxy stats` defaults to persisted cumulative
@@ -647,7 +664,7 @@ earliest available time. The cumulative summary stays compact in `stats.json`;
 minute history is stored in bounded UTC hourly files under `stats-history/`, and
 range parsing/aggregation runs outside the proxy request lock. Use
 `kproxy stats --detail` for recent requests and
-grouped counters, and `kproxy logs` plus trace IDs for individual failures.
+grouped counters, and `kproxy logs show` plus trace IDs for individual failures.
 
 Dynamic model discovery runs immediately at daemon startup, again when accounts
 change, and thereafter when the model-cache TTL expires. The one-minute account

@@ -42,8 +42,9 @@ cargo build --workspace --no-default-features --locked
 cp .env.example .env
 ```
 
-`kproxyd` 和 `kproxy` 每次启动都会在解析 CLI 参数前读取 `.env`。程序从当前目录向上查找，
-因此从 workspace 子目录启动时也能复用仓库根目录的文件。
+`kproxyd` 会在解析启动参数前读取 `.env`。`kproxy` 会先解析帮助、指南、补全和版本等本地
+导航，再在重新解析和执行业务命令前读取 `.env`。两者都从当前目录向上查找，因此从
+workspace 子目录启动时也能复用仓库根目录的文件。
 
 环境变量优先级如下：
 
@@ -53,7 +54,7 @@ cp .env.example .env
 4. 应用内置默认值。
 
 `.env` 不会覆盖已存在的进程变量。找不到 `.env` 可以正常启动；文件格式错误或无法读取时，
-启动会失败并返回错误。
+daemon 启动和业务命令会失败并返回错误，本地 CLI 导航仍然可用。
 
 示例使用 `KPROXY_HOME=.kproxy-dev` 隔离开发数据。主要进程级变量如下：
 
@@ -98,6 +99,20 @@ cargo run -p kproxy -- config path
 cargo run -p kproxy -- config show --effective
 cargo run -p kproxy -- account list
 ```
+
+CLI 导航不需要 daemon，也不依赖有效的 `.env`。无参命令组会展示可用动作；嵌套帮助、指南
+和静态补全都来自同一份命令定义：
+
+```bash
+cargo run -p kproxy -- logs
+cargo run -p kproxy -- help logs trace
+cargo run -p kproxy -- help --all
+cargo run -p kproxy -- guide logs
+cargo run -p kproxy -- completions zsh > /tmp/_kproxy
+```
+
+脚本中应使用显式动作：`logs show`、`models list`、`tasks list` 和 `diagnose all`。无参命令组
+与 `--json` 同时使用时会返回参数错误，避免自动化把帮助文本当成成功的业务数据。
 
 也可以使用编译后的二进制：
 
@@ -147,7 +162,7 @@ CLI 可以生成缺失的 `id`、`machine_id` 和 `created_at`。导入后检查
 ```bash
 cargo run -p kproxy -- account list
 cargo run -p kproxy -- account probe --all
-cargo run -p kproxy -- models
+cargo run -p kproxy -- models list
 ```
 
 默认构建已经包含 IAM Identity Center 登录。先在 `config.toml` 中设置全局 start URL
@@ -278,8 +293,8 @@ kproxy model-map delete low-credit
 
 `kproxy alert events` 会说明每个事件的实际触发条件。一个告警目标可重复传入 `--event`，
 也可使用逗号分隔订阅多个事件；`alert edit --event ...` 会整体替换该目标原有的事件列表。
-`kproxy alert platforms` 会说明 `--platform` 选择的通知平台及平台专用参数；旧参数名
-`--kind` 和 `--url` 作为兼容别名继续可用。钉钉机器人开启加签后，将机器人提供的
+`kproxy alert platforms` 会说明 `--platform` 选择的通知平台及平台专用参数；创建或编辑
+目标时使用 `--platform` 和 `--webhook-url`。钉钉机器人开启加签后，将机器人提供的
 `SEC...` 密钥传给 `--dingtalk-sign`；代理会在每次投递时动态生成 `timestamp` 和 `sign`。
 同一账号或服务在异常持续期间只发送一次 Markdown 告警，恢复后再次发生异常才会重新告警。
 同一告警目标在短时间内收到多个同类型账号事件时，会按账号聚合为一条消息，避免群机器人刷屏。
@@ -358,12 +373,12 @@ cargo run -p kproxy -- stats --start 2026-08-27T10:00:00+08:00 --end 2026-08-27T
 cargo run -p kproxy -- stats --detail --since 1h --by endpoint
 ```
 
-旧的 `kproxy logs --tail ...` 与 `kproxy logs -f` 用法继续兼容。
+日志查询参数必须放在 `logs show` 或 `logs follow` 等明确动作之后。
 
 `kproxy status` 显示本次 daemon 启动后的请求统计，`kproxy stats` 默认显示跨重启持久化的
 累计统计。两者都支持相对窗口 `--since`，或使用带时区的 `--start/--end` 查询起止时间；
 聚合时间分辨率为一分钟。`kproxy stats --detail` 才显示最近请求和按
-model/account/endpoint 的分组统计；逐条故障信息仍应使用 `kproxy logs` 和 Trace ID。
+model/account/endpoint 的分组统计；逐条故障信息仍应使用 `kproxy logs show` 和 Trace ID。
 
 需要更多细节时，将 `RUST_LOG` 或 `log.level` 调整为 `debug` 或 `trace`。日志不会记录
 提示词、生成的回复正文或 API Key 值。
@@ -378,7 +393,7 @@ kproxy health
 ```
 
 该脚本会完成 Compose 配置校验，在旧容器继续运行时拉取镜像，然后替换服务、等待健康，失败
-时恢复原镜像，并在宿主机安装 `kproxy` 命令。
+时恢复原镜像；健康检查通过后再原子替换宿主机的 `kproxy` wrapper。
 默认目标是 `/usr/local/bin/kproxy`；无 sudo 权限时可使用
 `--target "$HOME/.local/bin/kproxy"`。以下是对应的手工命令，适合调试：
 
@@ -456,6 +471,10 @@ kproxy service list
 不支持该终端类型，则自动回退为 `xterm-256color`。镜像内置完整的 `vim` 和扩展 terminfo，
 `kproxy config edit` 默认直接使用 `vim`，可正常处理方向键。这样既不需要暴露管理 Unix
 socket，也不存在宿主机与容器二进制兼容问题。
+
+daemon 容器停止后，wrapper 仍可通过该容器的精确镜像显示命令帮助，不会启动服务或挂载
+业务数据。可用入口包括无参命令组、`help`、`guide`、`completions`、`version` 和生命周期
+命令的 `--help`；业务命令仍需先执行 `kproxy restart`。
 
 升级已有部署时，wrapper 和容器镜像都需要更新：
 
