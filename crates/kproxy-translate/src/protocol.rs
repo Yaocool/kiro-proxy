@@ -498,6 +498,8 @@ pub struct KiroHistoryMessage {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct KiroAssistantMessage {
+    /// Preserve the actual assistant text, including an empty string for a
+    /// tool-only turn. Natural-language filler here pollutes replayed history.
     pub content: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_point: Option<KiroCachePoint>,

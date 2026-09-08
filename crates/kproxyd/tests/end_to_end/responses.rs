@@ -4,7 +4,9 @@ use serde_json::{json, Value};
 const CODEX_AGENT: &str = "codex_cli_rs/0.147.0 (Mac OS 26.0; arm64) Terminal/1.0";
 
 #[derive(Clone)]
-struct ToolRoundtrip;
+struct ToolRoundtrip {
+    assistant_content: &'static str,
+}
 
 impl wiremock::Respond for ToolRoundtrip {
     fn respond(&self, request: &wiremock::Request) -> ResponseTemplate {
@@ -22,10 +24,13 @@ impl wiremock::Respond for ToolRoundtrip {
                 .filter_map(|tool| tool["toolSpecification"]["name"].as_str())
                 .collect::<Vec<_>>();
             assert_eq!(names.len(), 2);
-            let mut body = event_stream_frame(
-                "assistantResponseEvent",
-                json!({"content":"Inspecting the file. "}),
-            );
+            let mut body = Vec::new();
+            if !self.assistant_content.is_empty() {
+                body.extend(event_stream_frame(
+                    "assistantResponseEvent",
+                    json!({"content":self.assistant_content}),
+                ));
+            }
             body.extend(event_stream_frame(
                 "toolUseEvent",
                 json!({"toolUseId":"call_read","name":names[0],"input":"{\"path\":","stop":false}),
@@ -191,12 +196,21 @@ async fn create_response(
 
 #[tokio::test]
 async fn responses_tool_roundtrip_works_through_both_aliases_and_buffer_modes() {
+    assert_tool_roundtrip("Inspecting the file. ").await;
+}
+
+#[tokio::test]
+async fn responses_tool_only_roundtrip_does_not_invent_assistant_text() {
+    assert_tool_roundtrip("").await;
+}
+
+async fn assert_tool_roundtrip(assistant_content: &'static str) {
     let _http_guard = HTTP_TEST_LOCK.lock().await;
     let mock = MockServer::start().await;
     mount_context_alignment_models(&mock).await;
     Mock::given(method("POST"))
         .and(path("/generateAssistantResponse"))
-        .respond_with(ToolRoundtrip)
+        .respond_with(ToolRoundtrip { assistant_content })
         .mount(&mock)
         .await;
     let port = unused_tcp_port();
@@ -265,11 +279,12 @@ async fn responses_tool_roundtrip_works_through_both_aliases_and_buffer_modes() 
                 assert!(first["id"].as_str().unwrap().starts_with("resp_"));
                 assert_eq!(first["tools"].as_array().map(Vec::len), Some(1));
                 let output = first["output"].as_array().unwrap();
-                let message = output
-                    .iter()
-                    .find(|item| item["type"] == "message")
-                    .unwrap();
-                assert_eq!(message["content"][0]["text"], "Inspecting the file. ");
+                let message = output.iter().find(|item| item["type"] == "message");
+                if assistant_content.is_empty() {
+                    assert!(message.is_none(), "{first}");
+                } else {
+                    assert_eq!(message.unwrap()["content"][0]["text"], assistant_content);
+                }
                 let function = output
                     .iter()
                     .find(|item| item["type"] == "function_call")
@@ -317,6 +332,16 @@ async fn responses_tool_roundtrip_works_through_both_aliases_and_buffer_modes() 
             pair[1]["conversationState"]["conversationId"],
             pair[0]["conversationState"]["conversationId"]
         );
+        let assistants = pair[1]["conversationState"]["history"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("assistantResponseMessage"))
+            .filter(|message| message["toolUses"].is_array())
+            .collect::<Vec<_>>();
+        assert_eq!(assistants.len(), 1);
+        assert_eq!(assistants[0]["content"], assistant_content);
+        assert_eq!(assistants[0]["toolUses"].as_array().unwrap().len(), 2);
         let results = pair[1]["conversationState"]["currentMessage"]["userInputMessage"]
             ["userInputMessageContext"]["toolResults"]
             .as_array()
@@ -368,7 +393,12 @@ async fn responses_codex_automation_bootstrap_survives_tool_roundtrip_and_replay
                     assert_eq!(result["content"][0]["text"], text);
                 }
             }
-            wiremock::Respond::respond(&ToolRoundtrip, request)
+            wiremock::Respond::respond(
+                &ToolRoundtrip {
+                    assistant_content: "Inspecting the file. ",
+                },
+                request,
+            )
         })
         .expect(24)
         .mount(&mock)
@@ -624,7 +654,9 @@ async fn responses_default_store_preserves_affinity_and_resumes_tool_roundtrips(
     mount_context_alignment_models(&mock).await;
     Mock::given(method("POST"))
         .and(path("/generateAssistantResponse"))
-        .respond_with(ToolRoundtrip)
+        .respond_with(ToolRoundtrip {
+            assistant_content: "Inspecting the file. ",
+        })
         .mount(&mock)
         .await;
     let port = unused_tcp_port();

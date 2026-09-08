@@ -261,11 +261,7 @@ pub fn web_search_continue_payload_batch(
     next.conversation_state.history.push(KiroHistoryMessage {
         user_input_message: None,
         assistant_response_message: Some(KiroAssistantMessage {
-            content: if assistant_content.trim().is_empty() {
-                "Searching the web.".into()
-            } else {
-                tail_chars(assistant_content, 48_000)
-            },
+            content: tail_chars(assistant_content, 48_000),
             cache_point: None,
             tool_uses: searches
                 .iter()
@@ -456,7 +452,15 @@ mod tests {
                 }],
             },
         );
-        let next = web_search_continue_payload(&payload, "searching", use_, &trace);
+        let next = web_search_continue_payload(&payload, "", use_, &trace);
+        assert_eq!(
+            next.conversation_state.history[1]
+                .assistant_response_message
+                .as_ref()
+                .unwrap()
+                .content,
+            ""
+        );
         assert_eq!(
             next.conversation_state.history[0]
                 .user_input_message
