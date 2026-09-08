@@ -177,8 +177,9 @@ GET  /health
 仅允许 Codex。共享 `/v1/models` 接受两类客户端；Claude 列表包含 `display_name`、`description`，
 非 Claude 模型以可回传的 `anthropic.` 别名展示，Codex 保留原始 ID。
 Claude Code 需设置 `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1` 启用发现。
-`server.enforce_user_agent_check = false` 可统一关闭
-User-Agent 检查，API key 认证和每个服务的 key 白名单仍生效。
+`server.enforce_user_agent_check = false` 可统一关闭 User-Agent 检查。全局检查开启时，
+可在单个 `[[proxy_service]]` 或 `[[api_key]]` 中设置 `skip_user_agent_check = true`，
+只豁免对应服务或 Key；API key 认证和每个服务的 key 白名单仍生效。
 
 Responses 支持 Codex 无状态多轮对话、流式输出、function/custom 工具、命名空间工具、
 图片输入和工具结果回传。Codex 使用 `wire_api = "responses"`，base URL 指向服务的 `/v1`。
@@ -423,6 +424,7 @@ kproxy service list
 kproxy service show main
 kproxy service create --name main --port 5580
 kproxy service edit main --port 5581 --add-api-key ci
+kproxy service edit main --skip-user-agent-check true
 kproxy service disable main
 kproxy service enable main
 kproxy service apikeys main
@@ -464,6 +466,7 @@ kproxy apikey list
 kproxy apikey list --detail
 kproxy apikey show ci
 kproxy apikey add --name ci
+kproxy apikey edit ci --skip-user-agent-check true
 kproxy apikey add --name recovered --key 'sk-original-key'  # 恢复误删密钥
 kproxy apikey limit ci --credits 100
 kproxy apikey limit ci --clear

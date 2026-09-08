@@ -153,9 +153,16 @@ pub struct ApiKeyView {
     pub id: String,
     pub name: String,
     pub enabled: bool,
+    pub skip_user_agent_check: bool,
     pub credits_limit: Option<f64>,
     pub reserved_credits: f64,
     pub usage: ApiKeyUsage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthenticatedApiKey {
+    pub id: String,
+    pub skip_user_agent_check: bool,
 }
 
 struct KeyState {
@@ -372,7 +379,10 @@ impl Meter {
         Ok(())
     }
 
-    pub fn authenticate(&self, presented: Option<&str>) -> Result<Option<String>, MeterError> {
+    pub fn authenticate(
+        &self,
+        presented: Option<&str>,
+    ) -> Result<Option<AuthenticatedApiKey>, MeterError> {
         let keys = lock(&self.keys);
         if keys.is_empty() {
             return Ok(None);
@@ -380,7 +390,12 @@ impl Meter {
         let presented = presented.ok_or(MeterError::Unauthorized)?;
         keys.values()
             .find(|state| state.config.enabled && constant_time_eq(&state.config.key, presented))
-            .map(|state| Some(state.id.clone()))
+            .map(|state| {
+                Some(AuthenticatedApiKey {
+                    id: state.id.clone(),
+                    skip_user_agent_check: state.config.skip_user_agent_check,
+                })
+            })
             .ok_or(MeterError::Unauthorized)
     }
 
@@ -436,6 +451,7 @@ impl Meter {
                 id: state.id.clone(),
                 name: state.config.name.clone(),
                 enabled: state.config.enabled,
+                skip_user_agent_check: state.config.skip_user_agent_check,
                 credits_limit: state.config.credits_limit,
                 reserved_credits: state.reserved,
                 usage: state.usage.clone(),
@@ -750,6 +766,7 @@ mod tests {
                 key: "secret".into(),
                 format: ApiKeyFormat::Sk,
                 enabled: true,
+                skip_user_agent_check: false,
                 credits_limit: Some(10.0),
             }],
         )
@@ -778,6 +795,7 @@ mod tests {
             key: format!("secret-{id}"),
             format: ApiKeyFormat::Sk,
             enabled: true,
+            skip_user_agent_check: false,
             credits_limit: None,
         });
         let meter = Meter::load(&directory.path().join("daily.json"), &configs)
@@ -858,6 +876,7 @@ mod tests {
             key: "secret".into(),
             format: ApiKeyFormat::Sk,
             enabled: true,
+            skip_user_agent_check: false,
             credits_limit: Some(10.0),
         };
         let meter = Meter::load(&path, std::slice::from_ref(&config))

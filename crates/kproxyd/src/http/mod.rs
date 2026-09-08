@@ -59,6 +59,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         host: config.server.host.clone(),
         port: config.server.port,
         enabled: true,
+        skip_user_agent_check: false,
         api_key_ids: config
             .api_key
             .iter()
@@ -415,7 +416,9 @@ impl ProxyServiceManager {
                 .iter()
                 .filter_map(|(id, current)| {
                     (current.task.is_finished()
-                        || desired.get(id).is_none_or(|next| next != &current.config))
+                        || desired
+                            .get(id)
+                            .is_none_or(|next| listener_config_changed(&current.config, next)))
                     .then_some(id.clone())
                 })
                 .collect::<Vec<_>>();
@@ -490,6 +493,7 @@ impl ProxyServiceManager {
                     host: service.host.clone(),
                     port: service.port,
                     enabled: service.enabled,
+                    skip_user_agent_check: service.skip_user_agent_check,
                     running: is_running,
                     api_key_ids: service.api_key_ids.clone(),
                     created_at: service.created_at,
@@ -498,6 +502,18 @@ impl ProxyServiceManager {
             })
             .collect()
     }
+}
+
+fn listener_config_changed(current: &ProxyServiceConfig, next: &ProxyServiceConfig) -> bool {
+    // UA policy is read from the live ConfigHandle for every request. Excluding
+    // it here applies policy edits without cancelling active streaming requests.
+    current.id != next.id
+        || current.name != next.name
+        || current.host != next.host
+        || current.port != next.port
+        || current.enabled != next.enabled
+        || current.api_key_ids != next.api_key_ids
+        || current.created_at != next.created_at
 }
 
 async fn start_service(
@@ -1021,10 +1037,35 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn client_allowlist_follows_protocol_for_every_alias_and_can_be_disabled() {
-        for enforced in [true, false] {
+    async fn client_allowlist_follows_protocol_for_every_alias_and_policy_scope() {
+        for (case, globally_enforced, service_bypass, api_key_bypass, policy_enforced) in [
+            ("enforced", true, false, false, true),
+            ("global-disabled", false, false, false, false),
+            ("service-bypass", true, true, false, false),
+            ("api-key-bypass", true, false, true, false),
+        ] {
             let mut config = Config::default();
-            config.server.enforce_user_agent_check = enforced;
+            config.server.enforce_user_agent_check = globally_enforced;
+            config.api_key.push(ApiKeyConfig {
+                id: Some("ak_user_agent".into()),
+                name: "user-agent".into(),
+                key: "sk-user-agent".into(),
+                format: ApiKeyFormat::Sk,
+                enabled: true,
+                skip_user_agent_check: api_key_bypass,
+                credits_limit: None,
+            });
+            let service = ProxyServiceConfig {
+                id: "svc_user_agent".into(),
+                name: "user-agent".into(),
+                host: "127.0.0.1".into(),
+                port: 5581,
+                enabled: true,
+                skip_user_agent_check: service_bypass,
+                api_key_ids: vec!["ak_user_agent".into()],
+                created_at: 0,
+            };
+            config.proxy_service.push(service.clone());
             let (_directory, state) = test_state(config).await;
             for path in [
                 "/v1/messages",
@@ -1057,6 +1098,7 @@ mod tests {
                         .method(if models { Method::GET } else { Method::POST })
                         .uri(path)
                         .header(header::CONTENT_TYPE, "application/json")
+                        .header(header::AUTHORIZATION, "Bearer sk-user-agent")
                         .header("originator", "codex_cli_rs");
                     if let Some(agent) = agent {
                         request = request.header(header::USER_AGENT, agent);
@@ -1066,11 +1108,11 @@ mod tests {
                     } else {
                         serde_json::json!({"model":"test","messages":[{"role":"user","content":"hello"}],"max_tokens":1})
                     };
-                    let response = router(Arc::clone(&state))
+                    let response = router_for_service(Arc::clone(&state), service.clone(), true)
                         .oneshot(request.body(Body::from(body.to_string())).unwrap())
                         .await
                         .unwrap();
-                    let allowed = !enforced
+                    let allowed = !policy_enforced
                         || (claude && client == "claude")
                         || (models && client == "claude")
                         || (!claude && client == "codex");
@@ -1084,7 +1126,7 @@ mod tests {
                     assert_eq!(
                         response.status(),
                         expected,
-                        "path={path}, client={client}, enforced={enforced}"
+                        "case={case}, path={path}, client={client}"
                     );
                     assert!(response.headers().contains_key("request-id"));
                     let body = body_json(response).await;
@@ -1097,6 +1139,69 @@ mod tests {
                             .contains(if claude { "Claude Code" } else { "Codex" }));
                     }
                 }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn user_agent_bypass_still_requires_a_valid_service_api_key() {
+        let mut config = Config::default();
+        config.api_key.push(ApiKeyConfig {
+            id: Some("ak_bypass".into()),
+            name: "bypass".into(),
+            key: "sk-bypass".into(),
+            format: ApiKeyFormat::Sk,
+            enabled: true,
+            skip_user_agent_check: true,
+            credits_limit: None,
+        });
+        config.api_key.push(ApiKeyConfig {
+            id: Some("ak_unbound_bypass".into()),
+            name: "unbound-bypass".into(),
+            key: "sk-unbound-bypass".into(),
+            format: ApiKeyFormat::Sk,
+            enabled: true,
+            skip_user_agent_check: true,
+            credits_limit: None,
+        });
+        let service = ProxyServiceConfig {
+            id: "svc_bypass".into(),
+            name: "bypass".into(),
+            host: "127.0.0.1".into(),
+            port: 5581,
+            enabled: true,
+            skip_user_agent_check: true,
+            api_key_ids: vec!["ak_bypass".into()],
+            created_at: 0,
+        };
+        config.proxy_service.push(service.clone());
+        let (_directory, state) = test_state(config).await;
+
+        for credential in ["invalid", "sk-unbound-bypass"] {
+            for path in ["/v1/messages", "/v1/responses", "/v1/models"] {
+                let request = Request::builder()
+                    .method(if path.ends_with("models") {
+                        Method::GET
+                    } else {
+                        Method::POST
+                    })
+                    .uri(path)
+                    .header(header::AUTHORIZATION, format!("Bearer {credential}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({"model":"test","messages":[],"input":"hello"})
+                            .to_string(),
+                    ))
+                    .expect("request");
+                let response = router_for_service(Arc::clone(&state), service.clone(), true)
+                    .oneshot(request)
+                    .await
+                    .expect("response");
+                assert_eq!(
+                    response.status(),
+                    StatusCode::UNAUTHORIZED,
+                    "credential={credential}, path={path}"
+                );
             }
         }
     }
@@ -1298,6 +1403,7 @@ mod tests {
             key: "sk-secret".into(),
             format: ApiKeyFormat::Sk,
             enabled: true,
+            skip_user_agent_check: false,
             credits_limit: None,
         });
         let (_directory, state) = test_state(config).await;
@@ -1339,6 +1445,7 @@ mod tests {
             key: "sk-secret".into(),
             format: ApiKeyFormat::Sk,
             enabled: true,
+            skip_user_agent_check: false,
             credits_limit: None,
         });
         let (_directory, state) = test_state(config).await;
@@ -1369,6 +1476,7 @@ mod tests {
             .oneshot(
                 Request::post("/v1/messages")
                     .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::AUTHORIZATION, "Bearer sk-secret")
                     .body(Body::from(
                         serde_json::json!({
                             "model": rejected_user_agent_model,
@@ -1680,6 +1788,93 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn user_agent_policy_hot_reload_keeps_the_proxy_listener_running() {
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port");
+        let port = probe.local_addr().expect("address").port();
+        drop(probe);
+        let mut config = Config::default();
+        config.api_key.push(ApiKeyConfig {
+            id: Some("ak_hot_policy".into()),
+            name: "hot-policy".into(),
+            key: "sk-hot-policy".into(),
+            format: ApiKeyFormat::Sk,
+            enabled: true,
+            skip_user_agent_check: false,
+            credits_limit: None,
+        });
+        config.proxy_service.push(ProxyServiceConfig {
+            id: "svc_hot_policy".into(),
+            name: "hot-policy".into(),
+            host: "127.0.0.1".into(),
+            port,
+            enabled: true,
+            skip_user_agent_check: false,
+            api_key_ids: vec!["ak_hot_policy".into()],
+            created_at: 0,
+        });
+        let (_directory, state) = test_state(config.clone()).await;
+        assert!(state.reconcile_proxy_services(&config).await.is_empty());
+        let listener_cancel = state
+            .proxy_services
+            .running
+            .lock()
+            .await
+            .get("svc_hot_policy")
+            .expect("running service")
+            .cancel
+            .clone();
+        let client = reqwest::Client::new();
+        let url = format!("http://127.0.0.1:{port}/v1/models");
+
+        let rejected = client
+            .get(&url)
+            .bearer_auth("sk-hot-policy")
+            .header(header::USER_AGENT, "curl/8.0")
+            .send()
+            .await
+            .expect("strict request");
+        assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+        let mut service_bypass = config.clone();
+        service_bypass.proxy_service[0].skip_user_agent_check = true;
+        state
+            .apply_config_transaction(&service_bypass)
+            .await
+            .expect("service policy reload");
+        assert!(!listener_cancel.is_cancelled());
+        let service_allowed = client
+            .get(&url)
+            .bearer_auth("sk-hot-policy")
+            .header(header::USER_AGENT, "curl/8.0")
+            .send()
+            .await
+            .expect("service bypass request");
+        assert_eq!(service_allowed.status(), StatusCode::OK);
+
+        let mut key_bypass = config.clone();
+        key_bypass.api_key[0].skip_user_agent_check = true;
+        state
+            .apply_config_transaction(&key_bypass)
+            .await
+            .expect("API key policy reload");
+        assert!(!listener_cancel.is_cancelled());
+        let key_allowed = client
+            .get(&url)
+            .bearer_auth("sk-hot-policy")
+            .header(header::USER_AGENT, "curl/8.0")
+            .send()
+            .await
+            .expect("API key bypass request");
+        assert_eq!(key_allowed.status(), StatusCode::OK);
+
+        state.shutdown.cancel();
+        state
+            .proxy_services
+            .reconcile(Arc::clone(&state), &[])
+            .await;
+    }
+
+    #[tokio::test]
     async fn reconcile_restarts_a_finished_proxy_listener() {
         let (_directory, state) = test_state(Config::default()).await;
         let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port");
@@ -1691,6 +1886,7 @@ mod tests {
             host: "127.0.0.1".into(),
             port,
             enabled: true,
+            skip_user_agent_check: false,
             api_key_ids: Vec::new(),
             created_at: 0,
         };

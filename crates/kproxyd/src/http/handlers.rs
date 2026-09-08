@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 use uuid::Uuid;
 
-use crate::meter::{now_secs, CreditReservation, MeterError, UsageRecord};
+use crate::meter::{now_secs, AuthenticatedApiKey, CreditReservation, MeterError, UsageRecord};
 use crate::state::AppState;
 use crate::stats::{RequestDiagnostics, RequestLog, UpstreamAttemptLog};
 
@@ -391,13 +391,14 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
     let result = async {
         let (headers, body, _body_reservations) =
             read_bounded_body(&state, request, ErrorFormat::Claude).await?;
-        enforce_claude_user_agent(&state, &headers)?;
-        let key_id = authenticate(
+        let authenticated_key = authenticate(
             &state,
             &service.allowed_api_key_ids,
             &headers,
             ErrorFormat::Claude,
         )?;
+        enforce_claude_user_agent(&service, &headers, authenticated_key.as_ref())?;
+        let key_id = authenticated_key.map(|key| key.id);
         tracing::debug!(
             trace_id = %trace_id,
             protocol = "claude_count_tokens",
@@ -616,8 +617,9 @@ pub async fn models(State(service): State<ServiceHttpState>, headers: HeaderMap)
         ErrorFormat::OpenAi
     };
     let result = async {
-        authenticate(&state, &service.allowed_api_key_ids, &headers, format)?;
-        enforce_client_user_agent(&state, &headers, format)?;
+        let authenticated_key =
+            authenticate(&state, &service.allowed_api_key_ids, &headers, format)?;
+        enforce_client_user_agent(&service, &headers, format, authenticated_key.as_ref())?;
         let config = state.config.current();
         if !config.models.dynamic_discovery {
             return Ok::<_, ApiError>(model_list(fallback_models(&config), claude));
@@ -762,7 +764,7 @@ fn authenticate(
     allowed_api_key_ids: &HashSet<String>,
     headers: &HeaderMap,
     format: ErrorFormat,
-) -> Result<Option<String>, ApiError> {
+) -> Result<Option<AuthenticatedApiKey>, ApiError> {
     let presented = headers
         .get("x-api-key")
         .or_else(|| headers.get("anthropic-api-key"))
@@ -782,7 +784,7 @@ fn authenticate(
     if !allowed_api_key_ids.is_empty()
         && key_id
             .as_ref()
-            .is_none_or(|id| !allowed_api_key_ids.contains(id))
+            .is_none_or(|key| !allowed_api_key_ids.contains(&key.id))
     {
         let mut error = ApiError::new(StatusCode::UNAUTHORIZED, "invalid API key", format);
         error.authenticate = true;
@@ -792,20 +794,41 @@ fn authenticate(
     Ok(key_id)
 }
 
-fn enforce_claude_user_agent(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(), ApiError> {
-    enforce_client_user_agent(state, headers, ErrorFormat::Claude)
+fn enforce_claude_user_agent(
+    service: &ServiceHttpState,
+    headers: &HeaderMap,
+    authenticated_key: Option<&AuthenticatedApiKey>,
+) -> Result<(), ApiError> {
+    enforce_client_user_agent(service, headers, ErrorFormat::Claude, authenticated_key)
 }
 
-fn enforce_codex_user_agent(state: &Arc<AppState>, headers: &HeaderMap) -> Result<(), ApiError> {
-    enforce_client_user_agent(state, headers, ErrorFormat::OpenAi)
+fn enforce_codex_user_agent(
+    service: &ServiceHttpState,
+    headers: &HeaderMap,
+    authenticated_key: Option<&AuthenticatedApiKey>,
+) -> Result<(), ApiError> {
+    enforce_client_user_agent(service, headers, ErrorFormat::OpenAi, authenticated_key)
 }
 
 fn enforce_client_user_agent(
-    state: &Arc<AppState>,
+    service: &ServiceHttpState,
     headers: &HeaderMap,
     format: ErrorFormat,
+    authenticated_key: Option<&AuthenticatedApiKey>,
 ) -> Result<(), ApiError> {
-    if !state.config.current().server.enforce_user_agent_check {
+    let config = service.app.config.current();
+    let service_bypass = config
+        .proxy_service
+        .iter()
+        .find(|current| current.id == service.service.id)
+        .map(|current| current.skip_user_agent_check)
+        .unwrap_or(service.service.skip_user_agent_check);
+    let policy = kproxy_core::config::resolve_user_agent_check_policy(
+        config.server.enforce_user_agent_check,
+        service_bypass,
+        authenticated_key.is_some_and(|key| key.skip_user_agent_check),
+    );
+    if !policy.enforced() {
         return Ok(());
     }
     let value = headers

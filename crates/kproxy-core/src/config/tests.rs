@@ -81,6 +81,53 @@ fn defaults_match_the_spec() {
 }
 
 #[test]
+fn user_agent_policy_reports_the_effective_bypass_scope() {
+    assert_eq!(
+        resolve_user_agent_check_policy(true, false, false),
+        UserAgentCheckPolicy::Enforced
+    );
+    assert_eq!(
+        resolve_user_agent_check_policy(false, true, true),
+        UserAgentCheckPolicy::GlobalDisabled
+    );
+    assert_eq!(
+        resolve_user_agent_check_policy(true, true, true),
+        UserAgentCheckPolicy::ServiceBypass
+    );
+    assert_eq!(
+        resolve_user_agent_check_policy(true, false, true),
+        UserAgentCheckPolicy::ApiKeyBypass
+    );
+}
+
+#[test]
+fn existing_service_and_api_key_configs_default_to_user_agent_checks() {
+    let config: Config = toml::from_str(
+        r#"
+[[api_key]]
+id = "ak_existing"
+name = "existing"
+key = "sk-existing"
+format = "sk"
+enabled = true
+
+[[proxy_service]]
+id = "svc_existing"
+name = "existing"
+host = "127.0.0.1"
+port = 5580
+enabled = true
+api_key_ids = ["ak_existing"]
+created_at = 0
+"#,
+    )
+    .expect("existing config");
+
+    assert!(!config.api_key[0].skip_user_agent_check);
+    assert!(!config.proxy_service[0].skip_user_agent_check);
+}
+
+#[test]
 fn default_toml_parses_into_default_config() {
     let parsed: Config = toml::from_str(DEFAULT_CONFIG_TOML).expect("default toml must parse");
     let expected = Config::default();
@@ -191,6 +238,7 @@ fn fully_populated_config() -> Config {
         key: "sk-example".into(),
         format: ApiKeyFormat::Sk,
         enabled: true,
+        skip_user_agent_check: false,
         credits_limit: Some(100.0),
     });
     config.proxy_service.push(ProxyServiceConfig {
@@ -199,6 +247,7 @@ fn fully_populated_config() -> Config {
         host: "127.0.0.1".into(),
         port: 5580,
         enabled: true,
+        skip_user_agent_check: false,
         api_key_ids: vec!["ak_example".into()],
         created_at: 1,
     });
@@ -388,6 +437,7 @@ fn rejects_non_local_host_without_api_key() {
         host: "0.0.0.0".into(),
         port: 5580,
         enabled: true,
+        skip_user_agent_check: false,
         api_key_ids: vec!["ak_missing".into()],
         created_at: 0,
     });
@@ -404,6 +454,7 @@ fn accepts_non_local_host_with_enabled_api_key() {
         key: "sk-test".into(),
         format: ApiKeyFormat::Sk,
         enabled: true,
+        skip_user_agent_check: false,
         credits_limit: None,
     });
     config.proxy_service.push(ProxyServiceConfig {
@@ -412,6 +463,7 @@ fn accepts_non_local_host_with_enabled_api_key() {
         host: "0.0.0.0".into(),
         port: 5580,
         enabled: true,
+        skip_user_agent_check: false,
         api_key_ids: vec!["ak_test".into()],
         created_at: 0,
     });
@@ -428,6 +480,7 @@ fn treats_loopback_hosts_as_local() {
             key: "sk-test".into(),
             format: ApiKeyFormat::Sk,
             enabled: true,
+            skip_user_agent_check: false,
             credits_limit: None,
         });
         config.proxy_service.push(ProxyServiceConfig {
@@ -436,6 +489,7 @@ fn treats_loopback_hosts_as_local() {
             host: host.into(),
             port: 5580,
             enabled: true,
+            skip_user_agent_check: false,
             api_key_ids: vec!["ak_test".into()],
             created_at: 0,
         });
@@ -454,6 +508,7 @@ fn rejects_disabled_api_key_as_public_credential() {
         key: "sk-test".into(),
         format: ApiKeyFormat::Sk,
         enabled: false,
+        skip_user_agent_check: false,
         credits_limit: None,
     });
     config.proxy_service.push(ProxyServiceConfig {
@@ -462,6 +517,7 @@ fn rejects_disabled_api_key_as_public_credential() {
         host: "0.0.0.0".into(),
         port: 5580,
         enabled: true,
+        skip_user_agent_check: false,
         api_key_ids: vec!["ak_test".into()],
         created_at: 0,
     });

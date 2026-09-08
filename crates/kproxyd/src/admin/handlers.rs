@@ -1159,18 +1159,28 @@ fn handle_service_apikeys(state: &Arc<AppState>, params: serde_json::Value) -> H
                 .api_key
                 .iter()
                 .find(|key| key.id.as_deref() == Some(key_id.as_str()))
-                .map(|key| ProxyServiceApiKeyView {
-                    id: key_id.clone(),
-                    name: key.name.clone(),
-                    format: match key.format {
-                        ApiKeyFormat::Sk => "sk",
-                        ApiKeyFormat::Simple => "simple",
-                        ApiKeyFormat::Token => "token",
+                .map(|key| {
+                    let policy = kproxy_core::config::resolve_user_agent_check_policy(
+                        config.server.enforce_user_agent_check,
+                        service.skip_user_agent_check,
+                        key.skip_user_agent_check,
+                    );
+                    ProxyServiceApiKeyView {
+                        id: key_id.clone(),
+                        name: key.name.clone(),
+                        format: match key.format {
+                            ApiKeyFormat::Sk => "sk",
+                            ApiKeyFormat::Simple => "simple",
+                            ApiKeyFormat::Token => "token",
+                        }
+                        .to_string(),
+                        enabled: key.enabled,
+                        skip_user_agent_check: key.skip_user_agent_check,
+                        user_agent_check_enforced: policy.enforced(),
+                        user_agent_check_reason: policy.reason().to_string(),
+                        credits_limit: key.credits_limit,
+                        key: params.show_secret.then(|| key.key.clone()),
                     }
-                    .to_string(),
-                    enabled: key.enabled,
-                    credits_limit: key.credits_limit,
-                    key: params.show_secret.then(|| key.key.clone()),
                 })
         })
         .collect::<Vec<_>>();
@@ -1228,6 +1238,7 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
         host: params.host.unwrap_or_else(|| previous.server.host.clone()),
         port: params.port.unwrap_or(previous.server.port),
         enabled: true,
+        skip_user_agent_check: params.skip_user_agent_check,
         api_key_ids: vec![key_id.clone()],
         created_at: now_secs(),
     };
@@ -1237,6 +1248,7 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
         key: key.clone(),
         format,
         enabled: true,
+        skip_user_agent_check: false,
         credits_limit: None,
     };
 

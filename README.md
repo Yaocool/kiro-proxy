@@ -201,9 +201,11 @@ accept Claude Code; OpenAI generation routes accept Codex. The shared `/v1/model
 endpoint accepts both clients. Claude discovery includes `display_name` and
 `description`; non-Claude Kiro IDs receive an `anthropic.` alias that is removed
 before upstream routing. Enable it with `CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1`.
-The shared
-`server.enforce_user_agent_check = false` setting disables these User-Agent checks.
-API key authentication and each service's key allowlist still apply.
+The shared `server.enforce_user_agent_check = false` setting disables these
+User-Agent checks globally. While the global check is enabled, set
+`skip_user_agent_check = true` on one `[[proxy_service]]` or `[[api_key]]` to
+exempt that service or key. API key authentication and each service's key
+allowlist still apply.
 
 Responses stores Codex conversations by default and supports explicit `store: false` stateless
 requests, streaming, top-level or Responses Lite `additional_tools` catalogs, function/custom tools,
@@ -534,6 +536,7 @@ kproxy service list
 kproxy service show main
 kproxy service create --name main --port 5580
 kproxy service edit main --port 5581 --add-api-key ci
+kproxy service edit main --skip-user-agent-check true
 kproxy service disable main
 kproxy service enable main
 kproxy service apikeys main
@@ -575,6 +578,7 @@ kproxy apikey list
 kproxy apikey list --detail
 kproxy apikey show ci
 kproxy apikey add --name ci
+kproxy apikey edit ci --skip-user-agent-check true
 kproxy apikey add --name recovered --key 'sk-original-key'  # restore a deleted key
 kproxy apikey limit ci --credits 100
 kproxy apikey limit ci --clear

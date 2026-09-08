@@ -110,13 +110,13 @@ pub fn print(topic: Option<&str>) -> Result<()> {
 批量：CSV 仅含 email,password 两列，运行 `kproxy account add-sso --batch accounts.csv -c 1`；也可用 `--batch - < accounts.csv` 从 stdin 读取。`--start-url` 可覆盖全局值，`--headful` 可手工完成额外验证。默认/full 构建包含 SSO。"#
         }
         "service" => {
-            "`kproxy service list/show/create/edit/enable/disable/apikeys/delete` 管理独立代理监听。edit 可修改监听并按 API key ID 或名称增删绑定；disable 会保留配置和 key；删除时仅级联删除未共享 key，并要求 y/yes 确认。"
+            "`kproxy service list/show/create/edit/enable/disable/apikeys/delete` 管理独立代理监听。edit 可修改监听、按 API key ID 或名称增删绑定，并用 `--skip-user-agent-check true|false` 管理该服务的 User-Agent 校验豁免；disable 会保留配置和 key；删除时仅级联删除未共享 key，并要求 y/yes 确认。"
         }
         "config" => {
             "配置默认位于 $KPROXY_HOME/config.toml，修改后热重载；server.host/port、admin.socket 和 TLS 监听变更需要重启。\n`kproxy config list` 列出全部顶层模块及是否允许重置；`show [模块]` 可查看完整配置或单个模块，增加 `--effective` 查看合并默认值后的结果；`edit [模块]` 可编辑完整配置或单个模块，保存时会合并、整体校验并重载。`reset [模块]` 只恢复指定模块，其他配置不变；不指定模块时恢复全部通用配置，并保留 API key、代理服务和告警配置。`validate [file]` 只校验，不应用。"
         }
         "apikey" => {
-            "API key 限额采用在途预留：请求进入时预留估算 credits，结束后按上游实际用量结算，避免并发突破限额。\n`kproxy apikey show <ID|名称>` 查看单项，`list --detail` 查看 token/credits 消耗；`limit <ID|名称> --clear` 可恢复不限，`rm`/`delete` 均可删除。日维度、模型、路径和历史可用 `usage` 与 `history` 查询。"
+            "API key 限额采用在途预留：请求进入时预留估算 credits，结束后按上游实际用量结算，避免并发突破限额。\n`kproxy apikey show <ID|名称>` 查看单项，`list --detail` 查看 token/credits 消耗；`edit <ID|名称> --skip-user-agent-check true|false` 管理该 key 的 User-Agent 校验豁免；`limit <ID|名称> --clear` 可恢复不限，`rm`/`delete` 均可删除。日维度、模型、路径和历史可用 `usage` 与 `history` 查询。"
         }
         "diagnose" => {
             "`kproxy diagnose all` 依次检查 CodeWhisperer/AmazonQ/OIDC 端点，并对全部账号发起真实推理；也可分别使用 `kproxy diagnose endpoints` 和 `kproxy diagnose account <id|--all>`。"
