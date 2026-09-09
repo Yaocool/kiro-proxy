@@ -93,6 +93,7 @@ async fn dispatch_upstream(
     prepared: Option<PreparedUpstream>,
     preflight_only: bool,
 ) -> Result<DispatchOutcome, ExecuteError> {
+    let mut input_tokens = input_tokens;
     let config = state.config.current();
     let pool = state.pool();
     let account_count = pool.snapshot().await.len() as u32;
@@ -315,6 +316,21 @@ async fn dispatch_upstream(
                 payload: request_payload,
             })));
         }
+        input_tokens = super::super::truncate_context_if_requested(
+            state,
+            &mut request_payload,
+            input_tokens,
+            compact,
+            &actual_model,
+        )
+        .await
+        .map_err(|message| {
+            ExecuteError::Upstream(KiroError {
+                status: None,
+                endpoint: "context-preparation".into(),
+                message,
+            })
+        })?;
         if let Err(limit) = check_context_limit(state, input_tokens, compact, &actual_model) {
             return Err(ExecuteError::ContextLimit(limit));
         }
@@ -542,9 +558,29 @@ async fn dispatch_upstream(
                             Some(fallback.clone())
                         };
                         if let Some(resolved) = resolved {
-                            let fits_context =
-                                check_context_limit(state, input_tokens, compact, &resolved)
-                                    .is_ok();
+                            let fallback_input_tokens =
+                                super::super::truncate_context_if_requested(
+                                    state,
+                                    &mut request_payload,
+                                    input_tokens,
+                                    compact,
+                                    &resolved,
+                                )
+                                .await
+                                .map_err(|message| {
+                                    ExecuteError::Upstream(KiroError {
+                                        status: None,
+                                        endpoint: "context-preparation".into(),
+                                        message,
+                                    })
+                                })?;
+                            let fits_context = check_context_limit(
+                                state,
+                                fallback_input_tokens,
+                                compact,
+                                &resolved,
+                            )
+                            .is_ok();
                             if !fits_context {
                                 tracing::warn!(
                                     trace_id,
@@ -556,6 +592,7 @@ async fn dispatch_upstream(
                                     "skipping model fallback because its context window is too small"
                                 );
                             } else {
+                                input_tokens = fallback_input_tokens;
                                 fallback_model = Some(fallback.clone());
                                 mapped_model = fallback;
                                 actual_model = resolved;

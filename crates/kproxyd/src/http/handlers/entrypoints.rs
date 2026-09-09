@@ -439,7 +439,7 @@ pub(super) fn record_failed_request(
         credits: 0.0,
         error: Some(safe_error),
         diagnostics: RequestDiagnostics {
-            client_status: error.status.as_u16(),
+            client_status: error.client_status.unwrap_or(error.status.as_u16()),
             upstream_status,
             error_code: error.error_code.to_owned(),
             error_stage: error.error_stage.to_owned(),

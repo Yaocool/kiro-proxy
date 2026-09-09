@@ -559,9 +559,19 @@ pub fn response(
                     if let Some(fallback) =
                         super::super::handlers::find_model_fallback(&context.kiro_model, &models)
                     {
+                        let fallback_input_tokens = match super::super::handlers::truncate_context_if_requested(
+                            &context.state, &mut payload, context.input_tokens, context.compact, &fallback,
+                        ).await {
+                            Ok(tokens) => tokens,
+                            Err(error) => {
+                                failed = Some(error.clone());
+                                yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &context.request_id, &error)));
+                                break 'rounds;
+                            }
+                        };
                         let fits_context = super::super::handlers::check_context_limit(
                             &context.state,
-                            context.input_tokens,
+                            fallback_input_tokens,
                             context.compact,
                             &fallback,
                         )
@@ -576,6 +586,7 @@ pub fn response(
                             );
                         }
                         if fits_context {
+                            context.input_tokens = fallback_input_tokens;
                             fallback_model = Some(fallback.clone());
                             context.mapped_model.clone_from(&fallback);
                             context.kiro_model.clone_from(&fallback);
@@ -726,10 +737,24 @@ pub fn response(
                                 &context.kiro_model,
                             );
                         }
+                        let retry_input_tokens = if incompatible {
+                            context.input_tokens
+                        } else {
+                            match super::super::handlers::truncate_context_if_requested(
+                                &context.state, &mut payload, context.input_tokens, context.compact, &context.kiro_model,
+                            ).await {
+                                Ok(tokens) => tokens,
+                                Err(error) => {
+                                    failed = Some(error.clone());
+                                    yield Ok::<Bytes, Infallible>(Bytes::from(stream_error(&protocol, &context.request_id, &error)));
+                                    break 'rounds;
+                                }
+                            }
+                        };
                         if !incompatible
                             && super::super::handlers::check_context_limit(
                                 &context.state,
-                                context.input_tokens,
+                                retry_input_tokens,
                                 context.compact,
                                 &context.kiro_model,
                             )
@@ -744,6 +769,9 @@ pub fn response(
                                 input_tokens = context.input_tokens,
                                 "skipping stream retry account because resolved model context is too small"
                             );
+                        }
+                        if !incompatible {
+                            context.input_tokens = retry_input_tokens;
                         }
                         }
                         if incompatible {
