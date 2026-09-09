@@ -6,9 +6,9 @@ use crate::{
 };
 
 use super::common::{
-    content_cache_point, content_text, context, enhance_system, extract_openai_images, inference,
-    kiro_cache_point, kiro_tool_named, merged_cache_point, needs_chunked_write_hint,
-    ToolNameRegistry,
+    content_cache_point, content_text, context, enhance_system, extract_documents,
+    extract_openai_images, inference, kiro_cache_point, kiro_tool_named, merged_cache_point,
+    needs_chunked_write_hint, ToolNameRegistry,
 };
 use super::{TranslationOptions, SYSTEM_PROMPT_ACKNOWLEDGEMENT};
 
@@ -28,12 +28,6 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
             ),
         ],
     );
-    if request.max_completion_tokens.is_some() {
-        tracing::debug!(
-            field = "max_completion_tokens",
-            "ignoring OpenAI completion limit to match the reference Kiro adapter; only max_tokens is forwarded"
-        );
-    }
     let tool_names = ToolNameRegistry::new(request.tools.iter().filter_map(|tool| {
         tool.body
             .get(&tool.r#type)
@@ -146,6 +140,7 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
     let mut current_text = String::new();
     let mut current_results = Vec::new();
     let mut current_images = Vec::new();
+    let mut current_documents = Vec::new();
     let mut current_cache_point = None;
     let mut current_result_cache_point = None;
 
@@ -163,16 +158,23 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
                     .as_ref()
                     .map(extract_openai_images)
                     .unwrap_or_default();
+                let documents = message
+                    .content
+                    .as_ref()
+                    .map(extract_documents)
+                    .unwrap_or_default();
                 current_cache_point = openai_message_cache_point(message);
                 if last {
                     current_text = text;
                     current_images = images;
+                    current_documents = documents;
                 } else {
                     push_user(
                         &mut history,
                         make_user(
                             text,
                             images,
+                            documents,
                             Vec::new(),
                             current_cache_point.take(),
                             options,
@@ -189,6 +191,7 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
                 // Codex view_image result). Keep them with the tool-result turn.
                 if let Some(content) = &message.content {
                     current_images.extend(extract_openai_images(content));
+                    current_documents.extend(extract_documents(content));
                 }
                 current_result_cache_point = merged_cache_point(
                     current_result_cache_point,
@@ -215,6 +218,7 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
                         make_user(
                             "Tool results provided.".into(),
                             std::mem::take(&mut current_images),
+                            std::mem::take(&mut current_documents),
                             current_results.split_off(0),
                             current_result_cache_point.take(),
                             options,
@@ -238,7 +242,7 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
         model_id: options.model_id.clone(),
         origin: options.origin.clone(),
         images: current_images,
-        documents: Vec::new(),
+        documents: current_documents,
         cache_point: current_cache_point,
         client_cache_config: None,
         user_input_message_context: context(tools.clone(), current_results),
@@ -252,6 +256,7 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
                 KiroHistoryMessage {
                     user_input_message: Some(make_user(
                         system.trim().to_owned(),
+                        Vec::new(),
                         Vec::new(),
                         Vec::new(),
                         system_cache_point,
@@ -284,10 +289,8 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
             history,
         },
         profile_arn: options.profile_arn.clone(),
-        // The reference uses max_tokens only; max_completion_tokens is not
-        // translated and no proxy default is inserted into the wire payload.
         inference_config: inference(
-            request.max_tokens,
+            request.output_token_limit(),
             !tools.is_empty(),
             request.temperature,
             request.top_p,
@@ -295,8 +298,20 @@ pub fn openai_to_kiro(request: &OpenAiRequest, options: &TranslationOptions) -> 
         additional_model_request_fields: None,
         model_request_intent: Some(crate::ModelRequestIntent {
             requested_model: request.model.clone(),
-            thinking: request.thinking.clone(),
-            effort: request.reasoning_effort.clone(),
+            thinking: if request.reasoning_effort.as_deref() == Some("none") {
+                Some(crate::ThinkingConfig {
+                    r#type: "disabled".into(),
+                    budget_tokens: None,
+                    display: None,
+                })
+            } else {
+                request.thinking.clone()
+            },
+            effort: request
+                .reasoning_effort
+                .clone()
+                .filter(|effort| effort != "none"),
+            automatic_history_truncation: false,
         }),
         protected_history_messages,
     };
@@ -374,6 +389,9 @@ fn assistant_message(
         .as_ref()
         .map(content_text)
         .unwrap_or_default();
+    if let Some(refusal) = &message.refusal {
+        content = join(&content, refusal);
+    }
     let tool_uses = message
         .tool_calls
         .iter()
@@ -416,6 +434,7 @@ fn assistant_message(
 fn make_user(
     text: String,
     images: Vec<crate::KiroImage>,
+    documents: Vec<crate::KiroDocument>,
     results: Vec<KiroToolResult>,
     cache_point: Option<crate::KiroCachePoint>,
     options: &TranslationOptions,
@@ -429,7 +448,7 @@ fn make_user(
         model_id: options.model_id.clone(),
         origin: options.origin.clone(),
         images,
-        documents: Vec::new(),
+        documents,
         cache_point,
         client_cache_config: None,
         user_input_message_context: context(Vec::new(), results),

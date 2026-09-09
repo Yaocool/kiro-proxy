@@ -420,6 +420,9 @@ pub fn responses_to_openai(
         top_p: request.top_p,
         max_tokens: request.max_output_tokens,
         max_completion_tokens: None,
+        stop: None,
+        n: None,
+        legacy_functions: false,
         stream: request.stream,
         stream_options: request.stream.then(|| json!({"include_usage":true})),
         tools,
@@ -490,7 +493,6 @@ fn validate_controls(request: &ResponsesRequest) -> Result<(), ValidationError> 
     for (field, unsupported) in [
         ("background", request.background == Some(true)),
         ("conversation", request.conversation.is_some()),
-        ("max_tool_calls", request.max_tool_calls.is_some()),
         ("context_management", request.context_management.is_some()),
     ] {
         if unsupported {
@@ -500,12 +502,9 @@ fn validate_controls(request: &ResponsesRequest) -> Result<(), ValidationError> 
     if request
         .truncation
         .as_deref()
-        .is_some_and(|v| v != "disabled")
+        .is_some_and(|v| !matches!(v, "disabled" | "auto"))
     {
-        return invalid(
-            "truncation",
-            "only disabled is supported; compact the history on the client",
-        );
+        return invalid("truncation", "expected disabled or auto");
     }
     // Retention, include and reasoning presentation hints do not change the
     // Kiro payload. Accept them like the reference gateways, without promising
@@ -627,6 +626,12 @@ fn content(value: Option<&Value>, field: &str, images: bool) -> Result<Value, Va
                     Some("input_text" | "output_text") => {
                         Ok(json!({"type":"text","text":string(part, "text", &field)?}))
                     }
+                    Some("refusal") => {
+                        Ok(json!({"type":"text","text":string(part, "refusal", &field)?}))
+                    }
+                    Some("input_file") if images => {
+                        crate::compatibility::openai_file_document(part, &field)
+                    }
                     Some("input_image") if images => {
                         let url = required_string(part, "image_url", &field)?;
                         if part.get("file_id").is_some_and(|v| !v.is_null()) {
@@ -672,6 +677,7 @@ fn message(role: &str, content: Option<Value>) -> OpenAiMessage {
         tool_calls: Vec::new(),
         tool_call_id: None,
         reasoning_content: None,
+        refusal: None,
         name: None,
         cache_control: None,
     }

@@ -1,5 +1,6 @@
 //! Claude/OpenAI 与 Kiro 协议之间的纯转换层。
 
+pub mod compatibility;
 pub mod context;
 pub mod error;
 pub mod model;
@@ -10,6 +11,7 @@ pub mod tool_history;
 pub mod translate;
 pub mod validate;
 
+pub use compatibility::parse_openai_request;
 pub use context::{
     apply_compaction_boundary, apply_context_management_edits, compact_trigger_tokens,
     estimate_context_management_input_tokens, has_context_management_edits, is_compact_edit_type,
@@ -42,4 +44,7 @@ pub use translate::{
     WebSearchReplayCodec, WebSearchReplayError,
 };
 pub use validate::document_bytes_match_format;
-pub use validate::{validate_claude, validate_claude_generation, validate_openai, ValidationError};
+pub use validate::{
+    validate_claude, validate_claude_count, validate_claude_generation, validate_openai,
+    ValidationError,
+};

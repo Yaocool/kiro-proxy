@@ -155,11 +155,18 @@ pub struct OpenAiRequest {
     pub max_tokens: Option<u32>,
     #[serde(default)]
     pub max_completion_tokens: Option<u32>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub stream: bool,
     #[serde(default)]
-    pub stream_options: Option<Value>,
+    pub stop: Option<Value>,
     #[serde(default)]
+    pub n: Option<u32>,
+    /// Restore the deprecated function_call response shape for legacy clients.
+    #[serde(skip)]
+    pub legacy_functions: bool,
+    #[serde(default)]
+    pub stream_options: Option<Value>,
+    #[serde(default, deserialize_with = "null_default")]
     pub tools: Vec<OpenAiTool>,
     #[serde(default)]
     pub tool_choice: Option<Value>,
@@ -177,17 +184,47 @@ pub struct OpenAiRequest {
     pub response_format: Option<Value>,
 }
 
+impl OpenAiRequest {
+    /// Prefer the current API's limit, retaining max_tokens as a legacy alias.
+    pub fn output_token_limit(&self) -> Option<u32> {
+        self.max_completion_tokens.or(self.max_tokens)
+    }
+
+    /// Validation checks the shape and resource limits before execution.
+    pub fn stop_sequences(&self) -> Vec<String> {
+        match self.stop.as_ref() {
+            Some(Value::String(value)) => vec![value.clone()],
+            Some(Value::Array(values)) => values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+pub(crate) fn null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenAiMessage {
     pub role: String,
     #[serde(default)]
     pub content: Option<Value>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_default")]
     pub tool_calls: Vec<Value>,
     #[serde(default)]
     pub tool_call_id: Option<String>,
     #[serde(default)]
     pub reasoning_content: Option<String>,
+    #[serde(default)]
+    pub refusal: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
     #[serde(default)]
@@ -209,6 +246,9 @@ pub struct ModelRequestIntent {
     pub thinking: Option<ThinkingConfig>,
     /// Explicit OpenAI reasoning_effort or the effective Claude output_config.effort.
     pub effort: Option<String>,
+    /// Responses opt-in, retained across model retries and continuations.
+    /// This intent is proxy-local and never serialized onto the Kiro wire.
+    pub automatic_history_truncation: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

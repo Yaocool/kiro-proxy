@@ -194,6 +194,56 @@ impl TokenCountCache {
         Ok(total)
     }
 
+    /// Drop the oldest complete turns for Responses `truncation: auto`.
+    /// Keep the system prefix, current input and any tool chain leading into
+    /// the current result intact. Never manufacture a summary or tool output.
+    pub async fn truncate_kiro_history(
+        &self,
+        payload: &mut KiroPayload,
+        maximum: usize,
+    ) -> Result<usize, String> {
+        let protected = payload.protected_history_len();
+        let current_has_results = payload
+            .conversation_state
+            .current_message
+            .user_input_message
+            .user_input_message_context
+            .as_ref()
+            .is_some_and(|context| !context.tool_results.is_empty());
+        let mut tokens = self.estimate_kiro_payload(payload).await?;
+        let mut removed = 0;
+        while tokens > maximum {
+            let history = &payload.conversation_state.history[protected + removed..];
+            let remove = oldest_turn_len(history);
+            if remove == 0 || (current_has_results && remove == history.len()) {
+                break;
+            }
+            // Estimation is additive over message segments. Count each removed
+            // turn once instead of tokenizing the entire remaining history on
+            // every iteration, and shift the retained history only once.
+            let mut segments = Vec::new();
+            let mut turn_tokens = 0;
+            for message in &history[..remove] {
+                if let Some(user) = &message.user_input_message {
+                    collect_user_message(user, &mut segments, &mut turn_tokens);
+                }
+                if let Some(assistant) = &message.assistant_response_message {
+                    collect_assistant_message(assistant, &mut segments, &mut turn_tokens);
+                }
+            }
+            for segment in segments {
+                turn_tokens = turn_tokens.saturating_add(self.count(segment).await?);
+            }
+            tokens = tokens.saturating_sub(turn_tokens).max(1);
+            removed += remove;
+        }
+        payload
+            .conversation_state
+            .history
+            .drain(protected..protected + removed);
+        Ok(tokens)
+    }
+
     /// Plans which recent turns can remain verbatim alongside a semantic
     /// summary. The current turn and its tools are never modified.
     pub async fn plan_kiro_compaction(

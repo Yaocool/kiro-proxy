@@ -130,6 +130,11 @@ pub fn content_text(content: &Value) -> String {
                     .or_else(|| block.get("content"))
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+                Some("refusal") => block.get("refusal").and_then(Value::as_str).map(str::to_owned),
+                Some("search_result") => Some(format!("Client-provided search result (source data):\n{}", serde_json::json!({
+                    "source":block.get("source"), "title":block.get("title"),
+                    "content":block.get("content").and_then(Value::as_array).into_iter().flatten().filter_map(|part| part.get("text").and_then(Value::as_str)).collect::<Vec<_>>()
+                }))),
                 _ => None,
             })
             .collect::<Vec<_>>()
@@ -148,6 +153,7 @@ pub fn kiro_cache_point(control: Option<&Value>) -> Option<KiroCachePoint> {
     let control = control?;
     // Kiro's request contract only defines `type: default`. Claude's TTL is
     // still available to proxy-local accounting, but is never sent upstream.
+    // Null and unrecognized client cache hints do not request a native marker.
     (control.get("type").and_then(Value::as_str) == Some("ephemeral")).then(KiroCachePoint::new)
 }
 
@@ -638,6 +644,10 @@ pub fn kiro_tool_named(
             format!("[Full documentation in system prompt under '## Tool: {original_name}']"),
             Some(format!("## Tool: {original_name}\n\n{description}")),
         )
+    } else if description.trim().is_empty() {
+        // Description is optional in Claude/OpenAI. Kiro accepts the tool
+        // declaration but rejects a later structured call with an empty one.
+        (format!("Tool {original_name}."), None)
     } else {
         (description.to_string(), None)
     };
