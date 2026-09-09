@@ -171,9 +171,9 @@ session-affinity 请求头影响。
 以下参数仍需要尚未实现的执行/数据链路，因此返回 HTTP 400：
 
 - `conversation`、`background: true`。
-- `truncation: auto`、`context_management`、`max_tool_calls`。
+- `context_management` 的服务器端执行。
 - defer_loading 工具、托管工具（如 web_search、file_search、computer、MCP server 执行）。
-- Files API 的 file_id、input_file；附加控制字段则兼容忽略。
+- Files API 的托管 `file_id`；`input_file` 的内联 base64/data URL 或公共 URL 已转换为 Kiro 文档，支持工具输出内的文件。
 
 输入历史里无法转换的条目**不再拒绝**，而是跳过后继续处理，因为 Codex 会把上一轮收到的条目原样回传，
 拒绝会让第二轮起的整段会话不可用：
@@ -186,7 +186,18 @@ session-affinity 请求头影响。
 
 Codex 常用的 `include: ["reasoning.encrypted_content"]` 可以提交，但本代理只返回明文推理，
 不会伪造加密 replay token。这里不提供 WebSocket 或 `/responses/compact`；长上下文仍应由客户端
-维护或自行裁剪。
+维护；也可显式启用 `truncation: auto`。
+
+## 自动裁剪
+
+`truncation` 接受 `disabled`（默认）和 `auto`。`auto` 先选择账号并解析实际 Kiro 模型，
+按其安全上下文窗口移除最早的完整轮次，保留 system/developer 指令、当前输入以及关联的
+工具调用链，不生成摘要。若这些必须保留的内容本身就超限，仍返回明确的上下文错误。
+模型回退、换账号重试和内部续写也沿用该设置；切换到更小的窗口时重新裁剪。
+无法容纳必须保留内容的候选模型不会破坏供其他候选使用的历史。启用自动裁剪时，
+缓存用量采用上游数据，不再根据尚未裁剪的原始请求估算本地缓存命中。
+JSON/SSE 响应回显实际请求模式。`max_tool_calls` 可以提交并回显；它限制服务器工具调用，
+当前 Responses 不执行托管工具，因此不会用于截断客户端 function/custom 调用。
 
 ## 流式事件
 

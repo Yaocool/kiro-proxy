@@ -30,6 +30,39 @@
 JSON 时，即使上游未发送工具 stop 事件也可正常返回。非空但损坏的 JSON 会明确报错，
 不会通过猜测缺失参数来补全调用。
 
+## 协议字段归一化
+
+Claude `count_tokens` 接受不带输出预算的 enabled thinking，不再拿 `budget_tokens`
+与临时补入的生成上限比较；生成请求仍校验预算。省略 `tool_result.content` 按空结果处理，
+`document.citations: null` 等同省略，空文档标题使用中性名称。客户端 `search_result` 及
+工具结果内的同类块保留 source、title 和正文，作为带标识的来源数据；不伪造 Anthropic 引用索引。
+
+Chat 接受可空的 `stream`、`tools`、`tool_calls`、`stream_options.include_usage` 和 function `strict`。
+assistant refusal 内容块及 Chat 的 `refusal` 字段会保留为历史文本。旧版 `functions`、
+`function_call`、`role: function` 转成配对的 Kiro 工具调用；仅使用旧接口声明的请求，响应
+和流式 delta 仍使用 `function_call` 及对应结束原因。工具描述缺省或空白时补中性默认值：
+真实 Kiro 会接收空描述声明，却在回放其工具调用时拒绝请求。
+现代工具列表为 `null` 或空数组时，不覆盖旧版函数控制，也不改变旧版响应格式。
+
+Chat `stop` 复用增量停止序列过滤，覆盖跨流块匹配。`n`（1–128）串行执行独立 Kiro 请求，
+返回全部带索引的候选并汇总 usage；流式按需只发一个最终 usage 块及一个 `[DONE]`。
+每个候选都执行正常的准入、认证和额度核算；客户端取消流后不继续发起后续候选。
+下一候选会等待上一轮计费及并发名额释放；流中保留的请求正文继续占用共享内存配额。
+SSE 开始后的候选失败也会记录，并正确区分 HTTP 200 和上游错误状态。
+
+OpenAI Chat 的 `file` 和 Responses 的 `input_file`（含工具输出）支持内联 base64、
+data URL 和公共文件 URL，转为 Kiro 文档并复用 Claude 的媒体、大小和 SSRF 检查。
+外部托管的 `file_id` 仍需要当前代理没有提供的 Files 服务。
+文件名或 MIME 不能确定格式时，可通过 PDF 标识或 UTF-8 文本推断内联内容的类型，
+因此无扩展名文件也能转换为 Kiro 支持的文档。
+
+图片数量上限改为 100，字节数和内存限制不变；真实 Kiro 已接收 100 张有效小 PNG。
+6 个小文本文件仍触发 Kiro 400，因此保留 5 个文档的限制。Kiro 接收零 token 设置后仍生成
+文本，所以 `max_tokens: 0` 缓存预热仍未实现。后台任务、Conversations API 状态、Responses
+context-management 执行和托管工具、精确 prefill、logprobs 与严格 JSON Schema 保证属于
+单独的能力，不能靠放宽字段校验实现。Claude Web Search 的空域名列表按无过滤处理；非空
+过滤仍需适配搜索执行器。
+
 ## Claude Code MCP Tool Search
 
 当 `ANTHROPIC_BASE_URL` 指向第三方代理时，Claude Code 默认会关闭 Tool Search，并在请求中
@@ -62,7 +95,7 @@ Claude Messages 默认开启 `context.auto_compact_on_overflow`。代理先选�
 重新压缩并只重试一次。摘要请求使用完整源材料；输入装不下时，先按 UTF-8/token 边界无损分段，各段独立摘要后
 按时间顺序组合 checkpoint。分段前不做有损摘录，每段都校验输入窗口。
 摘要前释放账号并发名额，避免单并发账号阻塞自己的摘要请求；摘要后重新调度时若模型窗口更小，
-同一份压缩产物最多重新应用一次。OpenAI Chat Completions / Responses
+同一份压缩产物最多重新应用一次。OpenAI Chat Completions、使用 `truncation: disabled` 的 Responses
 以及 Tool Search 已开始输出后的上下文增长仍返回明确的上下文错误，因为这些路径无法安全回传位于
 Claude 响应首部的 `compaction` 边界。摘要超时会立即释放主请求；后台仅在有界宽限期内继续结算，
 到期后主动取消摘要流，并结算此前已经解码的 usage。
@@ -213,7 +246,7 @@ code-execution caller 仍需兼容执行器支持；strict 和 eager streaming �
 Claude `document` 支持 `base64`、`text`、HTTP(S) `url` 和 `content` 来源，也支持工具结果中的
 文档。自定义 `content` 文档按原顺序转为文本，内嵌图片提升到同一条 Kiro 消息的图片列表，并保留
 图片序号标记；这不保留 Anthropic 的自定义引用分块语义。每个请求最多 5 个文档（每个解码后
-4,500,000 字节）和 20 张图片（每张 5 MiB）。URL 附件只访问公共地址，每次重定向重新检查 DNS，
+4,500,000 字节）和 100 张图片（每张 5 MiB）。URL 附件只访问公共地址，每次重定向重新检查 DNS，
 禁用环境代理，并验证实际文件签名与媒体类型。Kiro 的引用、网页来源和许可证信息会显示为
 References，不会把回答位置伪装成 Claude 原始文档的字符/页码/块索引。
 
@@ -230,24 +263,29 @@ clear_tool_inputs；`clear_thinking` 支持保留指定轮次或全部 thinking�
 相邻同角色消息会合并。assistant prefill、`max_tokens=0` 缓存预热和 Anthropic Files API 的
 `file_id` 来源尚未接入对应的生成/数据获取链路，仍会拒绝。
 协议兼容在首次发送前确定，不再缓存字段拒绝结果、定时过期重探测或通过逐项删字段重试。
-缓存标记只发送 `type: default`，Claude 的缓存 TTL 不控制 Kiro 缓存有效期。Claude 历史 thinking 不回传
+缓存标记只发送 `type: default`，Claude 的缓存 TTL 不控制 Kiro 缓存有效期。
+所有支持的请求、消息、工具和内容块位置都将 `cache_control: null` 视为未设置；
+`ephemeral` 以外的非空字符串类型作为未实现的提示接收并忽略，`scope`、`evict_on_complete`
+等附加字段也不会传给 Kiro。只有 `ephemeral` 计入四个断点的上限并产生原生或本地缓存标记；
+对象或类型格式错误、无效的 `ephemeral.ttl` 仍会拒绝。Chat Completions 的缓存扩展字段和
+Messages 的 token 计数别名使用相同规则。Claude 历史 thinking 不回传
 到 Kiro 请求历史，但不关闭当前生成的 thinking；Responses 的明文推理摘要保留在 assistant 历史中。
 文档 context 则保留为独立、带 JSON 标识的消息文本。
 模型控制参数采用 [chaogei/Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager/blob/447adcdb468157312621b1f09448278bd9bca748/Kiro-account-manager/src/main/proxy/translator.ts) 的显式映射方式，但不沿用其缺失元数据时猜测开启 thinking 的回退：
 
 | 客户端参数 | Kiro / 代理处理 |
 | --- | --- |
-| `max_tokens`、`temperature`、`top_p` | 映射为 `inferenceConfig.maxTokens/temperature/topP`，保留显式的零采样值；OpenAI 未传 `max_tokens` 时不补 8192，也不发送 `maxTokens`，交给 Kiro 默认行为；仍可能受到具体模型的参数限制。 |
-| OpenAI `max_completion_tokens` | 接收、校验但忽略，与参考项目一致；需要限制上游输出时使用 `max_tokens`。 |
+| `max_tokens`、`temperature`、`top_p` | 映射为 `inferenceConfig.maxTokens/temperature/topP`，保留显式的零采样值；OpenAI 两个输出上限均未传时不补 8192，也不发送 `maxTokens`，交给 Kiro 默认行为；仍可能受到具体模型的参数限制。 |
+| OpenAI `max_completion_tokens` | 映射为 `inferenceConfig.maxTokens`，优先于 `max_tokens`；同一有效上限也用于内部续写预算、额度预估和结束原因。 |
 | Claude `top_k` | 接收但不发送，不因模型 schema 而开启；记录 debug 诊断。这是网关兼容策略，不代表断言 Kiro 全局不支持。 |
-| Claude `stop_sequences` | 在流式 / 非流式响应中本地执行，不发送原生 `stopSequences`；不保证上游生成量或费用也因此受限。 |
+| Claude `stop_sequences` / Chat `stop` | 在流式 / 非流式响应中本地执行，不发送原生 `stopSequences`；不保证上游生成量或费用也因此受限。 |
 | thinking / effort | 有可识别的 effort 元数据时使用 `thinking: adaptive` + `output_config.effort`，或 `reasoning.effort`；元数据缺失、不完整或不可识别时，完全省略 `additionalModelRequestFields`，不发送 `{}`、`null` 或猜测的 adaptive thinking。 |
 | Claude `output_config.effort` | 显式 effort 优先于 thinking budget，按实际模型元数据映射；system 消息中的 effort 从下一条 user 消息开始生效，压缩和内部续写后保留。映射为 Kiro 的请求级 effort，不保证 Anthropic 的逐消息缓存语义。 |
 | Claude `output_config.format` / `task_budget` | 接收但不发送给 Kiro，debug 诊断仅记录字段名；不提供 JSON/Schema 或 task budget 保证，`output_config.effort` 仍独立映射。 |
 | OpenAI `response_format` / Responses `text.format` | 接收但不放入 Kiro 输入，沿用参考项目的宽松行为；不新增 JSON/Schema 保证或基于 Schema 的生成重试。 |
 | 工具 `strict`、Claude `eager_input_streaming` | 接收为提示，保留正常 Kiro 工具 schema 和既有流式行为。 |
 | 服务等级、附加字段、未使用的流式提示 | 接收但不猜测为 Kiro 字段发送；实际使用的 `include_usage` 等值仍校验类型。 |
-| OpenAI `reasoning_effort` | 优先于 `thinking.budget_tokens`；均未提供时默认 high。档位不支持时取模型枚举最后一项，不排序、不做最近档位匹配。 |
+| OpenAI `reasoning_effort` | `none` 走已有的 disabled thinking 路径；其他值优先于 `thinking.budget_tokens`；均未提供时默认 high。档位不支持时取模型枚举最后一项，不排序、不做最近档位匹配。 |
 | `thinking.display` | output_config 路径固定发送 summarized；reasoning 路径不发 display；没有可识别的元数据时省略整个扩展字段。客户端 display 不覆盖这些上游格式。 |
 | `thinking.budget_tokens` | 原始预算直接映射为 low（≤4000）、medium（≤16000）、high（≤64000）、xhigh，不是上游独立 thinking token 硬上限。 |
 | `thinking: disabled` | 不发送 thinking 控制字段，并过滤返回的思考内容；省略字段不保证默认开启思考的模型在内部停止思考。 |
@@ -265,7 +303,7 @@ clear_tool_inputs；`clear_thinking` 支持保留指定轮次或全部 thinking�
 对齐范围是出站生成参数；保留请求校验、本地停止词过滤、内部续写预算和响应保护。
 `display: omitted` 仍在本地隐藏返回的思考文本、保留原生签名，但不改变参考项目的上游 display 策略。
 原始参数保存在不序列化的内部元数据中，每次按实际模型重新转换，覆盖 HTTP / 流内模型回退和内部续写。
-OpenAI 未传 `max_tokens` 时，8192 仅用于额度预估，不限制内部续写，也不会据此返回 `length`；
+OpenAI 两个输出上限均未传时，8192 仅用于额度预估，不限制内部续写，也不会据此返回 `length`；
 显式输出上限仍然生效，不向上游补默认 `maxTokens`。
 普通参数校验和签名错误直接返回，不推导或试探协议能力；现有鉴权、临时故障和上下文溢出处理不变。
 
