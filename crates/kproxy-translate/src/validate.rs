@@ -24,7 +24,7 @@ pub const MAX_STOP_SEQUENCE_TOTAL_BYTES: usize = 64 * 1024;
 pub const MAX_DOCUMENTS_PER_MESSAGE: usize = 5;
 pub const MAX_DOCUMENT_BYTES: usize = 4_500_000;
 pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
-pub const MAX_IMAGES_PER_REQUEST: usize = 20;
+pub const MAX_IMAGES_PER_REQUEST: usize = 100;
 pub const MAX_DOCUMENTS_PER_REQUEST: usize = 5;
 pub const MAX_CACHE_BREAKPOINTS: usize = 4;
 /// Resource/logging boundary, not an enumeration of Kiro's supported models.
@@ -61,13 +61,22 @@ pub enum ValidationError {
 }
 
 pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
+    validate_claude_request(request, false)
+}
+
+/// Counting has no generation budget, even when extended thinking is enabled.
+pub fn validate_claude_count(request: &ClaudeRequest) -> Result<(), ValidationError> {
+    validate_claude_request(request, true)
+}
+
+fn validate_claude_request(request: &ClaudeRequest, counting: bool) -> Result<(), ValidationError> {
     common(&request.model, request.messages.is_empty())?;
     // Match the reference gateways' permissive handling of additive controls.
     // Validate data we consume, not official guarantees Kiro does not expose.
-    if request.max_tokens == 0 {
+    if !counting && request.max_tokens == 0 {
         return invalid(
             "max_tokens",
-            "zero-token cache warming cannot be represented by Kiro, whose inference protocol requires at least one output token",
+            "zero-token cache warming is not supported by Kiro; setting maxTokens to zero can still generate output",
         );
     }
     if request
@@ -114,9 +123,8 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
     }
     validate_claude_system(request.system.as_ref())?;
     validate_claude_output_config(request.output_config.as_ref(), "output_config")?;
-    if let Some(control) = request.cache_control.as_ref() {
-        validate_cache_control(control, "cache_control")?;
-    }
+    let mut cache_breakpoints =
+        validate_cache_control(request.cache_control.as_ref(), "cache_control")?;
     if request
         .metadata
         .as_ref()
@@ -134,7 +142,6 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
             "must be a non-empty string of at most 256 bytes",
         );
     }
-    let mut cache_breakpoints = usize::from(request.cache_control.is_some());
     cache_breakpoints =
         cache_breakpoints.saturating_add(validate_system_cache_controls(request.system.as_ref())?);
     let mut image_count = 0usize;
@@ -158,10 +165,10 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
             &message.role,
             format!("messages.{index}.content"),
         )?;
-        if let Some(control) = message.cache_control.as_ref() {
-            validate_cache_control(control, &format!("messages.{index}.cache_control"))?;
-            cache_breakpoints = cache_breakpoints.saturating_add(1);
-        }
+        cache_breakpoints = cache_breakpoints.saturating_add(validate_cache_control(
+            message.cache_control.as_ref(),
+            &format!("messages.{index}.cache_control"),
+        )?);
         cache_breakpoints = cache_breakpoints.saturating_add(validate_content_cache_controls(
             &message.content,
             &format!("messages.{index}.content"),
@@ -296,10 +303,11 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
                 }
             })?;
         }
-        if let Some(control) = tool.cache_control.as_ref() {
-            validate_cache_control(control, &format!("tools.{index}.cache_control"))?;
-            cache_breakpoints = cache_breakpoints.saturating_add(1);
-        }
+        let tool_cache_breakpoints = validate_cache_control(
+            tool.cache_control.as_ref(),
+            &format!("tools.{index}.cache_control"),
+        )?;
+        cache_breakpoints = cache_breakpoints.saturating_add(tool_cache_breakpoints);
         if let Some(callers) = &tool.allowed_callers {
             if callers.as_slice() != ["direct"] {
                 return invalid(
@@ -325,7 +333,15 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
                     "input_examples is not supported on Claude server tools",
                 );
             }
-            if tool.allowed_domains.is_some() || tool.blocked_domains.is_some() {
+            if tool
+                .allowed_domains
+                .as_ref()
+                .is_some_and(|domains| !domains.is_empty())
+                || tool
+                    .blocked_domains
+                    .as_ref()
+                    .is_some_and(|domains| !domains.is_empty())
+            {
                 return invalid(
                     format!("tools.{index}"),
                     "web search domain filters are not supported by the Kiro MCP search endpoint",
@@ -367,7 +383,7 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
                 "web search configuration fields are only valid on web_search server tools",
             );
         }
-        if tool.defer_loading && tool.cache_control.is_some() {
+        if tool.defer_loading && tool_cache_breakpoints > 0 {
             return invalid(
                 format!("tools.{index}.cache_control"),
                 "deferred tools cannot define cache_control",
@@ -453,7 +469,10 @@ pub fn validate_claude(request: &ClaudeRequest) -> Result<(), ValidationError> {
             );
         }
     }
-    validate_thinking(request.thinking.as_ref(), request.max_tokens)?;
+    validate_thinking(
+        request.thinking.as_ref(),
+        (!counting).then_some(request.max_tokens),
+    )?;
     validate_context_management(request.context_management.as_ref())?;
     Ok(())
 }
@@ -688,12 +707,26 @@ fn validate_claude_system(value: Option<&Value>) -> Result<(), ValidationError> 
     }
 }
 
-fn validate_cache_control(value: &Value, field: &str) -> Result<(), ValidationError> {
+/// Count only cache breakpoints we can translate. Null means omission in the
+/// Messages API; additive string types and fields are compatibility hints, not
+/// speculative Kiro controls. Keep shape checks and validate TTL only for the
+/// ephemeral marker whose TTL the proxy actually reads.
+fn validate_cache_control(value: Option<&Value>, field: &str) -> Result<usize, ValidationError> {
+    let Some(value) = value.filter(|value| !value.is_null()) else {
+        return Ok(0);
+    };
     let Some(control) = value.as_object() else {
         return invalid(field, "expected an object");
     };
-    if control.get("type").and_then(Value::as_str) != Some("ephemeral") {
-        return invalid(format!("{field}.type"), "expected ephemeral");
+    let Some(kind) = control
+        .get("type")
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.trim().is_empty())
+    else {
+        return invalid(format!("{field}.type"), "expected a non-empty string");
+    };
+    if kind != "ephemeral" {
+        return Ok(0);
     }
     if control
         .get("ttl")
@@ -701,16 +734,7 @@ fn validate_cache_control(value: &Value, field: &str) -> Result<(), ValidationEr
     {
         return invalid(format!("{field}.ttl"), "expected 5m or 1h");
     }
-    if let Some(unknown) = control
-        .keys()
-        .find(|key| !matches!(key.as_str(), "type" | "ttl"))
-    {
-        return invalid(
-            field,
-            format!("unsupported cache control field '{unknown}'"),
-        );
-    }
-    Ok(())
+    Ok(1)
 }
 
 fn validate_system_cache_controls(value: Option<&Value>) -> Result<usize, ValidationError> {
@@ -719,10 +743,10 @@ fn validate_system_cache_controls(value: Option<&Value>) -> Result<usize, Valida
     };
     let mut count = 0usize;
     for (index, block) in blocks.iter().enumerate() {
-        if let Some(control) = block.get("cache_control") {
-            validate_cache_control(control, &format!("system.{index}.cache_control"))?;
-            count = count.saturating_add(1);
-        }
+        count = count.saturating_add(validate_cache_control(
+            block.get("cache_control"),
+            &format!("system.{index}.cache_control"),
+        )?);
     }
     Ok(count)
 }
@@ -733,10 +757,10 @@ fn validate_content_cache_controls(content: &Value, field: &str) -> Result<usize
     };
     let mut count = 0usize;
     for (index, block) in blocks.iter().enumerate() {
-        if let Some(control) = block.get("cache_control") {
-            validate_cache_control(control, &format!("{field}.{index}.cache_control"))?;
-            count = count.saturating_add(1);
-        }
+        count = count.saturating_add(validate_cache_control(
+            block.get("cache_control"),
+            &format!("{field}.{index}.cache_control"),
+        )?);
         if block.get("type").and_then(Value::as_str) == Some("tool_result") {
             count = count.saturating_add(validate_content_cache_controls(
                 block.get("content").unwrap_or(&Value::Null),
@@ -794,6 +818,36 @@ fn validate_claude_block(
                 return invalid(format!("{field}.text"), "expected a string");
             }
         }
+        "search_result" if role == "user" => {
+            for name in ["source", "title"] {
+                if !block.get(name).is_some_and(Value::is_string) {
+                    return invalid(format!("{field}.{name}"), "expected a string");
+                }
+            }
+            let Some(parts) = block.get("content").and_then(Value::as_array) else {
+                return invalid(
+                    format!("{field}.content"),
+                    "expected an array of text blocks",
+                );
+            };
+            for (index, part) in parts.iter().enumerate() {
+                if part["type"] != "text" || !part.get("text").is_some_and(Value::is_string) {
+                    return invalid(format!("{field}.content.{index}"), "expected a text block");
+                }
+            }
+            if let Some(citations) = block.get("citations").filter(|value| !value.is_null()) {
+                if !citations.is_object()
+                    || citations
+                        .get("enabled")
+                        .is_some_and(|value| !value.is_boolean())
+                {
+                    return invalid(
+                        format!("{field}.citations"),
+                        "expected citation options with a boolean enabled field",
+                    );
+                }
+            }
+        }
         "image" => {
             if role != "user" {
                 return invalid(format!("{field}.type"), "image blocks require a user role");
@@ -822,6 +876,7 @@ fn validate_claude_block(
                 return invalid(format!("{field}.is_error"), "expected a boolean");
             }
             match block.get("content") {
+                None => {}
                 Some(Value::String(_)) => {}
                 Some(Value::Array(blocks)) => {
                     for (index, nested) in blocks.iter().enumerate() {
@@ -1044,13 +1099,11 @@ fn count_claude_documents_in_content(content: &Value) -> usize {
 
 fn validate_claude_document(block: &Value, field: &str) -> Result<(), ValidationError> {
     for name in ["name", "title"] {
-        if block.get(name).is_some_and(|value| {
-            !value.is_null() && value.as_str().is_none_or(|value| value.trim().is_empty())
-        }) {
-            return invalid(
-                format!("{field}.{name}"),
-                "expected a non-empty string or null",
-            );
+        if block
+            .get(name)
+            .is_some_and(|value| !value.is_null() && !value.is_string())
+        {
+            return invalid(format!("{field}.{name}"), "expected a string or null");
         }
     }
     if block
@@ -1059,7 +1112,7 @@ fn validate_claude_document(block: &Value, field: &str) -> Result<(), Validation
     {
         return invalid(format!("{field}.context"), "expected a string or null");
     }
-    if let Some(citations) = block.get("citations") {
+    if let Some(citations) = block.get("citations").filter(|value| !value.is_null()) {
         let Some(citations) = citations.as_object() else {
             return invalid(format!("{field}.citations"), "expected an object");
         };
@@ -1820,6 +1873,27 @@ fn validate_compact_edit(
 
 pub fn validate_openai(request: &OpenAiRequest) -> Result<(), ValidationError> {
     common(&request.model, request.messages.is_empty())?;
+    if request.n.is_some_and(|n| !(1..=128).contains(&n)) {
+        return invalid("n", "must be in 1..=128");
+    }
+    if let Some(stop) = &request.stop {
+        let sequences = match stop {
+            Value::String(value) => vec![value.as_str()],
+            Value::Array(values) if values.len() <= 4 && values.iter().all(Value::is_string) => {
+                values.iter().filter_map(Value::as_str).collect()
+            }
+            _ => return invalid("stop", "expected a string or an array of at most 4 strings"),
+        };
+        if sequences
+            .iter()
+            .any(|value| value.is_empty() || value.len() > MAX_STOP_SEQUENCE_BYTES)
+        {
+            return invalid(
+                "stop",
+                format!("each sequence must contain 1..={MAX_STOP_SEQUENCE_BYTES} bytes"),
+            );
+        }
+    }
     let mut cache_breakpoints = 0usize;
     if request
         .temperature
@@ -1842,12 +1916,13 @@ pub fn validate_openai(request: &OpenAiRequest) -> Result<(), ValidationError> {
         };
         if options
             .get("include_usage")
-            .is_some_and(|value| !value.is_boolean())
+            .is_some_and(|value| !value.is_null() && !value.is_boolean())
         {
             return invalid("stream_options", "include_usage must be a boolean");
         }
     }
     let mut image_count = 0usize;
+    let mut document_count = 0usize;
     for (index, message) in request.messages.iter().enumerate() {
         if !matches!(
             message.role.as_str(),
@@ -1856,11 +1931,12 @@ pub fn validate_openai(request: &OpenAiRequest) -> Result<(), ValidationError> {
             return Err(ValidationError::InvalidRole(message.role.clone()));
         }
         image_count = image_count.saturating_add(validate_openai_message(message, index)?);
-        if let Some(control) = message.cache_control.as_ref() {
-            validate_cache_control(control, &format!("messages.{index}.cache_control"))?;
-            cache_breakpoints = cache_breakpoints.saturating_add(1);
-        }
+        cache_breakpoints = cache_breakpoints.saturating_add(validate_cache_control(
+            message.cache_control.as_ref(),
+            &format!("messages.{index}.cache_control"),
+        )?);
         if let Some(content) = message.content.as_ref() {
+            document_count += count_claude_documents_in_content(content);
             cache_breakpoints = cache_breakpoints.saturating_add(validate_content_cache_controls(
                 content,
                 &format!("messages.{index}.content"),
@@ -1876,16 +1952,22 @@ pub fn validate_openai(request: &OpenAiRequest) -> Result<(), ValidationError> {
     if request.tools.len() > MAX_TOOLS {
         return Err(ValidationError::TooManyTools);
     }
+    if document_count > MAX_DOCUMENTS_PER_REQUEST {
+        return invalid(
+            "messages",
+            format!("must contain at most {MAX_DOCUMENTS_PER_REQUEST} file parts"),
+        );
+    }
     let mut docs = 0usize;
     for (index, tool) in request.tools.iter().enumerate() {
         if !matches!(tool.r#type.as_str(), "function" | "custom") {
             return invalid(format!("tools.{index}.type"), "expected function or custom");
         }
         let definition = tool.body.get(&tool.r#type).unwrap_or(&Value::Null);
-        if let Some(control) = tool.body.get("cache_control") {
-            validate_cache_control(control, &format!("tools.{index}.cache_control"))?;
-            cache_breakpoints = cache_breakpoints.saturating_add(1);
-        }
+        cache_breakpoints = cache_breakpoints.saturating_add(validate_cache_control(
+            tool.body.get("cache_control"),
+            &format!("tools.{index}.cache_control"),
+        )?);
         if !definition.is_object() {
             return invalid(
                 format!("tools.{index}.{}", tool.r#type),
@@ -1939,7 +2021,7 @@ pub fn validate_openai(request: &OpenAiRequest) -> Result<(), ValidationError> {
             }
             if definition
                 .get("strict")
-                .is_some_and(|strict| !strict.is_boolean())
+                .is_some_and(|strict| !strict.is_null() && !strict.is_boolean())
             {
                 return invalid(
                     format!("tools.{index}.function.strict"),
@@ -1967,12 +2049,12 @@ pub fn validate_openai(request: &OpenAiRequest) -> Result<(), ValidationError> {
     if request.reasoning_effort.as_deref().is_some_and(|effort| {
         !matches!(
             effort,
-            "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
         )
     }) {
         return invalid(
             "reasoning_effort",
-            "expected minimal, low, medium, high, xhigh, or max",
+            "expected none, minimal, low, medium, high, xhigh, or max",
         );
     }
     if request
@@ -1992,10 +2074,7 @@ pub fn validate_openai(request: &OpenAiRequest) -> Result<(), ValidationError> {
     {
         return invalid("metadata", "expected an object");
     }
-    validate_thinking(
-        request.thinking.as_ref(),
-        request.max_tokens.unwrap_or(u32::MAX),
-    )?;
+    validate_thinking(request.thinking.as_ref(), request.output_token_limit())?;
     Ok(())
 }
 
@@ -2015,7 +2094,10 @@ fn validate_openai_message(
             "is required for tool messages",
         );
     }
-    if message.content.is_none() && (message.role != "assistant" || message.tool_calls.is_empty()) {
+    if message.content.is_none()
+        && (message.role != "assistant"
+            || (message.tool_calls.is_empty() && message.refusal.is_none()))
+    {
         return invalid(format!("messages.{index}.content"), "is required");
     }
     if let Some(content) = &message.content {
@@ -2027,6 +2109,12 @@ fn validate_openai_message(
                     let field = format!("messages.{index}.content.{part_index}");
                     match kind {
                         Some("text") if part.get("text").is_some_and(Value::is_string) => {}
+                        Some("refusal")
+                            if message.role == "assistant"
+                                && part.get("refusal").is_some_and(Value::is_string) => {}
+                        Some("document") if matches!(message.role.as_str(), "user" | "tool") => {
+                            validate_claude_document(part, &field)?;
+                        }
                         Some("image_url") => {
                             let Some(url) = part.pointer("/image_url/url").and_then(Value::as_str)
                             else {
@@ -2199,7 +2287,7 @@ fn validate_custom_format(format: Option<&Value>, index: usize) -> Result<(), Va
 
 fn validate_thinking(
     thinking: Option<&crate::ThinkingConfig>,
-    max_tokens: u32,
+    max_tokens: Option<u32>,
 ) -> Result<(), ValidationError> {
     let Some(thinking) = thinking else {
         return Ok(());
@@ -2219,7 +2307,7 @@ fn validate_thinking(
     if thinking.r#type == "enabled"
         && thinking
             .budget_tokens
-            .is_some_and(|budget| budget >= max_tokens)
+            .is_some_and(|budget| max_tokens.is_some_and(|maximum| budget >= maximum))
     {
         return invalid("thinking.budget_tokens", "must be less than max_tokens");
     }

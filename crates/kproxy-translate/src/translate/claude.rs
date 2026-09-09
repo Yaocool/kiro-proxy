@@ -286,6 +286,7 @@ pub fn claude_to_kiro(request: &ClaudeRequest, options: &TranslationOptions) -> 
             requested_model: request.model.clone(),
             thinking: request.thinking.clone(),
             effort: effective_effort(request),
+            automatic_history_truncation: false,
         }),
         protected_history_messages,
     };
@@ -582,7 +583,7 @@ fn normalized_non_system_messages(messages: &[crate::ClaudeMessage]) -> Vec<crat
             .filter(|previous| previous.role == message.role)
         {
             merge_claude_content(&mut previous.content, &message.content);
-            if message.cache_control.is_some() {
+            if kiro_cache_point(message.cache_control.as_ref()).is_some() {
                 previous.cache_control.clone_from(&message.cache_control);
             }
             continue;

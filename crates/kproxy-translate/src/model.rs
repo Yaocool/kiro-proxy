@@ -1045,7 +1045,7 @@ mod tests {
         let mut wire = serde_json::to_value(&payload).unwrap();
         assert_eq!(
             wire["inferenceConfig"],
-            serde_json::json!({"temperature":0.0,"topP":0.0})
+            serde_json::json!({"maxTokens":4096,"temperature":0.0,"topP":0.0})
         );
         assert!(wire.get("modelRequestIntent").is_none());
         wire["modelRequestIntent"] = serde_json::json!({"effort":"max"});

@@ -183,8 +183,8 @@ fn responses_still_rejects_malformed_history_and_unimplemented_controls() {
                 {"type":"function_call","call_id":"c1","name":"f","arguments":"{}"}]}),
         ),
         (
-            "server-side truncation",
-            json!({"model":"claude-haiku-4.5","input":"hi","truncation":"auto"}),
+            "invalid truncation mode",
+            json!({"model":"claude-haiku-4.5","input":"hi","truncation":"invalid"}),
         ),
         (
             "hosted tool the proxy cannot execute",
@@ -205,6 +205,7 @@ fn responses_accepts_stateful_controls_for_authenticated_http_handling() {
     for body in [
         json!({"model":"claude-haiku-4.5","input":"hi","store":true}),
         json!({"model":"claude-haiku-4.5","input":"hi","previous_response_id":"resp_1"}),
+        json!({"model":"claude-haiku-4.5","input":"hi","truncation":"auto","max_tool_calls":1}),
     ] {
         let request: ResponsesRequest =
             serde_json::from_value(body).expect("request should deserialize");

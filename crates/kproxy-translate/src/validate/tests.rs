@@ -405,7 +405,7 @@ fn custom_document_images_share_the_request_image_limit() {
     assert!(validate_claude(&input)
         .expect_err("custom document images must count toward the request limit")
         .to_string()
-        .contains("at most 20 image blocks"));
+        .contains("at most 100 image blocks"));
 }
 
 #[test]
@@ -574,6 +574,10 @@ fn validates_anthropic_tool_search_contract() {
         .expect_err("deferred cache control")
         .to_string()
         .contains("cache_control"));
+    input.tools[1].cache_control = None;
+
+    input.tools[1].cache_control = Some(serde_json::json!({"type":"future_cache_hint"}));
+    validate_claude(&input).expect("ignored cache hints do not cache deferred tools");
     input.tools[1].cache_control = None;
 
     input.tools.remove(0);
@@ -856,13 +860,14 @@ fn openai_business_fields_and_tool_call_json_are_validated() {
         tool_calls: Vec::new(),
         tool_call_id: None,
         reasoning_content: None,
+        refusal: None,
         name: None,
         cache_control: None,
     }];
     input.max_tokens = Some(1);
     input.max_completion_tokens = Some(1);
     validate_openai(&input)
-        .expect("ignored max_completion_tokens does not conflict with max_tokens");
+        .expect("max_completion_tokens can coexist with the deprecated max_tokens");
 }
 
 #[test]
@@ -905,7 +910,7 @@ fn openai_images_are_validated_and_bounded_before_translation() {
     assert!(validate_openai(&too_many)
         .expect_err("image limit")
         .to_string()
-        .contains("at most 20"));
+        .contains("at most 100"));
 }
 
 #[test]

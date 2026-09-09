@@ -7,6 +7,8 @@
 //! Keep the original fixture intact to document rather than hide that difference.
 //! Claude explicit effort also intentionally diverges: the current gateway
 //! honors output_config.effort instead of retaining the older adapter's omission.
+//! OpenAI max_completion_tokens now takes precedence over max_tokens and maps
+//! to the native limit; the pinned reference still ignores that modern field.
 
 use kproxy_translate::{
     claude_to_kiro, openai_to_kiro, validate_claude, validate_openai, ClaudeRequest, OpenAiRequest,
@@ -59,9 +61,14 @@ fn outbound_model_controls_document_supported_departures_from_reference() {
             other => panic!("unexpected fixture protocol: {other}"),
         };
         let wire = serde_json::to_value(payload).unwrap();
+        let expected_inference = match name {
+            "openai_completion_limit_is_not_forwarded" => json!({"maxTokens":64}),
+            "openai_max_tokens_is_the_only_token_control" => json!({"maxTokens":128}),
+            _ => case["expectedInference"].clone(),
+        };
         assert_eq!(
             canonical(&wire["inferenceConfig"]),
-            canonical(&case["expectedInference"]),
+            canonical(&expected_inference),
             "{name}: inferenceConfig"
         );
         let expected_additional = match name {

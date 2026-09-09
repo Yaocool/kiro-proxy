@@ -571,9 +571,8 @@ fn unsupported_execution_controls_are_rejected_explicitly() {
     for (field, value) in [
         ("background", json!(true)),
         ("conversation", json!("conv_unknown")),
-        ("truncation", json!("auto")),
+        ("truncation", json!("invalid")),
         ("max_output_tokens", json!(0)),
-        ("max_tool_calls", json!(2)),
         ("context_management", json!([])),
         ("tools", json!([{"type":"web_search"}])),
         (
