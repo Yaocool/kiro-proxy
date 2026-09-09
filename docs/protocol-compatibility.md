@@ -10,7 +10,7 @@ This reference describes Claude Messages and OpenAI Chat Completions in the curr
 | --- | --- |
 | Implemented controls | Validate fields actually read and map them through model metadata. |
 | Compatibility hints | Accept/ignore format and strict without hard schema guarantees; unknown extra fields alone do not trigger rejection. |
-| Missing execution/data paths | Explicitly reject enabled capabilities such as background and Files. |
+| Missing execution/data paths | Explicitly reject enabled capabilities such as background jobs and foreign hosted file IDs. |
 | Responses history | Skip unconvertible items while requiring effective conversation content; tool-catalog controls are not skippable history. |
 | Resources and access | Preserve authentication, allowlists, tool pairing, type checks and schema/attachment/context/byte limits. |
 
@@ -35,6 +35,52 @@ rules in Claude/OpenAI, streaming/non-streaming, and buffered/unbuffered respons
 Tool names are not used to infer read or write operations. Empty arguments become
 `{}`; valid JSON is accepted even when the upstream omits the tool stop event.
 Non-empty malformed JSON fails explicitly instead of guessing missing arguments.
+
+## Protocol field normalization
+
+Claude `count_tokens` accepts enabled thinking without an output budget; it does
+not compare `budget_tokens` with a synthetic generation limit. Generation still
+validates the budget. Missing `tool_result.content` represents an empty result;
+`document.citations: null` means omission. Empty document titles use a neutral
+native name. Client `search_result` blocks, including tool results, preserve their
+source, title and text as labeled source data. They do not acquire Anthropic
+citation-index guarantees.
+
+Chat accepts nullable `stream`, `tools`, `tool_calls`, `stream_options.include_usage` and function
+`strict`. Assistant refusal blocks and the Chat `refusal` field are preserved as
+history text. Legacy `functions`, `function_call` and `role: function` are
+normalized into paired Kiro tool calls. Legacy-only requests receive
+`function_call` messages/deltas and finish reasons. Missing/blank tool descriptions
+receive a neutral default: real Kiro accepts the declaration but rejects replay
+of the call when its description is empty.
+Null or empty modern tool lists do not override legacy function controls or
+change the legacy response format.
+
+Chat `stop` uses the shared incremental stop filter, including matches across
+stream chunks. `n` (1–128) executes sequential independent Kiro requests, returns
+all indexed choices and sums their usage. Streaming emits one final usage chunk
+when requested and one `[DONE]`. Every candidate uses ordinary admission,
+authentication and quota accounting; cancelling the stream stops further calls.
+The next candidate waits for the previous stream's accounting and admission
+release. Retained request bodies stay within the shared memory budget, and
+failures after SSE starts are recorded with the committed HTTP status.
+
+OpenAI Chat `file` and Responses `input_file`, including tool outputs, accept
+inline base64/data URLs and public file URLs and map to native Kiro documents.
+They share Claude's media, size and SSRF protections. Foreign hosted `file_id`
+values still require a Files service this proxy does not provide.
+If a filename or MIME type does not identify the format, PDF signatures and UTF-8
+text can identify supported inline content, including extensionless filenames.
+
+The image-count limit is 100, with unchanged byte/memory limits. Real Kiro accepted
+100 small valid PNGs. Six small text documents still produced an upstream 400,
+so the five-document bound remains. Kiro accepted a zero-token setting but still
+generated text; `max_tokens: 0` cache warming remains unsupported. Background jobs,
+Conversations API state, Responses context-management execution/hosted tools,
+exact prefill, log probabilities and hard JSON Schema guarantees are separate
+capabilities; accepting their shapes cannot create those guarantees. Empty Claude
+web-search domain lists are no-ops; non-empty filters still need a compatible
+search executor.
 
 ## Claude Code MCP Tool Search
 
@@ -84,9 +130,8 @@ and the summaries are assembled in order. No extractive truncation precedes the
 semantic summary, and every chunk is checked against the summary input window. The account
 slot is released before summarization so a single-concurrency account cannot
 block its own summary request. The same compaction artifact may also be reapplied
-once if dispatch after summarization resolves to a smaller window. OpenAI Chat
-Completions/Responses and context growth after a Tool Search response has started retain
-hard context-limit errors because they cannot safely return a leading Claude
+once if dispatch after summarization resolves to a smaller window. OpenAI Chat Completions, Responses with `truncation: disabled`, and context growth
+after a Tool Search response has started retain hard context-limit errors because they cannot safely return a leading Claude
 `compaction` boundary. A summary timeout releases the main request immediately;
 late accounting is allowed only for a bounded grace period, after which the
 summary stream is canceled and any already decoded usage is settled.
@@ -245,7 +290,7 @@ sources, including documents inside tool results. Custom content is flattened
 in order into a text document; embedded images are hoisted to the same Kiro
 message's image list with numbered markers. This does not preserve Anthropic's
 custom citation-chunk semantics. Each request accepts at most five documents
-(4,500,000 decoded bytes each) and twenty images (5 MiB each). Remote media is
+(4,500,000 decoded bytes each) and 100 images (5 MiB each). Remote media is
 restricted to public addresses, revalidates DNS on every redirect, ignores
 environment proxies, and checks file signatures against media types. Kiro
 citations, web sources, and license details remain visible as References rather
@@ -272,7 +317,14 @@ generation/data-resolution paths and are still rejected.
 Protocol compatibility is resolved before
 the first upstream call, without a time-based rejection cache or field-removal
 probes. Cache markers contain only `type: default`; Claude cache TTL preferences
-do not control Kiro's cache lifetime. Claude historical thinking is omitted from Kiro
+do not control Kiro's cache lifetime. `cache_control: null` means omission at every
+supported request/message/tool/content location. Non-empty string types other than
+`ephemeral` are accepted as unused hints, and extra fields such as `scope` and
+`evict_on_complete` are ignored. Only `ephemeral` markers count toward the four
+breakpoint limit or create native/local cache markers; malformed objects/types and
+unsupported `ephemeral.ttl` values still fail validation. This policy also covers
+Chat Completions cache extensions and the Messages counting aliases.
+Claude historical thinking is omitted from Kiro
 request history without disabling current-generation thinking; Responses plaintext
 reasoning summaries are preserved in assistant history. Document context
 is preserved as separate JSON-labelled message text rather than a document field.
@@ -281,17 +333,17 @@ Generation controls use the explicit mapping in
 
 | Client control | Kiro/proxy handling |
 | --- | --- |
-| `max_tokens`, `temperature`, `top_p` | Map to `inferenceConfig.maxTokens/temperature/topP`; explicit zero sampling values survive. An omitted OpenAI `max_tokens` stays omitted; no 8192 default is sent. Model-specific rejection is still possible. |
-| OpenAI `max_completion_tokens` | Accepted/validated but ignored, matching the reference; use `max_tokens` for an upstream limit. |
+| `max_tokens`, `temperature`, `top_p` | Map to `inferenceConfig.maxTokens/temperature/topP`; explicit zero sampling values survive. If neither OpenAI output-limit field is provided, `maxTokens` stays omitted; no 8192 default is sent. Model-specific rejection is still possible. |
+| OpenAI `max_completion_tokens` | Maps to `inferenceConfig.maxTokens` and takes precedence over `max_tokens`; the effective limit also drives continuation budgets, credit estimates and finish reasons. |
 | Claude `top_k` | Accepted but omitted with a debug diagnostic, regardless of model metadata. This is a gateway compatibility policy, not a claim that Kiro universally rejects it. |
-| Claude `stop_sequences` | Enforced locally in streaming and non-streaming responses; no native `stopSequences` is sent. This does not guarantee a server-side generation/cost limit. |
+| Claude `stop_sequences` / Chat `stop` | Enforced locally in streaming and non-streaming responses; no native `stopSequences` is sent. This does not guarantee a server-side generation/cost limit. |
 | Thinking / effort | Recognized effort metadata chooses `thinking: adaptive` + `output_config.effort`, or `reasoning.effort`. Missing, incomplete, or unrecognized metadata omits the entire `additionalModelRequestFields` field, never sending `{}`, `null`, or speculative adaptive thinking. |
 | Claude `output_config.effort` | Explicit effort takes precedence over the thinking budget and is mapped through the selected model's Kiro metadata. Effort-only system messages apply from the next user turn and survive compaction and internal continuations. Kiro receives the effective request-level effort; Anthropic's per-message cache semantics are not guaranteed. |
 | Claude `output_config.format` / `task_budget` | Accepted but omitted from Kiro input, with a debug diagnostic containing only field names. No JSON/Schema or task-budget guarantee is added; `output_config.effort` is still mapped independently. |
 | OpenAI `response_format` / Responses `text.format` | Accepted but omitted from Kiro input, matching the permissive reference behavior; no JSON/Schema guarantee or schema-driven retries are added. |
 | Tool `strict`, Claude `eager_input_streaming` | Accepted as hints; normal Kiro tool schemas and existing streaming behavior are retained. |
 | Service tier, additive fields, unused stream hints | Accepted without forwarding them as speculative Kiro fields. Used values such as `include_usage` retain type validation. |
-| OpenAI `reasoning_effort` | Takes precedence over `thinking.budget_tokens`; otherwise the default is high. Unsupported values select the last advertised effort, without sorting or nearest-rank matching. |
+| OpenAI `reasoning_effort` | `none` uses the existing disabled-thinking path. Other values take precedence over `thinking.budget_tokens`; otherwise the default is high. Unsupported values select the last advertised effort, without sorting or nearest-rank matching. |
 | `thinking.display` | The output_config dialect always sends summarized; the reasoning dialect omits display. Without recognized metadata, the entire extension is omitted. Client display does not override these upstream shapes. |
 | `thinking.budget_tokens` | Maps directly to low (≤4000), medium (≤16000), high (≤64000), or xhigh; it is not an exact native thinking-token cap. |
 | `thinking: disabled` | Omits thinking controls and suppresses returned reasoning; omission does not guarantee that a model with thinking enabled by default stops thinking internally. |

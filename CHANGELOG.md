@@ -36,6 +36,21 @@ they must receive a new version rather than replacing that tag or its image.
 
 ### Fixed
 
+- Align Claude counting, optional tool results and nullable citations, and OpenAI
+  nullable stream/strict controls, disabled reasoning and refusal replay with the
+  public protocols. Normalize missing tool descriptions for Kiro tool replay.
+- Execute Chat stop sequences and multiple choices in JSON/SSE, map
+  `max_completion_tokens`, and adapt legacy function requests and responses.
+  Wait for each streamed candidate's settlement before the next admission,
+  retain body memory reservations, and record failures after SSE starts.
+- Translate OpenAI inline/URL files and Claude search-result content to Kiro,
+  accept empty web-search domain filters, and raise the image count limit to 100.
+- Support Responses `truncation: auto` against the account's resolved model
+  window, including smaller fallback models and continuations, while preserving
+  instructions and the current tool chain.
+- Accept null and additive cache hints across Claude Messages, counting aliases
+  and OpenAI Chat Completions; count and translate only recognized ephemeral
+  breakpoints, without forwarding client cache fields to Kiro.
 - Preserve tool-only/empty assistant turns and validate upstream tool JSON across
   buffered/unbuffered, JSON/SSE paths; recover hollow Responses tool continuations
   once and surface repeated failure.
