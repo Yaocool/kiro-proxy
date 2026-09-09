@@ -276,11 +276,7 @@ fn build_profile_with_tokens(
 
 fn cache_ttl(value: &Value) -> Option<Duration> {
     let control = value.get("cache_control")?;
-    if !control
-        .get("type")
-        .and_then(Value::as_str)
-        .is_some_and(|kind| kind.eq_ignore_ascii_case("ephemeral"))
-    {
+    if control.get("type").and_then(Value::as_str) != Some("ephemeral") {
         return None;
     }
     match control.get("ttl") {
@@ -319,6 +315,23 @@ fn stable_json(value: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn ignored_cache_hints_do_not_create_local_cache_profiles() {
+        let tracker = PromptCacheTracker::default();
+        for control in [
+            Value::Null,
+            json!({"type":"future_cache_hint"}),
+            json!({"type":"Ephemeral"}),
+        ] {
+            let request: ClaudeRequest = serde_json::from_value(json!({
+                "model":"claude-opus-5","max_tokens":128,
+                "system":[{"type":"text","text":"cacheable context ".repeat(1500),"cache_control":control}],
+                "messages":[{"role":"user","content":"summarize"}]
+            })).unwrap();
+            assert!(tracker.claude_profile(&request, 8_000).is_none());
+        }
+    }
 
     #[test]
     fn estimated_cache_state_never_overwrites_upstream_usage() {

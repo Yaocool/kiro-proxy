@@ -286,7 +286,8 @@ impl ResponsesOptions {
                 })).unwrap_or_else(|| json!({"format":{"type":"text"}})),
                 "temperature":request.temperature.unwrap_or(1.0),
                 "top_p":request.top_p.unwrap_or(1.0),
-                "truncation":"disabled", "service_tier":"auto",
+                "truncation":request.truncation.as_deref().unwrap_or("disabled"), "service_tier":"auto",
+                "max_tool_calls":request.max_tool_calls,
                 "metadata":request.metadata.as_ref().unwrap_or(&json!({}))
             }),
             tool_names,
@@ -305,6 +306,10 @@ impl ResponsesOptions {
 
     pub fn id(&self) -> &str {
         self.template["id"].as_str().expect("response id")
+    }
+
+    pub(super) fn automatic_truncation(&self) -> bool {
+        self.template["truncation"] == "auto"
     }
 
     pub(super) fn inherited_conversation_id(&self) -> Option<&str> {
@@ -874,7 +879,7 @@ pub(super) fn stream_response(response: Response, options: ResponsesOptions) -> 
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
-fn frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
+pub(super) fn frame_end(buffer: &[u8]) -> Option<(usize, usize)> {
     let lf = buffer
         .windows(2)
         .position(|bytes| bytes == b"\n\n")

@@ -1140,7 +1140,7 @@ pub(in crate::http) async fn validate_internal_continuation(
 ) -> Result<u64, KiroError> {
     prepare_kiro_payload(payload, endpoint, stage)?;
     let config = state.config.current();
-    let input_tokens = state
+    let mut input_tokens = state
         .tokenizer
         .estimate_kiro_payload(payload)
         .await
@@ -1149,6 +1149,20 @@ pub(in crate::http) async fn validate_internal_continuation(
             endpoint: endpoint.into(),
             message,
         })? as u64;
+    let model = payload
+        .conversation_state
+        .current_message
+        .user_input_message
+        .model_id
+        .clone();
+    input_tokens =
+        super::truncate_context_if_requested(state, payload, input_tokens, compact, &model)
+            .await
+            .map_err(|message| KiroError {
+                status: None,
+                endpoint: endpoint.into(),
+                message,
+            })?;
     let tool_tokens = state
         .tokenizer
         .estimate_kiro_tools(payload)
@@ -1410,7 +1424,7 @@ pub(super) async fn nonstream_openai(
         payload,
         false,
         max_tokens,
-        &[],
+        &request.stop_sequences(),
         thinking_enabled,
         None,
         0,
@@ -1485,7 +1499,7 @@ pub(super) async fn nonstream_openai(
     } else {
         state.config.current().features.thinking_output_format
     };
-    let chat = decoded.openai_json(
+    let mut chat = decoded.openai_json(
         &request_id,
         &request.model,
         now_secs(),
@@ -1494,6 +1508,10 @@ pub(super) async fn nonstream_openai(
         thinking_format,
         &openai_tools,
     );
+    if request.legacy_functions {
+        super::chat::legacy_chunk(&mut chat)
+            .map_err(|message| ApiError::response_assembly(message, ErrorFormat::OpenAi))?;
+    }
     let response = match responses_options {
         Some(options) => super::super::responses::json_response(chat, options)
             .map_err(|message| ApiError::response_assembly(message, ErrorFormat::OpenAi))?,

@@ -948,10 +948,17 @@ pub(super) async fn handle_openai(
         );
         (translated.request, Some(options))
     } else {
-        let request: OpenAiRequest = serde_json::from_slice(&body).map_err(|_| {
+        let value: Value = serde_json::from_slice(&body).map_err(|_| {
             ApiError::new(
                 StatusCode::BAD_REQUEST,
                 "Invalid JSON in request body",
+                ErrorFormat::OpenAi,
+            )
+        })?;
+        let request = kproxy_translate::parse_openai_request(value).map_err(|error| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                error.to_string(),
                 ErrorFormat::OpenAi,
             )
         })?;
@@ -964,6 +971,31 @@ pub(super) async fn handle_openai(
         })?;
         (request, None)
     };
+    if responses_options.is_none() && request.n.unwrap_or(1) > 1 {
+        let include_usage = request
+            .stream_options
+            .as_ref()
+            .and_then(|value| value["include_usage"].as_bool())
+            .unwrap_or(false);
+        // Each sequential candidate owns the ordinary admission/quota guards.
+        // Do not retain an additional parent slot (a configured limit of one
+        // must still permit n > 1).
+        drop(connection_guard);
+        drop(admission_guard);
+        let count = request.n.unwrap();
+        let streaming = request.stream;
+        drop(request);
+        return super::chat::multiple(
+            service,
+            path,
+            headers,
+            body,
+            count,
+            streaming,
+            include_usage,
+        )
+        .await;
+    }
     tracing::info!(
         event = "proxy.request.validated",
         trace_id = %trace_id,
@@ -982,10 +1014,17 @@ pub(super) async fn handle_openai(
         request.tools.retain(|tool| tool.r#type != "web_search");
     }
     let openai_tools = openai_tool_identities(&request);
-    let image_guards = hydrate_openai_images(&state, &mut request).await?;
+    let image_guards = hydrate_openai_attachments(&state, &mut request).await?;
+    validate_openai(&request).map_err(|error| {
+        ApiError::new(
+            StatusCode::BAD_REQUEST,
+            error.to_string(),
+            ErrorFormat::OpenAi,
+        )
+    })?;
     // Omission must survive through response formatting and continuations,
     // not just the initial Kiro payload. Only credit estimates use a default.
-    let max_tokens = request.max_tokens;
+    let max_tokens = request.output_token_limit();
     let route = map_model(
         &request.model,
         &config.model_mapping,
@@ -1043,7 +1082,7 @@ pub(super) async fn handle_openai(
             ErrorFormat::OpenAi,
         )
     })?;
-    let input_tokens = state
+    let mut input_tokens = state
         .tokenizer
         .estimate_kiro_payload(&payload)
         .await
@@ -1054,9 +1093,57 @@ pub(super) async fn handle_openai(
                 ErrorFormat::OpenAi,
             )
         })? as u64;
-    let prompt_cache = config
-        .features
-        .enable_prompt_cache
+    let mut prepared = None;
+    let automatic_truncation = responses_options
+        .as_ref()
+        .is_some_and(ResponsesOptions::automatic_truncation);
+    if automatic_truncation {
+        payload
+            .model_request_intent
+            .get_or_insert_default()
+            .automatic_history_truncation = true;
+        let mut selected = prepare_upstream(
+            &state,
+            &trace_id,
+            &route.mapped,
+            &request.model,
+            key_id.as_deref(),
+            &config.features.default_model_id,
+            &payload,
+        )
+        .await
+        .map_err(|error| upstream_error(error, ErrorFormat::OpenAi))?;
+        payload = selected.payload.clone();
+        let original_history = payload.conversation_state.history.len();
+        input_tokens = super::truncate_context_if_requested(
+            &state,
+            &mut payload,
+            input_tokens,
+            false,
+            &selected.kiro_model,
+        )
+        .await
+        .map_err(|message| {
+            ApiError::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                message,
+                ErrorFormat::OpenAi,
+            )
+        })?;
+        if original_history != payload.conversation_state.history.len() {
+            tracing::info!(
+                trace_id,
+                removed_messages = original_history - payload.conversation_state.history.len(),
+                input_tokens,
+                "Responses history truncated to the resolved model window"
+            );
+        }
+        selected.payload = payload.clone();
+        prepared = Some(selected);
+    }
+    // A fallback may trim additional history after this point. Native cache
+    // usage remains authoritative; don't estimate it from the original input.
+    let prompt_cache = (config.features.enable_prompt_cache && !automatic_truncation)
         .then(|| state.prompt_cache.openai_profile(&request, input_tokens))
         .flatten();
     let tool_tokens = state
@@ -1145,11 +1232,20 @@ pub(super) async fn handle_openai(
         input_tokens,
         false,
         &payload,
-        None,
+        prepared,
     )
     .await
     .map_err(|error| upstream_error(error, ErrorFormat::OpenAi))?;
+    if automatic_truncation {
+        input_tokens = state
+            .tokenizer
+            .estimate_kiro_payload(&payload)
+            .await
+            .map_err(|message| ApiError::response_assembly(message, ErrorFormat::OpenAi))?
+            as u64;
+    }
     if request.stream {
+        let legacy_functions = request.legacy_functions;
         let thinking_output_format = if responses_options.is_some() {
             kproxy_core::config::ThinkingOutputFormat::Openai
         } else {
@@ -1168,7 +1264,7 @@ pub(super) async fn handle_openai(
                 path,
                 model: request.model.clone(),
                 mapped_model,
-                original_model: request.model,
+                original_model: request.model.clone(),
                 api_key_id: key_id.clone(),
                 kiro_model,
                 model_path,
@@ -1183,7 +1279,7 @@ pub(super) async fn handle_openai(
                 context_edit_stats: Default::default(),
                 estimated_credits: estimate,
                 max_tokens,
-                stop_sequences: Vec::new(),
+                stop_sequences: request.stop_sequences(),
                 started,
                 prompt_cache,
                 payload,
@@ -1212,6 +1308,7 @@ pub(super) async fn handle_openai(
         );
         return Ok(match responses_options {
             Some(options) => stream_response(response, options),
+            None if legacy_functions => super::chat::legacy_stream(response),
             None => response,
         });
     }
@@ -1395,7 +1492,7 @@ fn collect_claude_remote_attachments(
     }
 }
 
-async fn hydrate_openai_images(
+async fn hydrate_openai_attachments(
     state: &Arc<AppState>,
     request: &mut OpenAiRequest,
 ) -> Result<Vec<crate::state::BodyGuard>, ApiError> {
@@ -1412,7 +1509,23 @@ async fn hydrate_openai_images(
                     Url::parse(url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
                 })
             {
-                targets.push((message_index, part_index, url.to_owned()));
+                targets.push((
+                    message_index,
+                    part_index,
+                    RemoteAttachmentKind::Image,
+                    url.to_owned(),
+                ));
+            } else if part.get("type").and_then(Value::as_str) == Some("document")
+                && part.pointer("/source/type").and_then(Value::as_str) == Some("url")
+            {
+                if let Some(url) = part.pointer("/source/url").and_then(Value::as_str) {
+                    targets.push((
+                        message_index,
+                        part_index,
+                        RemoteAttachmentKind::Document,
+                        url.to_owned(),
+                    ));
+                }
             }
         }
     }
@@ -1420,46 +1533,69 @@ async fn hydrate_openai_images(
     let guarded_targets = targets
         .into_iter()
         .map(|target| {
-            reserve_remote_attachment(state, REMOTE_IMAGE_MAX_BYTES, ErrorFormat::OpenAi)
-                .map(|guard| (target, guard))
+            let maximum = match target.2 {
+                RemoteAttachmentKind::Image => REMOTE_IMAGE_MAX_BYTES,
+                RemoteAttachmentKind::Document => REMOTE_DOCUMENT_MAX_BYTES,
+            };
+            reserve_remote_attachment(state, maximum, ErrorFormat::OpenAi)
+                .map(|guard| (target, maximum, guard))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let fetched = futures::stream::iter(guarded_targets)
-        .map(|((message_index, part_index, url), guard)| async move {
-            let image =
-                fetch_remote_attachment(&url, RemoteAttachmentKind::Image, REMOTE_IMAGE_MAX_BYTES)
-                    .await
-                    .map_err(|message| {
-                        ApiError::new(
-                            StatusCode::BAD_GATEWAY,
-                            format!("unable to fetch remote image: {message}"),
-                            ErrorFormat::OpenAi,
-                        )
-                    })?;
-            Ok::<_, ApiError>((message_index, part_index, image, guard))
-        })
+        .map(
+            |((message_index, part_index, kind, url), maximum, guard)| async move {
+                let image =
+                    fetch_remote_attachment(&url, kind, maximum)
+                        .await
+                        .map_err(|message| {
+                            ApiError::new(
+                                StatusCode::BAD_GATEWAY,
+                                format!("unable to fetch remote attachment: {message}"),
+                                ErrorFormat::OpenAi,
+                            )
+                        })?;
+                Ok::<_, ApiError>((message_index, part_index, kind, image, guard))
+            },
+        )
         .buffer_unordered(REMOTE_ATTACHMENT_CONCURRENCY)
         .try_collect::<Vec<_>>()
         .await?;
 
     let mut guards = Vec::with_capacity(fetched.len());
-    for (message_index, part_index, fetched, guard) in fetched {
+    for (message_index, part_index, kind, fetched, guard) in fetched {
         let encoded = base64::engine::general_purpose::STANDARD.encode(fetched.bytes);
-        let data_url = format!("data:{};base64,{encoded}", fetched.media_type);
         let value = request.messages[message_index]
             .content
             .as_mut()
             .and_then(Value::as_array_mut)
             .and_then(|parts| parts.get_mut(part_index))
-            .and_then(|part| part.pointer_mut("/image_url/url"))
             .ok_or_else(|| {
                 ApiError::new(
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    "remote image changed while preparing the request",
+                    "remote attachment changed while preparing the request",
                     ErrorFormat::OpenAi,
                 )
             })?;
-        *value = Value::String(data_url);
+        match kind {
+            RemoteAttachmentKind::Image => {
+                value["image_url"]["url"] =
+                    Value::String(format!("data:{};base64,{encoded}", fetched.media_type));
+            }
+            RemoteAttachmentKind::Document => {
+                value["source"] = serde_json::json!({"type":"base64","media_type":fetched.media_type,"data":encoded});
+                if value.get("title").is_none() {
+                    value["title"] = Value::String(
+                        fetched
+                            .final_url
+                            .path_segments()
+                            .and_then(|mut segments| segments.next_back())
+                            .filter(|name| !name.is_empty())
+                            .unwrap_or("document")
+                            .to_owned(),
+                    );
+                }
+            }
+        }
         guards.push(guard);
     }
     Ok(guards)

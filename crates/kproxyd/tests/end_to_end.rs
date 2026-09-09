@@ -27,6 +27,12 @@ mod compatibility_controls;
 #[path = "end_to_end/claude_gateway.rs"]
 mod claude_gateway;
 
+#[path = "end_to_end/cache_controls.rs"]
+mod cache_controls;
+
+#[path = "end_to_end/protocol_parameters.rs"]
+mod protocol_parameters;
+
 #[path = "end_to_end/warning_regressions.rs"]
 mod warning_regressions;
 
@@ -785,7 +791,7 @@ async fn openai_model_controls_follow_reference_omission_rules_through_http() {
         (serde_json::json!({}), serde_json::Value::Null),
         (
             serde_json::json!({"max_completion_tokens":64}),
-            serde_json::Value::Null,
+            serde_json::json!({"maxTokens":64}),
         ),
         (
             serde_json::json!({"temperature":0,"top_p":0}),
@@ -793,7 +799,7 @@ async fn openai_model_controls_follow_reference_omission_rules_through_http() {
         ),
         (
             serde_json::json!({"max_tokens":64,"max_completion_tokens":128}),
-            serde_json::json!({"maxTokens":64}),
+            serde_json::json!({"maxTokens":128}),
         ),
     ];
     for (controls, _) in &cases {
@@ -864,7 +870,7 @@ async fn openai_omitted_output_limits_do_not_report_false_truncation() {
     for stream in [false, true] {
         for (controls, expected) in [
             (serde_json::json!({}), "stop"),
-            (serde_json::json!({"max_completion_tokens":64}), "stop"),
+            (serde_json::json!({"max_completion_tokens":64}), "length"),
             (serde_json::json!({"max_tokens":8192}), "length"),
         ] {
             let mut request = serde_json::json!({
@@ -917,7 +923,7 @@ async fn openai_omitted_output_limits_do_not_report_false_truncation() {
         let limit = payload
             .pointer("/inferenceConfig/maxTokens")
             .and_then(serde_json::Value::as_u64);
-        assert_eq!(limit, (index % 3 == 2).then_some(8192));
+        assert_eq!(limit, [None, Some(64), Some(8192)][index % 3]);
     }
     daemon.stop().await;
 }

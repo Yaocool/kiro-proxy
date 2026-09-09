@@ -256,6 +256,7 @@ mod entrypoints;
 use entrypoints::{attempt_diagnostics, read_bounded_body, record_failed_request};
 pub use entrypoints::{claude_messages, health, openai_chat, readiness, root};
 
+mod chat;
 mod request;
 
 use request::{handle_claude, handle_openai};
@@ -438,7 +439,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         let mut request = original_request.clone();
         let compaction_normalization = normalize_compaction_boundary(&mut request);
         let boundary_applied = compaction_normalization.boundary_applied;
-        validate_claude(&request).map_err(claude_validation_error)?;
+        kproxy_translate::validate_claude_count(&request).map_err(claude_validation_error)?;
         // Counting must include the real bytes of every attachment in the
         // pre-edit request. Generation can avoid fetching history that will
         // be cleared, but the count endpoint promises both original and
@@ -447,7 +448,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             request::hydrate_claude_attachments(&state, &mut original_request).await?;
         request.clone_from(&original_request);
         normalize_compaction_boundary(&mut request);
-        validate_claude(&request).map_err(claude_validation_error)?;
+        kproxy_translate::validate_claude_count(&request).map_err(claude_validation_error)?;
         tracing::info!(
             trace_id = %trace_id,
             protocol = "claude_count_tokens",
@@ -1150,6 +1151,35 @@ fn context_maximum(state: &Arc<AppState>, compact: bool, model: &str) -> u64 {
     (f64::from(model_maximum) * ratio) as u64
 }
 
+/// Apply the same Responses history policy whenever an attempt resolves a new
+/// model. An unusable fallback must not discard history from the next attempt.
+pub(in crate::http) async fn truncate_context_if_requested(
+    state: &Arc<AppState>,
+    payload: &mut KiroPayload,
+    input_tokens: u64,
+    compact: bool,
+    model: &str,
+) -> Result<u64, String> {
+    let maximum = context_maximum(state, compact, model);
+    if input_tokens <= maximum
+        || !payload
+            .model_request_intent
+            .as_ref()
+            .is_some_and(|intent| intent.automatic_history_truncation)
+    {
+        return Ok(input_tokens);
+    }
+    let mut candidate = payload.clone();
+    let tokens = state
+        .tokenizer
+        .truncate_kiro_history(&mut candidate, maximum as usize)
+        .await? as u64;
+    if tokens <= maximum {
+        *payload = candidate;
+    }
+    Ok(tokens)
+}
+
 fn compact_target_tokens(state: &Arc<AppState>, model: &str, trigger: u64) -> u64 {
     // Leave meaningful room for subsequent tool turns rather than compacting
     // to just below the trigger and immediately repeating the operation.
@@ -1362,6 +1392,8 @@ fn upstream_bad_request_is_actionable(message: &str) -> bool {
 
 struct ApiError {
     status: StatusCode,
+    /// A wrapping stream can commit HTTP 200 before a later candidate fails.
+    client_status: Option<u16>,
     message: Box<str>,
     format: ErrorFormat,
     allow: Option<&'static str>,
@@ -1383,6 +1415,7 @@ impl ApiError {
         let (error_code, error_stage) = classify_api_error(status, &message);
         Self {
             status,
+            client_status: None,
             message: message.into_boxed_str(),
             format,
             allow: None,
