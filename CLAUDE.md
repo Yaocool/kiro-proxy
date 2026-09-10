@@ -112,7 +112,7 @@ Kiro 没有原生 Tool Search / Web Search server tool，代理在本地补齐�
 - 摘要输入先转换为无 tools 的完整可读历史。能装下时直接生成 `<summary>`，超长时无损分段，每段独立摘要并按原顺序合成一个 checkpoint；禁止先用 extractive 摘录丢弃中间事实。最多 16 段、并发最多 2（服从账号并发配置），共用一次总超时。
 - 摘要子请求独立走 `AccountPool`、额度预留与 stats，内部统计路径 `/internal/compact`，不混入主响应顶层 usage。
 - 超时/额度不足/上游失败/摘要非法时恢复原 payload 并退回 extractive fallback，日志 `compaction_mode` 区分 `semantic` 与 `extractive_fallback`。
-- 相关配置：`context.auto_compact_on_overflow`（默认开）、`compaction_summary_model`、`compaction_summary_timeout_ms`（默认 150000；保留已有显式配置）、`compaction_preserve_recent_turns`（默认 3，上限 64）。
+- 相关配置：`context.auto_compact_on_overflow`（默认开）、`compaction_summary_model`、`compaction_summary_timeout_ms`（默认 120000；保留已有显式配置）、`compaction_preserve_recent_turns`（默认 3，上限 64）。
 - Claude Code 2.1.260 忽略 `compaction_delta`，因此对识别出的 Claude Code 客户端在 start 块携带完整 checkpoint 并直接 stop；其他客户端保持 null start + 完整 delta。不要同时发送两份摘要，TypeScript SDK 会拼接重复内容；不要发空 delta，Python SDK 会覆盖已有摘要。
 
 ### 错误码约定

@@ -102,8 +102,8 @@ Claude Messages 默认开启 `context.auto_compact_on_overflow`。代理先选�
 Claude 响应首部的 `compaction` 边界。摘要超时会立即释放主请求；后台仅在有界宽限期内继续结算，
 到期后主动取消摘要流，并结算此前已经解码的 usage。
 
-摘要等待默认 150 秒（`context.compaction_summary_timeout_ms`）；升级会保留已有显式值，原先的
-`30000` 或 `60000` 不会自动改写。Claude Code 流式压缩使用完整 start 块以兼容忽略 compaction delta 的客户端；
+摘要等待默认 120 秒（`context.compaction_summary_timeout_ms`）；升级会保留已有显式值，原先的
+`30000`、`60000` 或 `150000` 不会自动改写。Claude Code 流式压缩使用完整 start 块以兼容忽略 compaction delta 的客户端；
 普通 SDK 仍使用标准 delta。超时回退只记录一条 WARN，后台结算为带 trace ID 的 INFO，
 `credits_source=estimated` 表示本地估算，并非上游实际扣费证明。日志卷按日持久化，重建容器不会清除旧 WARN。
 
@@ -127,7 +127,7 @@ max_tool_input_tokens = 32000
 max_loaded_tools = 512
 max_upstream_payload_bytes = 8388608
 compaction_summary_model = ""
-compaction_summary_timeout_ms = 150000
+compaction_summary_timeout_ms = 120000
 compaction_preserve_recent_turns = 3
 ```
 

@@ -138,8 +138,8 @@ after a Tool Search response has started retain hard context-limit errors becaus
 late accounting is allowed only for a bounded grace period, after which the
 summary stream is canceled and any already decoded usage is settled.
 
-Summary waiting defaults to 150 seconds (`context.compaction_summary_timeout_ms`);
-upgrades preserve explicit settings, including existing `30000` or `60000`
+Summary waiting defaults to 120 seconds (`context.compaction_summary_timeout_ms`);
+upgrades preserve explicit settings, including existing `30000`, `60000`, or `150000`
 values. Claude Code receives a complete compaction start block because its
 accumulator can ignore compaction deltas; other SDKs retain the standard delta
 stream. A timeout emits one fallback warning, with subsequent accounting at INFO
@@ -171,7 +171,7 @@ max_tool_input_tokens = 32000
 max_loaded_tools = 512
 max_upstream_payload_bytes = 8388608
 compaction_summary_model = ""
-compaction_summary_timeout_ms = 150000
+compaction_summary_timeout_ms = 120000
 compaction_preserve_recent_turns = 3
 ```
 
