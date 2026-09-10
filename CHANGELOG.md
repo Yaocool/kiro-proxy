@@ -48,9 +48,11 @@ they must receive a new version rather than replacing that tag or its image.
 - Support Responses `truncation: auto` against the account's resolved model
   window, including smaller fallback models and continuations, while preserving
   instructions and the current tool chain.
-- Accept null and additive cache hints across Claude Messages, counting aliases
-  and OpenAI Chat Completions; count and translate only recognized ephemeral
-  breakpoints, without forwarding client cache fields to Kiro.
+- Validate cache controls against Claude's `ephemeral` and TTL schema across
+  Messages, counting aliases, and OpenAI Chat cache extensions; accept absent/null
+  controls and reject malformed or unknown types. Check Claude TTL ordering,
+  automatic/explicit breakpoint conflicts and limits, uncacheable blocks, and
+  nested search-result controls without forwarding client cache fields to Kiro.
 - Preserve tool-only/empty assistant turns and validate upstream tool JSON across
   buffered/unbuffered, JSON/SSE paths; recover hollow Responses tool continuations
   once and surface repeated failure.

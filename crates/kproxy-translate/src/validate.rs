@@ -9,6 +9,9 @@ use url::Url;
 use crate::translate::common::claude_document_format;
 use crate::{is_tool_search_type, matches_type_family, ClaudeRequest, OpenAiRequest};
 
+mod cache;
+use cache::{validate_cache_control, validate_claude_cache_controls};
+
 pub const MAX_SCHEMA_DEPTH: usize = 64;
 pub const MAX_SCHEMA_NODES: usize = 50_000;
 pub const MAX_TOOL_DOC_CHARS: usize = 512_000;
@@ -123,8 +126,6 @@ fn validate_claude_request(request: &ClaudeRequest, counting: bool) -> Result<()
     }
     validate_claude_system(request.system.as_ref())?;
     validate_claude_output_config(request.output_config.as_ref(), "output_config")?;
-    let mut cache_breakpoints =
-        validate_cache_control(request.cache_control.as_ref(), "cache_control")?;
     if request
         .metadata
         .as_ref()
@@ -142,8 +143,6 @@ fn validate_claude_request(request: &ClaudeRequest, counting: bool) -> Result<()
             "must be a non-empty string of at most 256 bytes",
         );
     }
-    cache_breakpoints =
-        cache_breakpoints.saturating_add(validate_system_cache_controls(request.system.as_ref())?);
     let mut image_count = 0usize;
     let mut document_count = 0usize;
     for (index, message) in request.messages.iter().enumerate() {
@@ -165,14 +164,6 @@ fn validate_claude_request(request: &ClaudeRequest, counting: bool) -> Result<()
             &message.role,
             format!("messages.{index}.content"),
         )?;
-        cache_breakpoints = cache_breakpoints.saturating_add(validate_cache_control(
-            message.cache_control.as_ref(),
-            &format!("messages.{index}.cache_control"),
-        )?);
-        cache_breakpoints = cache_breakpoints.saturating_add(validate_content_cache_controls(
-            &message.content,
-            &format!("messages.{index}.content"),
-        )?);
         image_count = image_count.saturating_add(count_claude_images(&message.content));
         document_count =
             document_count.saturating_add(count_claude_documents_in_content(&message.content));
@@ -307,7 +298,6 @@ fn validate_claude_request(request: &ClaudeRequest, counting: bool) -> Result<()
             tool.cache_control.as_ref(),
             &format!("tools.{index}.cache_control"),
         )?;
-        cache_breakpoints = cache_breakpoints.saturating_add(tool_cache_breakpoints);
         if let Some(callers) = &tool.allowed_callers {
             if callers.as_slice() != ["direct"] {
                 return invalid(
@@ -412,12 +402,7 @@ fn validate_claude_request(request: &ClaudeRequest, counting: bool) -> Result<()
             );
         }
     }
-    if cache_breakpoints > MAX_CACHE_BREAKPOINTS {
-        return invalid(
-            "cache_control",
-            format!("must define at most {MAX_CACHE_BREAKPOINTS} cache breakpoints"),
-        );
-    }
+    validate_claude_cache_controls(request)?;
     validate_tool_references(request, &seen_tool_names)?;
     if let Some(choice) = &request.tool_choice {
         if !matches!(choice.r#type.as_str(), "auto" | "any" | "tool" | "none") {
@@ -705,50 +690,6 @@ fn validate_claude_system(value: Option<&Value>) -> Result<(), ValidationError> 
         }
         _ => invalid("system", "expected a string or content array"),
     }
-}
-
-/// Count only cache breakpoints we can translate. Null means omission in the
-/// Messages API; additive string types and fields are compatibility hints, not
-/// speculative Kiro controls. Keep shape checks and validate TTL only for the
-/// ephemeral marker whose TTL the proxy actually reads.
-fn validate_cache_control(value: Option<&Value>, field: &str) -> Result<usize, ValidationError> {
-    let Some(value) = value.filter(|value| !value.is_null()) else {
-        return Ok(0);
-    };
-    let Some(control) = value.as_object() else {
-        return invalid(field, "expected an object");
-    };
-    let Some(kind) = control
-        .get("type")
-        .and_then(Value::as_str)
-        .filter(|kind| !kind.trim().is_empty())
-    else {
-        return invalid(format!("{field}.type"), "expected a non-empty string");
-    };
-    if kind != "ephemeral" {
-        return Ok(0);
-    }
-    if control
-        .get("ttl")
-        .is_some_and(|ttl| !matches!(ttl.as_str(), Some("5m" | "1h")))
-    {
-        return invalid(format!("{field}.ttl"), "expected 5m or 1h");
-    }
-    Ok(1)
-}
-
-fn validate_system_cache_controls(value: Option<&Value>) -> Result<usize, ValidationError> {
-    let Some(Value::Array(blocks)) = value else {
-        return Ok(0);
-    };
-    let mut count = 0usize;
-    for (index, block) in blocks.iter().enumerate() {
-        count = count.saturating_add(validate_cache_control(
-            block.get("cache_control"),
-            &format!("system.{index}.cache_control"),
-        )?);
-    }
-    Ok(count)
 }
 
 fn validate_content_cache_controls(content: &Value, field: &str) -> Result<usize, ValidationError> {

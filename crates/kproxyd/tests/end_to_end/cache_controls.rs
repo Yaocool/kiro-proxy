@@ -7,11 +7,11 @@ fn request() -> Value {
         "system":[{"type":"text","text":"System context","cache_control":{
             "type":"ephemeral","ttl":"1h","scope":"global"}}],
         "tools":[{"name":"lookup","input_schema":{"type":"object"},"cache_control":{
-            "type":"ephemeral","evict_on_complete":true}}],
+            "type":"ephemeral","ttl":"1h","evict_on_complete":true}}],
         "messages":[
             {"role":"user","content":"Hello","cache_control":null},
             {"role":"assistant","content":[{"type":"text","text":"Ready",
-                "cache_control":{"type":"future_cache_hint","ttl":"future_ttl"}}]},
+                "cache_control":null}]},
             {"role":"user","content":[
                 {"type":"text","text":"Reply pong","cache_control":{"type":"ephemeral"}},
                 {"type":"text","text":"Please","cache_control":null}
@@ -39,8 +39,6 @@ async fn cache_hints_work_across_messages_aliases_counting_and_openai_http_modes
             let serialized = wire.to_string();
             for hint in [
                 "cache_control",
-                "future_cache_hint",
-                "future_ttl",
                 "ephemeral",
                 "scope",
                 "evict_on_complete",
@@ -106,7 +104,7 @@ async fn cache_hints_work_across_messages_aliases_counting_and_openai_http_modes
                     .as_array_mut()
                     .unwrap()
                     .insert(0, json!({"role":"system","content":system}));
-                body["tools"] = json!([{"type":"function","cache_control":{"type":"ephemeral","scope":"global"},
+                body["tools"] = json!([{"type":"function","cache_control":{"type":"ephemeral","ttl":"1h","scope":"global"},
                     "function":{"name":"lookup","parameters":{"type":"object"}}}]);
             }
             let response = client
@@ -152,12 +150,92 @@ async fn cache_hints_work_across_messages_aliases_counting_and_openai_http_modes
             .as_u64()
             .is_some_and(|tokens| tokens > 0));
     }
-    for stream in [false, true] {
+    let mut automatic = request();
+    automatic["cache_control"] = json!({"type":"ephemeral","ttl":"1h"});
+    automatic["messages"][2]["content"][0]["cache_control"] = Value::Null;
+    automatic["messages"][2]["content"][1]["cache_control"] =
+        json!({"type":"ephemeral","ttl":"1h"});
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages/count_tokens"))
+        .header("x-api-key", daemon.api_key.as_deref().unwrap())
+        .header("user-agent", "claude-cli/2.1.266 (external, cli)")
+        .json(&automatic)
+        .send()
+        .await
+        .unwrap();
+    let status = response.status();
+    let body: Value = response.json().await.unwrap();
+    assert_eq!(status, reqwest::StatusCode::OK, "{body}");
+    assert!(body["input_tokens"]
+        .as_u64()
+        .is_some_and(|tokens| tokens > 0));
+
+    let mut invalid_requests = Vec::new();
+    for (control, field) in [
+        (
+            json!({"type":"default"}),
+            "messages.1.content.0.cache_control.type",
+        ),
+        (json!({}), "messages.1.content.0.cache_control.type"),
+        (
+            json!({"type":null}),
+            "messages.1.content.0.cache_control.type",
+        ),
+        (
+            json!({"type":""}),
+            "messages.1.content.0.cache_control.type",
+        ),
+        (
+            json!({"type":42}),
+            "messages.1.content.0.cache_control.type",
+        ),
+        (
+            json!({"type":"ephemeral","ttl":"24h"}),
+            "messages.1.content.0.cache_control.ttl",
+        ),
+        (
+            json!({"type":"ephemeral","ttl":null}),
+            "messages.1.content.0.cache_control.ttl",
+        ),
+    ] {
         let mut invalid = request();
-        invalid["stream"] = json!(stream);
-        invalid["messages"][1]["content"][0]["cache_control"]["type"] = json!(42);
+        invalid["messages"][1]["content"][0]["cache_control"] = control;
+        invalid_requests.push((invalid, field));
+    }
+    let mut invalid_order = request();
+    invalid_order["tools"][0]["cache_control"]["ttl"] = json!("5m");
+    invalid_requests.push((invalid_order, "system.0.cache_control.ttl"));
+
+    automatic["messages"][2]["content"][1]["cache_control"]["ttl"] = json!("5m");
+    invalid_requests.push((automatic, "messages.2.content.1.cache_control.ttl"));
+
+    for (invalid, field) in invalid_requests {
+        for stream in [false, true] {
+            let mut invalid = invalid.clone();
+            invalid["stream"] = json!(stream);
+            let response = client
+                .post(format!("http://127.0.0.1:{port}/v1/messages"))
+                .header("x-api-key", daemon.api_key.as_deref().unwrap())
+                .header("user-agent", "claude-cli/2.1.266 (external, cli)")
+                .json(&invalid)
+                .send()
+                .await
+                .unwrap();
+            let status = response.status();
+            let body: Value = response.json().await.unwrap();
+            assert_eq!(
+                status,
+                reqwest::StatusCode::BAD_REQUEST,
+                "{invalid}: {body}"
+            );
+            assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+            assert!(
+                body["error"]["message"].as_str().unwrap().contains(field),
+                "{invalid}: {body}"
+            );
+        }
         let response = client
-            .post(format!("http://127.0.0.1:{port}/v1/messages"))
+            .post(format!("http://127.0.0.1:{port}/v1/messages/count_tokens"))
             .header("x-api-key", daemon.api_key.as_deref().unwrap())
             .header("user-agent", "claude-cli/2.1.266 (external, cli)")
             .json(&invalid)
@@ -166,12 +244,17 @@ async fn cache_hints_work_across_messages_aliases_counting_and_openai_http_modes
             .unwrap();
         let status = response.status();
         let body: Value = response.json().await.unwrap();
-        assert_eq!(status, reqwest::StatusCode::BAD_REQUEST, "{body}");
-        assert_eq!(body["error"]["type"], "invalid_request_error");
-        assert!(body["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("messages.1.content.0.cache_control.type"));
+        assert_eq!(
+            status,
+            reqwest::StatusCode::BAD_REQUEST,
+            "{invalid}: {body}"
+        );
+        assert_eq!(body["error"]["type"], "invalid_request_error", "{body}");
+        assert!(
+            body["error"]["message"].as_str().unwrap().contains(field),
+            "{invalid}: {body}"
+        );
     }
+    mock.verify().await;
     daemon.stop().await;
 }

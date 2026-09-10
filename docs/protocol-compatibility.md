@@ -9,6 +9,7 @@ This reference describes Claude Messages and OpenAI Chat Completions in the curr
 | Category | Policy |
 | --- | --- |
 | Implemented controls | Validate fields actually read and map them through model metadata. |
+| Cache controls | Validate `cache_control` against Claude's `ephemeral` / TTL schema; unknown types are not ignored as compatibility hints. |
 | Compatibility hints | Accept/ignore format and strict without hard schema guarantees; unknown extra fields alone do not trigger rejection. |
 | Missing execution/data paths | Explicitly reject enabled capabilities such as background jobs and foreign hosted file IDs. |
 | Responses history | Skip unconvertible items while requiring effective conversation content; tool-catalog controls are not skippable history. |
@@ -16,8 +17,9 @@ This reference describes Claude Messages and OpenAI Chat Completions in the curr
 
 Before adding rejection conditions, check the corresponding pinned reference paths
 below and identify a conversion requirement, observed upstream limitation or resource/security
-boundary. Missing native mappings or official enum membership alone do not justify
-rejecting previously accepted hints. Do not copy mappings observed to fail upstream.
+boundary. Apart from the explicitly validated cache controls, missing native
+mappings or official enum membership alone do not justify rejecting previously
+accepted hints. Do not copy mappings observed to fail upstream.
 Ignored-control diagnostics use `proxy.compatibility.controls_ignored` and fixed field
 names, without schemas or request values.
 
@@ -317,13 +319,26 @@ generation/data-resolution paths and are still rejected.
 Protocol compatibility is resolved before
 the first upstream call, without a time-based rejection cache or field-removal
 probes. Cache markers contain only `type: default`; Claude cache TTL preferences
-do not control Kiro's cache lifetime. `cache_control: null` means omission at every
-supported request/message/tool/content location. Non-empty string types other than
-`ephemeral` are accepted as unused hints, and extra fields such as `scope` and
-`evict_on_complete` are ignored. Only `ephemeral` markers count toward the four
-breakpoint limit or create native/local cache markers; malformed objects/types and
-unsupported `ephemeral.ttl` values still fail validation. This policy also covers
-Chat Completions cache extensions and the Messages counting aliases.
+do not control Kiro's cache lifetime. An absent or null `cache_control` means
+omission at every supported request/message/tool/content location. Cache objects
+follow the [Claude API schema](https://platform.claude.com/docs/en/api/messages/create):
+`type` must be `ephemeral`; `ttl` may be omitted (default `5m`) or set to `5m` or
+`1h`. Missing, null, empty, non-string, or unknown types and invalid TTLs return
+400 rather than being ignored or rewritten. Additional fields are not forwarded
+to Kiro and do not imply support for their semantics. Chat Completions cache
+extensions share this object validation; message-level `cache_control` remains a
+proxy extension.
+
+Claude Messages and its counting aliases also enforce the
+[documented cache rules](https://platform.claude.com/docs/en/build-with-claude/prompt-caching):
+at most four breakpoints, with `1h` preceding `5m` in `tools → system → messages`
+order. Automatic caching finds the last eligible block, merges an existing marker
+with the same TTL, and rejects a conflicting TTL. When an eligible target exists
+but four explicit breakpoints already occupy the slots, automatic caching is
+rejected; when no target exists, it is skipped. Thinking, redacted thinking, and
+empty text cannot have explicit cache markers. Nested cache objects in tool
+results, content documents, and search results are validated too. These input
+checks do not promise Claude's cache lifetime, hit boundaries, or billing on Kiro.
 Claude historical thinking is omitted from Kiro
 request history without disabling current-generation thinking; Responses plaintext
 reasoning summaries are preserved in assistant history. Document context

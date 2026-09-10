@@ -9,13 +9,15 @@
 | 类别 | 处理原则 |
 | --- | --- |
 | 已实现控制 | 校验读取的字段，并按实际模型元数据映射；例如 effort、采样和工具选择。 |
+| 缓存控制 | `cache_control` 按 Claude 的 `ephemeral` / TTL 定义校验；未知类型不作为兼容提示忽略。 |
 | 兼容提示 | 接收但忽略不参与执行的附加字段；format/strict 不产生结构化输出保证。 |
 | 缺少执行/数据链路 | 对请求启用的未实现能力明确拒绝；例如 Responses background 和 Files API 解析。 |
 | 历史中的不可转换条目 | 按 Responses 的跳过规则处理，不等于支持调用对应托管工具；必须仍有有效会话内容。 |
 | 资源与访问边界 | 保留认证、服务白名单、模型标识、工具配对、附件/Schema/上下文上限。 |
 
 新增拒绝条件前，核对本文固定参考的对应路径，说明是转换所需、已实测的上游限制还是资源/安全边界。
-不能仅因无原生映射或不在官方枚举中就拒绝此前可用的附加提示，也不照搬实测会让上游失败的映射。
+除明确按协议校验的缓存控制外，不能仅因无原生映射或不在官方枚举中就拒绝此前可用的附加提示，
+也不照搬实测会让上游失败的映射。
 已知忽略字段只记录 `proxy.compatibility.controls_ignored` 的固定字段名，不记录 Schema 或请求值。
 
 模型标识限制为 256 字节、禁止空白/控制字符；继续接受 Unicode、别名、`/`、`:` 和 `[1m]` 后缀。
@@ -264,11 +266,20 @@ clear_tool_inputs；`clear_thinking` 支持保留指定轮次或全部 thinking�
 `file_id` 来源尚未接入对应的生成/数据获取链路，仍会拒绝。
 协议兼容在首次发送前确定，不再缓存字段拒绝结果、定时过期重探测或通过逐项删字段重试。
 缓存标记只发送 `type: default`，Claude 的缓存 TTL 不控制 Kiro 缓存有效期。
-所有支持的请求、消息、工具和内容块位置都将 `cache_control: null` 视为未设置；
-`ephemeral` 以外的非空字符串类型作为未实现的提示接收并忽略，`scope`、`evict_on_complete`
-等附加字段也不会传给 Kiro。只有 `ephemeral` 计入四个断点的上限并产生原生或本地缓存标记；
-对象或类型格式错误、无效的 `ephemeral.ttl` 仍会拒绝。Chat Completions 的缓存扩展字段和
-Messages 的 token 计数别名使用相同规则。Claude 历史 thinking 不回传
+所有支持的请求、消息、工具和内容块位置都将省略或 `cache_control: null` 视为未设置。
+缓存对象遵循 [Claude 官方定义](https://platform.claude.com/docs/en/api/messages/create)：
+`type` 必须为 `ephemeral`；`ttl` 可省略（默认 `5m`），指定时只能为 `5m` 或 `1h`。
+缺失、空字符串、`null`、非字符串或未知的内层 `type`，以及非法 `ttl` 都返回 400；
+不会将未知类型静默忽略或改写。附加字段不传给 Kiro，也不表示代理实现了其语义。
+Chat Completions 的缓存扩展字段复用这套对象校验；消息级 `cache_control` 仍是代理扩展。
+
+Claude Messages 与 token 计数别名还按[官方缓存规则](https://platform.claude.com/docs/en/build-with-claude/prompt-caching)
+检查断点：总数最多四个，按 `tools → system → messages` 顺序，`1h` 必须位于 `5m` 前面。
+自动缓存寻找末个可缓存块；已有同 TTL 显式标记时合并，不同 TTL 返回 400；有目标但四个显式
+断点已占满时拒绝自动缓存。没有可缓存目标时跳过自动断点。不能直接标记 thinking、
+redacted_thinking 或空文本块；工具结果、内容文档和搜索结果内的嵌套缓存对象也会校验。
+这些入参检查不保证 Kiro 提供与 Claude 相同的缓存有效期、命中位置或计费行为。
+Claude 历史 thinking 不回传
 到 Kiro 请求历史，但不关闭当前生成的 thinking；Responses 的明文推理摘要保留在 assistant 历史中。
 文档 context 则保留为独立、带 JSON 标识的消息文本。
 模型控制参数采用 [chaogei/Kiro-account-manager](https://github.com/chaogei/Kiro-account-manager/blob/447adcdb468157312621b1f09448278bd9bca748/Kiro-account-manager/src/main/proxy/translator.ts) 的显式映射方式，但不沿用其缺失元数据时猜测开启 thinking 的回退：
