@@ -480,7 +480,7 @@ impl Default for ContextConfig {
             max_loaded_tools: MAX_LOADED_TOOLS,
             max_upstream_payload_bytes: 8 * 1024 * 1024,
             compaction_summary_model: String::new(),
-            compaction_summary_timeout_ms: 60_000,
+            compaction_summary_timeout_ms: 150_000,
             compaction_preserve_recent_turns: 3,
         }
     }
@@ -1575,7 +1575,7 @@ max_upstream_payload_bytes = 8388608
 # compact 摘要使用的模型；空字符串表示复用当轮映射后的模型。
 compaction_summary_model = ""
 # 主请求等待 compact 摘要结果的最长时间。
-compaction_summary_timeout_ms = 60000
+compaction_summary_timeout_ms = 150000
 # compact 摘要之外额外保留的最近完整 user/assistant 轮数；最大 64。
 compaction_preserve_recent_turns = 3
 
