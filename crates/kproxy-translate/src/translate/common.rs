@@ -211,7 +211,7 @@ pub fn content_cache_point(content: &Value) -> Option<KiroCachePoint> {
 
 fn block_cache_point(block: &Value) -> Option<KiroCachePoint> {
     let nested = match block.get("type").and_then(Value::as_str) {
-        Some("tool_result") => block.get("content").and_then(content_cache_point),
+        Some("tool_result" | "search_result") => block.get("content").and_then(content_cache_point),
         Some("document")
             if block.pointer("/source/type").and_then(Value::as_str) == Some("content") =>
         {

@@ -577,7 +577,10 @@ fn validates_anthropic_tool_search_contract() {
     input.tools[1].cache_control = None;
 
     input.tools[1].cache_control = Some(serde_json::json!({"type":"future_cache_hint"}));
-    validate_claude(&input).expect("ignored cache hints do not cache deferred tools");
+    assert!(validate_claude(&input)
+        .expect_err("unknown cache types are invalid even for deferred tools")
+        .to_string()
+        .contains("tools.1.cache_control.type"));
     input.tools[1].cache_control = None;
 
     input.tools.remove(0);
