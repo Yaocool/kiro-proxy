@@ -11,7 +11,7 @@ services:
     network_mode: host
     restart: unless-stopped
     init: true
-    stop_grace_period: 30s
+    stop_grace_period: 120s
     mem_limit: "${KPROXY_MEMORY_LIMIT:-1g}"
     pids_limit: ${KPROXY_PIDS_LIMIT:-512}
     logging:
