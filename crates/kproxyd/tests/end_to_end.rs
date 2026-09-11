@@ -2039,9 +2039,11 @@ priority = 10
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     let body: serde_json::Value = response.json().await.expect("Claude response JSON");
     assert_eq!(body["content"][0]["type"], "compaction");
+    assert!(body["content"][0]["content"]
+        .as_str()
+        .is_some_and(|content| content.contains("extractive fallback checkpoint")));
     assert_eq!(body["content"][1]["text"], "main request completed");
-    assert_eq!(body["usage"]["iterations"][0]["type"], "compaction");
-    assert_eq!(body["usage"]["iterations"][1]["type"], "message");
+    assert!(body["usage"].get("iterations").is_none());
     let applied = &body["context_management"]["applied_edits"][0];
     assert_eq!(applied["reason"], "model_mapping_overflow");
     assert!(
@@ -2059,8 +2061,8 @@ priority = 10
         .collect::<Vec<_>>();
     assert_eq!(
         payloads.len(),
-        3,
-        "two summary parts plus one main generation"
+        1,
+        "multiwave automatic compaction must skip doomed summary requests"
     );
     let summaries = payloads
         .iter()
@@ -2070,16 +2072,7 @@ priority = 10
                 .is_some_and(|content| content.contains("durable conversation checkpoint"))
         })
         .collect::<Vec<_>>();
-    assert_eq!(summaries.len(), 2);
-    for summary in summaries {
-        assert_eq!(
-            summary["conversationState"]["currentMessage"]["userInputMessage"]["modelId"],
-            "summary-large"
-        );
-        assert!(!summary
-            .to_string()
-            .contains("Never lose this governing instruction."));
-    }
+    assert!(summaries.is_empty());
     let main = payloads
         .iter()
         .find(|payload| {
@@ -2108,6 +2101,7 @@ priority = 10
         main["conversationState"]["history"][1]["assistantResponseMessage"]["content"],
         "I will follow these instructions."
     );
+    assert!(main.to_string().contains("extractive fallback checkpoint"));
 
     daemon.stop().await;
 }

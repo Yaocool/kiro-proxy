@@ -21,6 +21,7 @@ use super::{
 use futures::TryStreamExt;
 use kproxy_translate::{error::log_model, responses_to_openai, ResponsesRequest};
 
+use super::super::compaction_replay::CompactionReplaySource;
 use super::super::responses::{
     is_responses_path, resume_responses_request, stream_response, ResponsesOptions,
     ResponsesSessionOwner,
@@ -59,6 +60,23 @@ pub(super) async fn handle_claude(
             ErrorFormat::Claude,
         )
     })?;
+    let replay_source = CompactionReplaySource::capture(&request.messages);
+    let conversation_fingerprint = super::conversation_fingerprint(&request.messages);
+    let conversation_id = super::stable_conversation_id(
+        &headers,
+        key_id.as_deref(),
+        request.conversation_id.as_deref(),
+        super::metadata_conversation_hint(request.metadata.as_ref())
+            .or(conversation_fingerprint.as_deref()),
+    );
+    let replay_scope = super::compaction_replay_scope(
+        &service.service.id,
+        key_id.as_deref(),
+        conversation_fingerprint.as_deref(),
+    );
+    let replay_applied = replay_scope
+        .as_deref()
+        .and_then(|scope| state.compaction_replay.apply(scope, &mut request.messages));
     let compact_trigger = compact_trigger_tokens(request.context_management.as_ref());
     // Claude discards everything before the latest compaction block. Apply
     // that semantic boundary before validating references or authenticated
@@ -67,6 +85,10 @@ pub(super) async fn handle_claude(
     let compact_boundary_applied = compaction_normalization.boundary_applied;
     validate_claude(&request).map_err(claude_validation_error)?;
     validate_claude_generation(&request).map_err(claude_validation_error)?;
+    let claude_code = headers
+        .get("user-agent")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(is_claude_user_agent);
     let context_input_estimate = estimate_context_management_input_tokens(&request);
     let context_edit_stats = apply_context_management_edits(&mut request, context_input_estimate);
     let attachment_guards = hydrate_claude_attachments(&state, &mut request).await?;
@@ -97,14 +119,25 @@ pub(super) async fn handle_claude(
         max_tokens = request.max_tokens,
         removed_noop_compaction_blocks = compaction_normalization.removed_noop_blocks,
         removed_noop_compaction_messages = compaction_normalization.removed_noop_messages,
+        client_compact_edit = compact_trigger.is_some(),
+        client_compaction_boundary_applied =
+            compact_boundary_applied && replay_applied.is_none(),
+        server_compaction_replayed = replay_applied.is_some(),
+        claude_code_client = claude_code,
         "client request validated"
     );
+    if let Some(replay) = replay_applied {
+        tracing::info!(
+            event = "proxy.compaction.checkpoint_replayed",
+            trace_id = %trace_id,
+            source_message_count = replay.source_message_count,
+            incoming_message_count = replay.incoming_message_count,
+            checkpoint_bytes = replay.checkpoint_bytes,
+            "replayed a verified compaction checkpoint omitted by the client"
+        );
+    }
     let config = state.config.current();
     let original_tool_count = request.tools.len();
-    let claude_code = headers
-        .get("user-agent")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(is_claude_user_agent);
     let client_compaction =
         claude_code && kproxy_translate::prepare_claude_code_compaction(&mut request);
     if client_compaction {
@@ -182,14 +215,7 @@ pub(super) async fn handle_claude(
     options.web_search_replay = Some(state.web_search_replay.clone());
     options.enable_prompt_cache = config.features.enable_prompt_cache;
     options.separate_compaction_instruction = client_compaction;
-    let conversation_fingerprint = super::conversation_fingerprint(&request.messages);
-    options.conversation_id = super::stable_conversation_id(
-        &headers,
-        key_id.as_deref(),
-        request.conversation_id.as_deref(),
-        super::metadata_conversation_hint(request.metadata.as_ref())
-            .or(conversation_fingerprint.as_deref()),
-    );
+    options.conversation_id = conversation_id;
     options.additional_model_request_fields_schema = state
         .resolved_model_info(&route.mapped)
         .and_then(|model| model.additional_model_request_fields_schema);
@@ -490,6 +516,7 @@ pub(super) async fn handle_claude(
                 summary_model,
                 summary_timeout_ms: config.context.compaction_summary_timeout_ms,
                 preserve_recent_turns: config.context.compaction_preserve_recent_turns,
+                explicit_client_compaction: client_compaction,
             },
         )
         .await?;
@@ -656,6 +683,7 @@ pub(super) async fn handle_claude(
                         summary_model,
                         summary_timeout_ms: config.context.compaction_summary_timeout_ms,
                         preserve_recent_turns: config.context.compaction_preserve_recent_turns,
+                        explicit_client_compaction: client_compaction,
                     },
                 )
                 .await?
@@ -751,6 +779,24 @@ pub(super) async fn handle_claude(
         }
         Err(error) => return Err(upstream_error(error, ErrorFormat::Claude)),
     };
+    if !client_compaction {
+        if let (Some(scope), Some(source), Some(summary)) =
+            (replay_scope, replay_source, compaction_summary.as_ref())
+        {
+            if state
+                .compaction_replay
+                .remember(scope, source, summary.clone())
+            {
+                tracing::debug!(
+                    event = "proxy.compaction.checkpoint_cached",
+                    trace_id = %trace_id,
+                    source_message_count = source.message_count(),
+                    checkpoint_bytes = summary.len(),
+                    "cached a bounded compaction checkpoint for verified replay"
+                );
+            }
+        }
+    }
     let prompt_cache = if config.features.enable_prompt_cache {
         if compaction_summary.is_some() {
             state

@@ -473,6 +473,141 @@ async fn compaction_checkpoints_round_trip_without_another_summary() {
 }
 
 #[tokio::test]
+async fn omitted_client_checkpoint_is_replayed_without_another_summary() {
+    let _guard = HTTP_TEST_LOCK.lock().await;
+    let mock = MockServer::start().await;
+    mount_context_alignment_models(&mock).await;
+    let summaries = Arc::new(AtomicUsize::new(0));
+    let main_payloads = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let summary_count = Arc::clone(&summaries);
+    let captured_payloads = Arc::clone(&main_payloads);
+    Mock::given(method("POST"))
+        .and(path("/generateAssistantResponse"))
+        .respond_with(move |request: &wiremock::Request| {
+            let wire: Value = serde_json::from_slice(&request.body).unwrap();
+            let is_summary = wire["conversationState"]["currentMessage"]["userInputMessage"]
+                ["content"]
+                .as_str()
+                .unwrap()
+                .contains("durable conversation checkpoint");
+            let text = if is_summary {
+                summary_count.fetch_add(1, Ordering::SeqCst);
+                "<summary>Remember server replay checkpoint 8142.</summary>"
+            } else {
+                captured_payloads
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .push(wire);
+                "answer"
+            };
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "application/vnd.amazon.eventstream")
+                .set_body_bytes(generation_body(text))
+        })
+        .mount(&mock)
+        .await;
+    let port = unused_tcp_port();
+    let daemon =
+        Daemon::start_http(port, &format!("{}/generateAssistantResponse", mock.uri())).await;
+    import_context_alignment_account(&daemon, 0.0).await;
+    configure(&daemon, |config| {
+        config.server.enforce_user_agent_check = false;
+        config.context.compaction_summary_model = "summary-large".into();
+    })
+    .await;
+    let client = reqwest::Client::new();
+    let original_messages = json!([
+        {"role":"user","content":"earlier context ".repeat(70000)},
+        {"role":"assistant","content":"remember the old conclusion"},
+        {"role":"user","content":"continue"}
+    ]);
+    let first = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("x-api-key", daemon.api_key.as_deref().unwrap())
+        .header("user-agent", "custom-client/1.0")
+        .header("x-client-request-id", "request-one")
+        .json(&json!({
+            "model":"mapped-small",
+            "max_tokens":64,
+            "stream":false,
+            "messages":original_messages.clone()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    let first: Value = first.json().await.unwrap();
+    assert_eq!(first["content"][0]["type"], "compaction");
+    assert_eq!(summaries.load(Ordering::SeqCst), 1);
+
+    // Simulate a client that kept the assistant text but silently discarded
+    // the returned compaction block and therefore resent the entire old prefix.
+    let mut extended_messages = original_messages.as_array().unwrap().clone();
+    extended_messages.extend([
+        json!({"role":"assistant","content":[{"type":"text","text":"answer"}]}),
+        json!({"role":"user","content":"what next?"}),
+    ]);
+    let counted = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages/count_tokens"))
+        .header("x-api-key", daemon.api_key.as_deref().unwrap())
+        .header("user-agent", "custom-client/1.0")
+        .header("x-client-request-id", "request-count")
+        .json(&json!({
+            "model":"mapped-small",
+            "messages":extended_messages.clone()
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(counted.status(), 200);
+    assert!(
+        counted.json::<Value>().await.unwrap()["input_tokens"]
+            .as_u64()
+            .unwrap()
+            < 121_600
+    );
+    let second = client
+        .post(format!("http://127.0.0.1:{port}/v1/messages"))
+        .header("x-api-key", daemon.api_key.as_deref().unwrap())
+        .header("user-agent", "custom-client/1.0")
+        .header("x-client-request-id", "request-two")
+        .json(&json!({
+            "model":"mapped-small",
+            "max_tokens":64,
+            "stream":false,
+            "messages":extended_messages
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 200);
+    assert_eq!(
+        second.json::<Value>().await.unwrap()["content"][0]["text"],
+        "answer"
+    );
+    assert_eq!(
+        summaries.load(Ordering::SeqCst),
+        1,
+        "the same oversized source prefix must not be summarized again"
+    );
+    let replayed_wire = {
+        let payloads = main_payloads
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(payloads.len(), 2);
+        payloads[1].to_string()
+    };
+    assert!(replayed_wire.contains("server replay checkpoint 8142"));
+    assert!(replayed_wire.contains("answer"));
+    assert!(replayed_wire.contains("what next?"));
+    assert!(
+        replayed_wire.len() < 100_000,
+        "verified replay must keep the old multi-megabyte prefix off the upstream wire"
+    );
+    daemon.stop().await;
+}
+
+#[tokio::test]
 #[ignore = "requires a locally installed Claude Code supporting --bare; all HTTP calls use the local mock"]
 async fn real_claude_code_retains_the_compaction_checkpoint() {
     let _guard = HTTP_TEST_LOCK.lock().await;

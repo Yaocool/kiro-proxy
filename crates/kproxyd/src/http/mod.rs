@@ -2,6 +2,7 @@
 
 mod handlers;
 pub(crate) use handlers::fallback_models;
+pub(crate) mod compaction_replay;
 pub(crate) mod prompt_cache;
 mod response;
 pub(crate) mod responses;

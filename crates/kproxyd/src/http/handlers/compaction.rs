@@ -12,6 +12,15 @@ use super::{
 use crate::http::usage::produced_output;
 use tokio_util::codec::Decoder;
 
+fn compaction_summary_concurrency(state: &AppState) -> usize {
+    state
+        .config
+        .current()
+        .pool
+        .max_concurrent_per_account
+        .clamp(1, 2)
+}
+
 async fn generate_compaction_summary(
     state: &Arc<AppState>,
     trace_id: &str,
@@ -24,12 +33,7 @@ async fn generate_compaction_summary(
     let owned_trace_id = trace_id.to_owned();
     let owned_key_id = key_id.map(str::to_owned);
     let owned_summary_model = summary_model.to_owned();
-    let concurrency = state
-        .config
-        .current()
-        .pool
-        .max_concurrent_per_account
-        .clamp(1, 2);
+    let concurrency = compaction_summary_concurrency(state);
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
     let completed_usage = Arc::new(std::sync::Mutex::new(None));
@@ -733,6 +737,7 @@ pub(super) async fn run_compaction(
         summary_model,
         summary_timeout_ms,
         preserve_recent_turns,
+        explicit_client_compaction,
     } = request;
     let operation_target = compaction_operation_target(state, source_payload, decision).await?;
     let plan = state
@@ -805,38 +810,60 @@ pub(super) async fn run_compaction(
     let mut semantic_summary = None;
     let mut iteration_usage = None;
     if let Ok(summary_parts) = summary_parts {
+        let summary_chunk_count = summary_parts.len();
+        let summary_concurrency = compaction_summary_concurrency(state);
+        let client_requested = explicit_client_compaction
+            || decision.reasons.contains(&CompactionReason::ClientTrigger);
         tracing::info!(
             trace_id,
             summary_model,
             summary_input_tokens,
             summary_context_maximum,
             summary_chunk_input_limit,
-            summary_chunk_count = summary_parts.len(),
+            summary_chunk_count,
+            summary_concurrency,
             "complete compaction summary input partitioned within its model window"
         );
-        match generate_compaction_summary(
-            state,
-            trace_id,
-            key_id,
-            summary_model,
-            summary_parts,
-            summary_timeout_ms,
-        )
-        .await
-        {
-            Ok(summary) => semantic_summary = Some(summary),
-            Err(error) => {
-                iteration_usage = error.usage;
-                fallback_reason = Some(if error.message.contains("timed out") {
-                    "summary_timeout"
-                } else {
-                    "summary_upstream_error"
-                });
-                tracing::warn!(
-                    trace_id,
-                    reason = %sanitize_error_message(&error.message),
-                    "semantic compaction request failed; using extractive fallback"
-                );
+        if summary_chunk_count > summary_concurrency && !client_requested {
+            // Each near-window-sized part can consume most of the one global
+            // deadline. Starting multiple waves makes timeout-and-discard the
+            // expected result and also burns upstream capacity for no usable
+            // checkpoint during automatic overflow recovery. Explicit client
+            // compaction still requests semantic work and retains its contract.
+            fallback_reason = Some("summary_multiple_waves");
+            tracing::info!(
+                trace_id,
+                summary_model,
+                summary_chunk_count,
+                summary_concurrency,
+                summary_timeout_ms,
+                "automatic semantic compaction needs multiple dispatch waves; using extractive fallback"
+            );
+        } else {
+            match generate_compaction_summary(
+                state,
+                trace_id,
+                key_id,
+                summary_model,
+                summary_parts,
+                summary_timeout_ms,
+            )
+            .await
+            {
+                Ok(summary) => semantic_summary = Some(summary),
+                Err(error) => {
+                    iteration_usage = error.usage;
+                    fallback_reason = Some(if error.message.contains("timed out") {
+                        "summary_timeout"
+                    } else {
+                        "summary_upstream_error"
+                    });
+                    tracing::warn!(
+                        trace_id,
+                        reason = %sanitize_error_message(&error.message),
+                        "semantic compaction request failed; using extractive fallback"
+                    );
+                }
             }
         }
     } else if let Err(reason) = summary_parts {

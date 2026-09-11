@@ -945,7 +945,7 @@ async fn mapped_overflow_decision_uses_the_mapped_safe_window() {
 }
 
 #[tokio::test]
-async fn summary_input_is_partitioned_without_losing_source_before_semantic_compaction() {
+async fn multiwave_summary_input_falls_back_without_dispatching_semantic_work() {
     let directory = tempfile::tempdir().expect("tempdir");
     let paths = kproxy_core::paths::Paths::from_env_values(
         Some(directory.path().to_str().expect("utf8")),
@@ -1005,6 +1005,7 @@ async fn summary_input_is_partitioned_without_losing_source_before_semantic_comp
             summary_model: "mapped-tiny",
             summary_timeout_ms: 30_000,
             preserve_recent_turns: 3,
+            explicit_client_compaction: false,
         },
     )
     .await
@@ -1013,7 +1014,7 @@ async fn summary_input_is_partitioned_without_losing_source_before_semantic_comp
         Err(error) => panic!("extractive fallback failed: {}", error.message),
     };
     assert_eq!(run.mode, "extractive_fallback");
-    assert_eq!(run.fallback_reason, Some("summary_upstream_error"));
+    assert_eq!(run.fallback_reason, Some("summary_multiple_waves"));
     let source_tokens = state
         .tokenizer
         .estimate_kiro_payload(&source_payload)
@@ -1021,7 +1022,8 @@ async fn summary_input_is_partitioned_without_losing_source_before_semantic_comp
         .expect("source tokens") as u64;
     let summary_tokens = run.summary_input_tokens.expect("summary tokens");
     // Diagnostics describe the full source transcript, not a lossy pre-excerpt.
-    // Each independently dispatched part is checked against the model window.
+    // Each planned part is checked against the model window before the proxy
+    // decides that multiple dispatch waves cannot finish within one deadline.
     assert!(summary_tokens > 9_900);
     assert!(summary_tokens >= source_tokens);
     assert!(run.stats.compacted_tokens <= decision.target_tokens as usize);
@@ -1090,6 +1092,7 @@ async fn summary_input_is_partitioned_without_losing_source_before_semantic_comp
             summary_model: "mapped-tiny",
             summary_timeout_ms: 30_000,
             preserve_recent_turns: 3,
+            explicit_client_compaction: false,
         },
     )
     .await
