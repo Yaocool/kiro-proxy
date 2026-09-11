@@ -109,11 +109,12 @@ Kiro 没有原生 Tool Search / Web Search server tool，代理在本地补齐�
 
 压缩已是**语义摘要**而非纯截断，主逻辑在 `handlers/compaction.rs`：
 
-- 摘要输入先转换为无 tools 的完整可读历史。能装下时直接生成 `<summary>`，超长时无损分段，每段独立摘要并按原顺序合成一个 checkpoint；禁止先用 extractive 摘录丢弃中间事实。最多 16 段、并发最多 2（服从账号并发配置），共用一次总超时。
+- 摘要输入先转换为无 tools 的完整可读历史。能装下时直接生成 `<summary>`，超长时无损分段；自动溢出压缩只有全部分段能在同一并发波次启动时才做语义摘要，否则立即走 extractive fallback，避免多波次在一次总超时后丢弃结果。显式客户端 compact 保留完整语义分段行为。最多 16 段、并发最多 2（服从账号并发配置）。
 - 摘要子请求独立走 `AccountPool`、额度预留与 stats，内部统计路径 `/internal/compact`，不混入主响应顶层 usage。
 - 超时/额度不足/上游失败/摘要非法时恢复原 payload 并退回 extractive fallback，日志 `compaction_mode` 区分 `semantic` 与 `extractive_fallback`。
 - 相关配置：`context.auto_compact_on_overflow`（默认开）、`compaction_summary_model`、`compaction_summary_timeout_ms`（默认 120000；保留已有显式配置）、`compaction_preserve_recent_turns`（默认 3，上限 64）。
 - Claude Code 2.1.260 忽略 `compaction_delta`，因此对识别出的 Claude Code 客户端在 start 块携带完整 checkpoint 并直接 stop；其他客户端保持 null start + 完整 delta。不要同时发送两份摘要，TypeScript SDK 会拼接重复内容；不要发空 delta，Python SDK 会覆盖已有摘要。
+- 进程内 `CompactionReplayTracker` 只缓存 checkpoint、源消息数和源消息前缀的 SHA-256 指纹；客户端漏回传边界时，仅在 service/会话隔离且完整历史前缀哈希匹配后重放，不保存原始请求正文，也不能减少客户端到代理的请求体大小。
 
 ### 错误码约定
 
@@ -136,7 +137,7 @@ HTTP `413` / `request_too_large` **只**用于真实入站 body 超过 50 MiB。
   output_config.format / response_format / text.format、tool strict、eager_input_streaming 等接收并忽略，
   未知附加字段不单独触发拒绝。**新增拒绝条件前必须阅读**，说明是转换所需、已实测的 Kiro 限制还是资源/安全边界。
 - [自动压缩与窗口](docs/protocol-compatibility.zh-CN.md#自动压缩与窗口)统一维护实际模型预选、摘要资源、
-  手动 `/compact`、流式回放和降级。分段前无损不代表摘要无损；哈希缓存与跨段滚动归并尚未实现。
+  手动 `/compact`、流式回放和降级。分段前无损不代表摘要无损；跨段滚动归并尚未实现。
 - [Responses](docs/openai-responses.md)维护 Codex 接入、工具、进程内状态及流式边界。
 - [运维指南](docs/startup-and-debugging.zh-CN.md)维护 CLI 迁移、配置、部署和备份恢复。
 - [1.0 发布方案](docs/release-readiness-1.0.0.zh-CN.md)维护核查快照、修复工作包和发布步骤。

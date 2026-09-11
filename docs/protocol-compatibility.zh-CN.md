@@ -94,8 +94,11 @@ Kiro 上下文或上游 payload。Catalog 构建和搜索运行在 blocking work
 Claude Messages 默认开启 `context.auto_compact_on_overflow`。代理先选定账号、完成条件映射、加权选择、
 别名及默认模型解析，再按实际模型的安全窗口决定压缩或拒绝请求；无需压缩时复用这次选择。
 如果上游仍返回 `prompt is too long`/`context length exceeded`，代理会按保守窗口
-重新压缩并只重试一次。摘要请求使用完整源材料；输入装不下时，先按 UTF-8/token 边界无损分段，各段独立摘要后
-按时间顺序组合 checkpoint。分段前不做有损摘录，每段都校验输入窗口。
+重新压缩并只重试一次。摘要请求使用完整源材料；输入装不下时，先按 UTF-8/token 边界无损分段。
+自动溢出压缩只有在全部分段能于同一并发波次启动时才调用语义摘要，并按时间顺序组合 checkpoint；
+超过单波并发能力时立即使用本地 extractive fallback，避免多个近窗口上限的分段在一次总超时内排队、
+超时后丢弃全部已完成结果。显式客户端 compact 仍执行完整语义分段摘要。
+分段前不做有损摘录，每段都校验输入窗口。
 摘要前释放账号并发名额，避免单并发账号阻塞自己的摘要请求；摘要后重新调度时若模型窗口更小，
 同一份压缩产物最多重新应用一次。OpenAI Chat Completions、使用 `truncation: disabled` 的 Responses
 以及 Tool Search 已开始输出后的上下文增长仍返回明确的上下文错误，因为这些路径无法安全回传位于
@@ -109,7 +112,8 @@ Claude 响应首部的 `compaction` 边界。摘要超时会立即释放主请�
 
 ### 摘要资源与窗口
 
-一次主请求最多启动一次语义摘要操作，最多 16 段、并发最多 2，遵循账号并发及一次总超时。
+一次主请求最多启动一次语义摘要操作，最多 16 段、并发最多 2，遵循账号并发及一次总超时；自动溢出压缩需要
+超过一个并发波次时不会启动上游摘要，显式客户端 compact 不受这条快速降级规则影响。
 任何一段失败都不能冒充完整摘要成功。一次上下文重规划/重试复用 `CompactionArtifact`，
 可调整 checkpoint 和近期保留轮次，不再次启动摘要。主生成遵循实际映射模型，源名称或 `[1m]`
 后缀不会扩大目标模型容量。压缩目标通常预留安全窗口的 25% 余量；固定部分超过目标但低于
@@ -186,6 +190,14 @@ Claude Code 可能通过普通 Messages 请求追加摘要指令，而不是发�
 语义路径和 extractive fallback 都要验证下一轮回传。该版本记录不等于已验证所有未来客户端；
 客户端升级应重跑真实客户端测试。
 
+代理还保留最多 256 个、有效期 1 小时的进程内 checkpoint，仅保存 checkpoint、源消息数和源消息前缀的 SHA-256 指纹，
+不保存原请求正文。若同一 service/凭据隔离后的会话下一轮没有带回 `compaction`，但完整消息前缀与
+已压缩源逐字节哈希一致，代理会在原 assistant 边界重放 checkpoint，再走同一套标准边界归一化。
+新追加的 assistant/user 轮次不会被删除；前缀不一致、客户端已带回有效边界、进程重启或缓存过期时均不重放。
+该机制避免旧历史再次进入 Kiro 或重复触发摘要，但无法阻止不兼容客户端继续把大请求体传到代理。
+`proxy.request.validated` 会记录 `claude_code_client`、`client_compact_edit`、
+`client_compaction_boundary_applied` 和 `server_compaction_replayed`，用于区分客户端触发、客户端回传与代理补偿。
+
 ### 降级、超时与记账
 
 摘要失败、超时、额度不足、空/非法摘要或无法达到窗口目标时，先恢复原 payload，再尝试
@@ -202,7 +214,7 @@ Claude 顶层 `input_tokens`/`output_tokens` 表示主生成；`usage.iterations
 完全没有输出或 usage 的失败摘要不会仅按输入估算消耗 credits，空/非法摘要也按失败计数。
 摘要成功后主生成仍可能因额度不足失败，两次上游操作不能原子结算。
 
-摘要哈希缓存、跨段滚动归并尚未实现；客户端二次摘要仍可能损失信息。
+跨段滚动归并尚未实现；新的有效压缩会替换同一会话的旧 checkpoint，二次摘要仍可能损失信息。
 实现见[请求准备](../crates/kproxyd/src/http/handlers/request.rs)、
 [摘要执行](../crates/kproxyd/src/http/handlers/compaction.rs)、
 [摘要规划](../crates/kproxy-translate/src/tokenizer/compaction.rs)和

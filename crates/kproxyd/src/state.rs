@@ -32,6 +32,7 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
+use crate::http::compaction_replay::CompactionReplayTracker;
 use crate::http::prompt_cache::PromptCacheTracker;
 use crate::http::responses::ResponsesSessionStore;
 use crate::http::stream::KeepaliveHub;
@@ -160,6 +161,7 @@ pub struct AppState {
     pub connections: Arc<AdmissionGate>,
     pub body_budget: Arc<BodyBudget>,
     pub keepalive: KeepaliveHub,
+    pub(crate) compaction_replay: CompactionReplayTracker,
     pub prompt_cache: PromptCacheTracker,
     /// Ephemeral, credential-scoped state for Responses `store=true` turns.
     pub responses_sessions: ResponsesSessionStore,
@@ -297,6 +299,7 @@ impl AppState {
             connections: Arc::new(AdmissionGate::new(connection_limit)),
             body_budget: Arc::new(BodyBudget::new(128 * 1024 * 1024)),
             keepalive: KeepaliveHub::new(),
+            compaction_replay: CompactionReplayTracker::default(),
             prompt_cache: PromptCacheTracker::default(),
             responses_sessions: ResponsesSessionStore::default(),
             task_registry: TaskRegistry::default(),

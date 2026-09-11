@@ -168,6 +168,24 @@ fn conversation_fingerprint<T: serde::Serialize>(messages: &[T]) -> Option<Strin
     )
 }
 
+fn compaction_replay_scope(
+    service_id: &str,
+    api_key_id: Option<&str>,
+    conversation_fingerprint: Option<&str>,
+) -> Option<String> {
+    // Request-scoped affinity headers may legitimately change every turn.
+    // Replay instead uses the immutable first-message fingerprint plus the
+    // authenticated key namespace; the full-prefix digest is the correctness
+    // check before any checkpoint is inserted.
+    stable_conversation_id(
+        &HeaderMap::new(),
+        api_key_id,
+        None,
+        conversation_fingerprint,
+    )
+    .map(|conversation_id| format!("{service_id}:{conversation_id}"))
+}
+
 fn metadata_conversation_hint(metadata: Option<&Value>) -> Option<&str> {
     let metadata = metadata?.as_object()?;
     ["session_id", "conversation_id", "thread_id"]
@@ -249,6 +267,7 @@ struct CompactionRequest<'a> {
     summary_model: &'a str,
     summary_timeout_ms: u64,
     preserve_recent_turns: usize,
+    explicit_client_compaction: bool,
 }
 
 mod entrypoints;
@@ -430,6 +449,24 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
                     ErrorFormat::Claude,
                 )
             })?;
+        let conversation_fingerprint = conversation_fingerprint(&original_request.messages);
+        let conversation_id = stable_conversation_id(
+            &headers,
+            key_id.as_deref(),
+            original_request.conversation_id.as_deref(),
+            metadata_conversation_hint(original_request.metadata.as_ref())
+                .or(conversation_fingerprint.as_deref()),
+        );
+        let replay_scope = compaction_replay_scope(
+            &service.service.id,
+            key_id.as_deref(),
+            conversation_fingerprint.as_deref(),
+        );
+        let replay = replay_scope.as_deref().and_then(|scope| {
+            state
+                .compaction_replay
+                .find(scope, &original_request.messages)
+        });
         let has_context_edits =
             has_context_management_edits(original_request.context_management.as_ref());
         // Validate the semantically effective history before touching remote
@@ -437,6 +474,9 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         // irrelevant to protocol validation, while `original_input_tokens`
         // still needs to count that pre-boundary history.
         let mut request = original_request.clone();
+        let replay_applied = replay
+            .as_ref()
+            .and_then(|replay| replay.apply_to(&mut request.messages));
         let compaction_normalization = normalize_compaction_boundary(&mut request);
         let boundary_applied = compaction_normalization.boundary_applied;
         kproxy_translate::validate_claude_count(&request).map_err(claude_validation_error)?;
@@ -447,6 +487,9 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         let _attachment_guards =
             request::hydrate_claude_attachments(&state, &mut original_request).await?;
         request.clone_from(&original_request);
+        if let Some(replay) = replay.as_ref() {
+            let _ = replay.apply_to(&mut request.messages);
+        }
         normalize_compaction_boundary(&mut request);
         kproxy_translate::validate_claude_count(&request).map_err(claude_validation_error)?;
         tracing::info!(
@@ -455,6 +498,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             model = %log_model(&request.model),
             message_count = request.messages.len(),
             tool_count = request.tools.len(),
+            server_compaction_replayed = replay_applied.is_some(),
             "client token-count request validated"
         );
         let config = state.config.current();
@@ -511,14 +555,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
         normal.enhance_system_prompt = config.features.enhance_system_prompt && !client_compaction;
         normal.enable_prompt_cache = config.features.enable_prompt_cache;
         normal.separate_compaction_instruction = client_compaction;
-        let conversation_fingerprint = conversation_fingerprint(&request.messages);
-        normal.conversation_id = stable_conversation_id(
-            &headers,
-            key_id.as_deref(),
-            request.conversation_id.as_deref(),
-            metadata_conversation_hint(request.metadata.as_ref())
-                .or(conversation_fingerprint.as_deref()),
-        );
+        normal.conversation_id = conversation_id;
         normal.additional_model_request_fields_schema = state
             .resolved_model_info(&route.mapped)
             .and_then(|model| model.additional_model_request_fields_schema);
@@ -598,6 +635,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             input_tokens,
             original_input_tokens,
             compaction_boundary_applied = boundary_applied,
+            server_compaction_replayed = replay_applied.is_some(),
             removed_noop_compaction_blocks = compaction_normalization.removed_noop_blocks,
             removed_noop_compaction_messages = compaction_normalization.removed_noop_messages,
             cleared_tool_results = context_edit_stats.cleared_tool_results,
