@@ -4,6 +4,7 @@ pub mod catalog;
 pub mod client;
 pub mod endpoint;
 pub mod event_stream;
+pub mod identity;
 
 pub use catalog::{
     static_models, static_models_for_account, static_models_for_subscription,

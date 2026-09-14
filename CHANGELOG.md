@@ -36,6 +36,11 @@ they must receive a new version rather than replacing that tag or its image.
 
 ### Fixed
 
+- Update upstream client identities to Kiro IDE `1.0.437` and CLI `2.21.4`
+  ahead of the 2026-11-09 retirement of older clients. Share the version baseline
+  across generation, metadata and Social token refresh, add missing CLI Management
+  headers, and log the active baseline at startup. Rebuild and restart the daemon
+  to apply the update.
 - Align Claude counting, optional tool results and nullable citations, and OpenAI
   nullable stream/strict controls, disabled reasoning and refusal replay with the
   public protocols. Normalize missing tool descriptions for Kiro tool replay.
