@@ -4,6 +4,7 @@ use std::future::{ready, Future};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use kproxy_core::account::{Account, AuthMethod, Credentials};
+use kproxy_kiro::identity::ide_auth_user_agent;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -346,7 +347,7 @@ impl TokenRefresher {
                     .post(endpoint)
                     .header(
                         reqwest::header::USER_AGENT,
-                        format!("KiroIDE-0.7.45-{}", snapshot.machine_id),
+                        ide_auth_user_agent(&snapshot.machine_id),
                     )
                     .json(&SocialRefreshRequest { refresh_token })
                     .send()
@@ -578,7 +579,7 @@ mod tests {
     #[tokio::test]
     async fn social_refresh_persists_rotated_credentials_and_uses_current_user_agent() {
         let server = MockServer::start().await;
-        let expected_user_agent = format!("KiroIDE-0.7.45-{}", "a".repeat(64));
+        let expected_user_agent = format!("KiroIDE-1.0.437-{}", "a".repeat(64));
         Mock::given(method("POST"))
             .and(path("/refresh"))
             .and(header("user-agent", expected_user_agent.as_str()))

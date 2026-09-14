@@ -49,6 +49,12 @@ async fn main() -> Result<()> {
     config.validate().context("configuration is invalid")?;
     logging::init(&config.log, paths.data_dir.join("logs").join("kproxyd.log"))?;
 
+    info!(
+        ide_version = kproxy_kiro::identity::IDE_VERSION,
+        cli_version = kproxy_kiro::identity::CLI_VERSION,
+        "Kiro upstream client identity"
+    );
+
     if report.created_anything() {
         info!(config = %paths.config_file.display(), "wrote default configuration and data files");
     }

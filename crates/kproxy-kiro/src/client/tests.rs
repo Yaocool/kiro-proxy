@@ -31,18 +31,31 @@ fn account(method: AuthMethod) -> Account {
     }
 }
 
-#[test]
-fn kiro_ide_user_agents_match_the_current_desktop_client() {
-    let machine_id = "a".repeat(64);
+fn assert_ide_identity(headers: &reqwest::header::HeaderMap, machine_id: &str) {
     assert_eq!(
-        kiro_user_agent(&machine_id),
+        headers["user-agent"],
         format!(
-            "aws-sdk-js/1.0.27 ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-0.7.45-{machine_id}"
+            "aws-sdk-js/1.0.39 ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.39 m/E KiroIDE-1.0.437-{machine_id}"
         )
     );
     assert_eq!(
-        kiro_amz_user_agent(&machine_id),
-        format!("aws-sdk-js/1.0.27 KiroIDE-0.7.45-{machine_id}")
+        headers["x-amz-user-agent"],
+        format!("aws-sdk-js/1.0.39 KiroIDE-1.0.437-{machine_id}")
+    );
+}
+
+fn assert_cli_identity(headers: &reqwest::header::HeaderMap, api: &str) {
+    assert_eq!(
+        headers["user-agent"],
+        format!(
+            "aws-sdk-rust/1.3.15 ua/2.1 api/{api}/0.1.17975 os/macos lang/rust/1.92.0 md/appVersion-2.21.4 app/AmazonQ-For-CLI"
+        )
+    );
+    assert_eq!(
+        headers["x-amz-user-agent"],
+        format!(
+            "aws-sdk-rust/1.3.15 ua/2.1 api/{api}/0.1.17975 os/macos lang/rust/1.92.0 m/F app/AmazonQ-For-CLI"
+        )
     );
 }
 
@@ -120,6 +133,7 @@ async fn api_key_generation_uses_runtime_without_oauth_profile_or_refresh() {
     Mock::given(method("POST"))
         .and(path("/runtime"))
         .respond_with(|request: &wiremock::Request| {
+            assert_cli_identity(&request.headers, "codewhispererstreaming");
             assert_eq!(request.headers["authorization"], "Bearer ksk_test-key");
             assert_eq!(request.headers["tokentype"], "API_KEY");
             assert_eq!(
@@ -182,6 +196,11 @@ async fn runtime_catalog_uses_management_rpc_and_oauth_profile() {
     let server = MockServer::start().await;
     Mock::given(method("POST")).and(path("/management"))
         .respond_with(|request: &wiremock::Request| {
+            assert_cli_identity(&request.headers, "codewhispererruntime");
+            assert_eq!(request.headers["authorization"], "Bearer access-token");
+            assert_eq!(request.headers["content-type"], "application/x-amz-json-1.0");
+            assert!(request.headers.contains_key("amz-sdk-invocation-id"));
+            assert_eq!(request.headers["amz-sdk-request"], "attempt=1; max=1");
             assert_eq!(request.headers["x-amz-target"], "AmazonCodeWhispererService.ListAvailableModels");
             assert!(!request.headers.contains_key("tokentype"));
             let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
@@ -361,14 +380,7 @@ async fn idc_generation_uses_kiro_ide_origin_and_headers() {
     assert_eq!(requests.len(), 1);
     let request = &requests[0];
     assert!(request.headers.get("x-amz-target").is_none());
-    let user_agent = request
-        .headers
-        .get("user-agent")
-        .expect("user-agent")
-        .to_str()
-        .expect("valid user-agent");
-    assert!(user_agent.contains("api/codewhispererstreaming#1.0.27"));
-    assert!(user_agent.contains("KiroIDE-0.7.45-"));
+    assert_ide_identity(&request.headers, &account.machine_id);
     let body: serde_json::Value = serde_json::from_slice(&request.body).expect("JSON body");
     assert_eq!(
         body.pointer("/conversationState/currentMessage/userInputMessage/origin")
@@ -527,7 +539,10 @@ async fn generation_tries_401_fallback_serially_and_caches_success() {
         .await
         .expect("requests")
         .into_iter()
-        .map(|request| request.url.path().to_owned())
+        .map(|request| {
+            assert_ide_identity(&request.headers, &account.machine_id);
+            request.url.path().to_owned()
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         paths,
@@ -642,7 +657,10 @@ async fn concurrent_model_discovery_is_collapsed_and_401_uses_fallback() {
         .await
         .expect("requests")
         .into_iter()
-        .map(|request| request.url.path().to_owned())
+        .map(|request| {
+            assert_ide_identity(&request.headers, &account.machine_id);
+            request.url.path().to_owned()
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         paths,
@@ -674,6 +692,7 @@ async fn enterprise_model_discovery_sends_profile_and_ide_origin() {
     assert_eq!(models[0].model_id, "claude-opus-4.6");
     let requests = server.received_requests().await.expect("requests");
     assert_eq!(requests.len(), 1);
+    assert_ide_identity(&requests[0].headers, &account.machine_id);
     let query = requests[0]
         .url
         .query_pairs()
@@ -756,6 +775,7 @@ async fn subscriptions_use_only_the_auth_inferred_endpoint() {
     let requests = server.received_requests().await.expect("requests");
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].url.path(), "/amazon/listAvailableSubscriptions");
+    assert_ide_identity(&requests[0].headers, &account.machine_id);
 }
 
 #[tokio::test]
@@ -796,6 +816,7 @@ async fn web_search_calls_mcp_and_decodes_nested_json_text() {
     let requests = server.received_requests().await.expect("requests");
     let request = requests.last().expect("MCP request");
     assert_eq!(request.url.path(), "/mcp");
+    assert_ide_identity(&request.headers, &account.machine_id);
     assert_eq!(
         request
             .headers
@@ -872,6 +893,7 @@ async fn missing_idc_profile_is_discovered_once_per_access_token() {
     let requests = server.received_requests().await.expect("requests");
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].url.path(), "/amazon/ListAvailableProfiles");
+    assert_ide_identity(&requests[0].headers, &account.machine_id);
     assert_eq!(
         requests[0]
             .headers
@@ -934,6 +956,7 @@ async fn usage_limits_send_complete_enterprise_query_and_runtime_headers() {
     let requests = server.received_requests().await.expect("requests");
     assert_eq!(requests.len(), 1);
     let request = &requests[0];
+    assert_ide_identity(&request.headers, &account.machine_id);
     let query = request
         .url
         .query_pairs()
@@ -1030,7 +1053,10 @@ async fn usage_limits_retry_the_regional_endpoint_after_a_403() {
         .await
         .expect("requests")
         .into_iter()
-        .map(|request| request.url.path().to_owned())
+        .map(|request| {
+            assert_ide_identity(&request.headers, &account.machine_id);
+            request.url.path().to_owned()
+        })
         .collect::<Vec<_>>();
     assert_eq!(
         paths,

@@ -4,6 +4,39 @@
 
 本文描述当前源码的 Claude Messages 与 OpenAI Chat Completions 转换行为。Responses 的工具、状态和流式差异见 [Responses 与 Codex 接入](openai-responses.md)。兼容指可接入以下能力，不代表完整实现官方 API。
 
+## Kiro 客户端版本与 2026 年 11 月停用通知
+
+根据收到的 AWS Health 通知，2026-11-09 起，IDE 低于 `0.11.133`、CLI 低于
+`1.28.2` 的客户端将无法连接 Kiro。此前代理的 IDE 标识 `0.7.45` 低于此门槛；
+CLI 标识 `2.10.0` 已高于门槛，仍一起更新到核验过的稳定版本。
+
+2026-09-14 核验的官方发布包基线如下，来源为 [IDE 下载页](https://kiro.dev/downloads/)、
+[CLI stable manifest](https://prod.download.cli.kiro.dev/stable/latest/manifest.json) 和
+[官方 changelog](https://kiro.dev/changelog/)：
+
+| 路径 | 客户端版本 | SDK / 生成的服务客户端 |
+| --- | --- | --- |
+| IDE / CodeWhispererStreaming | `1.0.437` | `aws-sdk-js/1.0.39`、`codewhispererstreaming#1.0.39` |
+| CLI / V2 生成 | `2.21.4` | `aws-sdk-rust/1.3.15`、`codewhispererstreaming/0.1.17975` |
+| CLI / Management 模型目录 | `2.21.4` | `aws-sdk-rust/1.3.15`、`codewhispererruntime/0.1.17975` |
+
+版本和 UA 统一在 `crates/kproxy-kiro/src/identity.rs` 定义。IDE 生成、模型、订阅、
+额度、Profile 发现及 MCP Web Search 共用版本；Social Token 刷新也使用同一个
+`KiroIDE-<version>-<machine_id>`。CLI 生成和 Management 分别使用对应的服务标识，
+同时发送 `User-Agent` 和 `x-amz-user-agent`。保留原有 IDE Windows / CLI macOS
+平台模板与账号 machine ID，这些模板不表示代理宿主机的操作系统。
+
+这套基线对应当前已实现的 V2/CodeWhisperer 协议。新版客户端的 KiroRuntimeService、
+V3/KAS 是其他请求路径，不能只更换 UA 中的 service 名称就完成迁移。
+
+部署时必须重新构建并替换 `kproxyd` 二进制或镜像，再重启服务；配置热加载不会更新
+编译进二进制的版本。启动日志 `Kiro upstream client identity` 应显示
+`ide_version=1.0.437`、`cli_version=2.21.4`。升级后按
+[启动与排障](startup-and-debugging.zh-CN.md) 核对 `ready`、一次真实生成及适用的 Token
+刷新，并按 [官方防火墙文档](https://kiro.dev/docs/privacy-and-security/firewalls/)
+检查上游域名可达性。回归测试校验最低版本、实际发出的请求头、回退请求和凭证轮换；
+本地测试不等同于 AWS 停用日期后的服务端验收。
+
 ## 兼容性维护原则
 
 | 类别 | 处理原则 |

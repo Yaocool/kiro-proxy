@@ -22,6 +22,9 @@ use crate::endpoint::{
     EndpointOverrides, EndpointPurpose,
 };
 use crate::event_stream::{EventStreamDecoder, KiroEvent};
+use crate::identity::{
+    cli_amz_user_agent, cli_user_agent, ide_amz_user_agent, ide_user_agent, CliService,
+};
 
 const KIRO_BUILDER_ID_PROFILE_ARN: &str =
     "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
@@ -1124,8 +1127,8 @@ impl KiroClient {
                     "authorization",
                     format!("Bearer {}", account.credentials.access_token),
                 )
-                .header("user-agent", kiro_user_agent(&account.machine_id))
-                .header("x-amz-user-agent", kiro_amz_user_agent(&account.machine_id))
+                .header("user-agent", ide_user_agent(&account.machine_id))
+                .header("x-amz-user-agent", ide_amz_user_agent(&account.machine_id))
                 .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
                 .header("amz-sdk-request", "attempt=1; max=1")
                 .send()
@@ -1262,6 +1265,13 @@ impl KiroClient {
                     .bearer_auth(&account.credentials.access_token)
                     .header("accept", "*/*")
                     .header("content-type", "application/x-amz-json-1.0")
+                    .header("user-agent", cli_user_agent(CliService::Management))
+                    .header(
+                        "x-amz-user-agent",
+                        cli_amz_user_agent(CliService::Management),
+                    )
+                    .header("amz-sdk-invocation-id", Uuid::new_v4().to_string())
+                    .header("amz-sdk-request", "attempt=1; max=1")
                     .header(
                         "x-amz-target",
                         "AmazonCodeWhispererService.ListAvailableModels",
@@ -1441,14 +1451,14 @@ fn headers(
     let mut headers = HeaderMap::new();
     let cli = matches!(endpoint.origin, "CLI" | "KIRO_CLI");
     let user_agent = if cli {
-        "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17593 os/macos lang/rust/1.92.0 md/appVersion-2.10.0 app/AmazonQ-For-CLI".to_string()
+        cli_user_agent(CliService::Streaming)
     } else {
-        kiro_user_agent(&account.machine_id)
+        ide_user_agent(&account.machine_id)
     };
     let amz_user_agent = if cli {
-        "aws-sdk-rust/1.3.15 ua/2.1 api/codewhispererstreaming/0.1.17593 os/macos lang/rust/1.92.0 m/F app/AmazonQ-For-CLI".to_string()
+        cli_amz_user_agent(CliService::Streaming)
     } else {
-        kiro_amz_user_agent(&account.machine_id)
+        ide_amz_user_agent(&account.machine_id)
     };
     let mode = match mode {
         AgentMode::Auto if cli => "vibe",
@@ -1504,7 +1514,7 @@ fn mcp_headers(account: &Account) -> Result<reqwest::header::HeaderMap, KiroErro
 
     let mut headers = HeaderMap::new();
     let authorization = format!("Bearer {}", account.credentials.access_token);
-    let user_agent = kiro_user_agent(&account.machine_id);
+    let user_agent = ide_user_agent(&account.machine_id);
     for (name, value) in [
         (CONTENT_TYPE, "application/json"),
         (ACCEPT, "application/json"),
@@ -1539,7 +1549,7 @@ fn mcp_headers(account: &Account) -> Result<reqwest::header::HeaderMap, KiroErro
     }
     headers.insert(
         reqwest::header::HeaderName::from_static("x-amz-user-agent"),
-        HeaderValue::from_str(&kiro_amz_user_agent(&account.machine_id)).map_err(build_error)?,
+        HeaderValue::from_str(&ide_amz_user_agent(&account.machine_id)).map_err(build_error)?,
     );
     headers.insert(
         reqwest::header::HeaderName::from_static("amz-sdk-invocation-id"),
@@ -1559,8 +1569,8 @@ fn profile_headers(account: &Account) -> Result<reqwest::header::HeaderMap, Kiro
 
     let mut headers = HeaderMap::new();
     let authorization = format!("Bearer {}", account.credentials.access_token);
-    let user_agent = kiro_user_agent(&account.machine_id);
-    let amz_user_agent = kiro_amz_user_agent(&account.machine_id);
+    let user_agent = ide_user_agent(&account.machine_id);
+    let amz_user_agent = ide_amz_user_agent(&account.machine_id);
     for (name, value) in [
         (CONTENT_TYPE, "application/json"),
         (ACCEPT, "application/json"),
@@ -1580,16 +1590,6 @@ fn profile_headers(account: &Account) -> Result<reqwest::header::HeaderMap, Kiro
         );
     }
     Ok(headers)
-}
-
-fn kiro_user_agent(machine_id: &str) -> String {
-    format!(
-        "aws-sdk-js/1.0.27 ua/2.1 os/win32#10.0.19044 lang/js md/nodejs#22.21.1 api/codewhispererstreaming#1.0.27 m/E KiroIDE-0.7.45-{machine_id}"
-    )
-}
-
-fn kiro_amz_user_agent(machine_id: &str) -> String {
-    format!("aws-sdk-js/1.0.27 KiroIDE-0.7.45-{machine_id}")
 }
 
 fn metadata_headers(

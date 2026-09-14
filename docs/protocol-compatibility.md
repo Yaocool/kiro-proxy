@@ -4,6 +4,47 @@
 
 This reference describes Claude Messages and OpenAI Chat Completions in the current source. See [Responses and Codex](openai-responses.md) for its tool, state, and streaming contracts. Compatibility covers the behavior below, not the complete hosted APIs.
 
+## Kiro client versions and the November 2026 retirement
+
+The received AWS Health notice says IDE versions before `0.11.133` and CLI
+versions before `1.28.2` cannot connect starting 2026-11-09. The proxy's previous
+IDE identity, `0.7.45`, was below that floor. Its CLI identity, `2.10.0`, already
+met the floor and is also updated to a verified stable release.
+
+The following official release baseline was checked on 2026-09-14 using the
+[IDE downloads](https://kiro.dev/downloads/),
+[CLI stable manifest](https://prod.download.cli.kiro.dev/stable/latest/manifest.json)
+and [changelog](https://kiro.dev/changelog/):
+
+| Request path | Client version | SDK / generated service client |
+| --- | --- | --- |
+| IDE / CodeWhispererStreaming | `1.0.437` | `aws-sdk-js/1.0.39`, `codewhispererstreaming#1.0.39` |
+| CLI / V2 generation | `2.21.4` | `aws-sdk-rust/1.3.15`, `codewhispererstreaming/0.1.17975` |
+| CLI / Management model catalog | `2.21.4` | `aws-sdk-rust/1.3.15`, `codewhispererruntime/0.1.17975` |
+
+`crates/kproxy-kiro/src/identity.rs` owns all versions and UA construction.
+IDE generation, model/subscription/usage queries, profile discovery and MCP web
+search share the same version, including the `KiroIDE-<version>-<machine_id>`
+used for Social token refresh. CLI generation and Management send both
+`User-Agent` and `x-amz-user-agent` with the appropriate service identity.
+The existing IDE Windows / CLI macOS platform profiles and per-account machine
+IDs are preserved; these profiles do not describe the proxy host OS.
+
+This baseline targets the implemented V2/CodeWhisperer protocol. Newer
+KiroRuntimeService and V3/KAS paths need separate protocol integration; changing
+the service name in a UA does not migrate the request protocol.
+
+Rebuild and replace the `kproxyd` binary or image, then restart it. Configuration
+hot reload cannot update compiled identities. The startup log
+`Kiro upstream client identity` must show `ide_version=1.0.437` and
+`cli_version=2.21.4`. Follow [startup and debugging](startup-and-debugging.md) to
+check readiness, a real generation and applicable token refresh after deployment,
+and verify endpoint access against the
+[official firewall guide](https://kiro.dev/docs/privacy-and-security/firewalls/).
+Regression tests cover version floors, emitted headers, fallback requests and
+credential rotation. Local tests do not establish server acceptance after AWS's
+retirement date.
+
 ## Compatibility maintenance rules
 
 | Category | Policy |
