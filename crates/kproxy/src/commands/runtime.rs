@@ -2127,50 +2127,157 @@ fn is_executable(path: &Path) -> bool {
 }
 
 pub async fn show_models(client: &mut AdminClient, mapped: bool, json: bool) -> Result<()> {
-    let models: serde_json::Value = client.call(method::MODELS, serde_json::json!({})).await?;
+    let models: Vec<kproxy_kiro::ModelInfo> =
+        client.call(method::MODELS, serde_json::json!({})).await?;
     if !mapped {
         if json {
             return print_json(&models);
         }
-        for model in models.as_array().into_iter().flatten() {
-            println!(
-                "{:<34} {}",
-                model["modelId"].as_str().unwrap_or("-"),
-                model["modelName"].as_str().unwrap_or("")
-            );
-        }
+        print!("{}", render_model_list(&models));
         return Ok(());
     }
     let config = effective_config(client).await?;
+    let available_models = models
+        .iter()
+        .map(|model| model.model_id.clone())
+        .collect::<Vec<_>>();
     let routes = models
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|model| model["modelId"].as_str())
+        .iter()
         .map(|model| {
             let route = kproxy_translate::model::map_model(
-                model,
+                &model.model_id,
                 &config.model_mapping,
                 None,
                 None,
                 &config.features.default_model_id,
             );
-            serde_json::json!({"input":model,"mapped":route.mapped,"rule":route.rule})
+            let token_limits =
+                kproxy_translate::model::resolve_dynamic_model(&route.mapped, &available_models)
+                    .and_then(|resolved| {
+                        models
+                            .iter()
+                            .find(|candidate| candidate.model_id.eq_ignore_ascii_case(&resolved))
+                    })
+                    .map(model_token_limits)
+                    .unwrap_or_default();
+            ModelListRoute {
+                input: model.model_id.clone(),
+                mapped: route.mapped,
+                rule: route.rule,
+                max_input_tokens: token_limits.0,
+                max_output_tokens: token_limits.1,
+            }
         })
         .collect::<Vec<_>>();
     if json {
-        print_json(&routes)
+        print_json(
+            &routes
+                .iter()
+                .map(|route| {
+                    serde_json::json!({
+                        "input":route.input,
+                        "mapped":route.mapped,
+                        "rule":route.rule
+                    })
+                })
+                .collect::<Vec<_>>(),
+        )
     } else {
-        for route in routes {
-            println!(
-                "{:<34} -> {:<34} {}",
-                route["input"].as_str().unwrap_or("-"),
-                route["mapped"].as_str().unwrap_or("-"),
-                route["rule"].as_str().unwrap_or("(无规则)")
-            );
-        }
+        print!("{}", render_mapped_model_list(&routes));
         Ok(())
     }
+}
+
+#[derive(Debug)]
+struct ModelListRoute {
+    input: String,
+    mapped: String,
+    rule: Option<String>,
+    max_input_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+}
+
+fn render_model_list(models: &[kproxy_kiro::ModelInfo]) -> String {
+    if models.is_empty() {
+        return "暂无可用模型。\n".into();
+    }
+    let rows = models
+        .iter()
+        .map(|model| {
+            vec![
+                model.model_id.clone(),
+                format_model_token_limit(model_token_limits(model).0),
+                format_model_token_limit(model_token_limits(model).1),
+                if model.model_name.trim().is_empty() {
+                    "-".into()
+                } else {
+                    model.model_name.clone()
+                },
+            ]
+        })
+        .collect::<Vec<_>>();
+    render_table(&["模型", "输入上下文", "输出上限", "名称"], &rows)
+}
+
+fn render_mapped_model_list(routes: &[ModelListRoute]) -> String {
+    if routes.is_empty() {
+        return "暂无可用模型。\n".into();
+    }
+    let rows = routes
+        .iter()
+        .map(|route| {
+            vec![
+                route.input.clone(),
+                route.mapped.clone(),
+                format_model_token_limit(route.max_input_tokens),
+                format_model_token_limit(route.max_output_tokens),
+                route.rule.clone().unwrap_or_else(|| "(无规则)".into()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    render_table(
+        &["输入模型", "映射模型", "输入上下文", "输出上限", "规则"],
+        &rows,
+    )
+}
+
+fn model_token_limits(model: &kproxy_kiro::ModelInfo) -> (Option<u32>, Option<u32>) {
+    let Some(limits) = model.token_limits.as_ref() else {
+        return (None, None);
+    };
+    (
+        limits.max_input_tokens.filter(|tokens| *tokens > 0),
+        limits.max_output_tokens.filter(|tokens| *tokens > 0),
+    )
+}
+
+fn format_model_token_limit(tokens: Option<u32>) -> String {
+    let Some(tokens) = tokens.filter(|tokens| *tokens > 0) else {
+        return "-".into();
+    };
+    if tokens >= 1_000_000 {
+        return format_scaled_token_count(tokens, 1_000_000, "M");
+    }
+    if tokens >= 1_000 {
+        return format_scaled_token_count(tokens, 1_000, "K");
+    }
+    tokens.to_string()
+}
+
+fn format_scaled_token_count(tokens: u32, scale: u32, suffix: &str) -> String {
+    if tokens.is_multiple_of(scale) {
+        return format!("{}{suffix}", tokens / scale);
+    }
+    let scaled = f64::from(tokens) / f64::from(scale);
+    let formatted = if scaled < 10.0 {
+        format!("{scaled:.2}")
+    } else {
+        format!("{scaled:.1}")
+    };
+    format!(
+        "{}{suffix}",
+        formatted.trim_end_matches('0').trim_end_matches('.')
+    )
 }
 
 pub async fn show_model_resolution(

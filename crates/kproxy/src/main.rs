@@ -194,7 +194,7 @@ enum Command {
         #[command(subcommand)]
         command: Option<crate::commands::runtime::AlertCommand>,
     },
-    /// 显示上游动态模型。
+    /// 显示上游动态模型、输入上下文与输出上限。
     #[command(
         after_help = "示例：\n  kproxy models list\n  kproxy models list --mapped\n  kproxy models list --refresh\n  kproxy models resolve opus5\n\n操作说明：kproxy guide models"
     )]
@@ -248,7 +248,7 @@ enum CompletionShell {
 
 #[derive(Debug, Subcommand)]
 enum ModelsCommand {
-    /// 列出账号自动探测到的 Kiro 模型。
+    /// 列出账号自动探测到的 Kiro 模型、输入上下文与输出上限。
     #[command(
         after_help = "示例：\n  kproxy models list\n  kproxy models list --mapped\n  kproxy models list --refresh"
     )]
