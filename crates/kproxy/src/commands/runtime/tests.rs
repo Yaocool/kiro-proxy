@@ -85,6 +85,79 @@ fn credits_are_displayed_with_two_decimal_places() {
     assert_eq!(format_credits(4.0), "4.00");
 }
 
+fn model_fixture(
+    id: &str,
+    name: &str,
+    max_input_tokens: Option<u32>,
+    max_output_tokens: Option<u32>,
+) -> kproxy_kiro::ModelInfo {
+    kproxy_kiro::ModelInfo {
+        model_id: id.into(),
+        model_name: name.into(),
+        description: String::new(),
+        rate_multiplier: None,
+        token_limits: Some(kproxy_kiro::client::TokenLimits {
+            max_input_tokens,
+            max_output_tokens,
+        }),
+        additional_model_request_fields_schema: None,
+    }
+}
+
+#[test]
+fn model_context_windows_use_compact_decimal_units() {
+    assert_eq!(format_model_token_limit(None), "-");
+    assert_eq!(format_model_token_limit(Some(0)), "-");
+    assert_eq!(format_model_token_limit(Some(500)), "500");
+    assert_eq!(format_model_token_limit(Some(32_768)), "32.8K");
+    assert_eq!(format_model_token_limit(Some(200_000)), "200K");
+    assert_eq!(format_model_token_limit(Some(1_000_000)), "1M");
+    assert_eq!(format_model_token_limit(Some(1_500_000)), "1.5M");
+}
+
+#[test]
+fn model_list_table_displays_input_output_limits_and_unknown_metadata() {
+    let output = render_model_list(&[
+        model_fixture(
+            "claude-opus-5",
+            "Claude Opus 5",
+            Some(1_000_000),
+            Some(64_000),
+        ),
+        model_fixture("unknown-model", "", None, None),
+    ]);
+
+    assert!(output.contains("模型"));
+    assert!(output.contains("输入上下文"));
+    assert!(output.contains("输出上限"));
+    assert!(output.contains("claude-opus-5"));
+    assert!(output.contains("1M"));
+    assert!(output.contains("64K"));
+    assert!(output.contains("unknown-model"));
+    assert!(output
+        .lines()
+        .any(|line| line.contains("unknown-model") && line.contains('-')));
+}
+
+#[test]
+fn mapped_model_list_displays_the_target_context_window() {
+    let output = render_mapped_model_list(&[ModelListRoute {
+        input: "client-alias".into(),
+        mapped: "claude-sonnet-5".into(),
+        rule: Some("alias-to-sonnet".into()),
+        max_input_tokens: Some(1_000_000),
+        max_output_tokens: Some(128_000),
+    }]);
+
+    assert!(output.contains("映射模型"));
+    assert!(output.contains("输入上下文"));
+    assert!(output.contains("输出上限"));
+    assert!(output.contains("claude-sonnet-5"));
+    assert!(output.contains("1M"));
+    assert!(output.contains("128K"));
+    assert!(output.contains("alias-to-sonnet"));
+}
+
 #[test]
 fn api_key_selectors_are_resolved_from_the_supplied_latest_snapshot() {
     let current = r#"

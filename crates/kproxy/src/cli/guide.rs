@@ -137,7 +137,7 @@ pub fn print(topic: Option<&str>) -> Result<()> {
             "`kproxy alert events` 列出四类异常事件和触发条件，`kproxy alert platforms` 说明 --platform 支持的通知平台和平台专用参数；`kproxy alert config` 查看一次性告警策略。同类型的多账号事件会聚合为一条 Markdown 告警；每个账号或服务恢复后才允许再次告警。`kproxy alert add/edit/delete/list/test/logs` 管理告警目标。"
         }
         "models" => {
-            "`kproxy models list` 显示账号自动探测到的 Kiro 模型；`--refresh` 先立即刷新缓存，`--mapped` 同时显示显式映射结果。`kproxy models resolve <MODEL_ID>` 使用当前配置、账号额度和账号模型缓存，显示显式映射与最终 Kiro 模型；可配合 `--api-key` 和 `--refresh`。"
+            "`kproxy models list` 显示账号自动探测到的 Kiro 模型、最大输入上下文和最大输出 token，两者按 K/M 缩写；`-` 表示上游未返回对应元数据。`--refresh` 先立即刷新缓存，`--mapped` 同时显示显式映射结果及映射后模型的输入/输出上限。`kproxy models resolve <MODEL_ID>` 使用当前配置、账号额度和账号模型缓存，显示显式映射与最终 Kiro 模型；可配合 `--api-key` 和 `--refresh`。"
         }
         "docker" => {
             "默认 `docker compose up -d --build` 构建 runtime-full，启用全部 feature 并包含 Chromium SSO 运行时。数据保存在 kproxy-data 命名卷。"
