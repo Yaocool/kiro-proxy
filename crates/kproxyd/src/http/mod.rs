@@ -658,6 +658,25 @@ mod tests {
         serde_json::from_slice(&bytes).expect("json")
     }
 
+    fn discovered_model(
+        id: &str,
+        name: &str,
+        max_input_tokens: Option<u32>,
+        max_output_tokens: Option<u32>,
+    ) -> kproxy_kiro::ModelInfo {
+        kproxy_kiro::ModelInfo {
+            model_id: id.into(),
+            model_name: name.into(),
+            description: "upstream description must not leak into protocol responses".into(),
+            rate_multiplier: Some(1.0),
+            token_limits: Some(kproxy_kiro::client::TokenLimits {
+                max_input_tokens,
+                max_output_tokens,
+            }),
+            additional_model_request_fields_schema: None,
+        }
+    }
+
     fn account_with_usage(id: &str, email: &str, enabled: bool, usage: Option<Usage>) -> Account {
         Account {
             id: id.into(),
@@ -1038,6 +1057,275 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn openai_model_list_uses_only_the_openai_response_contract() {
+        let (_directory, state) = test_state(Config::default()).await;
+        state.models.finish_refresh(vec![
+            discovered_model(
+                "claude-opus-5",
+                "Claude Opus 5",
+                Some(1_000_000),
+                Some(64_000),
+            ),
+            discovered_model(
+                "claude-sonnet-5",
+                "Claude Sonnet 5",
+                Some(200_000),
+                Some(32_000),
+            ),
+        ]);
+
+        let response = router(state)
+            .oneshot(
+                Request::get("/v1/models?limit=1")
+                    .header(header::USER_AGENT, "codex_cli_rs/0.147.0 (test)")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["object"], "list");
+        let data = body["data"].as_array().expect("model data");
+        assert_eq!(data.len(), 2, "OpenAI does not define list pagination");
+        let entry = data[0].as_object().expect("model object");
+        assert_eq!(entry.len(), 4);
+        assert_eq!(entry["id"], "claude-opus-5");
+        assert_eq!(entry["object"], "model");
+        assert!(entry["created"].as_i64().is_some());
+        assert_eq!(entry["owned_by"], "kiro");
+        for anthropic_field in [
+            "type",
+            "display_name",
+            "created_at",
+            "capabilities",
+            "max_input_tokens",
+            "max_tokens",
+        ] {
+            assert!(!entry.contains_key(anthropic_field), "{anthropic_field}");
+        }
+        assert!(body.get("first_id").is_none());
+        assert!(body.get("has_more").is_none());
+        assert!(body.get("last_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn unidentified_model_list_merges_openai_and_anthropic_fields() {
+        let (_directory, state) = test_state(Config::default()).await;
+        state.models.finish_refresh(vec![
+            discovered_model("deepseek-3.2", "DeepSeek 3.2", Some(200_000), Some(16_384)),
+            discovered_model(
+                "claude-sonnet-5",
+                "Claude Sonnet 5",
+                Some(1_000_000),
+                Some(64_000),
+            ),
+        ]);
+
+        let response = router(Arc::clone(&state))
+            .oneshot(
+                Request::get("/v1/models")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body.as_object().expect("list response").len(), 5);
+        assert_eq!(body["object"], "list");
+        assert_eq!(body["first_id"], "anthropic.deepseek-3.2");
+        assert_eq!(body["last_id"], "claude-sonnet-5");
+        assert_eq!(body["has_more"], false);
+        assert_eq!(body["data"].as_array().expect("model data").len(), 2);
+        let entry = body["data"][0].as_object().expect("model object");
+        assert_eq!(entry.len(), 10);
+        assert_eq!(entry["id"], "anthropic.deepseek-3.2");
+        assert_eq!(entry["object"], "model");
+        assert!(entry["created"].as_i64().is_some());
+        assert_eq!(entry["owned_by"], "kiro");
+        assert_eq!(entry["type"], "model");
+        assert!(entry["capabilities"].is_null());
+        assert_eq!(entry["created_at"], "1970-01-01T00:00:00Z");
+        assert_eq!(entry["display_name"], "DeepSeek 3.2");
+        assert_eq!(entry["max_input_tokens"], 200_000);
+        assert_eq!(entry["max_tokens"], 16_384);
+
+        let paged = router(Arc::clone(&state))
+            .oneshot(
+                Request::get("/models?limit=1")
+                    .header(header::USER_AGENT, "curl/8.0")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(paged.status(), StatusCode::OK);
+        let paged = body_json(paged).await;
+        assert_eq!(paged["data"].as_array().expect("model data").len(), 1);
+        assert_eq!(paged["has_more"], true);
+
+        let anthropic = router(state)
+            .oneshot(
+                Request::get("/v1/models?limit=1")
+                    .header("anthropic-version", "2023-06-01")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(anthropic.status(), StatusCode::OK);
+        let anthropic = body_json(anthropic).await;
+        assert!(anthropic.get("object").is_none());
+        assert_eq!(anthropic["data"][0]["type"], "model");
+        assert!(anthropic["data"][0].get("object").is_none());
+    }
+
+    #[tokio::test]
+    async fn anthropic_model_list_matches_schema_and_paginates_by_response_id() {
+        let (_directory, state) = test_state(Config::default()).await;
+        state.models.finish_refresh(vec![
+            discovered_model("deepseek-3.2", "DeepSeek 3.2", Some(200_000), Some(16_384)),
+            discovered_model("claude-sonnet-5", "Claude Sonnet 5", None, None),
+            discovered_model(
+                "minimax-m2.5",
+                "MiniMax M2.5",
+                Some(1_000_000),
+                Some(64_000),
+            ),
+        ]);
+
+        let first = router(Arc::clone(&state))
+            .oneshot(
+                Request::get("/v1/models?limit=1")
+                    .header(header::USER_AGENT, "claude-code/2.1.263")
+                    .header("anthropic-version", "2023-06-01")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(first.status(), StatusCode::OK);
+        let first = body_json(first).await;
+        assert!(first.get("object").is_none());
+        assert_eq!(first.as_object().expect("list response").len(), 4);
+        assert_eq!(first["first_id"], "anthropic.deepseek-3.2");
+        assert_eq!(first["last_id"], "anthropic.deepseek-3.2");
+        assert_eq!(first["has_more"], true);
+        let entry = first["data"][0].as_object().expect("model object");
+        assert_eq!(entry.len(), 7);
+        assert_eq!(entry["type"], "model");
+        assert_eq!(entry["id"], "anthropic.deepseek-3.2");
+        assert_eq!(entry["display_name"], "DeepSeek 3.2");
+        assert_eq!(entry["created_at"], "1970-01-01T00:00:00Z");
+        assert!(entry["capabilities"].is_null());
+        assert_eq!(entry["max_input_tokens"], 200_000);
+        assert_eq!(entry["max_tokens"], 16_384);
+        for openai_or_extension_field in ["object", "created", "owned_by", "description"] {
+            assert!(
+                !entry.contains_key(openai_or_extension_field),
+                "{openai_or_extension_field}"
+            );
+        }
+
+        let after = router(Arc::clone(&state))
+            .oneshot(
+                Request::get("/v1/models?limit=1&after_id=anthropic.deepseek-3.2")
+                    .header(header::USER_AGENT, "claude-code/2.1.263")
+                    .header("anthropic-version", "2023-06-01")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let after = body_json(after).await;
+        assert_eq!(after["data"][0]["id"], "claude-sonnet-5");
+        assert!(after["data"][0]["max_input_tokens"].is_null());
+        assert!(after["data"][0]["max_tokens"].is_null());
+        assert_eq!(after["has_more"], true);
+
+        let before = router(state)
+            .oneshot(
+                Request::get("/v1/models?limit=1&before_id=anthropic.minimax-m2.5")
+                    .header(header::USER_AGENT, "claude-code/2.1.263")
+                    .header("anthropic-version", "2023-06-01")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let before = body_json(before).await;
+        assert_eq!(before["data"][0]["id"], "claude-sonnet-5");
+        assert_eq!(before["has_more"], true);
+    }
+
+    #[tokio::test]
+    async fn anthropic_model_list_rejects_invalid_pagination() {
+        let (_directory, state) = test_state(Config::default()).await;
+        state.models.finish_refresh(vec![discovered_model(
+            "claude-sonnet-5",
+            "Claude Sonnet 5",
+            None,
+            None,
+        )]);
+
+        for query in [
+            "limit=0",
+            "limit=1001",
+            "limit=invalid",
+            "after_id=claude-sonnet-5&before_id=claude-sonnet-5",
+            "after_id=missing",
+        ] {
+            let response = router(Arc::clone(&state))
+                .oneshot(
+                    Request::get(format!("/v1/models?{query}"))
+                        .header(header::USER_AGENT, "claude-code/2.1.263")
+                        .header("anthropic-version", "2023-06-01")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{query}");
+            let body = body_json(response).await;
+            assert_eq!(body["type"], "error");
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+        }
+    }
+
+    #[tokio::test]
+    async fn anthropic_model_list_defaults_to_twenty_results() {
+        let (_directory, state) = test_state(Config::default()).await;
+        state.models.finish_refresh(
+            (0..21)
+                .map(|index| {
+                    let id = format!("model-{index:02}");
+                    discovered_model(&id, &id, None, None)
+                })
+                .collect(),
+        );
+
+        let response = router(state)
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(header::USER_AGENT, "claude-code/2.1.263")
+                    .header("anthropic-version", "2023-06-01")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["data"].as_array().expect("model data").len(), 20);
+        assert_eq!(body["first_id"], "anthropic.model-00");
+        assert_eq!(body["last_id"], "anthropic.model-19");
+        assert_eq!(body["has_more"], true);
+    }
+
+    #[tokio::test]
     async fn client_allowlist_follows_protocol_for_every_alias_and_policy_scope() {
         for (case, globally_enforced, service_bypass, api_key_bypass, policy_enforced) in [
             ("enforced", true, false, false, true),
@@ -1114,8 +1402,8 @@ mod tests {
                         .await
                         .unwrap();
                     let allowed = !policy_enforced
+                        || models
                         || (claude && client == "claude")
-                        || (models && client == "claude")
                         || (!claude && client == "codex");
                     let expected = if !allowed {
                         StatusCode::BAD_REQUEST
@@ -1229,6 +1517,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{agent}");
+            let body = body_json(response).await;
+            assert_eq!(body["object"], "list", "{agent}");
+            assert!(body.get("first_id").is_none(), "{agent}");
+            assert!(body["data"][0].get("type").is_none(), "{agent}");
         }
         for agent in [
             "not-codex/1.0",
@@ -1246,7 +1538,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{agent}");
+            assert_eq!(response.status(), StatusCode::OK, "{agent}");
+            let body = body_json(response).await;
+            assert_eq!(body["object"], "list", "{agent}");
+            assert!(body.get("first_id").is_some(), "{agent}");
+            assert_eq!(body["data"][0]["type"], "model", "{agent}");
         }
     }
 
@@ -1283,7 +1579,12 @@ mod tests {
                 .expect("model alias");
             if agent.starts_with("claude-") {
                 assert_eq!(entry["display_name"], "DeepSeek 3.2");
-                assert!(entry["description"].is_string());
+                assert_eq!(entry["type"], "model");
+                assert_eq!(entry["created_at"], "1970-01-01T00:00:00Z");
+                assert!(entry["capabilities"].is_null());
+                assert!(entry["max_input_tokens"].is_null());
+                assert!(entry["max_tokens"].is_null());
+                assert!(entry.get("description").is_none());
                 assert_eq!(body["has_more"], false);
             }
         }
@@ -1825,12 +2126,14 @@ mod tests {
             .cancel
             .clone();
         let client = reqwest::Client::new();
-        let url = format!("http://127.0.0.1:{port}/v1/models");
+        let url = format!("http://127.0.0.1:{port}/v1/responses");
+        let request = serde_json::json!({"model":"test","input":"hello"});
 
         let rejected = client
-            .get(&url)
+            .post(&url)
             .bearer_auth("sk-hot-policy")
             .header(header::USER_AGENT, "curl/8.0")
+            .json(&request)
             .send()
             .await
             .expect("strict request");
@@ -1844,13 +2147,14 @@ mod tests {
             .expect("service policy reload");
         assert!(!listener_cancel.is_cancelled());
         let service_allowed = client
-            .get(&url)
+            .post(&url)
             .bearer_auth("sk-hot-policy")
             .header(header::USER_AGENT, "curl/8.0")
+            .json(&request)
             .send()
             .await
             .expect("service bypass request");
-        assert_eq!(service_allowed.status(), StatusCode::OK);
+        assert_eq!(service_allowed.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         let mut key_bypass = config.clone();
         key_bypass.api_key[0].skip_user_agent_check = true;
@@ -1860,13 +2164,14 @@ mod tests {
             .expect("API key policy reload");
         assert!(!listener_cancel.is_cancelled());
         let key_allowed = client
-            .get(&url)
+            .post(&url)
             .bearer_auth("sk-hot-policy")
             .header(header::USER_AGENT, "curl/8.0")
+            .json(&request)
             .send()
             .await
             .expect("API key bypass request");
-        assert_eq!(key_allowed.status(), StatusCode::OK);
+        assert_eq!(key_allowed.status(), StatusCode::SERVICE_UNAVAILABLE);
 
         state.shutdown.cancel();
         state

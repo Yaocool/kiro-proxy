@@ -1290,6 +1290,16 @@ fn fallback_models_use_catalog_and_keep_configured_targets() {
     let mut config = kproxy_core::config::Config::default();
     config.features.default_model_id = "private-model".into();
     let models = fallback_models(&config);
+    assert_eq!(
+        models.first().map(|model| model.model_id.as_str()),
+        kproxy_kiro::static_models()
+            .first()
+            .map(|model| model.model_id.as_str())
+    );
+    assert_eq!(
+        models.last().map(|model| model.model_id.as_str()),
+        Some("private-model")
+    );
     assert!(models.iter().any(|model| model.model_id == "auto"));
     assert!(models
         .iter()

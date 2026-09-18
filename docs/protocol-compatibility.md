@@ -71,6 +71,44 @@ resource limit, not a model enum. Keep non-null real format-schema/task-budget
 regressions across Messages aliases, counting and JSON/SSE; assert exclusion from
 Kiro payloads instead of replacing the fields with null to bypass validation.
 
+## Model discovery response contracts
+
+OpenAI and Anthropic both use `GET /v1/models` on their respective API hosts, so
+the proxy exposes that shared route and its `/models` alias. It selects the
+response protocol from the authenticated client headers. Codex receives the [OpenAI model-list
+shape](https://developers.openai.com/api/reference/resources/models/methods/list):
+the top-level `object: "list"` and model `id`, `object`, `created`, and `owned_by`
+fields. Anthropic-only metadata is not added to this response.
+
+Claude Code receives the [Anthropic model-list
+shape](https://platform.claude.com/docs/en/api/models/list). It supports `limit`
+(default 20, range 1–1000), `after_id`, and `before_id`, and returns `data`,
+`first_id`, `has_more`, and `last_id`. Each model contains `type`, `id`,
+`created_at`, `display_name`, `capabilities`, `max_input_tokens`, and `max_tokens`;
+OpenAI-only fields and the Kiro description extension are omitted. Kiro discovery
+does not provide release timestamps or an Anthropic capability matrix, so
+`created_at` uses the protocol-permitted Unix epoch and `capabilities` is `null`.
+Dynamic `tokenLimits.maxInputTokens` and `maxOutputTokens` map to the two Anthropic
+limit fields; static/configured fallback models report `null` rather than inventing
+limits. Cursor IDs are the client-visible IDs, including the `anthropic.` prefix
+used for non-Claude Kiro models. Dynamic discovery preserves Kiro's returned
+order instead of replacing it with alphabetical order; fallback discovery keeps
+the curated catalog order because Kiro does not provide release timestamps.
+
+When neither a Codex/Claude Code User-Agent nor `anthropic-version` identifies the
+protocol, an authenticated request receives a hybrid response. It combines the
+OpenAI `object` field and per-model `object`, `created`, and `owned_by` fields with
+Anthropic pagination and per-model metadata. Hybrid IDs use the Claude-compatible
+discovery form so non-Claude Kiro models remain visible; the request resolver also
+accepts these IDs on OpenAI generation endpoints. Hybrid requests return the full
+list by default and honor `limit`, `after_id`, and `before_id` when supplied. API-key
+authentication still runs first. Model discovery uses User-Agent only for response
+negotiation, so its client admission check does not reject missing or unrecognized
+agents; generation endpoints keep the configured admission policy.
+
+This compatibility covers listing. The separate OpenAI/Anthropic retrieve-model
+route (`GET /v1/models/{model_id}`) is not implemented.
+
 ## Tool call arguments
 
 Native upstream tool calls, including MCP calls, share the same JSON validation

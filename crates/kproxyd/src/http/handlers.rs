@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
-use axum::extract::{OriginalUri, Request, State};
+use axum::extract::{OriginalUri, RawQuery, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -655,28 +655,34 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
     }
 }
 
-pub async fn models(State(service): State<ServiceHttpState>, headers: HeaderMap) -> Response {
+pub async fn models(
+    State(service): State<ServiceHttpState>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
     let state = Arc::clone(&service.app);
-    let agent = headers
-        .get(header::USER_AGENT)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    // This endpoint is shared. An additive Anthropic header must not
-    // override a positively identified Codex client or change its model IDs.
-    let claude = is_claude_user_agent(agent)
-        || (!is_codex_user_agent(agent) && headers.contains_key("anthropic-version"));
-    let format = if claude {
-        ErrorFormat::Claude
-    } else {
-        ErrorFormat::OpenAi
-    };
+    let protocol = model_list_protocol(&headers);
+    let format = protocol.error_format();
     let result = async {
-        let authenticated_key =
-            authenticate(&state, &service.allowed_api_key_ids, &headers, format)?;
-        enforce_client_user_agent(&service, &headers, format, authenticated_key.as_ref())?;
+        authenticate(&state, &service.allowed_api_key_ids, &headers, format)?;
+        // Model discovery shares one URL across protocols, so User-Agent is
+        // content negotiation here rather than an admission requirement.
+        let query = match protocol {
+            ModelListProtocol::OpenAi => None,
+            ModelListProtocol::Anthropic => Some(parse_model_list_query(
+                raw_query.as_deref(),
+                ANTHROPIC_MODEL_LIST_DEFAULT_LIMIT,
+                format,
+            )?),
+            ModelListProtocol::Hybrid => Some(parse_model_list_query(
+                raw_query.as_deref(),
+                usize::MAX,
+                format,
+            )?),
+        };
         let config = state.config.current();
         if !config.models.dynamic_discovery {
-            return Ok::<_, ApiError>(model_list(fallback_models(&config), claude));
+            return model_list(fallback_models(&config), protocol, query.as_ref());
         }
         let (cached, fresh) = state.models.get(config.models.cache_ttl_ms);
         if !fresh && state.models.begin_refresh() {
@@ -692,40 +698,343 @@ pub async fn models(State(service): State<ServiceHttpState>, headers: HeaderMap)
         } else {
             cached
         };
-        Ok::<_, ApiError>(model_list(models, claude))
+        model_list(models, protocol, query.as_ref())
     }
     .await;
     result.unwrap_or_else(IntoResponse::into_response)
 }
 
-fn model_list(models: Vec<kproxy_kiro::ModelInfo>, claude: bool) -> Response {
-    let created = now_secs();
-    let data = models.into_iter().map(|model| {
-        let mut entry = json!({
-            "id": if claude { kproxy_translate::model::claude_discovery_model_id(&model.model_id) }
-                else { model.model_id.clone() },
-            "object":"model", "created":created, "owned_by":"kiro"
-        });
-        if claude {
-            entry["type"] = json!("model");
-            if !model.model_name.is_empty() { entry["display_name"] = json!(model.model_name); }
-            if !model.description.is_empty() { entry["description"] = json!(model.description); }
+const ANTHROPIC_MODEL_LIST_DEFAULT_LIMIT: usize = 20;
+const ANTHROPIC_MODEL_LIST_MAX_LIMIT: usize = 1_000;
+const UNKNOWN_MODEL_CREATED_AT: &str = "1970-01-01T00:00:00Z";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelListProtocol {
+    OpenAi,
+    Anthropic,
+    Hybrid,
+}
+
+impl ModelListProtocol {
+    fn error_format(self) -> ErrorFormat {
+        match self {
+            Self::Anthropic => ErrorFormat::Claude,
+            Self::OpenAi | Self::Hybrid => ErrorFormat::OpenAi,
         }
-        entry
-    }).collect::<Vec<_>>();
-    let mut result = json!({"object":"list", "data":data});
-    if claude {
-        result["has_more"] = json!(false);
-        result["first_id"] = data
-            .first()
-            .map(|entry| entry["id"].clone())
-            .unwrap_or(Value::Null);
-        result["last_id"] = data
-            .last()
-            .map(|entry| entry["id"].clone())
-            .unwrap_or(Value::Null);
     }
-    Json(result).into_response()
+}
+
+fn model_list_protocol(headers: &HeaderMap) -> ModelListProtocol {
+    let agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    // This endpoint is shared. A positively identified client takes priority;
+    // otherwise Anthropic's version header is an explicit protocol signal.
+    if is_claude_user_agent(agent) {
+        ModelListProtocol::Anthropic
+    } else if is_codex_user_agent(agent) {
+        ModelListProtocol::OpenAi
+    } else if headers.contains_key("anthropic-version") {
+        ModelListProtocol::Anthropic
+    } else {
+        ModelListProtocol::Hybrid
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AnthropicModelListQuery {
+    after_id: Option<String>,
+    before_id: Option<String>,
+    limit: usize,
+}
+
+impl Default for AnthropicModelListQuery {
+    fn default() -> Self {
+        Self {
+            after_id: None,
+            before_id: None,
+            limit: ANTHROPIC_MODEL_LIST_DEFAULT_LIMIT,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct OpenAiModelListResponse {
+    object: &'static str,
+    data: Vec<OpenAiModelResponse>,
+}
+
+#[derive(serde::Serialize)]
+struct OpenAiModelResponse {
+    id: String,
+    object: &'static str,
+    created: i64,
+    owned_by: &'static str,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct AnthropicModelResponse {
+    r#type: &'static str,
+    id: String,
+    capabilities: Value,
+    created_at: &'static str,
+    display_name: String,
+    max_input_tokens: Option<u32>,
+    max_tokens: Option<u32>,
+}
+
+#[derive(serde::Serialize)]
+struct AnthropicModelListResponse {
+    data: Vec<AnthropicModelResponse>,
+    first_id: Option<String>,
+    has_more: bool,
+    last_id: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct HybridModelResponse {
+    id: String,
+    object: &'static str,
+    created: i64,
+    owned_by: &'static str,
+    r#type: &'static str,
+    capabilities: Value,
+    created_at: &'static str,
+    display_name: String,
+    max_input_tokens: Option<u32>,
+    max_tokens: Option<u32>,
+}
+
+#[derive(serde::Serialize)]
+struct HybridModelListResponse {
+    object: &'static str,
+    data: Vec<HybridModelResponse>,
+    first_id: Option<String>,
+    has_more: bool,
+    last_id: Option<String>,
+}
+
+fn parse_model_list_query(
+    raw_query: Option<&str>,
+    default_limit: usize,
+    format: ErrorFormat,
+) -> Result<AnthropicModelListQuery, ApiError> {
+    let mut query = AnthropicModelListQuery {
+        limit: default_limit,
+        ..AnthropicModelListQuery::default()
+    };
+    for (name, value) in url::form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes()) {
+        match name.as_ref() {
+            "after_id" => {
+                if query.after_id.is_some() || value.is_empty() {
+                    return Err(invalid_model_list_query(
+                        "after_id must be a non-empty model ID and may appear only once",
+                        format,
+                    ));
+                }
+                query.after_id = Some(value.into_owned());
+            }
+            "before_id" => {
+                if query.before_id.is_some() || value.is_empty() {
+                    return Err(invalid_model_list_query(
+                        "before_id must be a non-empty model ID and may appear only once",
+                        format,
+                    ));
+                }
+                query.before_id = Some(value.into_owned());
+            }
+            "limit" => {
+                let limit = value.parse::<usize>().map_err(|_| {
+                    invalid_model_list_query("limit must be an integer from 1 to 1000", format)
+                })?;
+                if !(1..=ANTHROPIC_MODEL_LIST_MAX_LIMIT).contains(&limit) {
+                    return Err(invalid_model_list_query(
+                        "limit must be an integer from 1 to 1000",
+                        format,
+                    ));
+                }
+                query.limit = limit;
+            }
+            _ => {}
+        }
+    }
+    if query.after_id.is_some() && query.before_id.is_some() {
+        return Err(invalid_model_list_query(
+            "after_id and before_id cannot be used together",
+            format,
+        ));
+    }
+    Ok(query)
+}
+
+fn invalid_model_list_query(message: &str, format: ErrorFormat) -> ApiError {
+    ApiError::new(StatusCode::BAD_REQUEST, message, format)
+}
+
+fn model_list(
+    models: Vec<kproxy_kiro::ModelInfo>,
+    protocol: ModelListProtocol,
+    query: Option<&AnthropicModelListQuery>,
+) -> Result<Response, ApiError> {
+    match protocol {
+        ModelListProtocol::OpenAi => Ok(openai_model_list(models)),
+        ModelListProtocol::Anthropic => {
+            anthropic_model_list(models, query.cloned().unwrap_or_default())
+        }
+        ModelListProtocol::Hybrid => hybrid_model_list(
+            models,
+            query.cloned().unwrap_or(AnthropicModelListQuery {
+                limit: usize::MAX,
+                ..AnthropicModelListQuery::default()
+            }),
+        ),
+    }
+}
+
+fn openai_model_list(models: Vec<kproxy_kiro::ModelInfo>) -> Response {
+    let created = now_secs();
+    let data = models
+        .into_iter()
+        .map(|model| OpenAiModelResponse {
+            id: model.model_id,
+            object: "model",
+            created,
+            owned_by: "kiro",
+        })
+        .collect();
+    Json(OpenAiModelListResponse {
+        object: "list",
+        data,
+    })
+    .into_response()
+}
+
+fn anthropic_model_list(
+    models: Vec<kproxy_kiro::ModelInfo>,
+    query: AnthropicModelListQuery,
+) -> Result<Response, ApiError> {
+    let data = models
+        .into_iter()
+        .map(|model| {
+            let id = kproxy_translate::model::claude_discovery_model_id(&model.model_id);
+            let (max_input_tokens, max_tokens) = model
+                .token_limits
+                .map(|limits| (limits.max_input_tokens, limits.max_output_tokens))
+                .unwrap_or_default();
+            AnthropicModelResponse {
+                r#type: "model",
+                display_name: if model.model_name.trim().is_empty() {
+                    id.clone()
+                } else {
+                    model.model_name
+                },
+                id,
+                capabilities: Value::Null,
+                created_at: UNKNOWN_MODEL_CREATED_AT,
+                max_input_tokens,
+                max_tokens,
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let (start, end, has_more) = model_page_bounds(&data, &query, ErrorFormat::Claude, |model| {
+        model.id.as_str()
+    })?;
+    let page = data[start..end].to_vec();
+    let first_id = page.first().map(|model| model.id.clone());
+    let last_id = page.last().map(|model| model.id.clone());
+    Ok(Json(AnthropicModelListResponse {
+        data: page,
+        first_id,
+        has_more,
+        last_id,
+    })
+    .into_response())
+}
+
+fn hybrid_model_list(
+    models: Vec<kproxy_kiro::ModelInfo>,
+    query: AnthropicModelListQuery,
+) -> Result<Response, ApiError> {
+    let created = now_secs();
+    let data = models
+        .into_iter()
+        .map(|model| {
+            let id = kproxy_translate::model::claude_discovery_model_id(&model.model_id);
+            let (max_input_tokens, max_tokens) = model
+                .token_limits
+                .map(|limits| (limits.max_input_tokens, limits.max_output_tokens))
+                .unwrap_or_default();
+            HybridModelResponse {
+                object: "model",
+                created,
+                owned_by: "kiro",
+                r#type: "model",
+                capabilities: Value::Null,
+                created_at: UNKNOWN_MODEL_CREATED_AT,
+                display_name: if model.model_name.trim().is_empty() {
+                    id.clone()
+                } else {
+                    model.model_name
+                },
+                id,
+                max_input_tokens,
+                max_tokens,
+            }
+        })
+        .collect::<Vec<_>>();
+    let (start, end, has_more) = model_page_bounds(&data, &query, ErrorFormat::OpenAi, |model| {
+        model.id.as_str()
+    })?;
+    let page = data[start..end].to_vec();
+    let first_id = page.first().map(|model| model.id.clone());
+    let last_id = page.last().map(|model| model.id.clone());
+    Ok(Json(HybridModelListResponse {
+        object: "list",
+        data: page,
+        first_id,
+        has_more,
+        last_id,
+    })
+    .into_response())
+}
+
+fn model_page_bounds<T>(
+    data: &[T],
+    query: &AnthropicModelListQuery,
+    format: ErrorFormat,
+    id: impl Fn(&T) -> &str,
+) -> Result<(usize, usize, bool), ApiError> {
+    if let Some(after_id) = query.after_id.as_deref() {
+        let start = model_cursor_index(data, after_id, "after_id", format, &id)? + 1;
+        let end = start.saturating_add(query.limit).min(data.len());
+        Ok((start, end, end < data.len()))
+    } else if let Some(before_id) = query.before_id.as_deref() {
+        let end = model_cursor_index(data, before_id, "before_id", format, &id)?;
+        let start = end.saturating_sub(query.limit);
+        Ok((start, end, start > 0))
+    } else {
+        let end = query.limit.min(data.len());
+        Ok((0, end, end < data.len()))
+    }
+}
+
+fn model_cursor_index<T>(
+    data: &[T],
+    cursor: &str,
+    parameter: &str,
+    format: ErrorFormat,
+    id: impl Fn(&T) -> &str,
+) -> Result<usize, ApiError> {
+    data.iter()
+        .position(|model| id(model) == cursor)
+        .ok_or_else(|| {
+            invalid_model_list_query(
+                &format!("invalid pagination cursor for '{parameter}'"),
+                format,
+            )
+        })
 }
 
 pub async fn event_logging(
@@ -765,26 +1074,28 @@ pub async fn not_found(OriginalUri(uri): OriginalUri) -> Response {
 }
 
 pub(crate) fn fallback_models(config: &kproxy_core::config::Config) -> Vec<kproxy_kiro::ModelInfo> {
-    let mut models = kproxy_kiro::static_models()
-        .into_iter()
-        .map(|model| (model.model_id.clone(), model))
-        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut models = kproxy_kiro::static_models();
+    let mut model_ids = models
+        .iter()
+        .map(|model| model.model_id.clone())
+        .collect::<HashSet<_>>();
     let configured_ids = config
         .model_mapping
         .iter()
         .flat_map(|rule| rule.target_models.iter().cloned())
         .collect::<Vec<_>>();
     if !config.features.default_model_id.trim().is_empty() {
-        models
-            .entry(config.features.default_model_id.clone())
-            .or_insert_with(|| configured_model_info(config.features.default_model_id.clone()));
+        let model_id = config.features.default_model_id.clone();
+        if model_ids.insert(model_id.clone()) {
+            models.push(configured_model_info(model_id));
+        }
     }
     for model_id in configured_ids {
-        models
-            .entry(model_id.clone())
-            .or_insert_with(|| configured_model_info(model_id));
+        if model_ids.insert(model_id.clone()) {
+            models.push(configured_model_info(model_id));
+        }
     }
-    models.into_values().collect()
+    models
 }
 
 fn configured_model_info(model_id: String) -> kproxy_kiro::ModelInfo {

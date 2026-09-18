@@ -1,6 +1,6 @@
 //! Periodic refresh and persistence scheduler.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
@@ -587,7 +587,8 @@ pub(crate) async fn refresh_models(state: &Arc<AppState>) -> anyhow::Result<Stri
         state.models.finish_refresh(Vec::new());
         anyhow::bail!("no enabled account");
     }
-    let mut union = std::collections::BTreeMap::new();
+    let mut seen = HashSet::new();
+    let mut discovered = Vec::new();
     let mut failures = Vec::new();
     for account in accounts {
         match state.kiro().list_models(&account).await {
@@ -597,21 +598,30 @@ pub(crate) async fn refresh_models(state: &Arc<AppState>) -> anyhow::Result<Stri
                         .set_supported_models(models.iter().map(|model| model.model_id.clone()))
                         .await;
                 }
-                for model in models {
-                    union.entry(model.model_id.clone()).or_insert(model);
-                }
+                extend_discovered_models(&mut discovered, &mut seen, models);
             }
             Err(error) => failures.push(format!("{}: {error}", account.id)),
         }
     }
-    if union.is_empty() && !failures.is_empty() {
+    if discovered.is_empty() && !failures.is_empty() {
         state.models.finish_refresh(Vec::new());
         anyhow::bail!("model discovery failed: {}", failures.join("; "));
     }
-    let models = union.into_values().collect::<Vec<_>>();
-    let count = models.len();
-    state.models.finish_refresh(models);
+    let count = discovered.len();
+    state.models.finish_refresh(discovered);
     Ok(format!("ok: {count} models, {} failures", failures.len()))
+}
+
+fn extend_discovered_models(
+    discovered: &mut Vec<kproxy_kiro::ModelInfo>,
+    seen: &mut HashSet<String>,
+    models: Vec<kproxy_kiro::ModelInfo>,
+) {
+    for model in models {
+        if seen.insert(model.model_id.clone()) {
+            discovered.push(model);
+        }
+    }
 }
 
 async fn status_check(state: &Arc<AppState>) -> anyhow::Result<String> {
@@ -814,6 +824,42 @@ mod tests {
     use kproxy_store::config_loader::ConfigHandle;
 
     use super::*;
+
+    fn model(id: &str, name: &str) -> kproxy_kiro::ModelInfo {
+        kproxy_kiro::ModelInfo {
+            model_id: id.into(),
+            model_name: name.into(),
+            description: String::new(),
+            rate_multiplier: None,
+            token_limits: None,
+            additional_model_request_fields_schema: None,
+        }
+    }
+
+    #[test]
+    fn discovered_models_keep_upstream_order_and_first_metadata() {
+        let mut discovered = Vec::new();
+        let mut seen = HashSet::new();
+        extend_discovered_models(
+            &mut discovered,
+            &mut seen,
+            vec![model("model-b", "B first"), model("model-a", "A")],
+        );
+        extend_discovered_models(
+            &mut discovered,
+            &mut seen,
+            vec![model("model-b", "B duplicate"), model("model-c", "C")],
+        );
+
+        assert_eq!(
+            discovered
+                .iter()
+                .map(|model| model.model_id.as_str())
+                .collect::<Vec<_>>(),
+            ["model-b", "model-a", "model-c"]
+        );
+        assert_eq!(discovered[0].model_name, "B first");
+    }
 
     fn recorded_request() -> crate::stats::RequestLog {
         crate::stats::RequestLog {
