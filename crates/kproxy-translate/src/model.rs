@@ -215,6 +215,19 @@ pub struct ModelRoute {
     pub original: String,
     pub mapped: String,
     pub rule: Option<String>,
+    /// Index of the matched rule in the configuration slice. This lets the
+    /// provider gateway inspect the exact rule without relying on display
+    /// names, which are not required to be unique in legacy configurations.
+    pub rule_index: Option<usize>,
+}
+
+/// Provider-aware conditions used by the shared model mapping engine.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelMappingContext<'a> {
+    pub provider_id: &'a str,
+    pub service_id: Option<&'a str>,
+    pub api_key_id: Option<&'a str>,
+    pub remaining_percent: Option<f64>,
 }
 
 pub fn map_model(
@@ -224,9 +237,51 @@ pub fn map_model(
     remaining_percent: Option<f64>,
     default_model: &str,
 ) -> ModelRoute {
-    let mut ordered = rules.iter().filter(|rule| rule.enabled).collect::<Vec<_>>();
-    ordered.sort_by_key(|rule| rule.priority);
-    for rule in ordered {
+    map_model_for_provider(
+        model,
+        rules,
+        ModelMappingContext {
+            provider_id: "kiro",
+            service_id: None,
+            api_key_id,
+            remaining_percent,
+        },
+        default_model,
+    )
+}
+
+/// Applies the same mapping rules for any provider while preserving the legacy
+/// rule scope (`providers = []` means Kiro only).
+pub fn map_model_for_provider(
+    model: &str,
+    rules: &[ModelMappingRule],
+    context: ModelMappingContext<'_>,
+    default_model: &str,
+) -> ModelRoute {
+    let mut ordered = rules
+        .iter()
+        .enumerate()
+        .filter(|(_, rule)| rule.enabled)
+        .collect::<Vec<_>>();
+    ordered.sort_by_key(|(_, rule)| rule.priority);
+    for (rule_index, rule) in ordered {
+        let provider_matches = if rule.providers.is_empty() {
+            context.provider_id == "kiro"
+        } else {
+            rule.providers
+                .iter()
+                .any(|provider| provider == context.provider_id)
+        };
+        if !provider_matches {
+            continue;
+        }
+        if !rule.service_ids.is_empty()
+            && !context
+                .service_id
+                .is_some_and(|service| rule.service_ids.iter().any(|item| item == service))
+        {
+            continue;
+        }
         if !schedule_active(rule.schedule.as_ref()) {
             continue;
         }
@@ -238,20 +293,33 @@ pub fn map_model(
             continue;
         }
         if let Some(ids) = &rule.api_key_ids {
-            if !ids.is_empty() && !api_key_id.is_some_and(|id| ids.iter().any(|item| item == id)) {
+            if !ids.is_empty()
+                && !context
+                    .api_key_id
+                    .is_some_and(|id| ids.iter().any(|item| item == id))
+            {
                 continue;
             }
         }
         if let Some(maximum) = rule.max_remaining_credit_percent {
-            if remaining_percent.is_none_or(|value| value >= maximum) {
+            if context
+                .remaining_percent
+                .is_none_or(|value| value >= maximum)
+            {
                 continue;
             }
         }
         if let Some(mapped) = choose_target(rule) {
+            let mapped = mapped
+                .split_once('/')
+                .filter(|(provider, _)| *provider == context.provider_id)
+                .map_or(mapped.as_str(), |(_, model)| model)
+                .to_owned();
             return ModelRoute {
                 original: model.into(),
                 mapped,
                 rule: Some(rule.name.clone()),
+                rule_index: Some(rule_index),
             };
         }
     }
@@ -263,7 +331,14 @@ pub fn map_model(
             default_model.into()
         },
         rule: None,
+        rule_index: None,
     }
+}
+
+/// Matches a model permission pattern using the mapping engine's anchored glob
+/// semantics.
+pub fn model_glob_matches(pattern: &str, model: &str) -> bool {
+    glob(pattern, model)
 }
 
 fn schedule_active(schedule: Option<&ModelMappingSchedule>) -> bool {
@@ -1186,6 +1261,8 @@ mod tests {
             kind: "replace".into(),
             source_models: vec!["claude-4.6-sonnet".into()],
             target_models: vec!["claude-opus-4.6".into()],
+            providers: Vec::new(),
+            service_ids: Vec::new(),
             priority: 1,
             weights: None,
             max_remaining_credit_percent: None,
@@ -1213,6 +1290,8 @@ mod tests {
             kind: "replace".into(),
             source_models: vec!["claude-opus-*".into()],
             target_models: vec!["claude-sonnet-4.6".into()],
+            providers: Vec::new(),
+            service_ids: Vec::new(),
             priority: 1,
             weights: None,
             max_remaining_credit_percent: Some(10.0),
@@ -1234,5 +1313,28 @@ mod tests {
         let recovered = map_model("claude-opus-4.6", &[rule], None, Some(10.0), "");
         assert_eq!(recovered.mapped, "claude-opus-4.6");
         assert!(recovered.rule.is_none());
+    }
+
+    #[test]
+    fn same_provider_qualified_targets_become_provider_local_models() {
+        let rule = ModelMappingRule {
+            name: "qualified-local".into(),
+            source_models: vec!["team-fast".into()],
+            target_models: vec!["kiro/claude-sonnet-4.6".into()],
+            ..ModelMappingRule::default()
+        };
+
+        let route = map_model_for_provider(
+            "team-fast",
+            &[rule],
+            ModelMappingContext {
+                provider_id: "kiro",
+                ..ModelMappingContext::default()
+            },
+            "",
+        );
+
+        assert_eq!(route.mapped, "claude-sonnet-4.6");
+        assert_eq!(route.rule.as_deref(), Some("qualified-local"));
     }
 }

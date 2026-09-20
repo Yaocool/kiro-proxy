@@ -74,10 +74,58 @@ fn defaults_match_the_spec() {
     assert_eq!(config.log.retention_days, 3);
     assert_eq!(config.log.max_files_per_day, 3);
     assert!(config.model_mapping.is_empty());
+    assert!(config.provider.is_empty());
+    let providers = config.effective_providers();
+    assert_eq!(providers.len(), 1);
+    assert_eq!(providers[0].id, "kiro");
+    assert_eq!(providers[0].kind, "kiro");
+    assert!(providers[0].enabled);
     assert!(config.sso.start_url.is_empty());
     assert!(config.webhook.is_empty());
     assert!(config.api_key.is_empty());
     assert!(config.proxy_service.is_empty());
+}
+
+#[test]
+fn legacy_config_without_provider_stays_kiro_scoped() {
+    let config: Config = toml::from_str(
+        r#"
+[[api_key]]
+id = "ak_legacy"
+name = "legacy"
+key = "sk-legacy"
+
+[[proxy_service]]
+id = "svc_legacy"
+name = "legacy"
+host = "127.0.0.1"
+port = 5580
+api_key_ids = ["ak_legacy"]
+
+[[model_mapping]]
+name = "legacy-alias"
+type = "alias"
+source_models = ["team-fast"]
+target_models = ["claude-sonnet-4.6"]
+"#,
+    )
+    .expect("legacy config parses");
+
+    config.validate().expect("legacy config remains valid");
+    assert!(config.provider.is_empty());
+    assert_eq!(
+        config.default_provider_for_service(&config.proxy_service[0]),
+        "kiro"
+    );
+    assert_eq!(
+        config.allowed_providers_for_service(&config.proxy_service[0]),
+        vec!["kiro"]
+    );
+    assert_eq!(
+        config.allowed_providers_for_key(&config.api_key[0]),
+        vec!["kiro"]
+    );
+    assert!(config.model_mapping[0].providers.is_empty());
 }
 
 #[test]
@@ -199,6 +247,62 @@ fn uncomment_documented_settings() -> String {
 
 fn fully_populated_config() -> Config {
     let mut config = Config::default();
+    let mut provider = ProviderConfig {
+        id: "copilot".into(),
+        kind: "copilot".into(),
+        enabled: true,
+        pool: ProviderPoolConfig {
+            max_concurrent_per_account: 2,
+        },
+        models: ProviderModelsConfig {
+            cache_ttl_ms: 300_000,
+            max_stale_ms: 1_800_000,
+        },
+        routing: ProviderRoutingConfig::default(),
+        ..ProviderConfig::default()
+    };
+    provider
+        .settings
+        .insert("client_id".into(), serde_json::json!("Iv1.replace-me"));
+    provider
+        .settings
+        .insert("client_secret".into(), serde_json::json!("replace-me"));
+    provider
+        .settings
+        .insert("github_host".into(), serde_json::json!("github.com"));
+    provider.settings.insert(
+        "github_api_base".into(),
+        serde_json::json!("https://api.github.com"),
+    );
+    provider
+        .settings
+        .insert("oauth_base".into(), serde_json::json!("https://github.com"));
+    provider.settings.insert(
+        "api_token_refresh_before_secs".into(),
+        serde_json::json!(300),
+    );
+    provider.settings.insert(
+        "allowed_endpoint_hosts".into(),
+        serde_json::json!(["api.githubcopilot.com"]),
+    );
+    provider
+        .settings
+        .insert("allow_insecure_http".into(), serde_json::json!(false));
+    provider
+        .settings
+        .insert("editor_version".into(), serde_json::json!("vscode/1.104.0"));
+    provider.settings.insert(
+        "editor_plugin_version".into(),
+        serde_json::json!("copilot-chat/0.31.0"),
+    );
+    provider
+        .settings
+        .insert("integration_id".into(), serde_json::json!("vscode-chat"));
+    provider.settings.insert(
+        "user_agent".into(),
+        serde_json::json!("GitHubCopilotChat/0.31.0"),
+    );
+    config.provider.push(provider);
     config.server.tls.cert_path = Some("/cert.pem".into());
     config.server.tls.key_path = Some("/key.pem".into());
     config.server.tls.cert = Some("certificate".into());
@@ -211,6 +315,8 @@ fn fully_populated_config() -> Config {
         kind: "replace".into(),
         source_models: vec!["source".into()],
         target_models: vec!["target".into()],
+        providers: vec!["copilot".into()],
+        service_ids: vec!["svc_example".into()],
         priority: 1,
         weights: Some(vec![1]),
         max_remaining_credit_percent: Some(10.0),
@@ -245,6 +351,8 @@ fn fully_populated_config() -> Config {
         enabled: true,
         skip_user_agent_check: false,
         credits_limit: Some(100.0),
+        allowed_providers: vec!["copilot".into()],
+        allowed_models: vec!["copilot/claude-*".into(), "copilot/gpt-*".into()],
     });
     config.proxy_service.push(ProxyServiceConfig {
         id: "svc_example".into(),
@@ -254,6 +362,8 @@ fn fully_populated_config() -> Config {
         enabled: true,
         skip_user_agent_check: false,
         api_key_ids: vec!["ak_example".into()],
+        default_provider: "copilot".into(),
+        allowed_providers: vec!["copilot".into()],
         created_at: 1,
     });
     config
@@ -305,6 +415,47 @@ fn empty_toml_yields_defaults() {
     let parsed: Config = toml::from_str("").expect("empty toml must parse");
     assert_eq!(parsed.server.port, 5580);
     assert_eq!(parsed.pool.max_concurrent_per_account, 50);
+}
+
+#[test]
+fn provider_settings_accept_toml_scalars_and_arrays() {
+    let parsed: Config = toml::from_str(
+        r#"
+[[provider]]
+id = "copilot"
+kind = "copilot"
+
+[provider.settings]
+client_id = "client"
+api_token_refresh_before_secs = 300
+allowed_endpoint_hosts = ["copilot.example.com"]
+allow_insecure_http = false
+"#,
+    )
+    .expect("provider settings must deserialize");
+    let settings = &parsed.provider[0].settings;
+    assert_eq!(settings["client_id"], serde_json::json!("client"));
+    assert_eq!(
+        settings["api_token_refresh_before_secs"],
+        serde_json::json!(300)
+    );
+    assert_eq!(
+        settings["allowed_endpoint_hosts"],
+        serde_json::json!(["copilot.example.com"])
+    );
+    assert_eq!(settings["allow_insecure_http"], serde_json::json!(false));
+}
+
+#[test]
+fn built_in_kiro_provider_keeps_its_compatibility_id() {
+    let mut config = Config::default();
+    config.provider.push(ProviderConfig {
+        id: "kiro-secondary".into(),
+        kind: "kiro".into(),
+        ..ProviderConfig::default()
+    });
+    let error = config.validate().expect_err("Kiro alias must be rejected");
+    assert!(error.to_string().contains("must use id 'kiro'"), "{error}");
 }
 
 #[test]
@@ -444,6 +595,8 @@ fn rejects_non_local_host_without_api_key() {
         enabled: true,
         skip_user_agent_check: false,
         api_key_ids: vec!["ak_missing".into()],
+        default_provider: String::new(),
+        allowed_providers: Vec::new(),
         created_at: 0,
     });
     let error = config.validate().expect_err("public bind must fail");
@@ -461,6 +614,8 @@ fn accepts_non_local_host_with_enabled_api_key() {
         enabled: true,
         skip_user_agent_check: false,
         credits_limit: None,
+        allowed_providers: Vec::new(),
+        allowed_models: Vec::new(),
     });
     config.proxy_service.push(ProxyServiceConfig {
         id: "svc_test".into(),
@@ -470,6 +625,8 @@ fn accepts_non_local_host_with_enabled_api_key() {
         enabled: true,
         skip_user_agent_check: false,
         api_key_ids: vec!["ak_test".into()],
+        default_provider: String::new(),
+        allowed_providers: Vec::new(),
         created_at: 0,
     });
     config.validate().expect("public bind with key must pass");
@@ -487,6 +644,8 @@ fn treats_loopback_hosts_as_local() {
             enabled: true,
             skip_user_agent_check: false,
             credits_limit: None,
+            allowed_providers: Vec::new(),
+            allowed_models: Vec::new(),
         });
         config.proxy_service.push(ProxyServiceConfig {
             id: "svc_test".into(),
@@ -496,6 +655,8 @@ fn treats_loopback_hosts_as_local() {
             enabled: true,
             skip_user_agent_check: false,
             api_key_ids: vec!["ak_test".into()],
+            default_provider: String::new(),
+            allowed_providers: Vec::new(),
             created_at: 0,
         });
         config
@@ -515,6 +676,8 @@ fn rejects_disabled_api_key_as_public_credential() {
         enabled: false,
         skip_user_agent_check: false,
         credits_limit: None,
+        allowed_providers: Vec::new(),
+        allowed_models: Vec::new(),
     });
     config.proxy_service.push(ProxyServiceConfig {
         id: "svc_test".into(),
@@ -524,6 +687,8 @@ fn rejects_disabled_api_key_as_public_credential() {
         enabled: true,
         skip_user_agent_check: false,
         api_key_ids: vec!["ak_test".into()],
+        default_provider: String::new(),
+        allowed_providers: Vec::new(),
         created_at: 0,
     });
     assert!(config.validate().is_err());
@@ -580,4 +745,115 @@ fn socket_path_honours_development_environment() {
         default_socket_path_from(None, None),
         "/run/kproxy/admin.sock"
     );
+}
+
+#[test]
+fn provider_model_cache_staleness_cannot_be_shorter_than_ttl() {
+    let mut config = Config::default();
+    let mut provider = ProviderConfig::default();
+    provider.models.cache_ttl_ms = 60_000;
+    provider.models.max_stale_ms = 30_000;
+    config.provider = vec![provider];
+    let error = config
+        .validate()
+        .expect_err("provider stale window shorter than TTL must fail");
+    assert!(error.to_string().contains("max_stale_ms"), "{error}");
+}
+
+#[test]
+fn kiro_provider_id_cannot_be_reassigned_to_another_driver() {
+    let config = Config {
+        provider: vec![ProviderConfig {
+            id: "kiro".into(),
+            kind: "copilot".into(),
+            ..ProviderConfig::default()
+        }],
+        ..Config::default()
+    };
+    let error = config
+        .validate()
+        .expect_err("the legacy Kiro identity must stay reserved");
+    assert!(error.to_string().contains("reserved"), "{error}");
+}
+
+#[test]
+fn provider_credit_conditions_cannot_silently_cross_provider_boundaries() {
+    let mut config = Config {
+        provider: vec![
+            ProviderConfig::default(),
+            ProviderConfig {
+                id: "copilot".into(),
+                kind: "copilot".into(),
+                ..ProviderConfig::default()
+            },
+        ],
+        model_mapping: vec![ModelMappingRule {
+            name: "low-credit-cross-provider".into(),
+            source_models: vec!["claude-opus-*".into()],
+            target_models: vec!["copilot/gpt-test".into()],
+            max_remaining_credit_percent: Some(10.0),
+            ..ModelMappingRule::default()
+        }],
+        ..Config::default()
+    };
+    config.provider[0].routing.allow_cross_provider_fallback = true;
+
+    let error = config
+        .validate()
+        .expect_err("account-aware routing cannot change provider after Kiro selection");
+    assert!(
+        error
+            .to_string()
+            .contains("cannot route from Kiro to another provider"),
+        "{error}"
+    );
+
+    config.model_mapping[0].target_models = vec!["gpt-test".into()];
+    config.model_mapping[0].providers = vec!["copilot".into()];
+    let error = config
+        .validate()
+        .expect_err("Copilot has no Kiro credit percentage context");
+    assert!(
+        error
+            .to_string()
+            .contains("available only for the Kiro provider"),
+        "{error}"
+    );
+}
+
+#[test]
+fn cross_provider_mapping_requires_an_explicit_source_opt_in() {
+    let mut config = Config {
+        provider: vec![
+            ProviderConfig::default(),
+            ProviderConfig {
+                id: "copilot".into(),
+                kind: "copilot".into(),
+                ..ProviderConfig::default()
+            },
+        ],
+        model_mapping: vec![ModelMappingRule {
+            name: "kiro-to-copilot".into(),
+            source_models: vec!["team-fast".into()],
+            target_models: vec!["copilot/gpt-test".into()],
+            providers: vec!["kiro".into()],
+            ..ModelMappingRule::default()
+        }],
+        ..Config::default()
+    };
+
+    let error = config
+        .validate()
+        .expect_err("cross-provider routing must be explicitly enabled on the source");
+    assert!(
+        error
+            .to_string()
+            .contains("allow_cross_provider_fallback = true"),
+        "{error}"
+    );
+
+    config.provider[0].routing.allow_cross_provider_fallback = true;
+    config
+        .validate()
+        .expect("the source provider opt-in must enable the cross-provider rule");
 }

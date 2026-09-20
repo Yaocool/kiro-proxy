@@ -6,6 +6,40 @@ use thiserror::Error;
 
 /// 管理面方法名。
 pub mod method {
+    /// RPC/provider feature handshake.
+    pub const V2_CAPABILITIES: &str = "v2.capabilities";
+    /// List configured provider instances.
+    pub const V2_PROVIDER_LIST: &str = "v2.provider.list";
+    /// Show one provider instance.
+    pub const V2_PROVIDER_SHOW: &str = "v2.provider.show";
+    /// Aggregated provider-neutral account list.
+    pub const V2_ACCOUNT_LIST: &str = "v2.account.list";
+    /// Provider-neutral account detail.
+    pub const V2_ACCOUNT_SHOW: &str = "v2.account.show";
+    /// Import a provider token without placing it in argv.
+    pub const V2_ACCOUNT_IMPORT_TOKEN: &str = "v2.account.importToken";
+    /// Start provider-specific interactive login.
+    pub const V2_LOGIN_START: &str = "v2.login.start";
+    /// Poll an interactive login task.
+    pub const V2_LOGIN_STATUS: &str = "v2.login.status";
+    /// Cancel an interactive login task.
+    pub const V2_LOGIN_CANCEL: &str = "v2.login.cancel";
+    /// Enable or disable a provider-neutral account.
+    pub const V2_ACCOUNT_SET_ENABLED: &str = "v2.account.setEnabled";
+    /// Remove a provider-neutral account.
+    pub const V2_ACCOUNT_REMOVE: &str = "v2.account.remove";
+    /// Refresh a provider-neutral account.
+    pub const V2_ACCOUNT_REFRESH: &str = "v2.account.refresh";
+    /// Update provider-neutral account tags.
+    pub const V2_ACCOUNT_TAG: &str = "v2.account.tag";
+    /// Probe one provider-neutral account's authentication and model catalog.
+    pub const V2_ACCOUNT_PROBE: &str = "v2.account.probe";
+    /// Clear one provider-neutral account's transient health state.
+    pub const V2_ACCOUNT_RESET_HEALTH: &str = "v2.account.resetHealth";
+    /// Export provider-neutral accounts, optionally redacting credentials.
+    pub const V2_ACCOUNT_EXPORT: &str = "v2.account.export";
+    /// Aggregated provider-neutral model catalog.
+    pub const V2_MODELS: &str = "v2.models.list";
     /// 服务状态。
     pub const STATUS: &str = "status";
     /// 显示配置。
@@ -83,6 +117,23 @@ pub mod method {
 
     /// 全部方法名。
     pub const ALL: &[&str] = &[
+        V2_CAPABILITIES,
+        V2_PROVIDER_LIST,
+        V2_PROVIDER_SHOW,
+        V2_ACCOUNT_LIST,
+        V2_ACCOUNT_SHOW,
+        V2_ACCOUNT_IMPORT_TOKEN,
+        V2_LOGIN_START,
+        V2_LOGIN_STATUS,
+        V2_LOGIN_CANCEL,
+        V2_ACCOUNT_SET_ENABLED,
+        V2_ACCOUNT_REMOVE,
+        V2_ACCOUNT_REFRESH,
+        V2_ACCOUNT_TAG,
+        V2_ACCOUNT_PROBE,
+        V2_ACCOUNT_RESET_HEALTH,
+        V2_ACCOUNT_EXPORT,
+        V2_MODELS,
         STATUS,
         CONFIG_SHOW,
         CONFIG_RELOAD,
@@ -121,6 +172,65 @@ pub mod method {
         WEBHOOK_TEST,
         WEBHOOK_LOGS,
     ];
+}
+
+/// Common provider filter used by v2 read APIs.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderSelector {
+    /// Provider instance ID or `all`; omitted means all for v2 queries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Optional driver-kind filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_kind: Option<String>,
+}
+
+/// Provider-neutral account summary returned by v2 management APIs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderAccountSummary {
+    pub provider_id: String,
+    pub provider_kind: String,
+    pub id: String,
+    pub display_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    pub enabled: bool,
+    pub health: String,
+    pub auth_state: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_current: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_limit: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quota_unit: Option<String>,
+    #[serde(default)]
+    pub supported_models: Vec<String>,
+    #[serde(default)]
+    pub details: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderAccountListResult {
+    pub schema_version: u32,
+    pub scope: ProviderSelector,
+    pub accounts: Vec<ProviderAccountSummary>,
+    #[serde(default)]
+    pub errors: std::collections::BTreeMap<String, String>,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderModelListResult {
+    pub schema_version: u32,
+    pub scope: ProviderSelector,
+    pub models: Vec<kproxy_core::provider::ProviderModel>,
+    #[serde(default)]
+    pub errors: std::collections::BTreeMap<String, String>,
+    pub complete: bool,
 }
 
 /// 编解码错误。
@@ -238,6 +348,23 @@ pub fn decode_line<T: DeserializeOwned>(line: &str) -> Result<T, RpcCodecError> 
 
 /// `status` 结果。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderStatusView {
+    pub id: String,
+    pub kind: String,
+    pub enabled: bool,
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub account_total: usize,
+    #[serde(default)]
+    pub account_enabled: usize,
+    #[serde(default)]
+    pub account_available: usize,
+}
+
+/// `status` result for the daemon and its selected provider scope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusResult {
     /// daemon 版本。
     pub version: String,
@@ -335,6 +462,12 @@ pub struct StatusResult {
     /// readiness 降级原因。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub readiness_reasons: Vec<String>,
+    /// Provider selector used for this status view (`all` by default).
+    #[serde(default)]
+    pub provider_scope: String,
+    /// Per-provider lifecycle and account counts.
+    #[serde(default)]
+    pub providers: Vec<ProviderStatusView>,
 }
 
 /// API 代理服务运行视图。
@@ -350,6 +483,10 @@ pub struct ProxyServiceView {
     pub running: bool,
     #[serde(default)]
     pub api_key_ids: Vec<String>,
+    #[serde(default)]
+    pub default_provider: String,
+    #[serde(default)]
+    pub allowed_providers: Vec<String>,
     pub created_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -375,6 +512,10 @@ pub struct ProxyServiceCreateParams {
     pub api_key_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_format: Option<String>,
+    #[serde(default)]
+    pub allowed_providers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_provider: Option<String>,
 }
 
 /// 创建响应中的 API key 明文。
@@ -862,6 +1003,8 @@ mod tests {
             hint: Some("empty".into()),
             ready: true,
             readiness_reasons: Vec::new(),
+            provider_scope: "all".into(),
+            providers: Vec::new(),
         };
         let back: StatusResult =
             serde_json::from_str(&serde_json::to_string(&status).expect("serialize status"))

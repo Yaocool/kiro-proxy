@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::provider::ProviderId;
+
 /// Maximum number of immediately loaded tools accepted by the proxy.
 pub const MAX_LOADED_TOOLS: usize = 512;
 
@@ -599,6 +601,73 @@ fn default_socket_path_from(kproxy_home: Option<&str>, xdg_runtime: Option<&str>
     "/run/kproxy/admin.sock".into()
 }
 
+/// One configured model-provider instance.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderConfig {
+    /// Stable instance ID, independent from the driver kind.
+    pub id: String,
+    /// Driver kind such as `kiro` or `copilot`.
+    pub kind: String,
+    /// Whether this instance accepts new work.
+    pub enabled: bool,
+    /// Driver-specific settings. Unknown keys remain available to adapters.
+    #[serde(default)]
+    pub settings: BTreeMap<String, serde_json::Value>,
+    /// Per-provider scheduling limits.
+    pub pool: ProviderPoolConfig,
+    /// Per-provider model catalog settings.
+    pub models: ProviderModelsConfig,
+    /// Per-provider routing defaults.
+    pub routing: ProviderRoutingConfig,
+}
+
+impl Default for ProviderConfig {
+    fn default() -> Self {
+        Self {
+            id: "kiro".into(),
+            kind: "kiro".into(),
+            enabled: true,
+            settings: BTreeMap::new(),
+            pool: ProviderPoolConfig::default(),
+            models: ProviderModelsConfig::default(),
+            routing: ProviderRoutingConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderPoolConfig {
+    /// Optional provider-specific concurrency ceiling. Zero inherits the
+    /// legacy global account-pool limit.
+    pub max_concurrent_per_account: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderModelsConfig {
+    pub cache_ttl_ms: u64,
+    pub max_stale_ms: u64,
+}
+
+impl Default for ProviderModelsConfig {
+    fn default() -> Self {
+        Self {
+            cache_ttl_ms: 300_000,
+            max_stale_ms: 1_800_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProviderRoutingConfig {
+    pub default_model_id: String,
+    pub enable_model_fallback: bool,
+    pub allow_cross_provider_fallback: bool,
+}
+
 /// 模型映射规则。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelMappingRule {
@@ -616,6 +685,13 @@ pub struct ModelMappingRule {
     /// 目标模型。
     #[serde(default)]
     pub target_models: Vec<String>,
+    /// Provider instance scope. An omitted scope preserves the legacy Kiro
+    /// behavior instead of silently granting a newly added provider access.
+    #[serde(default)]
+    pub providers: Vec<String>,
+    /// Optional proxy-service scope.
+    #[serde(default)]
+    pub service_ids: Vec<String>,
     /// 数字越小优先级越高。
     #[serde(default)]
     pub priority: i32,
@@ -631,6 +707,25 @@ pub struct ModelMappingRule {
     /// 可选生效时间窗口。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<ModelMappingSchedule>,
+}
+
+impl Default for ModelMappingRule {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            enabled: true,
+            kind: "replace".into(),
+            source_models: Vec::new(),
+            target_models: Vec::new(),
+            providers: Vec::new(),
+            service_ids: Vec::new(),
+            priority: 0,
+            weights: None,
+            max_remaining_credit_percent: None,
+            api_key_ids: None,
+            schedule: None,
+        }
+    }
 }
 
 /// 模型映射生效时间窗口。
@@ -717,6 +812,30 @@ pub struct ApiKeyConfig {
     /// credits 上限。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub credits_limit: Option<f64>,
+    /// Provider instances this key may use. Empty means the legacy `kiro`
+    /// provider only.
+    #[serde(default)]
+    pub allowed_providers: Vec<String>,
+    /// Provider-qualified or unqualified model globs. Empty allows all models
+    /// within `allowed_providers`.
+    #[serde(default)]
+    pub allowed_models: Vec<String>,
+}
+
+impl Default for ApiKeyConfig {
+    fn default() -> Self {
+        Self {
+            id: None,
+            name: String::new(),
+            key: String::new(),
+            format: ApiKeyFormat::default(),
+            enabled: true,
+            skip_user_agent_check: false,
+            credits_limit: None,
+            allowed_providers: Vec::new(),
+            allowed_models: Vec::new(),
+        }
+    }
 }
 
 /// 一个独立的 API 代理监听实例。
@@ -739,9 +858,32 @@ pub struct ProxyServiceConfig {
     /// 允许访问此服务的 API key ID。
     #[serde(default)]
     pub api_key_ids: Vec<String>,
+    /// Provider selected for an unqualified model ID. Empty means `kiro`.
+    #[serde(default)]
+    pub default_provider: String,
+    /// Provider instances exposed by this listener. Empty means `kiro`.
+    #[serde(default)]
+    pub allowed_providers: Vec<String>,
     /// 创建时间（Unix 秒）。
     #[serde(default)]
     pub created_at: i64,
+}
+
+impl Default for ProxyServiceConfig {
+    fn default() -> Self {
+        Self {
+            id: String::new(),
+            name: String::new(),
+            host: String::new(),
+            port: 0,
+            enabled: true,
+            skip_user_agent_check: false,
+            api_key_ids: Vec::new(),
+            default_provider: String::new(),
+            allowed_providers: Vec::new(),
+            created_at: 0,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -811,6 +953,10 @@ pub struct Config {
     pub admin: AdminConfig,
     /// IAM Identity Center SSO defaults.
     pub sso: SsoConfig,
+    /// Model-provider instances. An empty list is interpreted as one enabled
+    /// legacy `kiro` instance for backward compatibility.
+    #[serde(default, rename = "provider")]
+    pub provider: Vec<ProviderConfig>,
     /// 模型映射列表。
     #[serde(default, rename = "model_mapping")]
     pub model_mapping: Vec<ModelMappingRule>,
@@ -841,6 +987,37 @@ fn is_local_host(host: &str) -> bool {
 }
 
 impl Config {
+    /// Provider instances after applying the legacy no-provider migration.
+    pub fn effective_providers(&self) -> Vec<ProviderConfig> {
+        if self.provider.is_empty() {
+            vec![ProviderConfig::default()]
+        } else {
+            self.provider.clone()
+        }
+    }
+
+    /// Provider IDs allowed for a key, preserving legacy Kiro-only access.
+    pub fn allowed_providers_for_key<'a>(&self, key: &'a ApiKeyConfig) -> Vec<&'a str> {
+        effective_provider_scope(&key.allowed_providers)
+    }
+
+    /// Provider IDs allowed for a service, preserving legacy Kiro-only access.
+    pub fn allowed_providers_for_service<'a>(
+        &self,
+        service: &'a ProxyServiceConfig,
+    ) -> Vec<&'a str> {
+        effective_provider_scope(&service.allowed_providers)
+    }
+
+    /// Default provider for one service.
+    pub fn default_provider_for_service<'a>(&self, service: &'a ProxyServiceConfig) -> &'a str {
+        if service.default_provider.trim().is_empty() {
+            "kiro"
+        } else {
+            service.default_provider.as_str()
+        }
+    }
+
     /// 是否存在启用且非空的 API key。
     pub fn has_enabled_api_key(&self) -> bool {
         self.api_key
@@ -1124,6 +1301,45 @@ impl Config {
                 "max_file_size_mb, retention_days, and max_files_per_day must be positive",
             );
         }
+        let effective_providers = self.effective_providers();
+        let mut provider_ids = BTreeSet::new();
+        for (index, provider) in effective_providers.iter().enumerate() {
+            ProviderId::parse(provider.id.clone()).map_err(|error| ConfigError::InvalidValue {
+                field: format!("provider.{index}.id"),
+                message: error.to_string(),
+            })?;
+            if !provider_ids.insert(provider.id.as_str()) {
+                return invalid_config(format!("provider.{index}.id"), "must be unique");
+            }
+            if provider.kind.trim().is_empty() {
+                return invalid_config(format!("provider.{index}.kind"), "must not be empty");
+            }
+            if provider.kind == "kiro" && provider.id != "kiro" {
+                return invalid_config(
+                    format!("provider.{index}.id"),
+                    "the built-in Kiro compatibility provider must use id 'kiro'",
+                );
+            }
+            if provider.id == "kiro" && provider.kind != "kiro" {
+                return invalid_config(
+                    format!("provider.{index}.kind"),
+                    "provider id 'kiro' is reserved for the built-in Kiro compatibility provider",
+                );
+            }
+            if provider.models.cache_ttl_ms == 0 || provider.models.max_stale_ms == 0 {
+                return invalid_config(
+                    format!("provider.{index}.models"),
+                    "cache_ttl_ms and max_stale_ms must be greater than zero",
+                );
+            }
+            if provider.models.max_stale_ms < provider.models.cache_ttl_ms {
+                return invalid_config(
+                    format!("provider.{index}.models.max_stale_ms"),
+                    "must be greater than or equal to cache_ttl_ms",
+                );
+            }
+        }
+
         let mut api_key_ids = BTreeSet::new();
         let mut api_key_names = BTreeSet::new();
         let mut api_key_values = BTreeSet::new();
@@ -1157,6 +1373,11 @@ impl Config {
                     "must be a finite non-negative number",
                 );
             }
+            validate_provider_scope(
+                &format!("api_key.{index}.allowed_providers"),
+                &key.allowed_providers,
+                &provider_ids,
+            )?;
         }
         let mut service_ids = BTreeSet::new();
         let mut service_names = BTreeSet::new();
@@ -1185,6 +1406,24 @@ impl Config {
                 return invalid_config(
                     format!("{field}.api_key_ids"),
                     "at least one API key is required",
+                );
+            }
+            validate_provider_scope(
+                &format!("{field}.allowed_providers"),
+                &service.allowed_providers,
+                &provider_ids,
+            )?;
+            let default_provider = self.default_provider_for_service(service);
+            if !provider_ids.contains(default_provider) {
+                return invalid_config(
+                    format!("{field}.default_provider"),
+                    format!("references unknown provider {default_provider}"),
+                );
+            }
+            if !effective_provider_scope(&service.allowed_providers).contains(&default_provider) {
+                return invalid_config(
+                    format!("{field}.default_provider"),
+                    "must be included in allowed_providers",
                 );
             }
             let mut bound_ids = BTreeSet::new();
@@ -1229,6 +1468,42 @@ impl Config {
                     "enabled rules require source_models and target_models",
                 );
             }
+            validate_provider_scope(
+                &format!("model_mapping.{index}.providers"),
+                &rule.providers,
+                &provider_ids,
+            )?;
+            if rule.enabled {
+                for source_provider in effective_provider_scope(&rule.providers) {
+                    let allows_cross_provider = effective_providers
+                        .iter()
+                        .find(|provider| provider.id == source_provider)
+                        .is_some_and(|provider| provider.routing.allow_cross_provider_fallback);
+                    let cross_target = rule.target_models.iter().find_map(|target| {
+                        target.split_once('/').and_then(|(target_provider, _)| {
+                            (target_provider != source_provider
+                                && provider_ids.contains(target_provider))
+                            .then_some(target_provider)
+                        })
+                    });
+                    if let Some(target_provider) = cross_target.filter(|_| !allows_cross_provider) {
+                        return invalid_config(
+                            format!("model_mapping.{index}.target_models"),
+                            format!(
+                                "routing from provider {source_provider} to {target_provider} requires provider {source_provider} routing.allow_cross_provider_fallback = true"
+                            ),
+                        );
+                    }
+                }
+            }
+            for service_id in &rule.service_ids {
+                if !service_ids.contains(service_id.as_str()) {
+                    return invalid_config(
+                        format!("model_mapping.{index}.service_ids"),
+                        format!("references unknown proxy service {service_id}"),
+                    );
+                }
+            }
             if let Some(weights) = &rule.weights {
                 if weights.len() != rule.target_models.len()
                     || weights.iter().all(|weight| *weight == 0)
@@ -1247,6 +1522,26 @@ impl Config {
                     format!("model_mapping.{index}.max_remaining_credit_percent"),
                     "must be in 0..=100",
                 );
+            }
+            if rule.max_remaining_credit_percent.is_some() {
+                let scoped_providers = effective_provider_scope(&rule.providers);
+                if scoped_providers.iter().any(|provider| *provider != "kiro") {
+                    return invalid_config(
+                        format!("model_mapping.{index}.providers"),
+                        "max_remaining_credit_percent is available only for the Kiro provider",
+                    );
+                }
+                let crosses_provider = rule.target_models.iter().any(|target| {
+                    target.split_once('/').is_some_and(|(target_provider, _)| {
+                        target_provider != "kiro" && provider_ids.contains(target_provider)
+                    })
+                });
+                if crosses_provider {
+                    return invalid_config(
+                        format!("model_mapping.{index}.max_remaining_credit_percent"),
+                        "account-credit conditions cannot route from Kiro to another provider",
+                    );
+                }
             }
             if let Some(schedule) = &rule.schedule {
                 if schedule
@@ -1347,6 +1642,31 @@ fn invalid_config<T>(
     })
 }
 
+fn effective_provider_scope(values: &[String]) -> Vec<&str> {
+    if values.is_empty() {
+        vec!["kiro"]
+    } else {
+        values.iter().map(String::as_str).collect()
+    }
+}
+
+fn validate_provider_scope(
+    field: &str,
+    values: &[String],
+    provider_ids: &BTreeSet<&str>,
+) -> Result<(), ConfigError> {
+    let mut seen = BTreeSet::new();
+    for provider_id in effective_provider_scope(values) {
+        if !seen.insert(provider_id) {
+            return invalid_config(field, "must not contain duplicate provider IDs");
+        }
+        if !provider_ids.contains(provider_id) {
+            return invalid_config(field, format!("references unknown provider {provider_id}"));
+        }
+    }
+    Ok(())
+}
+
 /// 首次运行写入的默认配置，每个字段附说明。
 pub const DEFAULT_CONFIG_TOML: &str = r#"# ============================================================================
 # kiro-proxy 配置文件
@@ -1360,7 +1680,64 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# =====================================
 # - `*_ms` 的单位是毫秒，`*_tokens` 的单位是 token，credits 支持小数。
 # - daemon 会监听文件并热重载；仅 `admin.socket` 和 TLS enabled 模式切换需重启。
 # - 修改已有服务/API key/模型映射时，优先使用 `kproxy service`、
-#   `kproxy apikey`、`kproxy model-map` 等命令，以免写错关联 ID。
+#   `kproxy provider`、`kproxy apikey`、`kproxy model-map` 等命令，以免写错关联 ID。
+
+# ----------------------------------------------------------------------------
+# 模型提供源实例（可重复数组）
+# ----------------------------------------------------------------------------
+# 未配置任何 [[provider]] 时自动使用旧版 Kiro 提供源。只要开始显式配置，必须把
+# 仍需使用的 Kiro 实例也写成 id="kiro"、kind="kiro"。推荐使用
+# `kproxy provider add/edit/enable/disable/delete` 管理。
+
+# GitHub Copilot 提供源示例。
+# [[provider]]
+# 稳定实例 ID；小写字母开头，只能包含小写字母、数字和连字符。
+# id = "copilot"
+# 驱动类型；当前内置 "kiro" 和 "copilot"。
+# kind = "copilot"
+# 是否接受新请求。
+# enabled = true
+
+# [provider.settings]
+# GitHub Device Flow 使用的 OAuth client ID；导入现成 token 时可以不配置。
+# client_id = "Iv1.replace-me"
+# OAuth 应用启用 expiring user token 时，刷新可能需要 client secret。
+# client_secret = "replace-me"
+# GitHub Enterprise 主机标识。
+# github_host = "github.com"
+# GitHub REST API 根地址。
+# github_api_base = "https://api.github.com"
+# GitHub Device Flow / OAuth 根地址。
+# oauth_base = "https://github.com"
+# Copilot API token 到期前提前刷新的秒数。
+# api_token_refresh_before_secs = 300
+# 动态 token 返回自定义 Copilot endpoint 时允许的额外主机。
+# allowed_endpoint_hosts = ["api.githubcopilot.com"]
+# 仅供本地 mock 测试；生产环境必须保持 false。
+# allow_insecure_http = false
+# 发往 Copilot 的编辑器身份头。
+# editor_version = "vscode/1.104.0"
+# editor_plugin_version = "copilot-chat/0.31.0"
+# integration_id = "vscode-chat"
+# user_agent = "GitHubCopilotChat/0.31.0"
+
+# [provider.pool]
+# 单个账号并发上限；0 使用驱动默认值。
+# max_concurrent_per_account = 2
+
+# [provider.models]
+# 模型发现缓存有效期。
+# cache_ttl_ms = 300000
+# 上游发现失败时允许继续使用旧缓存的最长时间。
+# max_stale_ms = 1800000
+
+# [provider.routing]
+# 未命中映射时使用的模型；空字符串保留请求模型。
+# default_model_id = ""
+# 是否允许驱动在同一提供源内自动降级模型。
+# enable_model_fallback = false
+# 是否允许映射规则把请求转发到另一提供源。
+# allow_cross_provider_fallback = false
 
 # ----------------------------------------------------------------------------
 # API 服务共享配置
@@ -1663,6 +2040,10 @@ start_url = ""
 # skip_user_agent_check = false
 # 该 key 的累计 credits 上限；不配置表示不限，0 会禁止产生任何新消耗。
 # credits_limit = 5000.0
+# 该 key 可访问的提供源；省略或空数组保持旧版 Kiro-only 语义。
+# allowed_providers = ["copilot"]
+# 允许的模型 glob；可写成 provider/model，空数组允许范围内全部模型。
+# allowed_models = ["copilot/claude-*", "copilot/gpt-*"]
 
 # 单个代理监听实例示例。每增加一个服务，就增加一个 `[[proxy_service]]` 块。
 # [[proxy_service]]
@@ -1680,6 +2061,10 @@ start_url = ""
 # skip_user_agent_check = false
 # 允许访问该服务的 API key ID；至少一个，且都必须存在于 [[api_key]]。
 # api_key_ids = ["ak_example"]
+# 未带 provider/ 前缀的请求默认发送到哪个提供源。
+# default_provider = "copilot"
+# 该监听实例公开的提供源；省略或空数组保持旧版 Kiro-only 语义。
+# allowed_providers = ["copilot"]
 # 创建时间（Unix 秒）；由 CLI 创建时自动填写。
 # created_at = 0
 
@@ -1700,6 +2085,10 @@ start_url = ""
 # source_models = ["claude-opus-4*"]
 # 映射后的目标模型列表；replace/alias 通常配置一个，loadbalance 可配置多个。
 # target_models = ["claude-sonnet-4.6"]
+# 规则作用的提供源；省略或空数组只作用于 Kiro，避免新来源意外继承旧规则。
+# providers = ["copilot"]
+# 规则作用的代理服务 ID；空数组表示不限制服务。
+# service_ids = ["svc_example"]
 # 数字越小优先级越高。
 # priority = 10
 # loadbalance 各目标的权重；数量必须与 target_models 相同，且至少一个大于 0。
