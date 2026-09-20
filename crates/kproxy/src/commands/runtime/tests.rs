@@ -1,5 +1,45 @@
 use super::*;
 
+#[test]
+fn implicit_kiro_can_be_materialized_for_provider_mutations() {
+    let mut providers = Vec::new();
+    materialize_implicit_kiro(&mut providers, "kiro");
+
+    assert_eq!(providers.len(), 1);
+    assert!(provider_value_matches(&providers[0], "kiro"));
+    assert_eq!(
+        providers[0]
+            .as_table()
+            .and_then(|provider| provider.get("enabled"))
+            .and_then(toml::Value::as_bool),
+        Some(true)
+    );
+}
+
+#[test]
+fn deleting_the_only_kiro_provider_cannot_reenable_it_implicitly() {
+    let mut providers = vec![provider_table("kiro", "kiro", false)];
+
+    let error = remove_provider_config(&mut providers, "kiro")
+        .expect_err("the sole Kiro provider must remain explicit");
+
+    assert!(error.to_string().contains("cannot be deleted"));
+    assert_eq!(providers.len(), 1);
+    assert!(provider_value_matches(&providers[0], "kiro"));
+}
+
+#[test]
+fn deleting_the_last_non_kiro_provider_cannot_activate_implicit_kiro() {
+    let mut providers = vec![provider_table("copilot", "copilot", true)];
+
+    let error = remove_provider_config(&mut providers, "copilot")
+        .expect_err("the final explicit provider must not be replaced implicitly");
+
+    assert!(error.to_string().contains("last configured provider"));
+    assert_eq!(providers.len(), 1);
+    assert!(provider_value_matches(&providers[0], "copilot"));
+}
+
 fn pool_output_fixture() -> PoolOutput {
     PoolOutput {
         model: "claude-opus-5".into(),

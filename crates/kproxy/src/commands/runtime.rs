@@ -25,7 +25,11 @@ use crate::ModelMapCommand;
 pub enum ServiceCommand {
     /// 列出 API 代理服务。
     #[command(after_help = "示例：\n  kproxy service list\n  kproxy --json service list")]
-    List,
+    List {
+        /// 只显示允许该提供源的服务；`all` 等同于不筛选。
+        #[arg(long)]
+        provider: Option<String>,
+    },
     /// 显示单个 API 代理服务详情。
     #[command(
         after_help = "示例：\n  kproxy service show main\n  kproxy --json service show svc_abcd"
@@ -57,6 +61,12 @@ pub enum ServiceCommand {
         api_key_name: Option<String>,
         #[arg(long, default_value = "sk")]
         api_key_format: String,
+        /// 服务和首个 API key 允许使用的提供源，可重复或逗号分隔。
+        #[arg(long = "provider", value_delimiter = ',')]
+        providers: Vec<String>,
+        /// 未带 provider 前缀的模型请求使用的提供源。
+        #[arg(long)]
+        default_provider: Option<String>,
     },
     /// 修改服务名称、监听地址、端口或绑定的 API key。
     #[command(
@@ -83,6 +93,15 @@ pub enum ServiceCommand {
         /// 移除绑定的 API key ID 或名称，可重复或逗号分隔。
         #[arg(long, value_delimiter = ',', value_name = "KEY")]
         remove_api_key: Vec<String>,
+        /// 替换服务允许的提供源，可重复或逗号分隔。
+        #[arg(long = "provider", value_delimiter = ',')]
+        providers: Vec<String>,
+        /// 清空显式范围并恢复为旧版 Kiro-only 语义。
+        #[arg(long)]
+        clear_providers: bool,
+        /// 修改未带 provider 前缀的默认提供源。
+        #[arg(long)]
+        default_provider: Option<String>,
     },
     /// 启动已停用的 API 代理服务。
     #[command(after_help = "示例：\n  kproxy service enable main")]
@@ -130,6 +149,9 @@ pub enum ApiKeyCommand {
         /// 展示每个 API key 的 token/credits 消耗明细。
         #[arg(long)]
         detail: bool,
+        /// 只显示允许该提供源的 key，并只统计该来源用量。
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// 显示单个 API key 的配置和累计用量，不显示密钥明文。
     #[command(
@@ -159,6 +181,12 @@ pub enum ApiKeyCommand {
             default_value_t = false
         )]
         skip_user_agent_check: bool,
+        /// 允许使用的提供源，可重复或逗号分隔；省略时仅允许 Kiro。
+        #[arg(long = "provider", value_delimiter = ',')]
+        providers: Vec<String>,
+        /// 允许的模型 glob，可使用 provider/model 形式。
+        #[arg(long = "model", value_delimiter = ',')]
+        models: Vec<String>,
     },
     /// 修改 API key 配置。
     #[command(
@@ -168,7 +196,17 @@ pub enum ApiKeyCommand {
         id: String,
         /// 设置是否允许该 key 跳过客户端 User-Agent 校验。
         #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
-        skip_user_agent_check: bool,
+        skip_user_agent_check: Option<bool>,
+        /// 替换允许使用的提供源。
+        #[arg(long = "provider", value_delimiter = ',')]
+        providers: Vec<String>,
+        #[arg(long)]
+        clear_providers: bool,
+        /// 替换允许的模型 glob。
+        #[arg(long = "model", value_delimiter = ',')]
+        models: Vec<String>,
+        #[arg(long)]
+        clear_models: bool,
     },
     /// 删除 API key，执行前需输入 y 或 yes 确认。
     #[command(
@@ -202,7 +240,11 @@ pub enum ApiKeyCommand {
     #[command(
         after_help = "示例：\n  kproxy apikey usage ak_ab12\n  kproxy --json apikey usage ak_ab12"
     )]
-    Usage { id: String },
+    Usage {
+        id: String,
+        #[arg(long)]
+        provider: Option<String>,
+    },
     /// 查看 API key 的最近请求历史。
     #[command(
         after_help = "示例：\n  kproxy apikey history ak_ab12\n  kproxy apikey history ak_ab12 --tail 200"
@@ -211,6 +253,8 @@ pub enum ApiKeyCommand {
         id: String,
         #[arg(long, default_value_t = 50)]
         tail: usize,
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// 清除 API key 的全部累计用量，执行前需确认。
     #[command(
@@ -452,10 +496,68 @@ struct PoolAccountOutput {
 
 pub async fn show_pool(
     client: &mut AdminClient,
+    provider: &str,
     model: &str,
     explain: bool,
     json: bool,
 ) -> Result<()> {
+    if provider != "kiro" {
+        let value: serde_json::Value = client
+            .call(
+                method::V2_ACCOUNT_LIST,
+                serde_json::json!({"provider":provider}),
+            )
+            .await?;
+        if json {
+            return print_json(&serde_json::json!({
+                "provider":provider,
+                "model":model,
+                "accounts":value["accounts"]
+            }));
+        }
+        let accounts = value["accounts"]
+            .as_array()
+            .ok_or_else(|| anyhow!("daemon 返回的 provider 账号池无效"))?;
+        let rows = accounts
+            .iter()
+            .map(|account| {
+                let models = account["supported_models"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>();
+                let enabled = account["enabled"].as_bool().unwrap_or(false);
+                let supports = models.contains(&model);
+                vec![
+                    account["provider_id"].as_str().unwrap_or("-").into(),
+                    account["id"].as_str().unwrap_or("-").into(),
+                    account["display_name"].as_str().unwrap_or("-").into(),
+                    if enabled && supports {
+                        "可调度"
+                    } else {
+                        "不可调度"
+                    }
+                    .into(),
+                    account["auth_state"].as_str().unwrap_or("unknown").into(),
+                    if models.is_empty() {
+                        "-".into()
+                    } else {
+                        models.join(",")
+                    },
+                ]
+            })
+            .collect::<Vec<_>>();
+        println!("提供源 {provider}  模型 {model}  账号 {}", rows.len());
+        println!(
+            "{}",
+            render_table(
+                &["提供源", "账号", "名称", "状态", "认证", "已发现模型"],
+                &rows
+            )
+        );
+        return Ok(());
+    }
     let value: serde_json::Value = client
         .call(method::POOL, serde_json::json!({"model":model}))
         .await?;
@@ -693,9 +795,12 @@ pub async fn run_service(
     json: bool,
 ) -> Result<()> {
     match command {
-        ServiceCommand::List => {
+        ServiceCommand::List { provider } => {
             let result: ProxyServiceListResult = client
-                .call(method::SERVICE_LIST, serde_json::json!({}))
+                .call(
+                    method::SERVICE_LIST,
+                    serde_json::json!({"provider":provider}),
+                )
                 .await?;
             if json {
                 print_json(&result)?;
@@ -718,13 +823,35 @@ pub async fn run_service(
                                 "disabled".into()
                             },
                             service.api_key_ids.len().to_string(),
+                            if service.allowed_providers.is_empty() {
+                                "kiro".into()
+                            } else {
+                                service.allowed_providers.join(",")
+                            },
+                            if service.default_provider.is_empty() {
+                                "kiro".into()
+                            } else {
+                                service.default_provider
+                            },
                             service.error.unwrap_or_default(),
                         ]
                     })
                     .collect::<Vec<_>>();
                 println!(
                     "{}",
-                    render_table(&["ID", "名称", "监听", "状态", "API Keys", "错误"], &rows)
+                    render_table(
+                        &[
+                            "ID",
+                            "名称",
+                            "监听",
+                            "状态",
+                            "API Keys",
+                            "提供源",
+                            "默认源",
+                            "错误",
+                        ],
+                        &rows,
+                    )
                 );
             }
             Ok(())
@@ -737,6 +864,8 @@ pub async fn run_service(
             skip_user_agent_check,
             api_key_name,
             api_key_format,
+            providers,
+            default_provider,
         } => {
             let result: ProxyServiceCreateResult = client
                 .call(
@@ -747,7 +876,9 @@ pub async fn run_service(
                         "port":port,
                         "skip_user_agent_check":skip_user_agent_check,
                         "api_key_name":api_key_name,
-                        "api_key_format":api_key_format
+                        "api_key_format":api_key_format,
+                        "allowed_providers":providers,
+                        "default_provider":default_provider
                     }),
                 )
                 .await?;
@@ -779,6 +910,9 @@ pub async fn run_service(
             skip_user_agent_check,
             add_api_key,
             remove_api_key,
+            providers,
+            clear_providers,
+            default_provider,
         } => {
             if rename.is_none()
                 && host.is_none()
@@ -786,9 +920,12 @@ pub async fn run_service(
                 && skip_user_agent_check.is_none()
                 && add_api_key.is_empty()
                 && remove_api_key.is_empty()
+                && providers.is_empty()
+                && !clear_providers
+                && default_provider.is_none()
             {
                 return Err(anyhow!(
-                    "没有指定修改项；请使用 --rename、--host、--port、--skip-user-agent-check、--add-api-key 或 --remove-api-key"
+                    "没有指定修改项；请使用 --rename、--host、--port、--skip-user-agent-check、--add-api-key、--remove-api-key、--provider 或 --default-provider"
                 ));
             }
             let result_selector = rename.clone().unwrap_or_else(|| service.clone());
@@ -813,6 +950,12 @@ pub async fn run_service(
                 if let Some(skip) = skip_user_agent_check {
                     table.insert("skip_user_agent_check".into(), toml::Value::Boolean(skip));
                 }
+                if clear_providers {
+                    table.remove("allowed_providers");
+                } else if !providers.is_empty() {
+                    table.insert("allowed_providers".into(), string_array_value(&providers));
+                }
+                replace_optional_string(table, "default_provider", default_provider.as_deref());
                 let key_ids = table
                     .entry("api_key_ids")
                     .or_insert_with(|| toml::Value::Array(Vec::new()))
@@ -1000,6 +1143,19 @@ async fn show_service(client: &mut AdminClient, selector: &str, json: bool) -> R
             service.api_key_ids.join(",")
         }
     );
+    println!(
+        "提供源    {} (默认 {})",
+        if service.allowed_providers.is_empty() {
+            "kiro".into()
+        } else {
+            service.allowed_providers.join(",")
+        },
+        if service.default_provider.is_empty() {
+            "kiro"
+        } else {
+            &service.default_provider
+        }
+    );
     if let Some(error) = service.error.filter(|error| !error.is_empty()) {
         println!("错误      {error}");
     }
@@ -1073,10 +1229,14 @@ async fn show_keys(
     client: &mut AdminClient,
     selected: Option<&str>,
     tail: Option<usize>,
+    provider: Option<&str>,
     json: bool,
 ) -> Result<()> {
     let mut value: serde_json::Value = client
-        .call(method::APIKEY_LIST, serde_json::json!({}))
+        .call(
+            method::APIKEY_LIST,
+            serde_json::json!({"provider":provider}),
+        )
         .await?;
     if let Some(id) = selected {
         let entry = value
@@ -1151,6 +1311,246 @@ async fn mutate_config_array(
         mutate(array)
     })
     .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn add_provider(
+    client: &mut AdminClient,
+    id: &str,
+    kind: &str,
+    settings: &[String],
+    max_concurrent_per_account: Option<usize>,
+    default_model: Option<&str>,
+    disabled: bool,
+    json: bool,
+) -> Result<()> {
+    let settings = parse_provider_settings(settings)?;
+    mutate_config_array(client, "provider", |array| {
+        if array.is_empty() && id != "kiro" {
+            array.push(provider_table("kiro", "kiro", true));
+        }
+        if array.iter().any(|value| provider_value_matches(value, id)) {
+            return Err(anyhow!("provider already exists: {id}"));
+        }
+        let mut value = provider_table(id, kind, !disabled);
+        let table = value.as_table_mut().expect("provider table");
+        if !settings.is_empty() {
+            table.insert("settings".into(), toml::Value::Table(settings.clone()));
+        }
+        if let Some(limit) = max_concurrent_per_account {
+            let limit = i64::try_from(limit).context("并发上限过大")?;
+            table.insert(
+                "pool".into(),
+                toml::Value::Table(toml::map::Map::from_iter([(
+                    "max_concurrent_per_account".into(),
+                    toml::Value::Integer(limit),
+                )])),
+            );
+        }
+        if let Some(model) = default_model {
+            table.insert(
+                "routing".into(),
+                toml::Value::Table(toml::map::Map::from_iter([(
+                    "default_model_id".into(),
+                    toml::Value::String(model.into()),
+                )])),
+            );
+        }
+        array.push(value);
+        Ok(())
+    })
+    .await?;
+    if json {
+        print_json(&serde_json::json!({"provider":id,"created":true}))
+    } else {
+        println!("已添加提供源 {id}");
+        Ok(())
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn edit_provider(
+    client: &mut AdminClient,
+    id: &str,
+    settings: &[String],
+    remove_settings: &[String],
+    max_concurrent_per_account: Option<usize>,
+    default_model: Option<&str>,
+    enable_model_fallback: Option<bool>,
+    allow_cross_provider_fallback: Option<bool>,
+    json: bool,
+) -> Result<()> {
+    let settings = parse_provider_settings(settings)?;
+    mutate_config_array(client, "provider", |array| {
+        materialize_implicit_kiro(array, id);
+        let table = array
+            .iter_mut()
+            .find(|value| provider_value_matches(value, id))
+            .and_then(toml::Value::as_table_mut)
+            .ok_or_else(|| anyhow!("provider not found: {id}"))?;
+        if !settings.is_empty() || !remove_settings.is_empty() {
+            let provider_settings = ensure_table(table, "settings")?;
+            for key in remove_settings {
+                provider_settings.remove(key);
+            }
+            provider_settings.extend(settings.clone());
+        }
+        if let Some(limit) = max_concurrent_per_account {
+            ensure_table(table, "pool")?.insert(
+                "max_concurrent_per_account".into(),
+                toml::Value::Integer(i64::try_from(limit).context("并发上限过大")?),
+            );
+        }
+        if let Some(model) = default_model {
+            ensure_table(table, "routing")?
+                .insert("default_model_id".into(), toml::Value::String(model.into()));
+        }
+        if let Some(enabled) = enable_model_fallback {
+            ensure_table(table, "routing")?.insert(
+                "enable_model_fallback".into(),
+                toml::Value::Boolean(enabled),
+            );
+        }
+        if let Some(enabled) = allow_cross_provider_fallback {
+            ensure_table(table, "routing")?.insert(
+                "allow_cross_provider_fallback".into(),
+                toml::Value::Boolean(enabled),
+            );
+        }
+        Ok(())
+    })
+    .await?;
+    if json {
+        print_json(&serde_json::json!({"provider":id,"updated":true}))
+    } else {
+        println!("已更新提供源 {id}");
+        Ok(())
+    }
+}
+
+pub async fn set_provider_enabled(
+    client: &mut AdminClient,
+    id: &str,
+    enabled: bool,
+    json: bool,
+) -> Result<()> {
+    mutate_config_array(client, "provider", |array| {
+        materialize_implicit_kiro(array, id);
+        let table = array
+            .iter_mut()
+            .find(|value| provider_value_matches(value, id))
+            .and_then(toml::Value::as_table_mut)
+            .ok_or_else(|| anyhow!("provider not found: {id}"))?;
+        table.insert("enabled".into(), toml::Value::Boolean(enabled));
+        Ok(())
+    })
+    .await?;
+    if json {
+        print_json(&serde_json::json!({"provider":id,"enabled":enabled}))
+    } else {
+        println!("已{}提供源 {id}", if enabled { "启用" } else { "停用" });
+        Ok(())
+    }
+}
+
+pub async fn delete_provider(client: &mut AdminClient, id: &str, json: bool) -> Result<()> {
+    if !crate::commands::confirm(&format!("确认删除提供源 {id} 的配置？")).await? {
+        if json {
+            return print_json(
+                &serde_json::json!({"provider":id,"deleted":false,"cancelled":true}),
+            );
+        }
+        println!("已取消");
+        return Ok(());
+    }
+    mutate_config_array(client, "provider", |array| {
+        remove_provider_config(array, id)
+    })
+    .await?;
+    if json {
+        print_json(&serde_json::json!({"provider":id,"deleted":true}))
+    } else {
+        println!("已删除提供源 {id} 的配置；账号文件未删除");
+        Ok(())
+    }
+}
+
+fn provider_table(id: &str, kind: &str, enabled: bool) -> toml::Value {
+    toml::Value::Table(toml::map::Map::from_iter([
+        ("id".into(), toml::Value::String(id.into())),
+        ("kind".into(), toml::Value::String(kind.into())),
+        ("enabled".into(), toml::Value::Boolean(enabled)),
+    ]))
+}
+
+fn provider_value_matches(value: &toml::Value, id: &str) -> bool {
+    value
+        .as_table()
+        .and_then(|table| table.get("id"))
+        .and_then(toml::Value::as_str)
+        .is_some_and(|candidate| candidate == id)
+}
+
+fn materialize_implicit_kiro(array: &mut Vec<toml::Value>, id: &str) {
+    if array.is_empty() && id == "kiro" {
+        array.push(provider_table("kiro", "kiro", true));
+    }
+}
+
+fn remove_provider_config(array: &mut Vec<toml::Value>, id: &str) -> Result<()> {
+    let Some(index) = array
+        .iter()
+        .position(|value| provider_value_matches(value, id))
+    else {
+        if array.is_empty() && id == "kiro" {
+            return Err(anyhow!(
+                "implicit Kiro provider cannot be deleted; add another provider first"
+            ));
+        }
+        return Err(anyhow!("provider not found: {id}"));
+    };
+    if array.len() == 1 {
+        return Err(anyhow!(
+            "the last configured provider cannot be deleted because an empty provider list enables legacy Kiro"
+        ));
+    }
+    array.remove(index);
+    Ok(())
+}
+
+fn parse_provider_settings(values: &[String]) -> Result<toml::map::Map<String, toml::Value>> {
+    let mut output = toml::map::Map::new();
+    for setting in values {
+        let (key, raw) = setting
+            .split_once('=')
+            .ok_or_else(|| anyhow!("provider setting must use KEY=VALUE: {setting}"))?;
+        let key = key.trim();
+        if key.is_empty() || key.contains('.') {
+            return Err(anyhow!(
+                "provider setting key must be a non-empty direct key: {key}"
+            ));
+        }
+        let document = format!("value = {raw}")
+            .parse::<toml::Value>()
+            .with_context(|| format!("provider setting {key} is not a TOML value"))?;
+        let value = document
+            .get("value")
+            .cloned()
+            .ok_or_else(|| anyhow!("provider setting {key} has no value"))?;
+        output.insert(key.into(), value);
+    }
+    Ok(output)
+}
+
+fn ensure_table<'a>(
+    table: &'a mut toml::map::Map<String, toml::Value>,
+    key: &str,
+) -> Result<&'a mut toml::map::Map<String, toml::Value>> {
+    table
+        .entry(key)
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("provider.{key} must be a table"))
 }
 
 async fn mutate_config(
@@ -1329,7 +1729,7 @@ struct ConfigModule {
 
 impl ConfigModule {
     fn resettable(&self) -> bool {
-        !matches!(self.key, "api_key" | "proxy_service")
+        !matches!(self.key, "provider" | "api_key" | "proxy_service")
     }
 }
 
@@ -1446,7 +1846,7 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         name: "model-mapping",
         key: "model_mapping",
         category: "规则",
-        description: "客户端模型到 Kiro 模型的映射规则",
+        description: "按提供源、服务和 API key 生效的模型映射规则",
         preferred_command: "kproxy model-map",
         aliases: &["model-map"],
         is_array: true,
@@ -1467,6 +1867,15 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         description: "告警投递目标",
         preferred_command: "kproxy alert",
         aliases: &["webhooks"],
+        is_array: true,
+    },
+    ConfigModule {
+        name: "provider",
+        key: "provider",
+        category: "基础服务",
+        description: "Kiro、Copilot 等模型提供源实例",
+        preferred_command: "kproxy provider",
+        aliases: &["providers"],
         is_array: true,
     },
     ConfigModule {
@@ -1863,7 +2272,7 @@ pub async fn reset_config(
     let path = PathBuf::from(paths.config_file);
     let prompt = module.map_or_else(
         || {
-            "确认将通用配置恢复为默认设置？API key、代理服务和告警配置会保留，模型映射会被清除"
+            "确认将通用配置恢复为默认设置？提供源、API key、代理服务和告警配置会保留，模型映射会被清除"
                 .to_string()
         },
         |module| {
@@ -1972,7 +2381,8 @@ fn render_config_module_reset(raw: &str, module: &ConfigModule) -> Result<String
 
 /// Renders defaults while retaining separately managed resources and alert settings.
 fn render_reset_config_preserving_resources_and_alerts(raw: &str) -> Result<String> {
-    const PRESERVED_SECTIONS: [&str; 4] = ["notify", "webhook", "api_key", "proxy_service"];
+    const PRESERVED_SECTIONS: [&str; 5] =
+        ["notify", "webhook", "provider", "api_key", "proxy_service"];
 
     let current = raw.parse::<toml::Value>().context("当前配置 TOML 无效")?;
     let current_table = current
@@ -2358,9 +2768,18 @@ pub async fn run_model_map(
     json: bool,
 ) -> Result<()> {
     match command {
-        ModelMapCommand::List => {
+        ModelMapCommand::List { provider } => {
             let config = effective_config(client).await?;
             let mut rules = config.model_mapping;
+            if let Some(provider) = provider.as_deref() {
+                rules.retain(|rule| {
+                    if rule.providers.is_empty() {
+                        provider == "kiro"
+                    } else {
+                        rule.providers.iter().any(|item| item == provider)
+                    }
+                });
+            }
             rules.sort_by_key(|rule| rule.priority);
             if json {
                 print_json(&rules)
@@ -2376,12 +2795,22 @@ pub async fn run_model_map(
                         .map(|schedule| schedule.mode.as_str())
                         .unwrap_or("全天");
                     println!(
-                        "[{:>3}] {:<24} {:<11} {} -> {}  {}  {}{}",
+                        "[{:>3}] {:<24} {:<11} {} -> {}  provider={} service={}  {}  {}{}",
                         rule.priority,
                         rule.name,
                         rule.kind,
                         rule.source_models.join(","),
                         rule.target_models.join(","),
+                        if rule.providers.is_empty() {
+                            "kiro".into()
+                        } else {
+                            rule.providers.join(",")
+                        },
+                        if rule.service_ids.is_empty() {
+                            "*".into()
+                        } else {
+                            rule.service_ids.join(",")
+                        },
                         credits,
                         schedule,
                         if rule.enabled { "" } else { " [disabled]" }
@@ -2399,6 +2828,8 @@ pub async fn run_model_map(
             weights,
             below_credits_percent,
             api_key_ids,
+            providers,
+            service_ids,
             disabled,
         } => {
             mutate_config_array(client, "model_mapping", |array| {
@@ -2424,6 +2855,12 @@ pub async fn run_model_map(
                 if !api_key_ids.is_empty() {
                     table.insert("api_key_ids".into(), string_array_value(&api_key_ids));
                 }
+                if !providers.is_empty() {
+                    table.insert("providers".into(), string_array_value(&providers));
+                }
+                if !service_ids.is_empty() {
+                    table.insert("service_ids".into(), string_array_value(&service_ids));
+                }
                 // Missing schedule means always active. A credits threshold
                 // naturally stops matching after the upstream monthly quota
                 // refresh raises the remaining percentage again.
@@ -2447,6 +2884,10 @@ pub async fn run_model_map(
             clear_credits_threshold,
             api_key_ids,
             clear_api_keys,
+            providers,
+            clear_providers,
+            service_ids,
+            clear_services,
             enable,
             disable,
         } => {
@@ -2481,6 +2922,16 @@ pub async fn run_model_map(
                 } else if !api_key_ids.is_empty() {
                     table.insert("api_key_ids".into(), string_array_value(&api_key_ids));
                 }
+                if clear_providers {
+                    table.remove("providers");
+                } else if !providers.is_empty() {
+                    table.insert("providers".into(), string_array_value(&providers));
+                }
+                if clear_services {
+                    table.remove("service_ids");
+                } else if !service_ids.is_empty() {
+                    table.insert("service_ids".into(), string_array_value(&service_ids));
+                }
                 if enable || disable {
                     table.insert("enabled".into(), toml::Value::Boolean(enable));
                 }
@@ -2507,20 +2958,37 @@ pub async fn run_model_map(
             model,
             remaining_credits_percent,
             api_key,
+            provider,
+            service,
         } => {
             let config = effective_config(client).await?;
-            let route = kproxy_translate::model::map_model(
+            let route = kproxy_translate::model::map_model_for_provider(
                 &model,
                 &config.model_mapping,
-                api_key.as_deref(),
-                remaining_credits_percent,
-                &config.features.default_model_id,
+                kproxy_translate::model::ModelMappingContext {
+                    provider_id: &provider,
+                    service_id: service.as_deref(),
+                    api_key_id: api_key.as_deref(),
+                    remaining_percent: remaining_credits_percent,
+                },
+                config
+                    .effective_providers()
+                    .iter()
+                    .find(|item| item.id == provider)
+                    .map(|item| item.routing.default_model_id.as_str())
+                    .filter(|model| !model.is_empty())
+                    .unwrap_or(&config.features.default_model_id),
             );
             if json {
                 print_json(&serde_json::json!({
+                    "provider":provider,"service":service,
                     "input":route.original,"matched_rule":route.rule,"result":route.mapped
                 }))
             } else {
+                println!("提供源    {provider}");
+                if let Some(service) = service {
+                    println!("代理服务  {service}");
+                }
                 println!("输入      {}", route.original);
                 println!("命中      {}", route.rule.as_deref().unwrap_or("(无规则)"));
                 println!("结果      {}", route.mapped);

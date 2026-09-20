@@ -128,7 +128,7 @@ pub fn print(topic: Option<&str>) -> Result<()> {
             "`kproxy tasks list` 查看 token 刷新、状态探测、统计持久化、模型缓存等周期任务；`kproxy tasks run <name>` 立即执行。"
         }
         "stats" => {
-            "`kproxy stats` 默认显示跨 daemon 重启的持久化累计统计；可用 `--since 1h` 或带时区的 `--start/--end` 查询时间段。`--detail` 显示最近请求，并可用 `--by model|account|endpoint` 分组。"
+            "`kproxy stats` 默认显示跨 daemon 重启的持久化累计统计；可用 `--since 1h` 或带时区的 `--start/--end` 查询时间段。`--detail` 显示最近请求，并可用 `--by provider|model|account|endpoint` 分组。"
         }
         "logs" => {
             "`kproxy logs show` 查看内存中的结构化请求日志，`follow` 持续跟踪；支持 `--level`、`--account` 和 `--tail`。`kproxy logs trace <TRACE_ID>` 默认跨日期和全部精确级别分片查询完整链路，可用 `--level error` 限定级别。info 文件只包含 INFO，WARN/ERROR 分别写入 warn/error 文件。`kproxy logs files [--level error]` 列出实际日志文件，`logs path` 显示目录、基础路径和当前日志配置。"
@@ -137,7 +137,7 @@ pub fn print(topic: Option<&str>) -> Result<()> {
             "`kproxy alert events` 列出四类异常事件和触发条件，`kproxy alert platforms` 说明 --platform 支持的通知平台和平台专用参数；`kproxy alert config` 查看一次性告警策略。同类型的多账号事件会聚合为一条 Markdown 告警；每个账号或服务恢复后才允许再次告警。`kproxy alert add/edit/delete/list/test/logs` 管理告警目标。"
         }
         "models" => {
-            "`kproxy models list` 显示账号自动探测到的 Kiro 模型、最大输入上下文和最大输出 token，两者按 K/M 缩写；`-` 表示上游未返回对应元数据。`--refresh` 先立即刷新缓存，`--mapped` 同时显示显式映射结果及映射后模型的输入/输出上限。`kproxy models resolve <MODEL_ID>` 使用当前配置、账号额度和账号模型缓存，显示显式映射与最终 Kiro 模型；可配合 `--api-key` 和 `--refresh`。"
+            "`kproxy models list` 默认聚合全部提供源发现的模型、最大输入上下文和最大输出 token，两者按 K/M 缩写；`-` 表示上游未返回对应元数据。用 `--provider <ID>` 或 `--provider-kind <KIND>` 限定来源，`--refresh` 先刷新对应缓存，`--mapped` 同时显示显式映射结果及映射后模型的输入/输出上限。`kproxy models resolve <MODEL_ID>` 显示指定提供源中的显式映射与最终模型；可配合 `--provider`、`--api-key` 和 `--refresh`。"
         }
         "docker" => {
             "默认 `docker compose up -d --build` 构建 runtime-full，启用全部 feature 并包含 Chromium SSO 运行时。数据保存在 kproxy-data 命名卷。"
