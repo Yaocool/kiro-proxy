@@ -2,13 +2,13 @@
 
 [English](README.md) | [简体中文](README.zh-CN.md) | [文档](#文档)
 
-`kiro-proxy` 在 Kiro 上游之上提供 Claude Messages、OpenAI Chat Completions 和
-OpenAI Responses 兼容 API。Rust 常驻进程 `kproxyd` 负责生成和账号调度，`kproxy`
-通过本地 Unix socket 管理服务。
+`kiro-proxy` 通过多 provider 架构提供 Claude Messages、OpenAI Chat Completions 和
+OpenAI Responses 兼容 API，内置 Kiro 与 GitHub Copilot adapter。Rust 常驻进程 `kproxyd`
+负责路由、生成和账号调度，`kproxy` 通过本地 Unix socket 统一管理，也可按 provider 管理。
 
-支持企业 SSO 凭证（AWS IAM Identity Center/IdC）和显式导入的 Kiro headless API key
-（`ksk_...`），不支持个人/社交 OAuth 登录。上游凭证与代理向客户端签发的 API Key 相互独立。
-项目不包含 GUI、MITM 或本机 Kiro 应用配置改写。
+Kiro 支持企业 SSO 凭证（AWS IAM Identity Center/IdC）和显式导入的 headless API key
+（`ksk_...`）；Copilot 支持 GitHub Device Flow 或从标准输入导入 token。上游凭证与代理向客户端
+签发的 API Key 相互独立。项目不包含 GUI、MITM 或本机客户端配置改写。
 
 > 文档对应当前源码，workspace 版本仍为 `0.2.4`，包含 **`v0.2.4` tag 之后尚未发布的改动**，
 > 其中包括 CLI 命令迁移。预构建的 `v0.2.4` 镜像不包含这些改动。
@@ -19,9 +19,9 @@ OpenAI Responses 兼容 API。Rust 常驻进程 `kproxyd` 负责生成和账号�
 | 范围 | 当前行为 |
 | --- | --- |
 | API | Messages、Token 计数、Chat Completions、Responses、模型发现；生成支持 JSON 和 SSE。 |
-| 账号 | 加权调度、单账号并发、冷却、额度保护和企业 Token 自动刷新。 |
-| 上游路由 | 区域 Q/CodeWhisperer/Kiro runtime、端点切换和 GovCloud 隔离。 |
-| 模型与工具 | 动态发现、别名、条件映射、工具回放、Claude Tool Search 与 Web Search。 |
+| 账号 | Provider 隔离账号池、单账号并发、启停、标签、探测和刷新；Kiro 保留额度调度，Copilot 支持 Device Flow。 |
+| 上游路由 | Kiro 区域 runtime 与 GovCloud 隔离；Copilot 短期 API token、动态 endpoint 和原生协议透传。 |
+| 模型与工具 | 跨 provider 动态发现、条件映射和访问范围；Kiro 继续支持工具回放、Claude Tool Search 与 Web Search。 |
 | 运维 | TOML 热重载、API Key 限额、TLS、Webhook、Trace 日志、持久化统计、Docker 和 systemd。 |
 | 兼容限制 | format/strict 提示不提供结构化输出保证；Responses 状态会过期且重启丢失；托管工具与自动压缩的支持范围因协议而异。 |
 
@@ -149,12 +149,13 @@ systemd 管理见[启动与排障指南](docs/startup-and-debugging.zh-CN.md)。
 | 部署、CLI 迁移、日志与恢复 | [中文](docs/startup-and-debugging.zh-CN.md) · [English](docs/startup-and-debugging.md) |
 | 协议限制、模型控制与上下文压缩 | [中文](docs/protocol-compatibility.zh-CN.md) · [English](docs/protocol-compatibility.md) |
 | Responses、Codex 与状态续轮 | [接入指南](docs/openai-responses.md) |
+| 多提供源路由与 GitHub Copilot | [接入指南](docs/providers-and-copilot.zh-CN.md) |
 | 1.0 评估、缺口修复与发布步骤 | [发布方案](docs/release-readiness-1.0.0.zh-CN.md) |
 
 ## 开发
 
-九个 workspace crate 分别负责领域与配置、持久化、IPC、协议转换、上游访问、调度、通知、
-daemon 和 CLI。开发流程见[贡献指南](CONTRIBUTING.md)，源码职责见[架构说明](CLAUDE.md)。
+workspace crate 分别负责领域与配置、持久化、IPC、协议转换、provider adapter、上游访问、
+调度、通知、daemon 和 CLI。开发流程见[贡献指南](CONTRIBUTING.md)，源码职责见[架构说明](CLAUDE.md)。
 
 ```bash
 cargo fmt --all -- --check
