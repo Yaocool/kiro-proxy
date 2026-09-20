@@ -1,6 +1,8 @@
 [workspace]
 members = [
     "crates/kproxy-core",
+    "crates/kproxy-provider",
+    "crates/kproxy-copilot",
     "crates/kproxy-store",
     "crates/kproxy-ipc",
     "crates/kproxy-translate",
@@ -20,6 +22,8 @@ license = "MIT"
 
 [workspace.dependencies]
 kproxy-core = { path = "crates/kproxy-core" }
+kproxy-provider = { path = "crates/kproxy-provider" }
+kproxy-copilot = { path = "crates/kproxy-copilot" }
 kproxy-store = { path = "crates/kproxy-store" }
 kproxy-ipc = { path = "crates/kproxy-ipc" }
 kproxy-translate = { path = "crates/kproxy-translate" }
