@@ -1,11 +1,25 @@
 use super::{
     attempt_diagnostics, build_model_path, check_context_limit, dispatch_error,
-    find_model_fallback, map_model, now_secs, push_model_path, resolve_static_model,
-    retry_attempt_count, sanitize_error_message, set_payload_model, upstream_attempt_log, AppState,
-    Arc, ExecuteError, HashSet, KiroError, PoolError, PreparedUpstream, Rng, UpstreamAttemptLog,
-    UpstreamExecution,
+    find_model_fallback, now_secs, push_model_path, resolve_static_model, retry_attempt_count,
+    sanitize_error_message, set_payload_model, upstream_attempt_log, AppState, Arc, ExecuteError,
+    HashSet, KiroError, PoolError, PreparedUpstream, Rng, UpstreamAttemptLog, UpstreamExecution,
 };
 use kproxy_translate::error::log_model;
+use kproxy_translate::model::{map_model_for_provider, ModelMappingContext};
+
+fn configured_cross_provider_target<'a>(
+    config: &kproxy_core::config::Config,
+    source_provider: &str,
+    mapped_model: &'a str,
+) -> Option<(&'a str, &'a str)> {
+    let (target_provider, target_model) = mapped_model.split_once('/')?;
+    (target_provider != source_provider
+        && config
+            .effective_providers()
+            .iter()
+            .any(|provider| provider.id == target_provider))
+    .then_some((target_provider, target_model))
+}
 
 enum DispatchOutcome {
     Prepared(Box<PreparedUpstream>),
@@ -19,7 +33,10 @@ pub(in crate::http::handlers) async fn prepare_upstream(
     model: &str,
     requested_model: &str,
     key_id: Option<&str>,
+    allowed_models: &[String],
+    service_id: Option<&str>,
     default_model: &str,
+    locked_mapping_rule: Option<&str>,
     payload: &kproxy_translate::KiroPayload,
 ) -> Result<PreparedUpstream, ExecuteError> {
     match dispatch_upstream(
@@ -28,7 +45,10 @@ pub(in crate::http::handlers) async fn prepare_upstream(
         model,
         requested_model,
         key_id,
+        allowed_models,
+        service_id,
         default_model,
+        locked_mapping_rule,
         0.0,
         0,
         false,
@@ -50,7 +70,10 @@ pub(in crate::http::handlers) async fn execute_upstream(
     model: &str,
     requested_model: &str,
     key_id: Option<&str>,
+    allowed_models: &[String],
+    service_id: Option<&str>,
     default_model: &str,
+    locked_mapping_rule: Option<&str>,
     estimate: f64,
     input_tokens: u64,
     compact: bool,
@@ -63,7 +86,10 @@ pub(in crate::http::handlers) async fn execute_upstream(
         model,
         requested_model,
         key_id,
+        allowed_models,
+        service_id,
         default_model,
+        locked_mapping_rule,
         estimate,
         input_tokens,
         compact,
@@ -85,7 +111,10 @@ async fn dispatch_upstream(
     model: &str,
     requested_model: &str,
     key_id: Option<&str>,
+    allowed_models: &[String],
+    service_id: Option<&str>,
     default_model: &str,
+    locked_mapping_rule: Option<&str>,
     estimate: f64,
     input_tokens: u64,
     compact: bool,
@@ -125,7 +154,20 @@ async fn dispatch_upstream(
             model.to_owned(),
             model.to_owned(),
             payload.clone(),
-            map_model(requested_model, &config.model_mapping, key_id, None, "").rule,
+            locked_mapping_rule.map(str::to_owned).or_else(|| {
+                map_model_for_provider(
+                    requested_model,
+                    &config.model_mapping,
+                    ModelMappingContext {
+                        provider_id: "kiro",
+                        service_id,
+                        api_key_id: key_id,
+                        remaining_percent: None,
+                    },
+                    "",
+                )
+                .rule
+            }),
             build_model_path(requested_model, model, ""),
             Vec::new(),
             None,
@@ -223,16 +265,32 @@ async fn dispatch_upstream(
                     });
                 if let Some(fallback) = fallback_model.clone() {
                     mapped_model = fallback;
+                } else if let Some(rule) = locked_mapping_rule {
+                    mapped_model = model.to_owned();
+                    model_mapping_rule = Some(rule.to_owned());
                 } else {
-                    let route = map_model(
+                    let route = map_model_for_provider(
                         requested_model,
                         &config.model_mapping,
-                        key_id,
-                        remaining,
+                        ModelMappingContext {
+                            provider_id: "kiro",
+                            service_id,
+                            api_key_id: key_id,
+                            remaining_percent: remaining,
+                        },
                         "",
                     );
                     mapped_model = route.mapped;
                     model_mapping_rule = route.rule;
+                }
+                if let Some((target_provider, target_model)) =
+                    configured_cross_provider_target(&config, "kiro", &mapped_model)
+                {
+                    return Err(ExecuteError::CrossProviderRoute {
+                        source_provider: "kiro".into(),
+                        target_provider: target_provider.into(),
+                        model: target_model.into(),
+                    });
                 }
                 model_path = build_model_path(requested_model, &mapped_model, "");
                 actual_model.clone_from(&mapped_model);
@@ -302,6 +360,12 @@ async fn dispatch_upstream(
             }
             lease
         };
+        if !super::super::model_is_allowed(allowed_models, "kiro", &actual_model) {
+            return Err(ExecuteError::ModelNotAllowed {
+                provider_id: "kiro".into(),
+                model: actual_model,
+            });
+        }
         let account = lease.account().await;
         let account_name = account.display_name().to_owned();
         state.prepare_model_request(&mut request_payload);
@@ -558,6 +622,17 @@ async fn dispatch_upstream(
                             Some(fallback.clone())
                         };
                         if let Some(resolved) = resolved {
+                            if !super::super::model_is_allowed(allowed_models, "kiro", &resolved) {
+                                tracing::warn!(
+                                    trace_id,
+                                    attempt = attempt + 1,
+                                    account_id = %account.id,
+                                    account_name,
+                                    fallback_model = %resolved,
+                                    "skipping model fallback because it is outside the API key model scope"
+                                );
+                                continue;
+                            }
                             let fallback_input_tokens =
                                 super::super::truncate_context_if_requested(
                                     state,
@@ -833,4 +908,41 @@ async fn dispatch_upstream(
         model_mapping_rule,
         attempt_logs,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::configured_cross_provider_target;
+    use kproxy_core::config::{Config, ProviderConfig};
+
+    fn mixed_config() -> Config {
+        Config {
+            provider: vec![
+                ProviderConfig::default(),
+                ProviderConfig {
+                    id: "copilot".into(),
+                    kind: "copilot".into(),
+                    ..ProviderConfig::default()
+                },
+            ],
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn internal_kiro_dispatch_rejects_a_configured_cross_provider_target() {
+        let config = mixed_config();
+        assert_eq!(
+            configured_cross_provider_target(&config, "kiro", "copilot/gpt-test"),
+            Some(("copilot", "gpt-test"))
+        );
+        assert_eq!(
+            configured_cross_provider_target(&config, "kiro", "kiro/claude-test"),
+            None
+        );
+        assert_eq!(
+            configured_cross_provider_target(&config, "kiro", "vendor/model"),
+            None
+        );
+    }
 }

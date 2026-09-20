@@ -15,6 +15,37 @@ use super::{
     ThinkingContentFilter, ToolLeakFilter, UpstreamStreamMetrics, Value,
 };
 
+#[allow(clippy::too_many_arguments)]
+fn retry_mapped_model(
+    locked: bool,
+    current: &str,
+    original: &str,
+    fallback: Option<&str>,
+    config: &kproxy_core::config::Config,
+    service_id: &str,
+    key_id: Option<&str>,
+    remaining_percent: Option<f64>,
+) -> String {
+    if let Some(fallback) = fallback {
+        return fallback.to_owned();
+    }
+    if locked {
+        return current.to_owned();
+    }
+    kproxy_translate::model::map_model_for_provider(
+        original,
+        &config.model_mapping,
+        kproxy_translate::model::ModelMappingContext {
+            provider_id: "kiro",
+            service_id: Some(service_id),
+            api_key_id: key_id,
+            remaining_percent,
+        },
+        "",
+    )
+    .mapped
+}
+
 pub fn response(
     upstream: KiroResponse,
     protocol: StreamProtocol,
@@ -558,6 +589,13 @@ pub fn response(
                     let (models, _) = context.state.models.get(config.models.cache_ttl_ms);
                     if let Some(fallback) =
                         super::super::handlers::find_model_fallback(&context.kiro_model, &models)
+                            .filter(|fallback| {
+                                super::super::handlers::model_is_allowed(
+                                    &context.allowed_models,
+                                    "kiro",
+                                    fallback,
+                                )
+                            })
                     {
                         let fallback_input_tokens = match super::super::handlers::truncate_context_if_requested(
                             &context.state, &mut payload, context.input_tokens, context.compact, &fallback,
@@ -700,16 +738,16 @@ pub fn response(
                                 ((usage.limit - usage.current) / usage.limit * 100.0)
                                     .clamp(0.0, 100.0)
                             });
-                        context.mapped_model = fallback_model.clone().unwrap_or_else(|| {
-                            kproxy_translate::model::map_model(
-                                &context.original_model,
-                                &config.model_mapping,
-                                context.api_key_id.as_deref(),
-                                remaining,
-                                "",
-                            )
-                            .mapped
-                        });
+                        context.mapped_model = retry_mapped_model(
+                            context.lock_model_mapping,
+                            &context.mapped_model,
+                            &context.original_model,
+                            fallback_model.as_deref(),
+                            &config,
+                            &context.service_id,
+                            context.api_key_id.as_deref(),
+                            remaining,
+                        );
                         context.kiro_model.clone_from(&context.mapped_model);
                         if let Some(resolved) = runtime.resolve_model(&context.kiro_model).await {
                             context.kiro_model = resolved;
@@ -735,6 +773,22 @@ pub fn response(
                             super::super::handlers::set_payload_model(
                                 &mut payload,
                                 &context.kiro_model,
+                            );
+                        }
+                        if !incompatible
+                            && !super::super::handlers::model_is_allowed(
+                                &context.allowed_models,
+                                "kiro",
+                                &context.kiro_model,
+                            )
+                        {
+                            incompatible = true;
+                            tracing::warn!(
+                                trace_id = %context.trace_id,
+                                request_id = %context.request_id,
+                                account_id = %account.id,
+                                resolved_model = %context.kiro_model,
+                                "skipping stream retry account because its resolved model is outside the API key model scope"
                             );
                         }
                         let retry_input_tokens = if incompatible {
@@ -1970,4 +2024,68 @@ pub fn response(
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-cache"));
     headers.insert(header::CONNECTION, HeaderValue::from_static("keep-alive"));
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::retry_mapped_model;
+    use kproxy_core::config::{Config, ModelMappingRule};
+
+    fn cross_provider_config() -> Config {
+        Config {
+            model_mapping: vec![ModelMappingRule {
+                name: "mixed".into(),
+                source_models: vec!["team".into()],
+                target_models: vec!["copilot/gpt-test".into()],
+                providers: vec!["kiro".into()],
+                ..ModelMappingRule::default()
+            }],
+            ..Config::default()
+        }
+    }
+
+    #[test]
+    fn locked_stream_retry_keeps_the_selected_kiro_target() {
+        let config = cross_provider_config();
+        assert_eq!(
+            retry_mapped_model(
+                true,
+                "claude-sonnet-test",
+                "team",
+                None,
+                &config,
+                "svc",
+                None,
+                None,
+            ),
+            "claude-sonnet-test"
+        );
+    }
+
+    #[test]
+    fn unlocked_stream_retry_reapplies_account_aware_mapping() {
+        let config = cross_provider_config();
+        assert_eq!(
+            retry_mapped_model(false, "team", "team", None, &config, "svc", None, None,),
+            "copilot/gpt-test"
+        );
+    }
+
+    #[test]
+    fn stream_retry_fallback_takes_precedence_over_a_locked_route() {
+        let config = cross_provider_config();
+        assert_eq!(
+            retry_mapped_model(
+                true,
+                "claude-sonnet-test",
+                "team",
+                Some("claude-haiku-test"),
+                &config,
+                "svc",
+                None,
+                None,
+            ),
+            "claude-haiku-test"
+        );
+    }
 }

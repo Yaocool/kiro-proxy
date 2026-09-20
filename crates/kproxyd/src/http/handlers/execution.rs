@@ -1,17 +1,17 @@
 use super::{
     attempt_diagnostics, check_context_limit, empty_tool_result_disposition, estimated_credits,
-    fallback_credits, fill_missing_usage, loaded_tool_count, loaded_tool_names, map_model,
-    meter_error, now_secs, remaining_tool_search_budget, resolve_dynamic_model,
-    resume_web_search_payload, sanitize_error_message, sanitize_kiro_tool_history,
-    tool_search_continue_payload_batch, upstream_error, validate_kiro_tool_history,
-    web_search_continue_payload_batch, AccountLease, ApiError, AppState, Arc,
-    ClaudeContextEditStats, ClaudeRequest, ClaudeServerEvent, ClaudeToolSearchBudget,
-    ClaudeToolSearchCatalog, ClaudeWebSearchTrace, CompactionIterationUsage, CreditReservation,
-    DecodedResponse, DispatchFailure, EmptyToolResultDisposition, ErrorFormat, ExecuteError,
-    HashSet, Instant, IntoResponse, Json, KiroError, KiroEvent, KiroResponse, OpenAiRequest,
-    OpenAiToolIdentity, PoolError, PreparedUpstream, PromptCacheProfile, RequestDiagnostics,
-    RequestLog, RequestLogContext, Response, Rng, StopSequenceFilter, ThinkingContentFilter,
-    ToolLeakFilter, UpstreamAttemptLog, UpstreamExecution, UsageRecord, Uuid, Value,
+    fallback_credits, fill_missing_usage, loaded_tool_count, loaded_tool_names, meter_error,
+    now_secs, remaining_tool_search_budget, resolve_dynamic_model, resume_web_search_payload,
+    sanitize_error_message, sanitize_kiro_tool_history, tool_search_continue_payload_batch,
+    upstream_error, validate_kiro_tool_history, web_search_continue_payload_batch, AccountLease,
+    ApiError, AppState, Arc, ClaudeContextEditStats, ClaudeRequest, ClaudeServerEvent,
+    ClaudeToolSearchBudget, ClaudeToolSearchCatalog, ClaudeWebSearchTrace,
+    CompactionIterationUsage, CreditReservation, DecodedResponse, DispatchFailure,
+    EmptyToolResultDisposition, ErrorFormat, ExecuteError, HashSet, Instant, IntoResponse, Json,
+    KiroError, KiroEvent, KiroResponse, OpenAiRequest, OpenAiToolIdentity, PoolError,
+    PreparedUpstream, PromptCacheProfile, RequestDiagnostics, RequestLog, RequestLogContext,
+    Response, Rng, StopSequenceFilter, ThinkingContentFilter, ToolLeakFilter, UpstreamAttemptLog,
+    UpstreamExecution, UsageRecord, Uuid, Value,
 };
 
 mod dispatch;
@@ -62,8 +62,9 @@ pub(super) fn dispatch_error(
         .last()
         .map(|attempt| (attempt.account_id.clone(), attempt.account_name.clone()))
         .unwrap_or_default();
-    ExecuteError::Dispatch(DispatchFailure {
+    ExecuteError::Dispatch(Box::new(DispatchFailure {
         context: RequestLogContext {
+            provider_id: "kiro".into(),
             account_id,
             account_name,
             endpoint: error.endpoint.clone(),
@@ -74,7 +75,7 @@ pub(super) fn dispatch_error(
             attempts,
         },
         error,
-    })
+    }))
 }
 
 pub(super) fn prepend_attempt_logs(
@@ -1569,6 +1570,7 @@ pub(super) fn usage_record(
 ) -> UsageRecord {
     UsageRecord {
         timestamp: now_secs(),
+        provider_id: "kiro".into(),
         model: model.into(),
         original_model: Some(original_model.into()),
         kiro_model: Some(kiro_model.into()),
@@ -1584,6 +1586,7 @@ pub(super) fn usage_record(
             "estimated"
         }
         .into(),
+        provider_billing: None,
         path: path.into(),
     }
 }
@@ -1647,6 +1650,7 @@ pub(super) fn request_log(
         trace_id: trace_id.into(),
         request_id: request_id.into(),
         path: path.into(),
+        provider_id: "kiro".into(),
         model: model.into(),
         original_model: original_model.into(),
         kiro_model: kiro_model.into(),

@@ -84,10 +84,15 @@ pub struct StreamContext {
     pub trace_id: String,
     pub request_id: String,
     pub path: String,
+    pub service_id: String,
     pub model: String,
     pub mapped_model: String,
     pub original_model: String,
     pub api_key_id: Option<String>,
+    pub allowed_models: Vec<String>,
+    /// A provider-aware route has already selected the Kiro target. Streaming
+    /// retries must preserve that choice instead of drawing the mapping again.
+    pub lock_model_mapping: bool,
     pub kiro_model: String,
     pub model_path: Vec<String>,
     pub model_mapping_rule: Option<String>,
@@ -1348,6 +1353,7 @@ async fn finish_accounting(
         .reservation
         .settle(UsageRecord {
             timestamp: now_secs(),
+            provider_id: "kiro".into(),
             model: context.mapped_model.clone(),
             original_model: Some(context.original_model.clone()),
             kiro_model: Some(context.kiro_model.clone()),
@@ -1363,6 +1369,7 @@ async fn finish_accounting(
                 "estimated"
             }
             .into(),
+            provider_billing: None,
             path: context.path.clone(),
         })
         .await
@@ -1458,6 +1465,7 @@ async fn finish_accounting(
         trace_id: context.trace_id,
         request_id: context.request_id,
         path: context.path,
+        provider_id: "kiro".into(),
         model: context.mapped_model,
         original_model: context.original_model,
         kiro_model: context.kiro_model,

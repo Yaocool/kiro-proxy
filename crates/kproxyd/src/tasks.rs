@@ -56,7 +56,7 @@ impl TaskRegistry {
             "adaptive_admission":{"interval_ms":config.server.adaptive.check_interval_ms,"run":runs.get("adaptive_admission")},
             "stats_persist":{"interval_ms":config.tasks.stats_persist_interval_ms,"run":runs.get("stats_persist")},
             "daily_reset":{"interval_ms":86_400_000u64,"run":runs.get("daily_reset")},
-            "model_cache_refresh":{"interval_ms":config.models.cache_ttl_ms,"run":runs.get("model_cache_refresh")},
+            "model_cache_refresh":{"interval_ms":model_refresh_interval_ms(&config),"run":runs.get("model_cache_refresh")},
             "proxy_service_reconcile":{"interval_ms":PROXY_SERVICE_RECONCILE_INTERVAL.as_millis() as u64,"run":runs.get("proxy_service_reconcile")},
             "health_recheck":{"interval_ms":config.pool.cooldown.quota_reset_ms,"run":runs.get("health_recheck")}
         })
@@ -78,10 +78,7 @@ impl TaskRegistry {
                 "adaptive_admission",
                 config.server.adaptive.check_interval_ms.max(1_000),
             ),
-            (
-                "model_cache_refresh",
-                config.models.cache_ttl_ms.max(60_000),
-            ),
+            ("model_cache_refresh", model_refresh_interval_ms(&config)),
             (
                 "status_check",
                 config.tasks.status_check_interval_ms.max(10_000),
@@ -301,7 +298,7 @@ fn spawn_model_refresh(state: Arc<AppState>, shutdown: CancellationToken) {
                     result.unwrap_or_else(|error| error.to_string()),
                 );
                 let delay =
-                    Duration::from_millis(state.config.current().models.cache_ttl_ms.max(60_000));
+                    Duration::from_millis(model_refresh_interval_ms(&state.config.current()));
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     _ = tokio::time::sleep(delay) => {}
@@ -310,6 +307,28 @@ fn spawn_model_refresh(state: Arc<AppState>, shutdown: CancellationToken) {
             }
         },
     );
+}
+
+fn model_refresh_interval_ms(config: &kproxy_core::config::Config) -> u64 {
+    let mut intervals = config
+        .effective_providers()
+        .into_iter()
+        .filter(|provider| provider.enabled && provider.kind != "kiro")
+        .map(|provider| provider.models.cache_ttl_ms)
+        .collect::<Vec<_>>();
+    if config
+        .effective_providers()
+        .iter()
+        .any(|provider| provider.enabled && provider.kind == "kiro")
+        && config.models.dynamic_discovery
+    {
+        intervals.push(config.models.cache_ttl_ms);
+    }
+    intervals
+        .into_iter()
+        .min()
+        .unwrap_or(config.models.cache_ttl_ms)
+        .max(60_000)
 }
 
 fn spawn_proxy_service_reconcile(state: Arc<AppState>, shutdown: CancellationToken) {
@@ -573,9 +592,83 @@ pub(crate) async fn flush_before_shutdown(state: &Arc<AppState>) {
 }
 
 pub(crate) async fn refresh_models(state: &Arc<AppState>) -> anyhow::Result<String> {
-    if !state.config.current().models.dynamic_discovery {
-        return Ok("disabled".into());
+    refresh_models_for(state, None).await
+}
+
+pub(crate) async fn refresh_models_for(
+    state: &Arc<AppState>,
+    provider_filter: Option<&str>,
+) -> anyhow::Result<String> {
+    let config = state.config.current();
+    let provider_filter = provider_filter.filter(|provider| *provider != "all");
+    let selected = config
+        .effective_providers()
+        .into_iter()
+        .filter(|provider| provider_filter.is_none_or(|id| provider.id == id))
+        .collect::<Vec<_>>();
+    if selected.is_empty() {
+        anyhow::bail!(
+            "unknown provider {}",
+            provider_filter.unwrap_or("<empty selection>")
+        );
     }
+
+    let mut refreshed = Vec::new();
+    let mut failures = Vec::new();
+    let mut adapter_ids = Vec::new();
+    for provider in &selected {
+        if !provider.enabled {
+            failures.push(format!("{}: provider is disabled", provider.id));
+        } else if provider.kind == "kiro" {
+            if !config.models.dynamic_discovery {
+                refreshed.push("kiro: discovery disabled".into());
+            } else {
+                match refresh_kiro_models(state).await {
+                    Ok(result) => refreshed.push(format!("kiro: {result}")),
+                    Err(error) => failures.push(format!("kiro: {error}")),
+                }
+            }
+        } else {
+            adapter_ids.push(kproxy_core::provider::ProviderId::parse(
+                provider.id.clone(),
+            )?);
+        }
+    }
+    if !adapter_ids.is_empty() {
+        let (models, errors) = state.providers.models(&adapter_ids, true).await;
+        let mut counts = BTreeMap::<String, usize>::new();
+        for model in models {
+            *counts.entry(model.provider_id.to_string()).or_default() += 1;
+        }
+        for provider_id in &adapter_ids {
+            if let Some(error) = errors.get(provider_id.as_str()) {
+                failures.push(format!("{provider_id}: {error}"));
+            } else {
+                refreshed.push(format!(
+                    "{provider_id}: {} models",
+                    counts
+                        .get(provider_id.as_str())
+                        .copied()
+                        .unwrap_or_default()
+                ));
+            }
+        }
+    }
+    if refreshed.is_empty() {
+        anyhow::bail!("model discovery failed: {}", failures.join("; "));
+    }
+    let mut summary = format!("ok: {}", refreshed.join(", "));
+    if !failures.is_empty() {
+        summary.push_str(&format!(
+            "; {} failures: {}",
+            failures.len(),
+            failures.join("; ")
+        ));
+    }
+    Ok(summary)
+}
+
+async fn refresh_kiro_models(state: &Arc<AppState>) -> anyhow::Result<String> {
     let pool = state.pool();
     let accounts = pool
         .snapshot()
@@ -818,7 +911,7 @@ pub(crate) async fn persist_pool_accounts(state: &Arc<AppState>) -> anyhow::Resu
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use kproxy_core::config::Config;
+    use kproxy_core::config::{Config, ProviderConfig};
     use kproxy_core::paths::Paths;
     use kproxy_store::accounts::AccountStore;
     use kproxy_store::config_loader::ConfigHandle;
@@ -861,12 +954,49 @@ mod tests {
         assert_eq!(discovered[0].model_name, "B first");
     }
 
+    #[tokio::test]
+    async fn provider_scoped_kiro_refresh_does_not_touch_other_providers() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        let accounts = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("accounts");
+        let mut config = Config {
+            provider: vec![
+                ProviderConfig::default(),
+                ProviderConfig {
+                    id: "copilot".into(),
+                    kind: "copilot".into(),
+                    ..ProviderConfig::default()
+                },
+            ],
+            ..Config::default()
+        };
+        config.models.dynamic_discovery = false;
+        let state = Arc::new(AppState::new(paths, ConfigHandle::new(config), accounts));
+
+        let result = refresh_models_for(&state, Some("kiro"))
+            .await
+            .expect("disabled Kiro discovery is a successful no-op");
+
+        assert_eq!(result, "ok: kiro: discovery disabled");
+    }
+
     fn recorded_request() -> crate::stats::RequestLog {
         crate::stats::RequestLog {
             timestamp: crate::now_secs(),
             trace_id: "trace-shutdown".into(),
             request_id: "request-shutdown".into(),
             path: "/v1/messages".into(),
+            provider_id: "kiro".into(),
             model: "claude-sonnet-4.6".into(),
             original_model: "claude-sonnet-4.6".into(),
             kiro_model: "claude-sonnet-4.6".into(),

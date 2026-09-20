@@ -5,20 +5,22 @@ use super::{
     enforce_codex_user_agent, enforce_context, enforce_payload_budget,
     estimate_context_management_input_tokens, estimated_credits, execute_kiro_web_search,
     execute_upstream, initial_compaction_decision, is_claude_user_agent, loaded_tool_bytes,
-    loaded_tool_count, loaded_tool_names, map_model, matches_type_family, nonstream_claude,
-    nonstream_openai, normalize_compaction_boundary, openai_to_kiro, openai_tool_identities,
-    prepare_kiro_payload, prepare_upstream, prepend_attempt_logs, prepend_execute_error_attempts,
-    reapply_compaction, remaining_tool_search_budget, reserve_credits,
-    resolved_compaction_decision, resume_tool_search_payload, resume_web_search_payload,
-    run_compaction, sanitize_error_message, serialized_payload_bytes, stream, upstream_error,
-    upstream_overflow_compaction_decision, validate_claude, validate_claude_generation,
-    validate_openai, web_search_error_code, ApiError, AppState, Arc, Bytes, ClaudeRequest,
-    ClaudeServerEvent, ClaudeToolSearchCatalog, ClaudeWebSearchTrace, CompactionReason,
-    CompactionRequest, Duration, Engine, ErrorFormat, ExecuteError, HeaderMap, Instant, IpAddr,
-    OpenAiRequest, RequestDiagnostics, Response, ServiceHttpState, StatusCode, StreamContext,
-    StreamExt, StreamProtocol, TranslationOptions, UpstreamExecution, Url, Uuid, Value,
+    loaded_tool_count, loaded_tool_names, matches_type_family, nonstream_claude, nonstream_openai,
+    normalize_compaction_boundary, openai_to_kiro, openai_tool_identities, prepare_kiro_payload,
+    prepare_upstream, prepend_attempt_logs, prepend_execute_error_attempts, reapply_compaction,
+    remaining_tool_search_budget, reserve_credits, resolved_compaction_decision,
+    resume_tool_search_payload, resume_web_search_payload, run_compaction, sanitize_error_message,
+    serialized_payload_bytes, stream, upstream_error, upstream_overflow_compaction_decision,
+    validate_claude, validate_claude_generation, validate_openai, web_search_error_code, ApiError,
+    AppState, Arc, Bytes, ClaudeRequest, ClaudeServerEvent, ClaudeToolSearchCatalog,
+    ClaudeWebSearchTrace, CompactionReason, CompactionRequest, Duration, Engine, ErrorFormat,
+    ExecuteError, HeaderMap, Instant, IpAddr, OpenAiRequest, RequestDiagnostics, Response,
+    ServiceHttpState, StatusCode, StreamContext, StreamExt, StreamProtocol, TranslationOptions,
+    UpstreamExecution, Url, Uuid, Value,
 };
 use futures::TryStreamExt;
+use kproxy_core::provider::ProviderProtocol;
+use kproxy_translate::model::{map_model_for_provider, ModelMappingContext, ModelRoute};
 use kproxy_translate::{error::log_model, responses_to_openai, ResponsesRequest};
 
 use super::super::compaction_replay::CompactionReplaySource;
@@ -26,6 +28,7 @@ use super::super::responses::{
     is_responses_path, resume_responses_request, stream_response, ResponsesOptions,
     ResponsesSessionOwner,
 };
+use super::provider_gateway::{execute_provider, select_provider_route};
 
 pub(super) async fn handle_claude(
     service: ServiceHttpState,
@@ -38,14 +41,52 @@ pub(super) async fn handle_claude(
 ) -> Result<Response, ApiError> {
     let state = Arc::clone(&service.app);
     let started = Instant::now();
+    let provider_hint = super::provider_gateway::request_provider_hint(
+        &state.config.current(),
+        &service.service,
+        &body,
+    );
     let authenticated_key = authenticate(
         &state,
         &service.allowed_api_key_ids,
         &headers,
         ErrorFormat::Claude,
+    )
+    .map_err(|error| error.with_provider_id_if_empty(&provider_hint))?;
+    enforce_claude_user_agent(&service, &headers, authenticated_key.as_ref())
+        .map_err(|error| error.with_provider_id_if_empty(&provider_hint))?;
+    let provider_route = select_provider_route(
+        &state.config.current(),
+        &service.service,
+        authenticated_key.as_ref(),
+        &body,
+        ErrorFormat::Claude,
     )?;
-    enforce_claude_user_agent(&service, &headers, authenticated_key.as_ref())?;
-    let key_id = authenticated_key.map(|key| key.id);
+    let allowed_models = authenticated_key
+        .as_ref()
+        .map_or_else(Vec::new, |key| key.allowed_models.clone());
+    let key_id = authenticated_key.as_ref().map(|key| key.id.clone());
+    if provider_route.provider_kind != "kiro" {
+        return execute_provider(
+            service,
+            provider_route,
+            ProviderProtocol::ClaudeMessages,
+            path,
+            headers,
+            trace_id,
+            key_id,
+            connection_guard,
+            admission_guard,
+            ErrorFormat::Claude,
+            false,
+        )
+        .await;
+    }
+    let lock_kiro_mapping = provider_route.lock_kiro_mapping;
+    let locked_original_model = provider_route.original_model.clone();
+    let locked_upstream_model = provider_route.upstream_model.clone();
+    let locked_mapping_name = provider_route.mapping_rule.clone();
+    let body = provider_route.body;
     tracing::debug!(
         event = "proxy.authentication.completed",
         trace_id = %trace_id,
@@ -60,6 +101,9 @@ pub(super) async fn handle_claude(
             ErrorFormat::Claude,
         )
     })?;
+    if lock_kiro_mapping {
+        request.model.clone_from(&locked_original_model);
+    }
     let replay_source = CompactionReplaySource::capture(&request.messages);
     let conversation_fingerprint = super::conversation_fingerprint(&request.messages);
     let conversation_id = super::stable_conversation_id(
@@ -203,13 +247,27 @@ pub(super) async fn handle_claude(
         .unwrap_or(0);
     let max_tool_search_operations = config.features.tool_search_max_operations.clamp(1, 256);
     let web_tool_names = claude_web_tool_names(&request);
-    let route = map_model(
-        &request.model,
-        &config.model_mapping,
-        key_id.as_deref(),
-        None,
-        "",
-    );
+    let route = if lock_kiro_mapping {
+        ModelRoute {
+            original: locked_original_model,
+            mapped: locked_upstream_model,
+            rule: locked_mapping_name,
+            rule_index: None,
+        }
+    } else {
+        map_model_for_provider(
+            &request.model,
+            &config.model_mapping,
+            ModelMappingContext {
+                provider_id: "kiro",
+                service_id: Some(&service.service.id),
+                api_key_id: key_id.as_deref(),
+                remaining_percent: None,
+            },
+            "",
+        )
+    };
+    let locked_mapping_rule = lock_kiro_mapping.then_some(route.rule.as_deref()).flatten();
     let mut options = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
     options.enhance_system_prompt = config.features.enhance_system_prompt && !client_compaction;
     options.web_search_replay = Some(state.web_search_replay.clone());
@@ -456,7 +514,10 @@ pub(super) async fn handle_claude(
         &route.mapped,
         &request.model,
         key_id.as_deref(),
+        &allowed_models,
+        Some(&service.service.id),
         &config.features.default_model_id,
+        locked_mapping_rule,
         &payload,
     )
     .await
@@ -511,6 +572,8 @@ pub(super) async fn handle_claude(
             CompactionRequest {
                 trace_id: &trace_id,
                 key_id: key_id.as_deref(),
+                allowed_models: &allowed_models,
+                service_id: Some(&service.service.id),
                 source_payload: &payload,
                 decision: &decision,
                 summary_model,
@@ -631,7 +694,10 @@ pub(super) async fn handle_claude(
         &route.mapped,
         &request.model,
         key_id.as_deref(),
+        &allowed_models,
+        Some(&service.service.id),
         &config.features.default_model_id,
+        locked_mapping_rule,
         estimate,
         input_tokens,
         compacted,
@@ -678,6 +744,8 @@ pub(super) async fn handle_claude(
                     CompactionRequest {
                         trace_id: &trace_id,
                         key_id: key_id.as_deref(),
+                        allowed_models: &allowed_models,
+                        service_id: Some(&service.service.id),
                         source_payload: &payload,
                         decision: &decision,
                         summary_model,
@@ -757,7 +825,10 @@ pub(super) async fn handle_claude(
                 &route.mapped,
                 &request.model,
                 key_id.as_deref(),
+                &allowed_models,
+                Some(&service.service.id),
                 &config.features.default_model_id,
+                locked_mapping_rule,
                 estimate,
                 input_tokens,
                 true,
@@ -832,10 +903,13 @@ pub(super) async fn handle_claude(
                 trace_id,
                 request_id,
                 path,
+                service_id: service.service.id.clone(),
                 model: request.model.clone(),
                 mapped_model,
                 original_model: request.model,
                 api_key_id: key_id.clone(),
+                allowed_models,
+                lock_model_mapping: lock_kiro_mapping,
                 kiro_model,
                 model_path,
                 model_mapping_rule,
@@ -929,14 +1003,61 @@ pub(super) async fn handle_openai(
 ) -> Result<Response, ApiError> {
     let state = Arc::clone(&service.app);
     let started = Instant::now();
+    // Multi-candidate chat re-enters this handler for every candidate. Keep
+    // the client body so provider selection and a cross-provider mapping are
+    // evaluated from the same request rather than from the first routed body.
+    let original_body = body.clone();
+    let provider_hint = super::provider_gateway::request_provider_hint(
+        &state.config.current(),
+        &service.service,
+        &body,
+    );
     let authenticated_key = authenticate(
         &state,
         &service.allowed_api_key_ids,
         &headers,
         ErrorFormat::OpenAi,
+    )
+    .map_err(|error| error.with_provider_id_if_empty(&provider_hint))?;
+    enforce_codex_user_agent(&service, &headers, authenticated_key.as_ref())
+        .map_err(|error| error.with_provider_id_if_empty(&provider_hint))?;
+    let provider_route = select_provider_route(
+        &state.config.current(),
+        &service.service,
+        authenticated_key.as_ref(),
+        &body,
+        ErrorFormat::OpenAi,
     )?;
-    enforce_codex_user_agent(&service, &headers, authenticated_key.as_ref())?;
-    let key_id = authenticated_key.map(|key| key.id);
+    let allowed_models = authenticated_key
+        .as_ref()
+        .map_or_else(Vec::new, |key| key.allowed_models.clone());
+    let key_id = authenticated_key.as_ref().map(|key| key.id.clone());
+    if provider_route.provider_kind != "kiro" {
+        let protocol = if is_responses_path(&path) {
+            ProviderProtocol::OpenAiResponses
+        } else {
+            ProviderProtocol::OpenAiChat
+        };
+        return execute_provider(
+            service,
+            provider_route,
+            protocol,
+            path,
+            headers,
+            trace_id,
+            key_id,
+            connection_guard,
+            admission_guard,
+            ErrorFormat::OpenAi,
+            false,
+        )
+        .await;
+    }
+    let lock_kiro_mapping = provider_route.lock_kiro_mapping;
+    let locked_original_model = provider_route.original_model.clone();
+    let locked_upstream_model = provider_route.upstream_model.clone();
+    let locked_mapping_name = provider_route.mapping_rule.clone();
+    let body = provider_route.body;
     tracing::debug!(
         event = "proxy.authentication.completed",
         trace_id = %trace_id,
@@ -1017,6 +1138,9 @@ pub(super) async fn handle_openai(
         })?;
         (request, None)
     };
+    if lock_kiro_mapping {
+        request.model.clone_from(&locked_original_model);
+    }
     if responses_options.is_none() && request.n.unwrap_or(1) > 1 {
         let include_usage = request
             .stream_options
@@ -1035,7 +1159,7 @@ pub(super) async fn handle_openai(
             service,
             path,
             headers,
-            body,
+            original_body,
             count,
             streaming,
             include_usage,
@@ -1071,13 +1195,27 @@ pub(super) async fn handle_openai(
     // Omission must survive through response formatting and continuations,
     // not just the initial Kiro payload. Only credit estimates use a default.
     let max_tokens = request.output_token_limit();
-    let route = map_model(
-        &request.model,
-        &config.model_mapping,
-        key_id.as_deref(),
-        None,
-        "",
-    );
+    let route = if lock_kiro_mapping {
+        ModelRoute {
+            original: locked_original_model,
+            mapped: locked_upstream_model,
+            rule: locked_mapping_name,
+            rule_index: None,
+        }
+    } else {
+        map_model_for_provider(
+            &request.model,
+            &config.model_mapping,
+            ModelMappingContext {
+                provider_id: "kiro",
+                service_id: Some(&service.service.id),
+                api_key_id: key_id.as_deref(),
+                remaining_percent: None,
+            },
+            "",
+        )
+    };
+    let locked_mapping_rule = lock_kiro_mapping.then_some(route.rule.as_deref()).flatten();
     let mut options = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
     options.enhance_system_prompt = config.features.enhance_system_prompt;
     options.enable_prompt_cache = config.features.enable_prompt_cache;
@@ -1154,7 +1292,10 @@ pub(super) async fn handle_openai(
             &route.mapped,
             &request.model,
             key_id.as_deref(),
+            &allowed_models,
+            Some(&service.service.id),
             &config.features.default_model_id,
+            locked_mapping_rule,
             &payload,
         )
         .await
@@ -1273,7 +1414,10 @@ pub(super) async fn handle_openai(
         &route.mapped,
         &request.model,
         key_id.as_deref(),
+        &allowed_models,
+        Some(&service.service.id),
         &config.features.default_model_id,
+        locked_mapping_rule,
         estimate,
         input_tokens,
         false,
@@ -1308,10 +1452,13 @@ pub(super) async fn handle_openai(
                 trace_id,
                 request_id,
                 path,
+                service_id: service.service.id.clone(),
                 model: request.model.clone(),
                 mapped_model,
                 original_model: request.model.clone(),
                 api_key_id: key_id.clone(),
+                allowed_models,
+                lock_model_mapping: lock_kiro_mapping,
                 kiro_model,
                 model_path,
                 model_mapping_rule,

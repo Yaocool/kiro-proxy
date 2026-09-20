@@ -67,6 +67,7 @@ pub fn router(state: Arc<AppState>) -> Router {
             .filter_map(|key| key.id.clone())
             .collect(),
         created_at: 0,
+        ..ProxyServiceConfig::default()
     };
     router_for_service(state, service, false)
 }
@@ -497,6 +498,8 @@ impl ProxyServiceManager {
                     skip_user_agent_check: service.skip_user_agent_check,
                     running: is_running,
                     api_key_ids: service.api_key_ids.clone(),
+                    default_provider: service.default_provider.clone(),
+                    allowed_providers: service.allowed_providers.clone(),
                     created_at: service.created_at,
                     error,
                 }
@@ -514,6 +517,8 @@ fn listener_config_changed(current: &ProxyServiceConfig, next: &ProxyServiceConf
         || current.port != next.port
         || current.enabled != next.enabled
         || current.api_key_ids != next.api_key_ids
+        || current.default_provider != next.default_provider
+        || current.allowed_providers != next.allowed_providers
         || current.created_at != next.created_at
 }
 
@@ -675,6 +680,23 @@ mod tests {
             }),
             additional_model_request_fields_schema: None,
         }
+    }
+
+    #[test]
+    fn provider_routing_changes_replace_the_listener_snapshot() {
+        let current = ProxyServiceConfig {
+            id: "svc_test".into(),
+            name: "test".into(),
+            host: "127.0.0.1".into(),
+            port: 5580,
+            api_key_ids: vec!["ak_test".into()],
+            ..ProxyServiceConfig::default()
+        };
+        let mut next = current.clone();
+        next.default_provider = "copilot".into();
+        next.allowed_providers = vec!["kiro".into(), "copilot".into()];
+
+        assert!(listener_config_changed(&current, &next));
     }
 
     fn account_with_usage(id: &str, email: &str, enabled: bool, usage: Option<Usage>) -> Account {
@@ -1111,6 +1133,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn legacy_kiro_model_list_respects_api_key_model_scope() {
+        let mut config = Config::default();
+        config.models.dynamic_discovery = false;
+        config.api_key.push(ApiKeyConfig {
+            id: Some("ak_model_scope".into()),
+            name: "model-scope".into(),
+            key: "sk-model-scope".into(),
+            format: ApiKeyFormat::Sk,
+            enabled: true,
+            skip_user_agent_check: false,
+            credits_limit: None,
+            allowed_providers: Vec::new(),
+            allowed_models: vec!["kiro/claude-sonnet-4.6".into()],
+        });
+        let (_directory, state) = test_state(config).await;
+
+        let response = router(state)
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(header::AUTHORIZATION, "Bearer sk-model-scope")
+                    .header(header::USER_AGENT, "codex_cli_rs/0.147.0 (test)")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let models = body["data"].as_array().expect("model data");
+        assert_eq!(models.len(), 1);
+        assert_eq!(models[0]["id"], "claude-sonnet-4.6");
+    }
+
+    #[tokio::test]
     async fn unidentified_model_list_merges_openai_and_anthropic_fields() {
         let (_directory, state) = test_state(Config::default()).await;
         state.models.finish_refresh(vec![
@@ -1343,6 +1400,7 @@ mod tests {
                 enabled: true,
                 skip_user_agent_check: api_key_bypass,
                 credits_limit: None,
+                ..ApiKeyConfig::default()
             });
             let service = ProxyServiceConfig {
                 id: "svc_user_agent".into(),
@@ -1353,6 +1411,7 @@ mod tests {
                 skip_user_agent_check: service_bypass,
                 api_key_ids: vec!["ak_user_agent".into()],
                 created_at: 0,
+                ..ProxyServiceConfig::default()
             };
             config.proxy_service.push(service.clone());
             let (_directory, state) = test_state(config).await;
@@ -1443,6 +1502,7 @@ mod tests {
             enabled: true,
             skip_user_agent_check: true,
             credits_limit: None,
+            ..ApiKeyConfig::default()
         });
         config.api_key.push(ApiKeyConfig {
             id: Some("ak_unbound_bypass".into()),
@@ -1452,6 +1512,7 @@ mod tests {
             enabled: true,
             skip_user_agent_check: true,
             credits_limit: None,
+            ..ApiKeyConfig::default()
         });
         let service = ProxyServiceConfig {
             id: "svc_bypass".into(),
@@ -1462,6 +1523,7 @@ mod tests {
             skip_user_agent_check: true,
             api_key_ids: vec!["ak_bypass".into()],
             created_at: 0,
+            ..ProxyServiceConfig::default()
         };
         config.proxy_service.push(service.clone());
         let (_directory, state) = test_state(config).await;
@@ -1707,6 +1769,7 @@ mod tests {
             enabled: true,
             skip_user_agent_check: false,
             credits_limit: None,
+            ..ApiKeyConfig::default()
         });
         let (_directory, state) = test_state(config).await;
         let unauthorized = router(Arc::clone(&state))
@@ -1749,6 +1812,7 @@ mod tests {
             enabled: true,
             skip_user_agent_check: false,
             credits_limit: None,
+            ..ApiKeyConfig::default()
         });
         let (_directory, state) = test_state(config).await;
         let attacker_model = "attacker-controlled-model";
@@ -2103,6 +2167,7 @@ mod tests {
             enabled: true,
             skip_user_agent_check: false,
             credits_limit: None,
+            ..ApiKeyConfig::default()
         });
         config.proxy_service.push(ProxyServiceConfig {
             id: "svc_hot_policy".into(),
@@ -2113,6 +2178,7 @@ mod tests {
             skip_user_agent_check: false,
             api_key_ids: vec!["ak_hot_policy".into()],
             created_at: 0,
+            ..ProxyServiceConfig::default()
         });
         let (_directory, state) = test_state(config.clone()).await;
         assert!(state.reconcile_proxy_services(&config).await.is_empty());
@@ -2195,6 +2261,7 @@ mod tests {
             skip_user_agent_check: false,
             api_key_ids: Vec::new(),
             created_at: 0,
+            ..ProxyServiceConfig::default()
         };
         let finished = tokio::spawn(async {});
         while !finished.is_finished() {

@@ -96,6 +96,10 @@ pub struct RequestLog {
     pub trace_id: String,
     pub request_id: String,
     pub path: String,
+    /// Provider instance that handled the request. Empty legacy records are
+    /// interpreted as `kiro` when grouped.
+    #[serde(default)]
+    pub provider_id: String,
     /// Model after an explicit `model_mapping` rule or runtime fallback.
     pub model: String,
     /// Model name received from the client.
@@ -167,6 +171,12 @@ impl Counter {
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct WindowBucket {
     pub total: Counter,
+    #[serde(default)]
+    pub by_provider: HashMap<String, Counter>,
+    /// Provider-local dimensions preserve exact filtering without relying on
+    /// account/model naming conventions or mixing equal model IDs.
+    #[serde(default)]
+    pub provider_details: HashMap<String, ProviderStatsBreakdown>,
     pub by_account: HashMap<String, Counter>,
     pub by_endpoint: HashMap<String, Counter>,
     pub by_model: HashMap<String, Counter>,
@@ -174,8 +184,40 @@ pub struct WindowBucket {
 }
 
 impl WindowBucket {
+    fn migrate_legacy_kiro_dimensions(&mut self) {
+        if self.total.requests == 0
+            || !self.by_provider.is_empty()
+            || !self.provider_details.is_empty()
+        {
+            return;
+        }
+        self.by_provider.insert("kiro".into(), self.total.clone());
+        self.provider_details.insert(
+            "kiro".into(),
+            ProviderStatsBreakdown {
+                total: self.total.clone(),
+                by_account: self.by_account.clone(),
+                by_endpoint: self.by_endpoint.clone(),
+                by_model: self.by_model.clone(),
+                latencies_ms: self.latencies_ms.clone(),
+            },
+        );
+    }
+
     fn record(&mut self, request: &RequestLog) {
         self.total.record(request);
+        provider_breakdown_entry(
+            &mut self.provider_details,
+            request_provider(request),
+            MAX_BUCKET_DIMENSION_KEYS,
+        )
+        .record(request, MAX_BUCKET_DIMENSION_KEYS);
+        record_dimension_with_limit(
+            &mut self.by_provider,
+            request_provider(request),
+            request,
+            MAX_BUCKET_DIMENSION_KEYS,
+        );
         record_dimension_with_limit(
             &mut self.by_account,
             &request.account_id,
@@ -201,9 +243,59 @@ impl WindowBucket {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ProviderStatsBreakdown {
+    pub total: Counter,
+    #[serde(default)]
+    pub by_account: HashMap<String, Counter>,
+    #[serde(default)]
+    pub by_endpoint: HashMap<String, Counter>,
+    #[serde(default)]
+    pub by_model: HashMap<String, Counter>,
+    #[serde(default)]
+    pub latencies_ms: VecDeque<u64>,
+}
+
+impl ProviderStatsBreakdown {
+    fn record(&mut self, request: &RequestLog, maximum: usize) {
+        self.total.record(request);
+        record_dimension_with_limit(&mut self.by_account, &request.account_id, request, maximum);
+        record_dimension_with_limit(&mut self.by_endpoint, &request.endpoint, request, maximum);
+        record_dimension_with_limit(&mut self.by_model, &request.model, request, maximum);
+        self.latencies_ms.push_back(request.duration_ms);
+        while self.latencies_ms.len() > MAX_BUCKET_LATENCIES {
+            self.latencies_ms.pop_front();
+        }
+    }
+
+    fn merge(&mut self, other: &Self, maximum: usize, maximum_latencies: usize) {
+        self.total.merge(&other.total);
+        merge_dimensions_with_limit(&mut self.by_account, &other.by_account, maximum);
+        merge_dimensions_with_limit(&mut self.by_endpoint, &other.by_endpoint, maximum);
+        merge_dimensions_with_limit(&mut self.by_model, &other.by_model, maximum);
+        self.latencies_ms.extend(other.latencies_ms.iter().copied());
+        while self.latencies_ms.len() > maximum_latencies {
+            self.latencies_ms.pop_front();
+        }
+    }
+
+    fn bound(&mut self, maximum: usize, maximum_latencies: usize) {
+        bound_dimensions_to(&mut self.by_account, maximum);
+        bound_dimensions_to(&mut self.by_endpoint, maximum);
+        bound_dimensions_to(&mut self.by_model, maximum);
+        while self.latencies_ms.len() > maximum_latencies {
+            self.latencies_ms.pop_front();
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProxyStats {
     pub total: Counter,
+    #[serde(default)]
+    pub by_provider: HashMap<String, Counter>,
+    #[serde(default)]
+    pub provider_details: HashMap<String, ProviderStatsBreakdown>,
     pub by_account: HashMap<String, Counter>,
     pub by_endpoint: HashMap<String, Counter>,
     pub by_model: HashMap<String, Counter>,
@@ -238,6 +330,8 @@ impl Default for ProxyStats {
     fn default() -> Self {
         Self {
             total: Counter::default(),
+            by_provider: HashMap::new(),
+            provider_details: HashMap::new(),
             by_account: HashMap::new(),
             by_endpoint: HashMap::new(),
             by_model: HashMap::new(),
@@ -252,11 +346,49 @@ impl Default for ProxyStats {
 }
 
 impl ProxyStats {
+    fn migrate_legacy_kiro_dimensions(&mut self) {
+        // Provider dimensions did not exist before the multi-provider schema,
+        // so every non-empty aggregate without them is known to be Kiro data.
+        if self.total.requests > 0
+            && self.by_provider.is_empty()
+            && self.provider_details.is_empty()
+        {
+            self.by_provider.insert("kiro".into(), self.total.clone());
+            self.provider_details.insert(
+                "kiro".into(),
+                ProviderStatsBreakdown {
+                    total: self.total.clone(),
+                    by_account: self.by_account.clone(),
+                    by_endpoint: self.by_endpoint.clone(),
+                    by_model: self.by_model.clone(),
+                    latencies_ms: self.latencies_ms.clone(),
+                },
+            );
+        }
+        for bucket in self.minute_buckets.values_mut() {
+            bucket.migrate_legacy_kiro_dimensions();
+        }
+    }
+
     fn bound_dimensions(&mut self) {
         bound_dimensions(&mut self.by_account);
+        bound_dimensions(&mut self.by_provider);
+        bound_provider_breakdowns(&mut self.provider_details, MAX_DIMENSION_KEYS, 10_000);
+        for details in self.provider_details.values_mut() {
+            details.bound(MAX_DIMENSION_KEYS, 10_000);
+        }
         bound_dimensions(&mut self.by_endpoint);
         bound_dimensions(&mut self.by_model);
         for bucket in self.minute_buckets.values_mut() {
+            bound_dimensions_to(&mut bucket.by_provider, MAX_BUCKET_DIMENSION_KEYS);
+            bound_provider_breakdowns(
+                &mut bucket.provider_details,
+                MAX_BUCKET_DIMENSION_KEYS,
+                MAX_BUCKET_LATENCIES,
+            );
+            for details in bucket.provider_details.values_mut() {
+                details.bound(MAX_BUCKET_DIMENSION_KEYS, MAX_BUCKET_LATENCIES);
+            }
             bound_dimensions_to(&mut bucket.by_account, MAX_BUCKET_DIMENSION_KEYS);
             bound_dimensions_to(&mut bucket.by_endpoint, MAX_BUCKET_DIMENSION_KEYS);
             bound_dimensions_to(&mut bucket.by_model, MAX_BUCKET_DIMENSION_KEYS);
@@ -280,6 +412,35 @@ impl ProxyStats {
             percentile(&values, 0.95),
             percentile(&values, 0.99),
         )
+    }
+
+    /// Restrict a materialized statistics window to one provider. New
+    /// snapshots include exact provider-local dimensions. Legacy snapshots
+    /// retain the provider total and report empty local dimensions rather than
+    /// returning unrelated global values.
+    pub fn retain_provider(&mut self, provider: &str) {
+        let provider_total = self.by_provider.get(provider).cloned().unwrap_or_default();
+        let details = self.provider_details.get(provider).cloned();
+        self.total = details
+            .as_ref()
+            .map_or(provider_total, |details| details.total.clone());
+        self.by_provider
+            .retain(|candidate, _| candidate == provider);
+        self.provider_details
+            .retain(|candidate, _| candidate == provider);
+        if let Some(details) = details {
+            self.by_account = details.by_account;
+            self.by_endpoint = details.by_endpoint;
+            self.by_model = details.by_model;
+            self.latencies_ms = details.latencies_ms;
+        } else {
+            self.by_account.clear();
+            self.by_endpoint.clear();
+            self.by_model.clear();
+            self.latencies_ms.clear();
+        }
+        self.recent_requests
+            .retain(|request| request_provider(request) == provider);
     }
 }
 
@@ -308,7 +469,27 @@ struct StatsRuntimeState {
 #[derive(Default)]
 struct SessionStats {
     total: Counter,
-    minute_buckets: BTreeMap<i64, Counter>,
+    by_provider: HashMap<String, Counter>,
+    minute_buckets: BTreeMap<i64, SessionBucket>,
+}
+
+#[derive(Default)]
+struct SessionBucket {
+    total: Counter,
+    by_provider: HashMap<String, Counter>,
+}
+
+impl SessionStats {
+    fn record(&mut self, request: &RequestLog) {
+        self.total.record(request);
+        record_dimension(&mut self.by_provider, request_provider(request), request);
+        let bucket = self
+            .minute_buckets
+            .entry(request.timestamp.div_euclid(60))
+            .or_default();
+        bucket.total.record(request);
+        record_dimension(&mut bucket.by_provider, request_provider(request), request);
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -333,6 +514,7 @@ impl StatsStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => ProxyStats::default(),
             Err(error) => return Err(error.into()),
         };
+        persistent.migrate_legacy_kiro_dimensions();
         persistent.bound_dimensions();
         let recent_requests = std::mem::take(&mut persistent.recent_requests)
             .into_iter()
@@ -446,13 +628,7 @@ impl StatsStore {
         )
         .record(&request);
         state.dirty_minutes.insert(minute);
-        state.session.total.record(&request);
-        state
-            .session
-            .minute_buckets
-            .entry(minute)
-            .or_default()
-            .record(&request);
+        state.session.record(&request);
         state.recent_requests.push_back(Arc::clone(&request));
         while state.recent_requests.len() > 1_000 {
             state.recent_requests.pop_front();
@@ -587,25 +763,29 @@ impl StatsStore {
         if start.is_none() && end.is_none() {
             return ProxyStats {
                 total: state.session.total.clone(),
+                by_provider: state.session.by_provider.clone(),
                 history_started_at: Some(self.session_started_at),
                 ..ProxyStats::default()
             };
         }
         let mut total = Counter::default();
+        let mut by_provider = HashMap::new();
         if !start.zip(end).is_some_and(|(start, end)| start > end) {
             let start_minute = start.unwrap_or(i64::MIN).div_euclid(60);
             let end_minute = end.unwrap_or(i64::MAX).div_euclid(60);
-            for counter in state
+            for bucket in state
                 .session
                 .minute_buckets
                 .range(start_minute..=end_minute)
-                .map(|(_, counter)| counter)
+                .map(|(_, bucket)| bucket)
             {
-                total.merge(counter);
+                total.merge(&bucket.total);
+                merge_dimensions(&mut by_provider, &bucket.by_provider);
             }
         }
         ProxyStats {
             total,
+            by_provider,
             history_started_at: Some(self.session_started_at),
             ..ProxyStats::default()
         }
@@ -635,6 +815,7 @@ impl StatsStore {
         let state = lock(&self.state);
         ProxyStats {
             total: state.session.total.clone(),
+            by_provider: state.session.by_provider.clone(),
             history_started_at: Some(self.session_started_at),
             ..ProxyStats::default()
         }
@@ -705,11 +886,12 @@ impl StatsStore {
         wait_ms: u64,
         level: Option<&str>,
         account: Option<&str>,
+        provider: Option<&str>,
     ) -> Vec<RequestLog> {
         // Subscribe before inspecting the ring to avoid missing a record between
         // the initial read and registration with the broadcast channel.
         let mut receiver = self.sender.subscribe();
-        let current = self.filtered_logs(after_request_id, tail, level, account);
+        let current = self.filtered_logs(after_request_id, tail, level, account, provider);
         if !current.is_empty() || wait_ms == 0 {
             return current;
         }
@@ -717,14 +899,14 @@ impl StatsStore {
         let _result = tokio::time::timeout(deadline, async {
             loop {
                 match receiver.recv().await {
-                    Ok(request) if matches_log(&request, level, account) => break,
+                    Ok(request) if matches_log(&request, level, account, provider) => break,
                     Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                 }
             }
         })
         .await;
-        self.filtered_logs(after_request_id, tail, level, account)
+        self.filtered_logs(after_request_id, tail, level, account, provider)
     }
 
     fn filtered_logs(
@@ -733,6 +915,7 @@ impl StatsStore {
         tail: usize,
         level: Option<&str>,
         account: Option<&str>,
+        provider: Option<&str>,
     ) -> Vec<RequestLog> {
         let entries = {
             let state = lock(&self.state);
@@ -749,7 +932,7 @@ impl StatsStore {
                 .recent_requests
                 .iter()
                 .skip(start)
-                .filter(|request| matches_log(request, level, account))
+                .filter(|request| matches_log(request, level, account, provider))
                 .take(tail.min(1_000))
                 .cloned()
                 .collect::<Vec<_>>()
@@ -763,6 +946,13 @@ impl StatsStore {
 
 fn record_persistent(state: &mut ProxyStats, request: &RequestLog) {
     state.total.record(request);
+    record_dimension(&mut state.by_provider, request_provider(request), request);
+    provider_breakdown_entry(
+        &mut state.provider_details,
+        request_provider(request),
+        MAX_DIMENSION_KEYS,
+    )
+    .record(request, MAX_DIMENSION_KEYS);
     record_dimension(&mut state.by_account, &request.account_id, request);
     record_dimension(&mut state.by_endpoint, &request.endpoint, request);
     record_dimension(&mut state.by_model, &request.model, request);
@@ -817,6 +1007,13 @@ fn recent_between(
 
 fn merge_bucket(output: &mut ProxyStats, bucket: &WindowBucket) {
     output.total.merge(&bucket.total);
+    merge_dimensions(&mut output.by_provider, &bucket.by_provider);
+    merge_provider_breakdowns(
+        &mut output.provider_details,
+        &bucket.provider_details,
+        MAX_DIMENSION_KEYS,
+        10_000,
+    );
     merge_dimensions(&mut output.by_account, &bucket.by_account);
     merge_dimensions(&mut output.by_endpoint, &bucket.by_endpoint);
     merge_dimensions(&mut output.by_model, &bucket.by_model);
@@ -840,7 +1037,7 @@ fn history_dir_for(path: &Path) -> PathBuf {
 }
 
 async fn read_history_day(path: &Path) -> anyhow::Result<HistoryDay> {
-    let history = match tokio::fs::read_to_string(path).await {
+    let mut history = match tokio::fs::read_to_string(path).await {
         Ok(raw) if matches!(raw.trim(), "" | "{}") => Ok(HistoryDay::default()),
         Ok(raw) => {
             let path = path.to_path_buf();
@@ -860,6 +1057,9 @@ async fn read_history_day(path: &Path) -> anyhow::Result<HistoryDay> {
             history.version,
             path.display()
         );
+    }
+    for bucket in history.minutes.values_mut() {
+        bucket.migrate_legacy_kiro_dimensions();
     }
     Ok(history)
 }
@@ -1200,6 +1400,8 @@ fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 fn compact_snapshot(state: &ProxyStats) -> ProxyStats {
     ProxyStats {
         total: state.total.clone(),
+        by_provider: state.by_provider.clone(),
+        provider_details: state.provider_details.clone(),
         by_account: state.by_account.clone(),
         by_endpoint: state.by_endpoint.clone(),
         by_model: state.by_model.clone(),
@@ -1224,8 +1426,24 @@ fn materialize_recent(requests: &VecDeque<Arc<RequestLog>>) -> VecDeque<RequestL
     requests.iter().map(|request| (**request).clone()).collect()
 }
 
-fn matches_log(request: &RequestLog, level: Option<&str>, account: Option<&str>) -> bool {
+fn request_provider(request: &RequestLog) -> &str {
+    if request.provider_id.is_empty() {
+        "kiro"
+    } else {
+        &request.provider_id
+    }
+}
+
+fn matches_log(
+    request: &RequestLog,
+    level: Option<&str>,
+    account: Option<&str>,
+    provider: Option<&str>,
+) -> bool {
     if account.is_some_and(|account| request.account_id != account) {
+        return false;
+    }
+    if provider.is_some_and(|provider| request_provider(request) != provider) {
         return false;
     }
     match level.map(str::to_ascii_lowercase).as_deref() {
@@ -1238,6 +1456,61 @@ fn matches_log(request: &RequestLog, level: Option<&str>, account: Option<&str>)
 fn merge_dimensions(target: &mut HashMap<String, Counter>, source: &HashMap<String, Counter>) {
     for (key, counter) in source {
         merge_dimension(target, key, counter);
+    }
+}
+
+fn merge_dimensions_with_limit(
+    target: &mut HashMap<String, Counter>,
+    source: &HashMap<String, Counter>,
+    maximum: usize,
+) {
+    for (key, counter) in source {
+        dimension_entry_with_limit(target, key, maximum).merge(counter);
+    }
+}
+
+fn provider_breakdown_entry<'a>(
+    dimensions: &'a mut HashMap<String, ProviderStatsBreakdown>,
+    key: &str,
+    maximum: usize,
+) -> &'a mut ProviderStatsBreakdown {
+    let maximum = maximum.max(2);
+    let bounded_key = if dimensions.contains_key(key)
+        || (key != OTHER_DIMENSION && dimensions.len() < maximum - 1)
+    {
+        key
+    } else {
+        OTHER_DIMENSION
+    };
+    dimensions.entry(bounded_key.to_owned()).or_default()
+}
+
+fn merge_provider_breakdowns(
+    target: &mut HashMap<String, ProviderStatsBreakdown>,
+    source: &HashMap<String, ProviderStatsBreakdown>,
+    maximum: usize,
+    maximum_latencies: usize,
+) {
+    for (key, details) in source {
+        provider_breakdown_entry(target, key, maximum).merge(details, maximum, maximum_latencies);
+    }
+}
+
+fn bound_provider_breakdowns(
+    dimensions: &mut HashMap<String, ProviderStatsBreakdown>,
+    maximum: usize,
+    maximum_latencies: usize,
+) {
+    if dimensions.len() < maximum {
+        return;
+    }
+    let entries = std::mem::take(dimensions);
+    for (key, details) in entries {
+        provider_breakdown_entry(dimensions, &key, maximum).merge(
+            &details,
+            maximum,
+            maximum_latencies,
+        );
     }
 }
 
@@ -1363,6 +1636,7 @@ mod tests {
             trace_id: format!("trace-{id}"),
             request_id: id.into(),
             path: "/v1/messages".into(),
+            provider_id: "kiro".into(),
             model: "mapped".into(),
             original_model: "client".into(),
             kiro_model: "kiro".into(),
@@ -1386,17 +1660,44 @@ mod tests {
     fn legacy_request_logs_default_new_diagnostic_fields() {
         let mut value = serde_json::to_value(request("req-old", 42, 502)).expect("serialize");
         let object = value.as_object_mut().expect("request object");
+        object.remove("provider_id");
         object.remove("account_name");
         object.remove("model_path");
         object.remove("model_mapping_rule");
         object.remove("attempts");
         object.remove("diagnostics");
         let decoded: RequestLog = serde_json::from_value(value).expect("deserialize legacy log");
+        assert!(decoded.provider_id.is_empty());
         assert!(decoded.account_name.is_empty());
         assert!(decoded.model_path.is_empty());
         assert!(decoded.model_mapping_rule.is_none());
         assert!(decoded.attempts.is_empty());
         assert_eq!(decoded.diagnostics.loaded_tool_count, 0);
+    }
+
+    #[test]
+    fn legacy_aggregate_dimensions_are_backfilled_as_kiro() {
+        let entry = request("legacy-provider", 42, 200);
+        let mut aggregate = ProxyStats::default();
+        record_persistent(&mut aggregate, &entry);
+        aggregate.by_provider.clear();
+        aggregate.provider_details.clear();
+        let mut bucket = WindowBucket::default();
+        bucket.record(&entry);
+        bucket.by_provider.clear();
+        bucket.provider_details.clear();
+        aggregate.minute_buckets.insert(0, bucket);
+
+        aggregate.migrate_legacy_kiro_dimensions();
+        aggregate.retain_provider("kiro");
+
+        assert_eq!(aggregate.total.requests, 1);
+        assert_eq!(aggregate.by_account["acc_test"].requests, 1);
+        assert_eq!(aggregate.by_endpoint["amazonq"].requests, 1);
+        assert_eq!(aggregate.by_model["mapped"].requests, 1);
+        let bucket = aggregate.minute_buckets.get(&0).expect("legacy minute");
+        assert_eq!(bucket.by_provider["kiro"].requests, 1);
+        assert_eq!(bucket.provider_details["kiro"].total.requests, 1);
     }
 
     #[tokio::test]
@@ -1461,6 +1762,33 @@ mod tests {
         assert!(window.by_model.len() <= MAX_DIMENSION_KEYS);
     }
 
+    #[tokio::test]
+    async fn provider_filter_uses_provider_local_dimensions() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let store = StatsStore::empty(&directory.path().join("stats.json"));
+        let mut kiro = request("kiro", 100, 200);
+        kiro.input_tokens = 11;
+        let mut copilot = request("copilot", 101, 500);
+        copilot.provider_id = "copilot-team".into();
+        copilot.account_id = "acc_copilot".into();
+        copilot.endpoint = "api.githubcopilot.com".into();
+        copilot.model = "gpt-test".into();
+        copilot.input_tokens = 22;
+        store.record(kiro);
+        store.record(copilot);
+
+        let mut scoped = store.window(None, None).await.expect("stats window");
+        scoped.retain_provider("copilot-team");
+        assert_eq!(scoped.total.requests, 1);
+        assert_eq!(scoped.total.failures, 1);
+        assert_eq!(scoped.total.input_tokens, 22);
+        assert_eq!(scoped.by_model["gpt-test"].requests, 1);
+        assert_eq!(scoped.by_account["acc_copilot"].requests, 1);
+        assert_eq!(scoped.by_endpoint["api.githubcopilot.com"].requests, 1);
+        assert_eq!(scoped.recent_requests.len(), 1);
+        assert_eq!(scoped.recent_requests[0].provider_id, "copilot-team");
+    }
+
     #[test]
     fn minute_buckets_bound_cardinality_without_dropping_history() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -1510,7 +1838,11 @@ mod tests {
         let store = std::sync::Arc::new(StatsStore::empty(&directory.path().join("stats.json")));
         let follower = {
             let store = std::sync::Arc::clone(&store);
-            tokio::spawn(async move { store.follow(None, 10, 1_000, Some("error"), None).await })
+            tokio::spawn(async move {
+                store
+                    .follow(None, 10, 1_000, Some("error"), None, None)
+                    .await
+            })
         };
         tokio::task::yield_now().await;
         store.record(request("ok", 1, 200));

@@ -6,11 +6,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use kproxy_core::config::{
+    ApiKeyConfig, ApiKeyFormat, Config, ModelMappingRule, ProviderConfig, ProxyServiceConfig,
+};
 use kproxy_ipc::protocol::{decode_line, encode_line, Request, Response};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 static HTTP_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
@@ -106,6 +109,84 @@ impl Daemon {
             socket,
             home,
             api_key: Some(api_key),
+        }
+    }
+
+    async fn start_copilot(port: u16, github_base: &str) -> Self {
+        let home = tempfile::tempdir().expect("tempdir");
+        let socket = home.path().join("admin.sock");
+        let mut copilot = ProviderConfig {
+            id: "copilot".into(),
+            kind: "copilot".into(),
+            ..ProviderConfig::default()
+        };
+        copilot.settings.insert(
+            "github_api_base".into(),
+            serde_json::Value::String(github_base.into()),
+        );
+        copilot.settings.insert(
+            "oauth_base".into(),
+            serde_json::Value::String(github_base.into()),
+        );
+        copilot
+            .settings
+            .insert("allow_insecure_http".into(), serde_json::Value::Bool(true));
+        let mut config = Config::default();
+        config.admin.socket = socket.to_string_lossy().into_owned();
+        config.provider = vec![copilot];
+        config.api_key = vec![ApiKeyConfig {
+            id: Some("ak_copilot_e2e".into()),
+            name: "copilot-e2e".into(),
+            key: "copilot-e2e-secret".into(),
+            format: ApiKeyFormat::Simple,
+            enabled: true,
+            skip_user_agent_check: true,
+            credits_limit: None,
+            allowed_providers: vec!["copilot".into()],
+            allowed_models: vec!["copilot/*".into()],
+        }];
+        config.proxy_service = vec![ProxyServiceConfig {
+            id: "svc_copilot_e2e".into(),
+            name: "copilot-e2e".into(),
+            host: "127.0.0.1".into(),
+            port,
+            enabled: true,
+            skip_user_agent_check: true,
+            api_key_ids: vec!["ak_copilot_e2e".into()],
+            default_provider: "copilot".into(),
+            allowed_providers: vec!["copilot".into()],
+            created_at: 1,
+        }];
+        config.model_mapping = vec![ModelMappingRule {
+            name: "copilot-fast".into(),
+            source_models: vec!["team-fast".into()],
+            target_models: vec!["gpt-test".into()],
+            providers: vec!["copilot".into()],
+            service_ids: vec!["svc_copilot_e2e".into()],
+            ..ModelMappingRule::default()
+        }];
+        config.validate().expect("valid Copilot e2e config");
+        tokio::fs::write(
+            home.path().join("config.toml"),
+            toml::to_string_pretty(&config).expect("serialize Copilot config"),
+        )
+        .await
+        .expect("write Copilot config");
+        let child = Command::new(env!("CARGO_BIN_EXE_kproxyd"))
+            .env("KPROXY_HOME", home.path())
+            .env("RUST_LOG", "warn")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .expect("spawn kproxyd with Copilot");
+        wait_for_socket(&socket).await;
+        wait_for_http(port).await;
+        Self {
+            child,
+            socket,
+            home,
+            api_key: Some("copilot-e2e-secret".into()),
         }
     }
 
@@ -536,6 +617,264 @@ async fn configure_context_alignment(daemon: &Daemon, summary_model: &str, mappi
         .as_array()
         .expect("model mappings")
         .is_empty());
+}
+
+#[tokio::test]
+async fn copilot_provider_routes_native_chat_models_mapping_and_usage_end_to_end() {
+    let _http_guard = HTTP_TEST_LOCK.lock().await;
+    let upstream = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .and(header("authorization", "Bearer github-e2e-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": 7,
+            "login": "copilot-e2e",
+            "email": "copilot-e2e@example.com"
+        })))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/copilot_internal/v2/token"))
+        .and(header("authorization", "token github-e2e-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "token": "copilot-e2e-api-token",
+            "expires_at": 4_000_000_000i64,
+            "endpoints": {"api": upstream.uri()}
+        })))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .and(header("authorization", "Bearer copilot-e2e-api-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{
+                "id": "gpt-test",
+                "name": "GPT Test",
+                "capabilities": {
+                    "limits": {"max_prompt_tokens": 8192, "max_output_tokens": 1024},
+                    "supported_endpoints": ["/chat/completions"]
+                }
+            }]
+        })))
+        .expect(2)
+        .mount(&upstream)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/chat/completions"))
+        .and(header("authorization", "Bearer copilot-e2e-api-token"))
+        .and(body_json(serde_json::json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id": "chatcmpl-e2e",
+            "object": "chat.completion",
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": "ok"}, "finish_reason": "stop"}],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "copilot_usage": {"total_nano_aiu": 12345, "cost_per_batch": 9}
+        })))
+        .expect(1)
+        .mount(&upstream)
+        .await;
+
+    let port = unused_tcp_port();
+    let daemon = Daemon::start_copilot(port, &upstream.uri()).await;
+    let imported = expect_ok(
+        daemon
+            .call(
+                "v2.account.importToken",
+                serde_json::json!({
+                    "provider": "copilot",
+                    "token": "github-e2e-token",
+                    "label": "e2e"
+                }),
+            )
+            .await,
+    );
+    assert_eq!(imported["provider_id"], "copilot");
+    assert_eq!(
+        imported["supported_models"],
+        serde_json::json!(["gpt-test"])
+    );
+    let refreshed = expect_ok(
+        daemon
+            .call(
+                "tasks.run",
+                serde_json::json!({
+                    "name":"model_cache_refresh",
+                    "provider":"copilot"
+                }),
+            )
+            .await,
+    );
+    assert_eq!(refreshed["provider"], "copilot");
+    assert!(refreshed["result"]
+        .as_str()
+        .is_some_and(|result| result.contains("copilot: 1 models")));
+    let subscriptions = expect_ok(
+        daemon
+            .call("subscriptions", serde_json::json!({"provider":"copilot"}))
+            .await,
+    );
+    assert_eq!(subscriptions["provider_id"], "copilot");
+    assert_eq!(subscriptions["supported"], false);
+    let account_id = imported["id"].as_str().expect("imported account ID");
+    let tagged = expect_ok(
+        daemon
+            .call(
+                "v2.account.tag",
+                serde_json::json!({
+                    "provider":"copilot",
+                    "id":account_id,
+                    "add":["e2e","team"],
+                    "remove":[]
+                }),
+            )
+            .await,
+    );
+    assert_eq!(tagged["tags"], serde_json::json!(["e2e", "team"]));
+    let reset = expect_ok(
+        daemon
+            .call(
+                "v2.account.resetHealth",
+                serde_json::json!({"provider":"copilot","id":account_id}),
+            )
+            .await,
+    );
+    assert_eq!(reset["reset"], serde_json::json!([account_id]));
+    let ready = expect_ok(
+        daemon
+            .call("status", serde_json::json!({"provider":"copilot"}))
+            .await,
+    );
+    assert_eq!(ready["provider_scope"], "copilot");
+    assert_eq!(ready["providers"][0]["id"], "copilot");
+    assert_eq!(ready["providers"][0]["account_available"], 1);
+    assert_eq!(
+        ready["ready"], true,
+        "Copilot status was not ready: {ready}"
+    );
+
+    let client = reqwest::Client::new();
+    let service_ready = client
+        .get(format!("http://127.0.0.1:{port}/ready"))
+        .send()
+        .await
+        .expect("service readiness request");
+    assert_eq!(service_ready.status(), reqwest::StatusCode::OK);
+    let service_ready: serde_json::Value = service_ready.json().await.expect("readiness JSON");
+    assert_eq!(
+        service_ready["provider_scope"],
+        serde_json::json!(["copilot"])
+    );
+    assert_eq!(service_ready["available_accounts"], 1);
+    let service_health: serde_json::Value = client
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .send()
+        .await
+        .expect("service health request")
+        .json()
+        .await
+        .expect("health JSON");
+    assert_eq!(service_health["total_accounts"], 1);
+    assert_eq!(service_health["available_accounts"], 1);
+    let catalog = client
+        .get(format!("http://127.0.0.1:{port}/v1/models"))
+        .bearer_auth(daemon.api_key.as_deref().expect("API key"))
+        .send()
+        .await
+        .expect("model-list request");
+    assert_eq!(catalog.status(), reqwest::StatusCode::OK);
+    let catalog: serde_json::Value = catalog.json().await.expect("model-list JSON");
+    assert_eq!(catalog["data"][0]["id"], "gpt-test");
+    assert_eq!(catalog["data"][0]["owned_by"], "copilot");
+
+    let response = client
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .bearer_auth(daemon.api_key.as_deref().expect("API key"))
+        .json(&serde_json::json!({
+            "model": "team-fast",
+            "messages": [{"role": "user", "content": "hello"}],
+            "stream": false
+        }))
+        .send()
+        .await
+        .expect("Copilot chat request");
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let response: serde_json::Value = response.json().await.expect("Copilot chat JSON");
+    assert_eq!(response["choices"][0]["message"]["content"], "ok");
+
+    let logs = expect_ok(
+        daemon
+            .call(
+                "logs.follow",
+                serde_json::json!({
+                    "after_request_id": null,
+                    "tail": 10,
+                    "wait_ms": 0,
+                    "provider": "copilot"
+                }),
+            )
+            .await,
+    );
+    let entry = logs["entries"].as_array().unwrap().last().unwrap();
+    assert_eq!(entry["provider_id"], "copilot");
+    assert_eq!(entry["original_model"], "team-fast");
+    assert_eq!(entry["model"], "gpt-test");
+    assert_eq!(entry["model_mapping_rule"], "copilot-fast");
+
+    let stats = expect_ok(
+        daemon
+            .call(
+                "stats",
+                serde_json::json!({
+                    "detail":true,
+                    "recent":10,
+                    "provider":"copilot",
+                    "by":"model"
+                }),
+            )
+            .await,
+    );
+    assert_eq!(stats["stats"]["total"]["requests"], 1);
+    assert_eq!(stats["grouped"]["gpt-test"]["requests"], 1);
+    assert_eq!(
+        stats["stats"]["recent_requests"][0]["provider_id"],
+        "copilot"
+    );
+
+    let keys = expect_ok(
+        daemon
+            .call("apikey.list", serde_json::json!({"provider":"copilot"}))
+            .await,
+    );
+    let history = keys[0]["usage"]["history"]
+        .as_array()
+        .expect("API key usage history");
+    let usage = history.last().expect("Copilot usage record");
+    assert_eq!(usage["provider_id"], "copilot");
+    assert_eq!(usage["token_usage_source"], "provider");
+    assert_eq!(usage["provider_billing"]["unit"], "nano_aiu");
+    assert_eq!(usage["provider_billing"]["amount"], 12_345);
+    assert_eq!(usage["provider_billing"]["raw"]["cost_per_batch"], 9);
+    let services = expect_ok(
+        daemon
+            .call("service.list", serde_json::json!({"provider":"copilot"}))
+            .await,
+    );
+    assert_eq!(services["services"].as_array().unwrap().len(), 1);
+    assert!(matches!(
+        daemon
+            .call("service.list", serde_json::json!({"provider":"kiro"}))
+            .await,
+        Response::Err { .. }
+    ));
+
+    upstream.verify().await;
+    daemon.stop().await;
 }
 
 #[tokio::test]

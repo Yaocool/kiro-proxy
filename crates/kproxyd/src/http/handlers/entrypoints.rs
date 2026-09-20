@@ -10,40 +10,137 @@ pub async fn root() -> Json<Value> {
     Json(json!({"name":"kiro-proxy","status":"ok","version":env!("CARGO_PKG_VERSION")}))
 }
 
+#[derive(Default)]
+struct ServiceAccountHealth {
+    provider_scope: Vec<String>,
+    total: usize,
+    available: usize,
+    protected: usize,
+    cooling: usize,
+    exhausted: usize,
+    banned: usize,
+    refreshing: usize,
+    disabled: usize,
+    unavailable: usize,
+    used_credits: f64,
+    total_credits: f64,
+    errors: Vec<String>,
+}
+
+async fn service_account_health(service: &ServiceHttpState) -> ServiceAccountHealth {
+    let config = service.app.config.current();
+    let allowed = config
+        .allowed_providers_for_service(&service.service)
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    let mut health = ServiceAccountHealth {
+        provider_scope: allowed.iter().cloned().collect(),
+        ..ServiceAccountHealth::default()
+    };
+    for provider in config
+        .effective_providers()
+        .into_iter()
+        .filter(|provider| allowed.contains(&provider.id))
+    {
+        match provider.kind.as_str() {
+            "kiro" => {
+                let pool = service.app.pool();
+                let accounts = pool.snapshot().await;
+                health.total += accounts.len();
+                if provider.enabled {
+                    let counts = pool.scheduling_counts().await;
+                    health.available += counts.available;
+                    health.protected += counts.protected;
+                    health.cooling += counts.cooling;
+                    health.exhausted += counts.exhausted;
+                    health.banned += counts.banned;
+                    health.refreshing += counts.refreshing;
+                    health.disabled += counts.disabled;
+                } else {
+                    health.disabled += accounts.len();
+                }
+                let (used, total) = accounts
+                    .iter()
+                    .filter_map(|account| account.usage.as_ref())
+                    .fold((0.0, 0.0), |(used, total), usage| {
+                        (used + usage.current, total + usage.limit)
+                    });
+                health.used_credits += used;
+                health.total_credits += total;
+            }
+            "copilot" => {
+                let id = match kproxy_core::provider::ProviderId::parse(provider.id.clone()) {
+                    Ok(id) => id,
+                    Err(error) => {
+                        health.errors.push(error.to_string());
+                        continue;
+                    }
+                };
+                let Some(runtime) = service.app.providers.copilot(&id).await else {
+                    health
+                        .errors
+                        .push(format!("provider {} runtime is unavailable", provider.id));
+                    continue;
+                };
+                for account in runtime.account_summaries().await {
+                    health.total += 1;
+                    if !provider.enabled || !account.enabled {
+                        health.disabled += 1;
+                    } else if account.is_available() {
+                        health.available += 1;
+                    } else {
+                        health.unavailable += 1;
+                    }
+                }
+            }
+            kind if provider.enabled => health.errors.push(format!(
+                "provider {} uses unavailable driver {kind}",
+                provider.id
+            )),
+            _ => {}
+        }
+    }
+    health
+}
+
 pub async fn health(State(service): State<ServiceHttpState>) -> Json<Value> {
-    let pool = service.app.pool();
-    let counts = pool.scheduling_counts().await;
-    let accounts = pool.snapshot().await;
-    let (used_credits, total_credits) = accounts
-        .iter()
-        .filter_map(|account| account.usage.as_ref())
-        .fold((0.0, 0.0), |(used, total), usage| {
-            (used + usage.current, total + usage.limit)
-        });
+    let accounts = service_account_health(&service).await;
     Json(json!({
         "status":"ok",
         "service_id":service.service.id,
         "service_name":service.service.name,
-        "total_accounts":accounts.len(),
-        "available_accounts":counts.available,
-        "protected_accounts":counts.protected,
-        "cooling_accounts":counts.cooling,
-        "exhausted_accounts":counts.exhausted,
-        "banned_accounts":counts.banned,
-        "refreshing_accounts":counts.refreshing,
-        "disabled_accounts":counts.disabled,
-        "used_credits":used_credits,
-        "total_credits":total_credits,
+        "provider_scope":accounts.provider_scope,
+        "total_accounts":accounts.total,
+        "available_accounts":accounts.available,
+        "protected_accounts":accounts.protected,
+        "cooling_accounts":accounts.cooling,
+        "exhausted_accounts":accounts.exhausted,
+        "banned_accounts":accounts.banned,
+        "refreshing_accounts":accounts.refreshing,
+        "disabled_accounts":accounts.disabled,
+        "unavailable_accounts":accounts.unavailable,
+        "provider_errors":accounts.errors,
+        "used_credits":accounts.used_credits,
+        "total_credits":accounts.total_credits,
         "uptime_secs":service.app.uptime_secs()
     }))
 }
 
 pub async fn readiness(State(service): State<ServiceHttpState>) -> Response {
-    let counts = service.app.pool().scheduling_counts().await;
+    let accounts = service_account_health(&service).await;
     let mut reasons = service.app.task_registry.readiness_issues(&service.app);
-    if counts.available == 0 {
-        reasons.push("no account is currently available".to_string());
+    if accounts.available == 0 {
+        reasons.push(
+            if service.app.config.current().provider.is_empty() {
+                "no account is currently available"
+            } else {
+                "no account is currently available in this service's provider scope"
+            }
+            .into(),
+        );
     }
+    reasons.extend(accounts.errors.iter().cloned());
     if let Some(error) = service.app.meter.recovery_error() {
         reasons.push(format!("metering recovery required: {error}"));
     }
@@ -61,7 +158,9 @@ pub async fn readiness(State(service): State<ServiceHttpState>) -> Response {
             "reasons":reasons,
             "service_id":service.service.id,
             "service_name":service.service.name,
-            "available_accounts":counts.available,
+            "provider_scope":accounts.provider_scope,
+            "available_accounts":accounts.available,
+            "unavailable_accounts":accounts.unavailable,
             "uptime_secs":service.app.uptime_secs()
         })),
     )
@@ -76,10 +175,16 @@ pub async fn claude_messages(
     let path = request.uri().path().to_string();
     let trace_id = request_trace_id(&request);
     let started = Instant::now();
+    let default_provider = state
+        .config
+        .current()
+        .default_provider_for_service(&service.service)
+        .to_owned();
     let connection_guard = match state.connections.try_acquire() {
         Some(guard) => guard,
         None => {
-            let error = ApiError::overloaded(ErrorFormat::Claude);
+            let error =
+                ApiError::overloaded(ErrorFormat::Claude).with_provider_id(&default_provider);
             record_failed_request(&state, &trace_id, &path, "", started, &error);
             return error.with_request_id(&trace_id).into_response();
         }
@@ -87,7 +192,8 @@ pub async fn claude_messages(
     let admission_guard = match state.admission.try_acquire() {
         Some(guard) => guard,
         None => {
-            let error = ApiError::overloaded(ErrorFormat::Claude);
+            let error =
+                ApiError::overloaded(ErrorFormat::Claude).with_provider_id(&default_provider);
             record_failed_request(&state, &trace_id, &path, "", started, &error);
             return error.with_request_id(&trace_id).into_response();
         }
@@ -96,6 +202,7 @@ pub async fn claude_messages(
         match read_bounded_body(&state, request, ErrorFormat::Claude).await {
             Ok(body) => body,
             Err(error) => {
+                let error = error.with_provider_id_if_empty(&default_provider);
                 record_failed_request(&state, &trace_id, &path, "", started, &error);
                 return error.with_request_id(&trace_id).into_response();
             }
@@ -132,10 +239,16 @@ pub async fn openai_chat(State(service): State<ServiceHttpState>, request: Reque
     let path = request.uri().path().to_string();
     let trace_id = request_trace_id(&request);
     let started = Instant::now();
+    let default_provider = state
+        .config
+        .current()
+        .default_provider_for_service(&service.service)
+        .to_owned();
     let connection_guard = match state.connections.try_acquire() {
         Some(guard) => guard,
         None => {
-            let error = ApiError::overloaded(ErrorFormat::OpenAi);
+            let error =
+                ApiError::overloaded(ErrorFormat::OpenAi).with_provider_id(&default_provider);
             record_failed_request(&state, &trace_id, &path, "", started, &error);
             return error.with_request_id(&trace_id).into_response();
         }
@@ -143,7 +256,8 @@ pub async fn openai_chat(State(service): State<ServiceHttpState>, request: Reque
     let admission_guard = match state.admission.try_acquire() {
         Some(guard) => guard,
         None => {
-            let error = ApiError::overloaded(ErrorFormat::OpenAi);
+            let error =
+                ApiError::overloaded(ErrorFormat::OpenAi).with_provider_id(&default_provider);
             record_failed_request(&state, &trace_id, &path, "", started, &error);
             return error.with_request_id(&trace_id).into_response();
         }
@@ -152,6 +266,7 @@ pub async fn openai_chat(State(service): State<ServiceHttpState>, request: Reque
         match read_bounded_body(&state, request, ErrorFormat::OpenAi).await {
             Ok(body) => body,
             Err(error) => {
+                let error = error.with_provider_id_if_empty(&default_provider);
                 record_failed_request(&state, &trace_id, &path, "", started, &error);
                 return error.with_request_id(&trace_id).into_response();
             }
@@ -419,6 +534,11 @@ pub(super) fn record_failed_request(
         trace_id: trace_id.into(),
         request_id,
         path: path.into(),
+        provider_id: if error.log_context.provider_id.is_empty() {
+            "kiro".into()
+        } else {
+            error.log_context.provider_id.clone()
+        },
         model: if error.log_context.mapped_model.is_empty() {
             model.clone()
         } else {
