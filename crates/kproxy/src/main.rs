@@ -103,7 +103,7 @@ enum Command {
     },
     /// 账号管理。
     #[command(
-        after_help = "示例：\n  kproxy account list\n  kproxy account show user@example.com\n  kproxy account probe --all\n\n操作说明：kproxy guide account 或 kproxy guide sso"
+        after_help = "示例：\n  kproxy account list\n  kproxy account show user@example.com\n  kproxy account services user@example.com\n  kproxy account probe --all\n\n操作说明：kproxy guide account 或 kproxy guide sso"
     )]
     Account {
         #[command(subcommand)]
@@ -1205,6 +1205,71 @@ mod tests {
         ));
 
         assert!(Cli::try_parse_from(["kproxy", "account", "rm"]).is_err());
+    }
+
+    #[test]
+    fn account_creation_accepts_tags_and_services_lookup() {
+        let services = Cli::try_parse_from(["kproxy", "account", "services", "alice@example.com"])
+            .expect("account services");
+        assert!(matches!(
+            services.command,
+            Some(Command::Account {
+                command: Some(crate::commands::account::AccountCommand::Services { id })
+            }) if id == "alice@example.com"
+        ));
+
+        let import = Cli::try_parse_from([
+            "kproxy",
+            "account",
+            "import",
+            "--file",
+            "accounts.json",
+            "--tag",
+            "team-a,prod",
+            "--tag",
+            "shared",
+        ])
+        .expect("tagged import");
+        assert!(matches!(
+            import.command,
+            Some(Command::Account {
+                command: Some(crate::commands::account::AccountCommand::Import { tags, .. })
+            }) if tags == ["team-a", "prod", "shared"]
+        ));
+
+        let api_key = Cli::try_parse_from([
+            "kproxy",
+            "account",
+            "add-api-key",
+            "--email",
+            "ci@example.com",
+            "--tag",
+            "ci",
+        ])
+        .expect("tagged API key account");
+        assert!(matches!(
+            api_key.command,
+            Some(Command::Account {
+                command: Some(crate::commands::account::AccountCommand::AddApiKey { tags, .. })
+            }) if tags == ["ci"]
+        ));
+
+        let sso_batch = Cli::try_parse_from([
+            "kproxy",
+            "account",
+            "add-sso",
+            "--batch",
+            "accounts.csv",
+            "--tag",
+            "team-a",
+        ])
+        .expect("tagged SSO batch");
+        assert!(matches!(
+            sso_batch.command,
+            Some(Command::Account {
+                command: Some(crate::commands::account::AccountCommand::AddSso { tags, .. })
+            }) if tags == ["team-a"]
+        ));
     }
 
     #[test]

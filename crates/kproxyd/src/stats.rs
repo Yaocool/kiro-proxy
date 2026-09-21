@@ -1330,6 +1330,22 @@ impl ModelCache {
         }
         state.refreshing = false;
     }
+
+    pub fn merge_refresh(&self, models: Vec<ModelInfo>) {
+        let mut state = lock(&self.state);
+        if !models.is_empty() {
+            let mut merged = std::mem::take(&mut state.models)
+                .into_iter()
+                .map(|model| (model.model_id.clone(), model))
+                .collect::<BTreeMap<_, _>>();
+            for model in models {
+                merged.insert(model.model_id.clone(), model);
+            }
+            state.models = merged.into_values().collect();
+            state.updated_at_ms = now_ms();
+        }
+        state.refreshing = false;
+    }
 }
 
 fn percentile(values: &[u64], quantile: f64) -> u64 {

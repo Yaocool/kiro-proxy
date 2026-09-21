@@ -6,8 +6,8 @@ use kproxy_core::paths::Paths;
 use kproxy_ipc::protocol::method;
 use kproxy_ipc::protocol::{
     ConfigPathResult, ConfigReloadResult, ConfigShowResult, LogFilesResult, LogTraceResult,
-    ModelResolutionResult, ProxyServiceApiKeysResult, ProxyServiceCreateResult,
-    ProxyServiceDeleteResult, ProxyServiceListResult,
+    ModelResolutionResult, ProxyServiceAccountsResult, ProxyServiceApiKeysResult,
+    ProxyServiceCreateResult, ProxyServiceDeleteResult, ProxyServiceListResult,
 };
 use rand::RngCore;
 use serde::Deserialize;
@@ -45,6 +45,9 @@ pub enum ServiceCommand {
         host: Option<String>,
         #[arg(long)]
         port: Option<u16>,
+        /// 使用该账号标签作为服务的基础账号池；不指定时使用全局账号池。
+        #[arg(long, value_name = "TAG")]
+        account_tag: Option<String>,
         /// 是否允许该服务的已认证请求跳过客户端 User-Agent 校验。
         #[arg(
             long,
@@ -77,6 +80,12 @@ pub enum ServiceCommand {
         /// 设置是否允许该服务的已认证请求跳过客户端 User-Agent 校验。
         #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
         skip_user_agent_check: Option<bool>,
+        /// 修改服务的基础账号标签；服务必须先停用。
+        #[arg(long, value_name = "TAG", conflicts_with = "clear_account_tag")]
+        account_tag: Option<String>,
+        /// 清除基础账号标签并恢复使用全局账号池；服务必须先停用。
+        #[arg(long)]
+        clear_account_tag: bool,
         /// 增加绑定的 API key ID 或名称，可重复或逗号分隔。
         #[arg(long, value_delimiter = ',', value_name = "KEY")]
         add_api_key: Vec<String>,
@@ -117,6 +126,36 @@ pub enum ServiceCommand {
         /// 输出 API key 明文。注意终端记录和 CI 日志泄露风险。
         #[arg(long)]
         show_secret: bool,
+    },
+    /// 查看服务的有效账号池。
+    #[command(after_help = "示例：\n  kproxy service accounts main")]
+    Accounts {
+        /// 服务 ID 或名称。
+        service: String,
+    },
+    /// 手工向服务账号池加入账号；账号可使用任意标签。
+    #[command(
+        name = "add-account",
+        after_help = "示例：\n  kproxy service add-account main acc_7f3a2b1c\n  kproxy service add-account main user@example.com"
+    )]
+    AddAccount {
+        /// 服务 ID 或名称。
+        service: String,
+        /// 一个或多个账号 ID/邮箱。
+        #[arg(required = true, num_args = 1.., value_name = "ID_OR_EMAIL")]
+        accounts: Vec<String>,
+    },
+    /// 从服务账号池排除账号。
+    #[command(
+        name = "remove-account",
+        after_help = "示例：\n  kproxy service remove-account main acc_7f3a2b1c"
+    )]
+    RemoveAccount {
+        /// 服务 ID 或名称。
+        service: String,
+        /// 一个或多个账号 ID/邮箱。
+        #[arg(required = true, num_args = 1.., value_name = "ID_OR_EMAIL")]
+        accounts: Vec<String>,
     },
 }
 
@@ -718,13 +757,20 @@ pub async fn run_service(
                                 "disabled".into()
                             },
                             service.api_key_ids.len().to_string(),
+                            service
+                                .account_tag
+                                .map(|tag| format!("tag:{tag}"))
+                                .unwrap_or_else(|| "global".into()),
                             service.error.unwrap_or_default(),
                         ]
                     })
                     .collect::<Vec<_>>();
                 println!(
                     "{}",
-                    render_table(&["ID", "名称", "监听", "状态", "API Keys", "错误"], &rows)
+                    render_table(
+                        &["ID", "名称", "监听", "状态", "API Keys", "账号池", "错误"],
+                        &rows
+                    )
                 );
             }
             Ok(())
@@ -734,6 +780,7 @@ pub async fn run_service(
             name,
             host,
             port,
+            account_tag,
             skip_user_agent_check,
             api_key_name,
             api_key_format,
@@ -745,6 +792,7 @@ pub async fn run_service(
                         "name":name,
                         "host":host,
                         "port":port,
+                        "account_tag":account_tag,
                         "skip_user_agent_check":skip_user_agent_check,
                         "api_key_name":api_key_name,
                         "api_key_format":api_key_format
@@ -777,6 +825,8 @@ pub async fn run_service(
             host,
             port,
             skip_user_agent_check,
+            account_tag,
+            clear_account_tag,
             add_api_key,
             remove_api_key,
         } => {
@@ -784,11 +834,13 @@ pub async fn run_service(
                 && host.is_none()
                 && port.is_none()
                 && skip_user_agent_check.is_none()
+                && account_tag.is_none()
+                && !clear_account_tag
                 && add_api_key.is_empty()
                 && remove_api_key.is_empty()
             {
                 return Err(anyhow!(
-                    "没有指定修改项；请使用 --rename、--host、--port、--skip-user-agent-check、--add-api-key 或 --remove-api-key"
+                    "没有指定修改项；请使用 --rename、--host、--port、--skip-user-agent-check、--account-tag、--clear-account-tag、--add-api-key 或 --remove-api-key"
                 ));
             }
             let result_selector = rename.clone().unwrap_or_else(|| service.clone());
@@ -812,6 +864,15 @@ pub async fn run_service(
                 }
                 if let Some(skip) = skip_user_agent_check {
                     table.insert("skip_user_agent_check".into(), toml::Value::Boolean(skip));
+                }
+                if clear_account_tag {
+                    table.remove("account_tag");
+                } else if let Some(tag) = account_tag.as_ref() {
+                    let tag = tag.trim();
+                    if tag.is_empty() {
+                        return Err(anyhow!("账号标签不能为空"));
+                    }
+                    table.insert("account_tag".into(), toml::Value::String(tag.to_owned()));
                 }
                 let key_ids = table
                     .entry("api_key_ids")
@@ -950,7 +1011,89 @@ pub async fn run_service(
             }
             Ok(())
         }
+        ServiceCommand::Accounts { service } => {
+            let result: ProxyServiceAccountsResult = client
+                .call(
+                    method::SERVICE_ACCOUNTS,
+                    serde_json::json!({"service":service}),
+                )
+                .await?;
+            print_service_accounts(&result, json)
+        }
+        ServiceCommand::AddAccount { service, accounts } => {
+            let result: ProxyServiceAccountsResult = client
+                .call(
+                    method::SERVICE_ACCOUNT_ADD,
+                    serde_json::json!({"service":service,"accounts":accounts}),
+                )
+                .await?;
+            print_service_accounts(&result, json)
+        }
+        ServiceCommand::RemoveAccount { service, accounts } => {
+            let result: ProxyServiceAccountsResult = client
+                .call(
+                    method::SERVICE_ACCOUNT_REMOVE,
+                    serde_json::json!({"service":service,"accounts":accounts}),
+                )
+                .await?;
+            print_service_accounts(&result, json)
+        }
     }
+}
+
+fn print_service_accounts(result: &ProxyServiceAccountsResult, json: bool) -> Result<()> {
+    if json {
+        return print_json(result);
+    }
+    println!(
+        "账号池    {}",
+        result
+            .account_tag
+            .as_ref()
+            .map(|tag| format!("tag:{tag}"))
+            .unwrap_or_else(|| "global".into())
+    );
+    println!(
+        "手工加入  {}",
+        if result.account_ids.is_empty() {
+            "-".into()
+        } else {
+            result.account_ids.join(",")
+        }
+    );
+    println!(
+        "显式排除  {}",
+        if result.excluded_account_ids.is_empty() {
+            "-".into()
+        } else {
+            result.excluded_account_ids.join(",")
+        }
+    );
+    if result.accounts.is_empty() {
+        println!(
+            "API 代理服务 {} ({}) 当前没有有效账号。",
+            result.service_id, result.service_name
+        );
+        return Ok(());
+    }
+    let rows = result
+        .accounts
+        .iter()
+        .map(|account| {
+            vec![
+                account.id.clone(),
+                account.email.clone(),
+                if account.tags.is_empty() {
+                    "-".into()
+                } else {
+                    account.tags.join(",")
+                },
+                account.health.clone().unwrap_or_else(|| "-".into()),
+            ]
+        })
+        .collect::<Vec<_>>();
+    println!("{}", render_table(&["ID", "邮箱", "标签", "状态"], &rows));
+    Ok(())
 }
 
 async fn show_service(client: &mut AdminClient, selector: &str, json: bool) -> Result<()> {
@@ -998,6 +1141,30 @@ async fn show_service(client: &mut AdminClient, selector: &str, json: bool) -> R
             "-".into()
         } else {
             service.api_key_ids.join(",")
+        }
+    );
+    println!(
+        "账号池    {}",
+        service
+            .account_tag
+            .as_ref()
+            .map(|tag| format!("tag:{tag}"))
+            .unwrap_or_else(|| "global".into())
+    );
+    println!(
+        "手工账号  {}",
+        if service.account_ids.is_empty() {
+            "-".into()
+        } else {
+            service.account_ids.join(",")
+        }
+    );
+    println!(
+        "排除账号  {}",
+        if service.excluded_account_ids.is_empty() {
+            "-".into()
+        } else {
+            service.excluded_account_ids.join(",")
         }
     );
     if let Some(error) = service.error.filter(|error| !error.is_empty()) {

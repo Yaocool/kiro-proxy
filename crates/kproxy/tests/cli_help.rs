@@ -140,7 +140,13 @@ fn full_tree_and_completions_expose_public_commands_only() {
     let tree = run(workspace.path(), &["help", "--all"]);
     assert!(tree.status.success());
     let tree = stdout(&tree);
-    for command in ["logs trace", "models list", "tasks list", "diagnose all"] {
+    for command in [
+        "account services",
+        "logs trace",
+        "models list",
+        "tasks list",
+        "diagnose all",
+    ] {
         assert!(tree.contains(command), "missing {command}: {tree}");
     }
     assert!(!tree.contains("add-sso-batch"));

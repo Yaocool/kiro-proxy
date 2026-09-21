@@ -15,6 +15,7 @@ enum DispatchOutcome {
 #[allow(clippy::too_many_arguments)]
 pub(in crate::http::handlers) async fn prepare_upstream(
     state: &Arc<AppState>,
+    account_ids: &HashSet<String>,
     trace_id: &str,
     model: &str,
     requested_model: &str,
@@ -24,6 +25,7 @@ pub(in crate::http::handlers) async fn prepare_upstream(
 ) -> Result<PreparedUpstream, ExecuteError> {
     match dispatch_upstream(
         state,
+        account_ids,
         trace_id,
         model,
         requested_model,
@@ -46,6 +48,7 @@ pub(in crate::http::handlers) async fn prepare_upstream(
 #[allow(clippy::too_many_arguments)]
 pub(in crate::http::handlers) async fn execute_upstream(
     state: &Arc<AppState>,
+    account_ids: &HashSet<String>,
     trace_id: &str,
     model: &str,
     requested_model: &str,
@@ -59,6 +62,7 @@ pub(in crate::http::handlers) async fn execute_upstream(
 ) -> Result<UpstreamExecution, ExecuteError> {
     match dispatch_upstream(
         state,
+        account_ids,
         trace_id,
         model,
         requested_model,
@@ -81,6 +85,7 @@ pub(in crate::http::handlers) async fn execute_upstream(
 #[allow(clippy::too_many_arguments)]
 async fn dispatch_upstream(
     state: &Arc<AppState>,
+    account_ids: &HashSet<String>,
     trace_id: &str,
     model: &str,
     requested_model: &str,
@@ -96,7 +101,7 @@ async fn dispatch_upstream(
     let mut input_tokens = input_tokens;
     let config = state.config.current();
     let pool = state.pool();
-    let account_count = pool.snapshot().await.len() as u32;
+    let account_count = account_ids.len() as u32;
     let attempts = retry_attempt_count(config.upstream.max_retries, account_count);
     let mut last_error = None;
     // Reuse the prepared state without cloning the full conversation again or
@@ -152,13 +157,15 @@ async fn dispatch_upstream(
             lease
         } else {
             let lease = match pool
-                .acquire_excluding(&actual_model, estimate, &attempted_accounts)
+                .acquire_scoped_excluding(&actual_model, estimate, account_ids, &attempted_accounts)
                 .await
             {
                 Ok(lease) => lease,
                 Err(PoolError::NoAvailableAccount(_)) if last_error.is_some() => break,
                 Err(PoolError::NoAvailableAccount(_))
-                    if pool.all_matching_credit_exhausted(&actual_model).await =>
+                    if pool
+                        .all_matching_credit_exhausted_scoped(&actual_model, account_ids)
+                        .await =>
                 {
                     crate::alerts::sync_service_quota(state).await;
                     return Err(ExecuteError::Pool(PoolError::CreditsExhausted));
@@ -169,13 +176,20 @@ async fn dispatch_upstream(
                     actual_model = default_model.to_string();
                     set_payload_model(&mut request_payload, &actual_model);
                     match pool
-                        .acquire_excluding(&actual_model, estimate, &attempted_accounts)
+                        .acquire_scoped_excluding(
+                            &actual_model,
+                            estimate,
+                            account_ids,
+                            &attempted_accounts,
+                        )
                         .await
                     {
                         Ok(lease) => lease,
                         Err(PoolError::NoAvailableAccount(_)) if last_error.is_some() => break,
                         Err(PoolError::NoAvailableAccount(_))
-                            if pool.all_matching_credit_exhausted(&actual_model).await =>
+                            if pool
+                                .all_matching_credit_exhausted_scoped(&actual_model, account_ids)
+                                .await =>
                         {
                             crate::alerts::sync_service_quota(state).await;
                             return Err(ExecuteError::Pool(PoolError::CreditsExhausted));
@@ -184,13 +198,15 @@ async fn dispatch_upstream(
                     }
                 }
                 Err(PoolError::NoAvailableAccount(_)) => match pool
-                    .acquire_excluding("", estimate, &attempted_accounts)
+                    .acquire_scoped_excluding("", estimate, account_ids, &attempted_accounts)
                     .await
                 {
                     Ok(lease) => lease,
                     Err(PoolError::NoAvailableAccount(_)) if last_error.is_some() => break,
                     Err(PoolError::NoAvailableAccount(_))
-                        if pool.all_matching_credit_exhausted("").await =>
+                        if pool
+                            .all_matching_credit_exhausted_scoped("", account_ids)
+                            .await =>
                     {
                         crate::alerts::sync_service_quota(state).await;
                         return Err(ExecuteError::Pool(PoolError::CreditsExhausted));

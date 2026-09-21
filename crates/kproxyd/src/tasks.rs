@@ -1,6 +1,6 @@
 //! Periodic refresh and persistence scheduler.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
@@ -165,6 +165,10 @@ fn spawn_account_file_watcher(state: Arc<AppState>, shutdown: CancellationToken)
                         if current == previous {
                             continue;
                         }
+                        // Account tag/removal validation depends on a stable
+                        // service-binding snapshot. Keep the global lock order
+                        // config -> accounts, matching admin mutations.
+                        let _config_mutation = state.lock_config_mutation().await;
                         let _transaction = match state.lock_account_storage().await {
                             Ok(transaction) => transaction,
                             Err(error) => {
@@ -185,8 +189,14 @@ fn spawn_account_file_watcher(state: Arc<AppState>, shutdown: CancellationToken)
                                 });
                                 if disk != memory {
                                     let count = next.len();
-                                    state.apply_account_file_reload(next).await;
-                                    info!(count, path = %path.display(), "accounts file reloaded");
+                                    match state.apply_account_file_reload(next).await {
+                                        Ok(()) => {
+                                            info!(count, path = %path.display(), "accounts file reloaded");
+                                        }
+                                        Err(error) => {
+                                            warn!(%error, path = %path.display(), "accounts file reload rejected; keeping current accounts");
+                                        }
+                                    }
                                 }
                             }
                             Err(error) => {
@@ -573,7 +583,22 @@ pub(crate) async fn flush_before_shutdown(state: &Arc<AppState>) {
 }
 
 pub(crate) async fn refresh_models(state: &Arc<AppState>) -> anyhow::Result<String> {
+    refresh_models_inner(state, None).await
+}
+
+pub(crate) async fn refresh_models_scoped(
+    state: &Arc<AppState>,
+    account_ids: &HashSet<String>,
+) -> anyhow::Result<String> {
+    refresh_models_inner(state, Some(account_ids)).await
+}
+
+async fn refresh_models_inner(
+    state: &Arc<AppState>,
+    account_ids: Option<&HashSet<String>>,
+) -> anyhow::Result<String> {
     if !state.config.current().models.dynamic_discovery {
+        state.models.finish_refresh(Vec::new());
         return Ok("disabled".into());
     }
     let pool = state.pool();
@@ -581,7 +606,10 @@ pub(crate) async fn refresh_models(state: &Arc<AppState>) -> anyhow::Result<Stri
         .snapshot()
         .await
         .into_iter()
-        .filter(|account| account.enabled)
+        .filter(|account| {
+            account.enabled
+                && account_ids.is_none_or(|allowed_ids| allowed_ids.contains(&account.id))
+        })
         .collect::<Vec<_>>();
     if accounts.is_empty() {
         state.models.finish_refresh(Vec::new());
@@ -610,7 +638,11 @@ pub(crate) async fn refresh_models(state: &Arc<AppState>) -> anyhow::Result<Stri
     }
     let models = union.into_values().collect::<Vec<_>>();
     let count = models.len();
-    state.models.finish_refresh(models);
+    if account_ids.is_some() {
+        state.models.merge_refresh(models);
+    } else {
+        state.models.finish_refresh(models);
+    }
     Ok(format!("ok: {count} models, {} failures", failures.len()))
 }
 

@@ -43,6 +43,31 @@ pub(crate) struct ServiceHttpState {
     pub allowed_api_key_ids: Arc<HashSet<String>>,
 }
 
+impl ServiceHttpState {
+    /// Resolve the service's effective account pool for one request. Keeping a
+    /// fixed ID snapshot prevents retries and internal subrequests from
+    /// escaping the service pool if accounts change mid-request.
+    pub async fn account_ids(&self) -> Arc<HashSet<String>> {
+        // Manual inclusions and exclusions are control-plane-only changes and
+        // must not restart the listening socket. Resolve the latest service
+        // snapshot by stable ID so new requests observe those edits while
+        // already accepted requests keep their fixed account ID set.
+        let config = self.app.config.current();
+        let service = config
+            .proxy_service
+            .iter()
+            .find(|service| service.id == self.service.id)
+            .cloned()
+            .unwrap_or_else(|| self.service.as_ref().clone());
+        Arc::new(
+            self.app
+                .pool()
+                .matching_account_ids(|account| service.includes_account(account))
+                .await,
+        )
+    }
+}
+
 pub(crate) fn request_trace_id(request: &axum::extract::Request) -> String {
     request
         .extensions()
@@ -66,6 +91,9 @@ pub fn router(state: Arc<AppState>) -> Router {
             .iter()
             .filter_map(|key| key.id.clone())
             .collect(),
+        account_tag: None,
+        account_ids: Vec::new(),
+        excluded_account_ids: Vec::new(),
         created_at: 0,
     };
     router_for_service(state, service, false)
@@ -497,6 +525,9 @@ impl ProxyServiceManager {
                     skip_user_agent_check: service.skip_user_agent_check,
                     running: is_running,
                     api_key_ids: service.api_key_ids.clone(),
+                    account_tag: service.account_tag.clone(),
+                    account_ids: service.account_ids.clone(),
+                    excluded_account_ids: service.excluded_account_ids.clone(),
                     created_at: service.created_at,
                     error,
                 }
@@ -506,8 +537,9 @@ impl ProxyServiceManager {
 }
 
 fn listener_config_changed(current: &ProxyServiceConfig, next: &ProxyServiceConfig) -> bool {
-    // UA policy is read from the live ConfigHandle for every request. Excluding
-    // it here applies policy edits without cancelling active streaming requests.
+    // UA policy and account-pool membership are read from the live
+    // ConfigHandle for every request. Excluding them here applies control-plane
+    // edits without cancelling active streaming requests.
     current.id != next.id
         || current.name != next.name
         || current.host != next.host
@@ -772,6 +804,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn service_http_state_resolves_an_isolated_effective_account_pool() {
+        let (_directory, state) = test_state(Config::default()).await;
+        let mut tagged = account_with_usage("acc_tagged", "tagged@example.com", true, None);
+        tagged.tags = vec!["team-a".into()];
+        let mut manual = account_with_usage("acc_manual", "manual@example.com", true, None);
+        manual.tags = vec!["team-b".into()];
+        let mut excluded = account_with_usage("acc_excluded", "excluded@example.com", true, None);
+        excluded.tags = vec!["team-a".into()];
+        state
+            .pool()
+            .replace_accounts(vec![tagged, manual, excluded])
+            .await;
+        let service = ServiceHttpState {
+            app: state,
+            service: Arc::new(ProxyServiceConfig {
+                id: "svc_team".into(),
+                name: "team".into(),
+                host: "127.0.0.1".into(),
+                port: 5580,
+                enabled: true,
+                skip_user_agent_check: false,
+                api_key_ids: Vec::new(),
+                account_tag: Some("team-a".into()),
+                account_ids: vec!["acc_manual".into()],
+                excluded_account_ids: vec!["acc_excluded".into()],
+                created_at: 0,
+            }),
+            allowed_api_key_ids: Arc::new(HashSet::new()),
+        };
+
+        let account_ids = service.account_ids().await;
+        assert_eq!(
+            account_ids.as_ref(),
+            &HashSet::from(["acc_tagged".to_string(), "acc_manual".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn account_pool_edits_are_hot_reloaded_without_restarting_the_listener() {
+        let service = ProxyServiceConfig {
+            id: "svc_team".into(),
+            name: "team".into(),
+            host: "127.0.0.1".into(),
+            port: 5580,
+            enabled: true,
+            skip_user_agent_check: false,
+            api_key_ids: Vec::new(),
+            account_tag: Some("team-a".into()),
+            account_ids: Vec::new(),
+            excluded_account_ids: Vec::new(),
+            created_at: 0,
+        };
+        let mut config = Config::default();
+        config.proxy_service.push(service.clone());
+        let (_directory, state) = test_state(config).await;
+        let mut tagged = account_with_usage("acc_tagged", "tagged@example.com", true, None);
+        tagged.tags = vec!["team-a".into()];
+        let mut manual = account_with_usage("acc_manual", "manual@example.com", true, None);
+        manual.tags = vec!["team-b".into()];
+        state.pool().replace_accounts(vec![tagged, manual]).await;
+        let http_state = ServiceHttpState {
+            app: Arc::clone(&state),
+            service: Arc::new(service.clone()),
+            allowed_api_key_ids: Arc::new(HashSet::new()),
+        };
+        assert_eq!(
+            http_state.account_ids().await.as_ref(),
+            &HashSet::from(["acc_tagged".to_string()])
+        );
+
+        let mut next = state.config.current().as_ref().clone();
+        next.proxy_service[0].account_ids = vec!["acc_manual".into()];
+        next.proxy_service[0].excluded_account_ids = vec!["acc_tagged".into()];
+        assert!(!listener_config_changed(&service, &next.proxy_service[0]));
+        state.config.replace(next);
+
+        assert_eq!(
+            http_state.account_ids().await.as_ref(),
+            &HashSet::from(["acc_manual".to_string()])
+        );
+    }
+
+    #[tokio::test]
     async fn health_reports_total_accounts_and_aggregate_upstream_credits() {
         let (_directory, state) = test_state(Config::default()).await;
         let mut accounts = AccountStore::load(&state.paths.accounts_file)
@@ -813,7 +928,10 @@ mod tests {
                 None,
             ))
             .expect("account without usage");
-        state.apply_account_file_reload(accounts).await;
+        state
+            .apply_account_file_reload(accounts)
+            .await
+            .expect("reload accounts");
 
         let response = router(state)
             .oneshot(
@@ -1038,6 +1156,144 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn model_catalog_does_not_fall_back_to_accounts_outside_the_service_pool() {
+        let (_directory, state) = test_state(Config::default()).await;
+        let mut outside = account_with_usage("acc_outside", "outside@example.com", true, None);
+        outside.tags = vec!["team-b".into()];
+        state.pool().replace_accounts(vec![outside]).await;
+        let service = ProxyServiceConfig {
+            id: "svc_team_a".into(),
+            name: "team-a".into(),
+            host: "127.0.0.1".into(),
+            port: 5580,
+            enabled: true,
+            skip_user_agent_check: false,
+            api_key_ids: Vec::new(),
+            account_tag: Some("team-a".into()),
+            account_ids: Vec::new(),
+            excluded_account_ids: Vec::new(),
+            created_at: 0,
+        };
+
+        let response = router_for_service(state, service, false)
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(header::USER_AGENT, "codex_cli_rs/0.147.0 (test)")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(body_json(response).await["data"]
+            .as_array()
+            .expect("model data")
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn model_catalog_never_borrows_another_services_dynamic_models() {
+        let (_directory, state) = test_state(Config::default()).await;
+        let mut inside = account_with_usage("acc_inside", "inside@example.com", true, None);
+        inside.tags = vec!["team-a".into()];
+        let mut outside = account_with_usage("acc_outside", "outside@example.com", true, None);
+        outside.tags = vec!["team-b".into()];
+        state.pool().replace_accounts(vec![inside, outside]).await;
+        state
+            .pool()
+            .get("acc_outside")
+            .await
+            .expect("outside account")
+            .set_supported_models(["outside-only".to_string()])
+            .await;
+        let model = |model_id: &str| kproxy_kiro::ModelInfo {
+            model_id: model_id.into(),
+            model_name: model_id.into(),
+            description: String::new(),
+            rate_multiplier: None,
+            token_limits: None,
+            additional_model_request_fields_schema: None,
+        };
+        state.models.finish_refresh(vec![model("outside-only")]);
+        let service = ProxyServiceConfig {
+            id: "svc_team_a".into(),
+            name: "team-a".into(),
+            host: "127.0.0.1".into(),
+            port: 5580,
+            enabled: true,
+            skip_user_agent_check: false,
+            api_key_ids: Vec::new(),
+            account_tag: Some("team-a".into()),
+            account_ids: Vec::new(),
+            excluded_account_ids: Vec::new(),
+            created_at: 0,
+        };
+
+        let response = router_for_service(Arc::clone(&state), service.clone(), false)
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(header::USER_AGENT, "codex_cli_rs/0.147.0 (test)")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let data = body_json(response).await["data"]
+            .as_array()
+            .expect("model data")
+            .clone();
+        assert!(
+            !data.is_empty(),
+            "cold scoped catalog should use static fallback"
+        );
+        assert!(data.iter().all(|entry| entry["id"] != "outside-only"));
+
+        let inside_runtime = state
+            .pool()
+            .get("acc_inside")
+            .await
+            .expect("inside account");
+        inside_runtime
+            .set_supported_models(["inside-only".to_string()])
+            .await;
+        state
+            .models
+            .finish_refresh(vec![model("inside-only"), model("outside-only")]);
+        inside_runtime.account.write().await.enabled = false;
+        let response = router_for_service(Arc::clone(&state), service.clone(), false)
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(header::USER_AGENT, "codex_cli_rs/0.147.0 (test)")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let disabled_data = body_json(response).await["data"]
+            .as_array()
+            .expect("model data")
+            .clone();
+        assert!(disabled_data
+            .iter()
+            .all(|entry| entry["id"] != "inside-only" && entry["id"] != "outside-only"));
+
+        inside_runtime.account.write().await.enabled = true;
+        let response = router_for_service(state, service, false)
+            .oneshot(
+                Request::get("/v1/models")
+                    .header(header::USER_AGENT, "codex_cli_rs/0.147.0 (test)")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        let body = body_json(response).await;
+        assert_eq!(body["data"].as_array().expect("model data").len(), 1);
+        assert_eq!(body["data"][0]["id"], "inside-only");
+    }
+
+    #[tokio::test]
     async fn client_allowlist_follows_protocol_for_every_alias_and_policy_scope() {
         for (case, globally_enforced, service_bypass, api_key_bypass, policy_enforced) in [
             ("enforced", true, false, false, true),
@@ -1064,6 +1320,9 @@ mod tests {
                 enabled: true,
                 skip_user_agent_check: service_bypass,
                 api_key_ids: vec!["ak_user_agent".into()],
+                account_tag: None,
+                account_ids: Vec::new(),
+                excluded_account_ids: Vec::new(),
                 created_at: 0,
             };
             config.proxy_service.push(service.clone());
@@ -1173,6 +1432,9 @@ mod tests {
             enabled: true,
             skip_user_agent_check: true,
             api_key_ids: vec!["ak_bypass".into()],
+            account_tag: None,
+            account_ids: Vec::new(),
+            excluded_account_ids: Vec::new(),
             created_at: 0,
         };
         config.proxy_service.push(service.clone());
@@ -1255,6 +1517,22 @@ mod tests {
         let mut config = Config::default();
         config.models.dynamic_discovery = false;
         let (_directory, state) = test_state(config).await;
+        state
+            .pool()
+            .replace_accounts(vec![account_with_usage(
+                "acc_stale",
+                "stale@example.com",
+                true,
+                None,
+            )])
+            .await;
+        state
+            .pool()
+            .get("acc_stale")
+            .await
+            .expect("stale account")
+            .set_supported_models(["stale-dynamic-only".to_string()])
+            .await;
         for (agent, expected) in [
             (
                 "claude-cli/2.1.235 (external, test)",
@@ -1811,6 +2089,9 @@ mod tests {
             enabled: true,
             skip_user_agent_check: false,
             api_key_ids: vec!["ak_hot_policy".into()],
+            account_tag: None,
+            account_ids: Vec::new(),
+            excluded_account_ids: Vec::new(),
             created_at: 0,
         });
         let (_directory, state) = test_state(config.clone()).await;
@@ -1889,6 +2170,9 @@ mod tests {
             enabled: true,
             skip_user_agent_check: false,
             api_key_ids: Vec::new(),
+            account_tag: None,
+            account_ids: Vec::new(),
+            excluded_account_ids: Vec::new(),
             created_at: 0,
         };
         let finished = tokio::spawn(async {});

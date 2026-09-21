@@ -5,6 +5,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use crate::account::Account;
+
 /// Maximum number of immediately loaded tools accepted by the proxy.
 pub const MAX_LOADED_TOOLS: usize = 512;
 
@@ -739,9 +741,49 @@ pub struct ProxyServiceConfig {
     /// 允许访问此服务的 API key ID。
     #[serde(default)]
     pub api_key_ids: Vec<String>,
+    /// 作为服务基础账号池的账号标签；未配置时使用全局账号池。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_tag: Option<String>,
+    /// 无论标签是否匹配，都手工加入服务账号池的账号 ID。
+    #[serde(default)]
+    pub account_ids: Vec<String>,
+    /// 从该服务账号池中显式排除的账号 ID。
+    #[serde(default)]
+    pub excluded_account_ids: Vec<String>,
     /// 创建时间（Unix 秒）。
     #[serde(default)]
     pub created_at: i64,
+}
+
+impl ProxyServiceConfig {
+    /// Returns whether an account belongs to this service's effective pool.
+    ///
+    /// Exclusions override both the tag-derived base pool and explicit manual
+    /// bindings. A service without an account tag inherits the global pool.
+    pub fn includes_account(&self, account: &Account) -> bool {
+        if self
+            .excluded_account_ids
+            .iter()
+            .any(|account_id| account_id == &account.id)
+        {
+            return false;
+        }
+        if self
+            .account_ids
+            .iter()
+            .any(|account_id| account_id == &account.id)
+        {
+            return true;
+        }
+        self.account_tag
+            .as_ref()
+            .is_none_or(|tag| account.tags.iter().any(|account_tag| account_tag == tag))
+    }
+
+    /// Returns true when the service inherits every non-excluded account.
+    pub fn uses_global_account_pool(&self) -> bool {
+        self.account_tag.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1199,6 +1241,52 @@ impl Config {
                     return invalid_config(
                         format!("{field}.api_key_ids"),
                         format!("references unknown API key ID {key_id}"),
+                    );
+                }
+            }
+            if service
+                .account_tag
+                .as_ref()
+                .is_some_and(|tag| tag.trim().is_empty() || tag.as_str() != tag.trim())
+            {
+                return invalid_config(
+                    format!("{field}.account_tag"),
+                    "must be non-empty and must not have surrounding whitespace",
+                );
+            }
+            let mut manual_account_ids = BTreeSet::new();
+            for account_id in &service.account_ids {
+                if account_id.trim().is_empty() || account_id.as_str() != account_id.trim() {
+                    return invalid_config(
+                        format!("{field}.account_ids"),
+                        "must contain non-empty IDs without surrounding whitespace",
+                    );
+                }
+                if !manual_account_ids.insert(account_id.as_str()) {
+                    return invalid_config(
+                        format!("{field}.account_ids"),
+                        "must not contain duplicate IDs",
+                    );
+                }
+            }
+            let mut excluded_account_ids = BTreeSet::new();
+            for account_id in &service.excluded_account_ids {
+                if account_id.trim().is_empty() || account_id.as_str() != account_id.trim() {
+                    return invalid_config(
+                        format!("{field}.excluded_account_ids"),
+                        "must contain non-empty IDs without surrounding whitespace",
+                    );
+                }
+                if !excluded_account_ids.insert(account_id.as_str()) {
+                    return invalid_config(
+                        format!("{field}.excluded_account_ids"),
+                        "must not contain duplicate IDs",
+                    );
+                }
+                if manual_account_ids.contains(account_id.as_str()) {
+                    return invalid_config(
+                        format!("{field}.excluded_account_ids"),
+                        format!("account {account_id} is also manually included"),
                     );
                 }
             }
@@ -1680,6 +1768,12 @@ start_url = ""
 # skip_user_agent_check = false
 # 允许访问该服务的 API key ID；至少一个，且都必须存在于 [[api_key]]。
 # api_key_ids = ["ak_example"]
+# 可选的基础账号标签；不配置时继承全局账号池。修改已有服务的标签前必须先停用服务。
+# account_tag = "team-a"
+# 手工加入的账号 ID；即使标签不匹配也会进入该服务账号池。
+# account_ids = ["acc_00000001"]
+# 从全局、标签或手工范围中排除的账号 ID。
+# excluded_account_ids = ["acc_00000002"]
 # 创建时间（Unix 秒）；由 CLI 创建时自动填写。
 # created_at = 0
 

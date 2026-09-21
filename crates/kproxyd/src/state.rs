@@ -1,6 +1,6 @@
 //! 服务运行态共享句柄。
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -254,6 +254,8 @@ impl AppState {
         web_search_replay: WebSearchReplayCodec,
     ) -> anyhow::Result<Self> {
         let current = config.current();
+        validate_service_account_references(&current, accounts.all())
+            .map_err(anyhow::Error::msg)?;
         meter.set_daily_limit(current.pool.daily_credit_limit);
         accounts.set_compression_threshold(current.storage.compression_threshold);
         accounts.set_incremental_write(current.storage.incremental_write);
@@ -349,12 +351,75 @@ impl AppState {
     }
 
     /// 应用账号文件的外部变更，并用新快照重建调度池。
-    pub async fn apply_account_file_reload(&self, mut next: AccountStore) {
+    pub async fn apply_account_file_reload(&self, mut next: AccountStore) -> Result<(), String> {
+        self.validate_or_restore_account_store(&next).await?;
         let config = self.config.current();
         next.set_compression_threshold(config.storage.compression_threshold);
         next.set_incremental_write(config.storage.incremental_write);
         self.install_account_store(next).await;
         self.request_model_refresh();
+        Ok(())
+    }
+
+    /// Return every configured service whose effective pool contains the
+    /// account. Disabled services still own their bindings.
+    pub(crate) fn account_service_bindings(&self, account: &Account) -> Vec<(String, String)> {
+        self.config
+            .current()
+            .proxy_service
+            .iter()
+            .filter(|service| service.includes_account(account))
+            .map(|service| (service.id.clone(), service.name.clone()))
+            .collect()
+    }
+
+    pub(crate) fn validate_account_store_transition(
+        &self,
+        next: &AccountStore,
+    ) -> Result<(), String> {
+        self.with_accounts(|current| {
+            for account in current.all() {
+                let tags_changed_or_removed = next
+                    .find(&account.id)
+                    .is_none_or(|replacement| !same_account_tags(&replacement.tags, &account.tags));
+                if !tags_changed_or_removed {
+                    continue;
+                }
+                let bindings = self.account_service_bindings(account);
+                if !bindings.is_empty() {
+                    return Err(format!(
+                        "account {} is bound to proxy service(s) {}; unbind it before changing tags or removing it",
+                        account.id,
+                        bindings
+                            .iter()
+                            .map(|(id, name)| format!("{name} ({id})"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    pub(crate) async fn validate_or_restore_account_store(
+        &self,
+        next: &AccountStore,
+    ) -> Result<(), String> {
+        let Err(error) = self.validate_account_store_transition(next) else {
+            return Ok(());
+        };
+        let mut current = self.with_accounts(Clone::clone);
+        self.configure_account_store(&mut current);
+        // A rejected direct file edit must not remain as the next startup
+        // generation or leak back through a later runtime persistence pass.
+        current.set_incremental_write(false);
+        current.save().await.map_err(|rollback_error| {
+            format!("{error}; restoring the previous account file failed: {rollback_error}")
+        })?;
+        Err(format!(
+            "{error}; the previous account file has been restored"
+        ))
     }
 
     /// Installs one durable account generation into both in-memory views.
@@ -459,6 +524,9 @@ impl AppState {
         next: &Config,
     ) -> Result<(), String> {
         let previous = self.runtime_config_snapshot();
+        validate_service_account_tag_transitions(&previous, next)?;
+        let accounts = self.with_accounts(|store| store.all().to_vec());
+        validate_service_account_references(next, &accounts)?;
         self.config.replace(next.clone());
         self.apply_runtime_config(next);
         let failures = self.reconcile_proxy_services(next).await;
@@ -801,6 +869,7 @@ impl AppState {
         pool: &AccountPool,
         account_id: &str,
     ) -> Result<Option<ReloadedCredentials>, String> {
+        let _config_mutation = self.lock_config_mutation().await;
         let _transaction = self
             .lock_account_storage()
             .await
@@ -809,6 +878,7 @@ impl AppState {
             .await
             .map_err(|error| error.to_string())?;
         self.configure_account_store(&mut disk);
+        self.validate_or_restore_account_store(&disk).await?;
         let candidate = disk
             .find(account_id)
             .cloned()
@@ -840,6 +910,7 @@ impl AppState {
         pool: &AccountPool,
         refreshed: RefreshedCredentials,
     ) -> Result<(), String> {
+        let _config_mutation = self.lock_config_mutation().await;
         let _transaction = self
             .lock_account_storage()
             .await
@@ -868,6 +939,7 @@ impl AppState {
             .await
             .map_err(|error| error.to_string())?;
         self.configure_account_store(&mut next);
+        self.validate_or_restore_account_store(&next).await?;
         let credentials = refreshed.credentials;
         let profile_arn = refreshed.profile_arn;
         if !next.update(&refreshed.account_id, move |account| {
@@ -894,10 +966,14 @@ impl AppState {
     /// The lock is acquired before taking the snapshot, and the snapshot is
     /// merged into the latest on-disk store.
     pub(crate) async fn persist_runtime_accounts(&self) -> anyhow::Result<()> {
+        let _config_mutation = self.lock_config_mutation().await;
         let _transaction = self.lock_account_storage().await?;
         let snapshot = self.pool().snapshot().await;
         let mut next = AccountStore::load(&self.paths.accounts_file).await?;
         self.configure_account_store(&mut next);
+        self.validate_or_restore_account_store(&next)
+            .await
+            .map_err(anyhow::Error::msg)?;
         for account in snapshot {
             merge_runtime_account(&mut next, &account);
         }
@@ -1205,6 +1281,57 @@ fn merge_runtime_account(store: &mut AccountStore, runtime: &Account) -> bool {
     store.replace_if_changed(merged)
 }
 
+fn same_account_tags(left: &[String], right: &[String]) -> bool {
+    left.iter().collect::<HashSet<_>>() == right.iter().collect::<HashSet<_>>()
+}
+
+fn validate_service_account_references(
+    config: &Config,
+    accounts: &[Account],
+) -> Result<(), String> {
+    let known_ids = accounts
+        .iter()
+        .map(|account| account.id.as_str())
+        .collect::<HashSet<_>>();
+    for service in &config.proxy_service {
+        // Manual inclusions must resolve to a usable account. Exclusions may
+        // intentionally remain as tombstones after an unbound account is
+        // deleted, preventing an account re-imported with the same ID from
+        // silently rejoining this service.
+        for account_id in &service.account_ids {
+            if !known_ids.contains(account_id.as_str()) {
+                return Err(format!(
+                    "proxy service {} ({}) references unknown account {account_id}",
+                    service.name, service.id
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_service_account_tag_transitions(
+    previous: &Config,
+    next: &Config,
+) -> Result<(), String> {
+    for current in &previous.proxy_service {
+        let Some(updated) = next
+            .proxy_service
+            .iter()
+            .find(|candidate| candidate.id == current.id)
+        else {
+            continue;
+        };
+        if current.account_tag != updated.account_tag && current.enabled {
+            return Err(format!(
+                "proxy service {} ({}) must be disabled before changing account_tag",
+                current.name, current.id
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn format_service_failures(failures: &[(String, String)]) -> String {
     failures
         .iter()
@@ -1379,6 +1506,77 @@ mod tests {
         assert_eq!(
             report.summary(),
             "ok: 3 checked, 1 eligible, 1 refreshed, 0 failures"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_persistence_cannot_apply_a_bound_accounts_external_tag_change() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        let mut accounts = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("accounts");
+        let mut account = refreshable_account("acc_00000001", "one@example.com", "token");
+        account.tags = vec!["team-a".into()];
+        accounts.insert(account).expect("account");
+        accounts.save().await.expect("save account");
+        let mut config = Config::default();
+        config
+            .proxy_service
+            .push(kproxy_core::config::ProxyServiceConfig {
+                id: "svc_team_a".into(),
+                name: "team-a".into(),
+                host: "127.0.0.1".into(),
+                port: 5580,
+                enabled: false,
+                skip_user_agent_check: false,
+                api_key_ids: Vec::new(),
+                account_tag: Some("team-a".into()),
+                account_ids: Vec::new(),
+                excluded_account_ids: Vec::new(),
+                created_at: 0,
+            });
+        let state = AppState::new(paths.clone(), ConfigHandle::new(config), accounts);
+
+        let mut external = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("external store");
+        assert!(external.update("acc_00000001", |account| {
+            account.tags = vec!["team-b".into()];
+        }));
+        external.save().await.expect("external save");
+
+        let error = state
+            .persist_runtime_accounts()
+            .await
+            .expect_err("bound tag change must stay rejected");
+
+        assert!(error.to_string().contains("bound to proxy service"));
+        assert_eq!(
+            state.with_accounts(|store| store
+                .find("acc_00000001")
+                .expect("runtime account")
+                .tags
+                .clone()),
+            ["team-a"]
+        );
+        let restored = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("restored account store");
+        assert_eq!(
+            restored
+                .find("acc_00000001")
+                .expect("restored account")
+                .tags,
+            ["team-a"]
         );
     }
 

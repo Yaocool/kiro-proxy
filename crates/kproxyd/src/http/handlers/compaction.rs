@@ -23,6 +23,7 @@ fn compaction_summary_concurrency(state: &AppState) -> usize {
 
 async fn generate_compaction_summary(
     state: &Arc<AppState>,
+    account_ids: Arc<std::collections::HashSet<String>>,
     trace_id: &str,
     key_id: Option<&str>,
     summary_model: &str,
@@ -30,6 +31,7 @@ async fn generate_compaction_summary(
     timeout_ms: u64,
 ) -> Result<GeneratedCompactionSummary, CompactionSummaryFailure> {
     let owned_state = Arc::clone(state);
+    let owned_account_ids = account_ids;
     let owned_trace_id = trace_id.to_owned();
     let owned_key_id = key_id.map(str::to_owned);
     let owned_summary_model = summary_model.to_owned();
@@ -51,6 +53,7 @@ async fn generate_compaction_summary(
         let mut requests = futures::stream::iter(payloads.into_iter().enumerate())
             .map(|(index, payload)| {
                 let state = &owned_state;
+                let account_ids = &owned_account_ids;
                 let trace_id = &owned_trace_id;
                 let key_id = owned_key_id.as_deref();
                 let model = &owned_summary_model;
@@ -67,7 +70,13 @@ async fn generate_compaction_summary(
                             .into())
                     } else {
                         generate_compaction_summary_inner(
-                            state, trace_id, key_id, model, payload, cancel,
+                            state,
+                            account_ids,
+                            trace_id,
+                            key_id,
+                            model,
+                            payload,
+                            cancel,
                         )
                         .await
                     };
@@ -242,6 +251,7 @@ fn log_late_compaction_result(
 
 async fn generate_compaction_summary_inner(
     state: &Arc<AppState>,
+    account_ids: &std::collections::HashSet<String>,
     trace_id: &str,
     key_id: Option<&str>,
     summary_model: &str,
@@ -264,6 +274,7 @@ async fn generate_compaction_summary_inner(
     let execution = tokio::select! {
         result = execute_upstream(
             state,
+            account_ids,
             trace_id,
             summary_model,
             summary_model,
@@ -732,6 +743,7 @@ pub(super) async fn run_compaction(
     let CompactionRequest {
         trace_id,
         key_id,
+        account_ids,
         source_payload,
         decision,
         summary_model,
@@ -842,6 +854,7 @@ pub(super) async fn run_compaction(
         } else {
             match generate_compaction_summary(
                 state,
+                Arc::clone(&account_ids),
                 trace_id,
                 key_id,
                 summary_model,

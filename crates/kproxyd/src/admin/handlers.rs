@@ -7,10 +7,12 @@ use kproxy_core::account::Account;
 use kproxy_core::config::{ApiKeyConfig, ApiKeyFormat, Config, ProxyServiceConfig};
 use kproxy_core::ids::{new_account_id, new_machine_id};
 use kproxy_ipc::protocol::{
-    method, AccountDetail, AccountImportParams, AccountImportResult, AccountListParams,
-    AccountListResult, AccountRefParams, AccountSetEnabledParams, AccountSummary, AccountTagParams,
+    method, AccountAddSsoParams, AccountDetail, AccountImportParams, AccountImportResult,
+    AccountListParams, AccountListResult, AccountRefParams, AccountServiceBinding,
+    AccountServicesResult, AccountSetEnabledParams, AccountSummary, AccountTagParams,
     ConfigPathResult, ConfigReloadResult, ConfigShowResult, CreatedApiKey, LogFileView,
     LogFilesResult, LogTraceEntry, LogTraceResult, ModelResolutionAccount, ModelResolutionResult,
+    ProxyServiceAccountChangeParams, ProxyServiceAccountsParams, ProxyServiceAccountsResult,
     ProxyServiceApiKeyView, ProxyServiceApiKeysParams, ProxyServiceApiKeysResult,
     ProxyServiceCreateParams, ProxyServiceCreateResult, ProxyServiceDeleteParams,
     ProxyServiceDeleteResult, ProxyServiceListResult, Request, Response, RpcError, StatusResult,
@@ -36,6 +38,7 @@ pub async fn dispatch(state: &Arc<AppState>, request: Request) -> Response {
         method::CONFIG_RELOAD => handle_config_reload(state).await,
         method::ACCOUNT_LIST => handle_account_list(state, request.params).await,
         method::ACCOUNT_SHOW => handle_account_show(state, request.params).await,
+        method::ACCOUNT_SERVICES => handle_account_services(state, request.params).await,
         method::ACCOUNT_IMPORT => handle_account_import(state, request.params).await,
         method::ACCOUNT_EXPORT => handle_account_export(state, request.params),
         method::ACCOUNT_ADD_SSO => handle_account_add_sso(state, request.params).await,
@@ -67,6 +70,13 @@ pub async fn dispatch(state: &Arc<AppState>, request: Request) -> Response {
         method::SERVICE_CREATE => handle_service_create(state, request.params).await,
         method::SERVICE_DELETE => handle_service_delete(state, request.params).await,
         method::SERVICE_APIKEYS => handle_service_apikeys(state, request.params),
+        method::SERVICE_ACCOUNTS => handle_service_accounts(state, request.params).await,
+        method::SERVICE_ACCOUNT_ADD => {
+            handle_service_account_change(state, request.params, true).await
+        }
+        method::SERVICE_ACCOUNT_REMOVE => {
+            handle_service_account_change(state, request.params, false).await
+        }
         method::WEBHOOK_LIST => handle_webhook_list(state),
         method::WEBHOOK_TEST => handle_webhook_test(state, request.params),
         method::WEBHOOK_LOGS => handle_webhook_logs(state, request.params),
@@ -681,8 +691,9 @@ use accounts::{authenticated_sso_user_id, sso_identities_match};
 use accounts::{
     compare_account_identity, effective_account_health, handle_account_add_sso,
     handle_account_import, handle_account_list, handle_account_probe, handle_account_refresh,
-    handle_account_remove, handle_account_reset_health, handle_account_set_enabled,
-    handle_account_show, handle_account_tag, handle_regenerate_machine_id,
+    handle_account_remove, handle_account_reset_health, handle_account_services,
+    handle_account_set_enabled, handle_account_show, handle_account_tag,
+    handle_regenerate_machine_id,
 };
 
 #[derive(serde::Deserialize)]
@@ -1194,6 +1205,194 @@ fn handle_service_apikeys(state: &Arc<AppState>, params: serde_json::Value) -> H
     })
 }
 
+async fn handle_service_accounts(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
+    let params: ProxyServiceAccountsParams = parse_params(params)?;
+    let selector = params.service.trim();
+    if selector.is_empty() {
+        return Err(RpcError::bad_params("service ID or name must not be empty"));
+    }
+    let config = state.config.current();
+    let service = config
+        .proxy_service
+        .iter()
+        .find(|service| service.id == selector || service.name == selector)
+        .ok_or_else(|| RpcError::bad_params(format!("proxy service not found: {selector}")))?;
+    service_accounts_result(state, service).await
+}
+
+async fn handle_service_account_change(
+    state: &Arc<AppState>,
+    params: serde_json::Value,
+    add: bool,
+) -> Handled {
+    let params: ProxyServiceAccountChangeParams = parse_params(params)?;
+    let selector = params.service.trim();
+    if selector.is_empty() {
+        return Err(RpcError::bad_params("service ID or name must not be empty"));
+    }
+    if params.accounts.is_empty() {
+        return Err(RpcError::bad_params("at least one account is required"));
+    }
+
+    let file_lock = kproxy_store::atomic::lock_file_exclusive(&state.paths.config_file)
+        .await
+        .map_err(|error| RpcError::internal(format!("lock config: {error}")))?;
+    let config_mutation = state.lock_config_mutation().await;
+    let account_transaction = state
+        .lock_account_storage()
+        .await
+        .map_err(|error| RpcError::internal(format!("lock accounts: {error}")))?;
+    let mut durable_accounts = AccountStore::load(&state.paths.accounts_file)
+        .await
+        .map_err(|error| RpcError::internal(format!("load accounts: {error}")))?;
+    state.configure_account_store(&mut durable_accounts);
+    let disk_accounts = serde_json::to_value(durable_accounts.all())
+        .map_err(|error| RpcError::internal(format!("serialize disk accounts: {error}")))?;
+    let memory_accounts = state
+        .with_accounts(|store| serde_json::to_value(store.all()))
+        .map_err(|error| RpcError::internal(format!("serialize runtime accounts: {error}")))?;
+    if disk_accounts != memory_accounts {
+        state
+            .apply_account_file_reload(durable_accounts)
+            .await
+            .map_err(RpcError::bad_params)?;
+    }
+    let accounts = state.with_accounts(|store| store.all().to_vec());
+    let mut resolved_ids = Vec::new();
+    for reference in params.accounts {
+        let reference = reference.trim();
+        if reference.is_empty() {
+            return Err(RpcError::bad_params("account references must not be empty"));
+        }
+        let account = accounts
+            .iter()
+            .find(|account| {
+                account.id == reference || account.email.eq_ignore_ascii_case(reference)
+            })
+            .ok_or_else(|| RpcError::bad_params(format!("account not found: {reference}")))?;
+        if !resolved_ids.contains(&account.id) {
+            resolved_ids.push(account.id.clone());
+        }
+    }
+
+    let previous = state.config.current().as_ref().clone();
+    let mut next = previous.clone();
+    let service = next
+        .proxy_service
+        .iter_mut()
+        .find(|service| service.id == selector || service.name == selector)
+        .ok_or_else(|| RpcError::bad_params(format!("proxy service not found: {selector}")))?;
+    let original_service = service.clone();
+    if add {
+        service
+            .excluded_account_ids
+            .retain(|account_id| !resolved_ids.contains(account_id));
+        for account_id in &resolved_ids {
+            if !service.account_ids.contains(account_id) {
+                service.account_ids.push(account_id.clone());
+            }
+        }
+    } else {
+        service
+            .account_ids
+            .retain(|account_id| !resolved_ids.contains(account_id));
+        for account_id in &resolved_ids {
+            if !service.excluded_account_ids.contains(account_id) {
+                service.excluded_account_ids.push(account_id.clone());
+            }
+        }
+    }
+    service.account_ids.sort();
+    service.excluded_account_ids.sort();
+    let service_id = service.id.clone();
+    let changed = service != &original_service;
+
+    if !changed {
+        let service = service.clone();
+        drop(account_transaction);
+        drop(config_mutation);
+        drop(file_lock);
+        return service_accounts_result(state, &service).await;
+    }
+
+    next.validate()
+        .map_err(|error| RpcError::bad_params(error.to_string()))?;
+    let raw = tokio::fs::read_to_string(&state.paths.config_file)
+        .await
+        .map_err(|error| RpcError::internal(error.to_string()))?;
+    persist_service_config_locked(state, &raw, &next).await?;
+    let service = next
+        .proxy_service
+        .iter()
+        .find(|service| service.id == service_id)
+        .cloned()
+        .ok_or_else(|| RpcError::internal("updated proxy service is missing"))?;
+    drop(account_transaction);
+    drop(config_mutation);
+    drop(file_lock);
+    service_accounts_result(state, &service).await
+}
+
+async fn service_accounts_result(state: &Arc<AppState>, service: &ProxyServiceConfig) -> Handled {
+    let source = state.with_accounts(|store| store.all().to_vec());
+    let pool = state.pool();
+    let pool_config = state.runtime_config_snapshot().pool;
+    let mut accounts = Vec::new();
+    for account in source
+        .iter()
+        .filter(|account| service.includes_account(account))
+    {
+        let mut summary = summarize(account);
+        summary.health = Some(effective_account_health(&pool, account, &pool_config).await);
+        accounts.push(summary);
+    }
+    accounts.sort_by(|left, right| {
+        compare_account_identity(&left.email, &left.id, &right.email, &right.id)
+    });
+    to_value(ProxyServiceAccountsResult {
+        service_id: service.id.clone(),
+        service_name: service.name.clone(),
+        account_tag: service.account_tag.clone(),
+        uses_global_pool: service.uses_global_account_pool(),
+        account_ids: service.account_ids.clone(),
+        excluded_account_ids: service.excluded_account_ids.clone(),
+        accounts,
+    })
+}
+
+async fn persist_service_config_locked(
+    state: &Arc<AppState>,
+    raw: &str,
+    next: &Config,
+) -> Result<(), RpcError> {
+    let output = render_service_config_update(raw, next)?;
+    kproxy_store::atomic::write_bytes_atomically(
+        &state.paths.config_file,
+        output.as_bytes(),
+        Some(0o600),
+    )
+    .await
+    .map_err(|error| RpcError::internal(error.to_string()))?;
+    if let Err(error) = state.apply_config_transaction_locked(next).await {
+        kproxy_store::atomic::write_bytes_atomically(
+            &state.paths.config_file,
+            raw.as_bytes(),
+            Some(0o600),
+        )
+        .await
+        .map_err(|rollback_error| {
+            RpcError::internal(format!(
+                "config apply failed ({error}); disk rollback failed: {rollback_error}"
+            ))
+        })?;
+        return Err(RpcError::bad_params(format!(
+            "proxy service update rejected: {error}"
+        )));
+    }
+    state.mark_config_reloaded(now_secs());
+    Ok(())
+}
+
 async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
     let params: ProxyServiceCreateParams = parse_params(params)?;
     let name = params.name.trim();
@@ -1214,6 +1413,13 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
             "proxy service name already exists: {name}"
         )));
     }
+    let account_tag = match params.account_tag {
+        Some(tag) if tag.trim().is_empty() => {
+            return Err(RpcError::bad_params("account tag must not be empty"))
+        }
+        Some(tag) => Some(tag.trim().to_owned()),
+        None => None,
+    };
 
     let format_name = params.api_key_format.as_deref().unwrap_or("sk");
     let format = match format_name {
@@ -1240,6 +1446,9 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
         enabled: true,
         skip_user_agent_check: params.skip_user_agent_check,
         api_key_ids: vec![key_id.clone()],
+        account_tag,
+        account_ids: Vec::new(),
+        excluded_account_ids: Vec::new(),
         created_at: now_secs(),
     };
     let key_config = ApiKeyConfig {

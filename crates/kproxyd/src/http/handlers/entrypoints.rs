@@ -12,8 +12,14 @@ pub async fn root() -> Json<Value> {
 
 pub async fn health(State(service): State<ServiceHttpState>) -> Json<Value> {
     let pool = service.app.pool();
-    let counts = pool.scheduling_counts().await;
-    let accounts = pool.snapshot().await;
+    let account_ids = service.account_ids().await;
+    let counts = pool.scheduling_counts_scoped(&account_ids).await;
+    let accounts = pool
+        .snapshot()
+        .await
+        .into_iter()
+        .filter(|account| account_ids.contains(&account.id))
+        .collect::<Vec<_>>();
     let (used_credits, total_credits) = accounts
         .iter()
         .filter_map(|account| account.usage.as_ref())
@@ -39,7 +45,12 @@ pub async fn health(State(service): State<ServiceHttpState>) -> Json<Value> {
 }
 
 pub async fn readiness(State(service): State<ServiceHttpState>) -> Response {
-    let counts = service.app.pool().scheduling_counts().await;
+    let account_ids = service.account_ids().await;
+    let counts = service
+        .app
+        .pool()
+        .scheduling_counts_scoped(&account_ids)
+        .await;
     let mut reasons = service.app.task_registry.readiness_issues(&service.app);
     if counts.available == 0 {
         reasons.push("no account is currently available".to_string());

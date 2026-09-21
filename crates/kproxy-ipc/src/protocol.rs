@@ -18,6 +18,8 @@ pub mod method {
     pub const ACCOUNT_LIST: &str = "account.list";
     /// 显示账号。
     pub const ACCOUNT_SHOW: &str = "account.show";
+    /// 查询账号绑定的 API 代理服务。
+    pub const ACCOUNT_SERVICES: &str = "account.services";
     /// 导入账号。
     pub const ACCOUNT_IMPORT: &str = "account.import";
     /// 导出账号。
@@ -74,6 +76,12 @@ pub mod method {
     pub const SERVICE_DELETE: &str = "service.delete";
     /// 查询指定 API 代理服务绑定的 API key。
     pub const SERVICE_APIKEYS: &str = "service.apikeys";
+    /// 查询指定 API 代理服务的有效账号池。
+    pub const SERVICE_ACCOUNTS: &str = "service.accounts";
+    /// 手工向指定 API 代理服务加入账号。
+    pub const SERVICE_ACCOUNT_ADD: &str = "service.account.add";
+    /// 从指定 API 代理服务排除账号。
+    pub const SERVICE_ACCOUNT_REMOVE: &str = "service.account.remove";
     /// Webhook 列表。
     pub const WEBHOOK_LIST: &str = "webhook.list";
     /// 测试 webhook。
@@ -89,6 +97,7 @@ pub mod method {
         CONFIG_PATH,
         ACCOUNT_LIST,
         ACCOUNT_SHOW,
+        ACCOUNT_SERVICES,
         ACCOUNT_IMPORT,
         ACCOUNT_EXPORT,
         ACCOUNT_ADD_SSO,
@@ -117,6 +126,9 @@ pub mod method {
         SERVICE_CREATE,
         SERVICE_DELETE,
         SERVICE_APIKEYS,
+        SERVICE_ACCOUNTS,
+        SERVICE_ACCOUNT_ADD,
+        SERVICE_ACCOUNT_REMOVE,
         WEBHOOK_LIST,
         WEBHOOK_TEST,
         WEBHOOK_LOGS,
@@ -350,6 +362,12 @@ pub struct ProxyServiceView {
     pub running: bool,
     #[serde(default)]
     pub api_key_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_tag: Option<String>,
+    #[serde(default)]
+    pub account_ids: Vec<String>,
+    #[serde(default)]
+    pub excluded_account_ids: Vec<String>,
     pub created_at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
@@ -371,6 +389,8 @@ pub struct ProxyServiceCreateParams {
     pub port: Option<u16>,
     #[serde(default)]
     pub skip_user_agent_check: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_tag: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -420,6 +440,38 @@ pub struct ProxyServiceApiKeysParams {
     /// 是否返回明文密钥。
     #[serde(default)]
     pub show_secret: bool,
+}
+
+/// `service.accounts` 参数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyServiceAccountsParams {
+    /// 服务 ID 或名称。
+    pub service: String,
+}
+
+/// `service.account.add` / `service.account.remove` 参数。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyServiceAccountChangeParams {
+    /// 服务 ID 或名称。
+    pub service: String,
+    /// 账号 ID 或邮箱。
+    pub accounts: Vec<String>,
+}
+
+/// API 代理服务的有效账号池。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyServiceAccountsResult {
+    pub service_id: String,
+    pub service_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_tag: Option<String>,
+    pub uses_global_pool: bool,
+    #[serde(default)]
+    pub account_ids: Vec<String>,
+    #[serde(default)]
+    pub excluded_account_ids: Vec<String>,
+    #[serde(default)]
+    pub accounts: Vec<AccountSummary>,
 }
 
 /// 服务绑定的 API key 视图。
@@ -532,6 +584,37 @@ pub struct AccountDetail {
     /// 近期错误摘要。
     #[serde(default)]
     pub recent_errors: Vec<String>,
+}
+
+/// 一个账号与 API 代理服务的有效绑定关系。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountServiceBinding {
+    /// 服务稳定 ID。
+    pub service_id: String,
+    /// 服务名称。
+    pub service_name: String,
+    /// 监听地址。
+    pub host: String,
+    /// 监听端口。
+    pub port: u16,
+    /// 配置是否启用。
+    pub enabled: bool,
+    /// 监听是否正在运行。
+    pub running: bool,
+    /// 绑定来源：`global`、`tag:<tag>` 或 `manual`；同一服务可有多个来源。
+    #[serde(default)]
+    pub binding_sources: Vec<String>,
+}
+
+/// `account.services` 结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountServicesResult {
+    /// 账号稳定 ID。
+    pub account_id: String,
+    /// 账号邮箱。
+    pub account_email: String,
+    /// 包含该账号的代理服务，按名称排序。
+    pub services: Vec<AccountServiceBinding>,
 }
 
 /// 一个账号对客户端模型 ID 的解析结果。
@@ -711,6 +794,9 @@ pub struct ConfigReloadResult {
 pub struct AccountImportParams {
     /// 待导入账号。
     pub accounts: Vec<kproxy_core::account::Account>,
+    /// 合并到每个导入账号的标签。
+    #[serde(default)]
+    pub tags: Vec<String>,
 }
 
 /// `account.import` 结果。
@@ -721,6 +807,44 @@ pub struct AccountImportResult {
     /// 因重复跳过的 ID。
     #[serde(default)]
     pub skipped: Vec<String>,
+}
+
+/// `account.addSso` 参数。
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AccountAddSsoParams {
+    /// IAM Identity Center 登录邮箱。
+    pub email: String,
+    /// 仅在管理 socket 上传输的登录密码。
+    pub password: String,
+    /// IAM Identity Center start URL。
+    pub start_url: String,
+    /// AWS 区域。
+    #[serde(default = "default_account_sso_region")]
+    pub region: String,
+    /// 是否显示浏览器窗口。
+    #[serde(default)]
+    pub headful: bool,
+    /// 新账号标签。
+    #[serde(default)]
+    pub tags: Vec<String>,
+}
+
+impl std::fmt::Debug for AccountAddSsoParams {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("AccountAddSsoParams")
+            .field("email", &self.email)
+            .field("password", &"<redacted>")
+            .field("start_url", &self.start_url)
+            .field("region", &self.region)
+            .field("headful", &self.headful)
+            .field("tags", &self.tags)
+            .finish()
+    }
+}
+
+fn default_account_sso_region() -> String {
+    "us-east-1".into()
 }
 
 /// 单账号定位参数。
@@ -821,6 +945,23 @@ mod tests {
     fn method_names_are_unique() {
         let unique: std::collections::HashSet<_> = method::ALL.iter().collect();
         assert_eq!(unique.len(), method::ALL.len());
+    }
+
+    #[test]
+    fn sso_params_debug_redacts_the_password() {
+        let params = AccountAddSsoParams {
+            email: "user@example.com".into(),
+            password: "super-secret-password".into(),
+            start_url: "https://example.awsapps.com/start".into(),
+            region: "us-east-1".into(),
+            headful: false,
+            tags: vec!["team-a".into()],
+        };
+
+        let debug = format!("{params:?}");
+        assert!(!debug.contains("super-secret-password"));
+        assert!(debug.contains("<redacted>"));
+        assert!(debug.contains("user@example.com"));
     }
 
     #[test]

@@ -472,7 +472,7 @@ pub fn response(
                 let retry_limit = config
                     .upstream
                     .max_retries
-                    .max(context.state.pool().snapshot().await.len() as u32);
+                    .max(context.account_ids.len() as u32);
                 let may_switch = (!is_quota || config.pool.auto_switch_on_quota_exhausted)
                     && !is_request_rejection;
                 let mut account_health_handled = false;
@@ -559,8 +559,22 @@ pub fn response(
                     if let Some(fallback) =
                         super::super::handlers::find_model_fallback(&context.kiro_model, &models)
                     {
-                        let fallback_input_tokens = match super::super::handlers::truncate_context_if_requested(
-                            &context.state, &mut payload, context.input_tokens, context.compact, &fallback,
+                        let account = context.lease.account().await;
+                        let resolved = if let Some(runtime) =
+                            context.state.pool().get(&account.id).await
+                        {
+                            let resolved = runtime.resolve_model(&fallback).await;
+                            if resolved.is_none() && !runtime.has_model_cache().await {
+                                Some(fallback.clone())
+                            } else {
+                                resolved
+                            }
+                        } else {
+                            Some(fallback.clone())
+                        };
+                        if let Some(resolved) = resolved {
+                            let fallback_input_tokens = match super::super::handlers::truncate_context_if_requested(
+                            &context.state, &mut payload, context.input_tokens, context.compact, &resolved,
                         ).await {
                             Ok(tokens) => tokens,
                             Err(error) => {
@@ -569,53 +583,63 @@ pub fn response(
                                 break 'rounds;
                             }
                         };
-                        let fits_context = super::super::handlers::check_context_limit(
-                            &context.state,
-                            fallback_input_tokens,
-                            context.compact,
-                            &fallback,
-                        )
-                        .is_ok();
-                        if !fits_context {
-                            tracing::warn!(
-                                trace_id = %context.trace_id,
-                                request_id = %context.request_id,
-                                fallback_model = %fallback,
-                                input_tokens = context.input_tokens,
-                                "skipping stream model fallback because its context window is too small"
-                            );
-                        }
-                        if fits_context {
-                            context.input_tokens = fallback_input_tokens;
-                            fallback_model = Some(fallback.clone());
-                            context.mapped_model.clone_from(&fallback);
-                            context.kiro_model.clone_from(&fallback);
-                            super::super::handlers::set_payload_model(&mut payload, &fallback);
-                            let account = context.lease.account().await;
-                            match context.state.generate(&account, &payload).await {
-                                Ok(retry) => {
-                                    upstream_access_token = account.credentials.access_token.clone();
-                                    effective_thinking = retry.thinking_enabled();
-                                    let (next_endpoint, next_response, next_permit) =
-                                        retry.into_parts();
-                                    endpoint = next_endpoint.name.to_string();
-                                    source = next_response.bytes_stream();
-                                    upstream_metrics.reset();
-                                    stream_failure = None;
-                                    upstream_permit = next_permit;
-                                    buffer.clear();
-                                    decoder = EventStreamDecoder;
-                                    decoded = DecodedResponse::default();
-                                    stop_filter = StopSequenceFilter::new(&context.stop_sequences);
-                                    failed = None;
-                                    pre_data_retries += 1;
-                                    continue 'rounds;
-                                }
-                                Err(error) => {
-                                    stream_failure = None;
-                                    failed = Some(error.to_string());
+                            let fits_context = super::super::handlers::check_context_limit(
+                                &context.state,
+                                fallback_input_tokens,
+                                context.compact,
+                                &resolved,
+                            )
+                            .is_ok();
+                            if !fits_context {
+                                tracing::warn!(
+                                    trace_id = %context.trace_id,
+                                    request_id = %context.request_id,
+                                    fallback_model = %resolved,
+                                    input_tokens = context.input_tokens,
+                                    "skipping stream model fallback because its context window is too small"
+                                );
+                            }
+                            if fits_context {
+                                context.input_tokens = fallback_input_tokens;
+                                fallback_model = Some(fallback.clone());
+                                context.mapped_model.clone_from(&fallback);
+                                context.kiro_model.clone_from(&resolved);
+                                super::super::handlers::set_payload_model(&mut payload, &resolved);
+                                match context.state.generate(&account, &payload).await {
+                                    Ok(retry) => {
+                                        upstream_access_token =
+                                            account.credentials.access_token.clone();
+                                        effective_thinking = retry.thinking_enabled();
+                                        let (next_endpoint, next_response, next_permit) =
+                                            retry.into_parts();
+                                        endpoint = next_endpoint.name.to_string();
+                                        source = next_response.bytes_stream();
+                                        upstream_metrics.reset();
+                                        stream_failure = None;
+                                        upstream_permit = next_permit;
+                                        buffer.clear();
+                                        decoder = EventStreamDecoder;
+                                        decoded = DecodedResponse::default();
+                                        stop_filter =
+                                            StopSequenceFilter::new(&context.stop_sequences);
+                                        failed = None;
+                                        pre_data_retries += 1;
+                                        continue 'rounds;
+                                    }
+                                    Err(error) => {
+                                        stream_failure = None;
+                                        failed = Some(error.to_string());
+                                    }
                                 }
                             }
+                        } else {
+                            tracing::debug!(
+                                trace_id = %context.trace_id,
+                                request_id = %context.request_id,
+                                account_id = %account.id,
+                                fallback_model = %fallback,
+                                "stream fallback is unavailable in the current service account"
+                            );
                         }
                     }
                 }
@@ -643,15 +667,13 @@ pub fn response(
                 attempted_accounts.insert(failed_account_id.clone());
                 if !data_started && pre_data_retries < retry_limit && may_switch {
                     let (new_lease, account) = loop {
-                        let candidate_ids = context
-                            .state
-                            .pool()
-                            .snapshot()
-                            .await
-                            .into_iter()
-                            .filter(|account| !attempted_accounts.contains(&account.id))
-                            .map(|account| account.id)
-                            .collect::<Vec<_>>();
+                        let pool = context.state.pool();
+                        let candidate_ids = pool
+                            .matching_account_ids(|account| {
+                                context.account_ids.contains(&account.id)
+                                    && !attempted_accounts.contains(&account.id)
+                            })
+                            .await;
                         if candidate_ids.is_empty() {
                             if let Some(message) = failed.as_deref() {
                                 yield Ok::<Bytes, Infallible>(Bytes::from(classified_stream_error(
@@ -663,10 +685,13 @@ pub fn response(
                             }
                             break 'rounds;
                         }
-                        let new_lease = match context
-                            .state
-                            .pool()
-                            .acquire(&context.kiro_model, context.estimated_credits, &candidate_ids)
+                        let new_lease = match pool
+                            .acquire_scoped_excluding(
+                                &context.kiro_model,
+                                context.estimated_credits,
+                                &context.account_ids,
+                                &attempted_accounts,
+                            )
                             .await
                         {
                             Ok(lease) => lease,
@@ -674,7 +699,10 @@ pub fn response(
                                 if context
                                     .state
                                     .pool()
-                                    .all_matching_credit_exhausted(&context.kiro_model)
+                                    .all_matching_credit_exhausted_scoped(
+                                        &context.kiro_model,
+                                        &context.account_ids,
+                                    )
                                     .await
                                 {
                                     crate::alerts::sync_service_quota(&context.state).await;

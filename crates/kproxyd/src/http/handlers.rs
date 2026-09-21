@@ -262,6 +262,7 @@ struct CompactionRun {
 struct CompactionRequest<'a> {
     trace_id: &'a str,
     key_id: Option<&'a str>,
+    account_ids: Arc<HashSet<String>>,
     source_payload: &'a KiroPayload,
     decision: &'a CompactionDecision,
     summary_model: &'a str,
@@ -674,15 +675,22 @@ pub async fn models(State(service): State<ServiceHttpState>, headers: HeaderMap)
         let authenticated_key =
             authenticate(&state, &service.allowed_api_key_ids, &headers, format)?;
         enforce_client_user_agent(&service, &headers, format, authenticated_key.as_ref())?;
+        let account_ids = service.account_ids().await;
         let config = state.config.current();
         if !config.models.dynamic_discovery {
             return Ok::<_, ApiError>(model_list(fallback_models(&config), claude));
         }
         let (cached, fresh) = state.models.get(config.models.cache_ttl_ms);
-        if !fresh && state.models.begin_refresh() {
+        let (has_enabled_accounts, scoped_catalog_ready) =
+            service_catalog_status(&state, &account_ids, &cached).await;
+        if has_enabled_accounts && (!fresh || !scoped_catalog_ready) && state.models.begin_refresh()
+        {
             let refresh_state = Arc::clone(&state);
+            let refresh_account_ids = Arc::clone(&account_ids);
             tokio::spawn(async move {
-                if let Err(error) = crate::tasks::refresh_models(&refresh_state).await {
+                if let Err(error) =
+                    crate::tasks::refresh_models_scoped(&refresh_state, &refresh_account_ids).await
+                {
                     tracing::warn!(%error, "on-demand model discovery failed");
                 }
             });
@@ -692,10 +700,88 @@ pub async fn models(State(service): State<ServiceHttpState>, headers: HeaderMap)
         } else {
             cached
         };
+        let models = service_models(&state, &account_ids, models).await;
         Ok::<_, ApiError>(model_list(models, claude))
     }
     .await;
     result.unwrap_or_else(IntoResponse::into_response)
+}
+
+async fn service_catalog_status(
+    state: &Arc<AppState>,
+    account_ids: &HashSet<String>,
+    models: &[kproxy_kiro::ModelInfo],
+) -> (bool, bool) {
+    let model_ids = models
+        .iter()
+        .map(|model| model.model_id.as_str())
+        .collect::<HashSet<_>>();
+    let pool = state.pool();
+    let scoped_accounts = pool
+        .snapshot()
+        .await
+        .into_iter()
+        .filter(|account| account.enabled && account_ids.contains(&account.id))
+        .collect::<Vec<_>>();
+    if scoped_accounts.is_empty() {
+        return (false, false);
+    }
+    for account in scoped_accounts {
+        let Some(runtime) = pool.get(&account.id).await else {
+            return (true, false);
+        };
+        if !runtime.has_model_cache().await
+            || runtime
+                .supported_models()
+                .await
+                .iter()
+                .any(|model_id| !model_ids.contains(model_id.as_str()))
+        {
+            return (true, false);
+        }
+    }
+    (true, true)
+}
+
+async fn service_models(
+    state: &Arc<AppState>,
+    account_ids: &HashSet<String>,
+    mut models: Vec<kproxy_kiro::ModelInfo>,
+) -> Vec<kproxy_kiro::ModelInfo> {
+    let pool = state.pool();
+    let pool_accounts = pool.snapshot().await;
+    if account_ids.is_empty() {
+        // Preserve the established cold-start catalog when the installation
+        // has no accounts at all. If other services do have accounts, an empty
+        // scope is real and must not expose their model availability.
+        return if pool_accounts.is_empty() {
+            fallback_models(&state.config.current())
+        } else {
+            Vec::new()
+        };
+    }
+    let enabled_ids = pool_accounts
+        .into_iter()
+        .filter(|account| account.enabled && account_ids.contains(&account.id))
+        .map(|account| account.id)
+        .collect::<Vec<_>>();
+    let mut supported = HashSet::new();
+    let mut has_scoped_catalog = false;
+    for account_id in enabled_ids {
+        if let Some(account) = pool.get(&account_id).await {
+            if account.has_model_cache().await {
+                has_scoped_catalog = true;
+                supported.extend(account.supported_models().await);
+            }
+        }
+    }
+    // Before discovery has populated any scoped account, use only the static
+    // fallback rather than a dynamic catalog learned from another service.
+    if !has_scoped_catalog {
+        return fallback_models(&state.config.current());
+    }
+    models.retain(|model| supported.contains(&model.model_id));
+    models
 }
 
 fn model_list(models: Vec<kproxy_kiro::ModelInfo>, claude: bool) -> Response {

@@ -46,6 +46,7 @@ pub(super) async fn handle_claude(
     )?;
     enforce_claude_user_agent(&service, &headers, authenticated_key.as_ref())?;
     let key_id = authenticated_key.map(|key| key.id);
+    let account_ids = service.account_ids().await;
     tracing::debug!(
         event = "proxy.authentication.completed",
         trace_id = %trace_id,
@@ -367,14 +368,24 @@ pub(super) async fn handle_claude(
             .take(web_search_max_rounds as usize)
             .next()
             .is_some();
-        let search_lease =
-            if needs_search_account {
-                Some(state.pool().acquire("", 0.0, &[]).await.map_err(|error| {
-                    upstream_error(ExecuteError::Pool(error), ErrorFormat::Claude)
-                })?)
-            } else {
-                None
-            };
+        let search_lease = if needs_search_account {
+            Some(
+                state
+                    .pool()
+                    .acquire_scoped_excluding(
+                        "",
+                        0.0,
+                        &account_ids,
+                        &std::collections::HashSet::new(),
+                    )
+                    .await
+                    .map_err(|error| {
+                        upstream_error(ExecuteError::Pool(error), ErrorFormat::Claude)
+                    })?,
+            )
+        } else {
+            None
+        };
         let mut resumed_web_search_uses = 0u32;
         for tool_use in pending_web_searches {
             let query = tool_use
@@ -452,6 +463,7 @@ pub(super) async fn handle_claude(
     // resolution must finish before irreversible context edits or rejection.
     let selected = prepare_upstream(
         &state,
+        &account_ids,
         &trace_id,
         &route.mapped,
         &request.model,
@@ -511,6 +523,7 @@ pub(super) async fn handle_claude(
             CompactionRequest {
                 trace_id: &trace_id,
                 key_id: key_id.as_deref(),
+                account_ids: Arc::clone(&account_ids),
                 source_payload: &payload,
                 decision: &decision,
                 summary_model,
@@ -627,6 +640,7 @@ pub(super) async fn handle_claude(
     let request_id = format!("msg_{}", Uuid::new_v4().simple());
     let first_execution = execute_upstream(
         &state,
+        &account_ids,
         &trace_id,
         &route.mapped,
         &request.model,
@@ -678,6 +692,7 @@ pub(super) async fn handle_claude(
                     CompactionRequest {
                         trace_id: &trace_id,
                         key_id: key_id.as_deref(),
+                        account_ids: Arc::clone(&account_ids),
                         source_payload: &payload,
                         decision: &decision,
                         summary_model,
@@ -753,6 +768,7 @@ pub(super) async fn handle_claude(
             );
             let retry_execution = execute_upstream(
                 &state,
+                &account_ids,
                 &trace_id,
                 &route.mapped,
                 &request.model,
@@ -826,6 +842,7 @@ pub(super) async fn handle_claude(
             StreamProtocol::Claude,
             StreamContext {
                 state,
+                account_ids: Arc::clone(&account_ids),
                 lease,
                 upstream_access_token,
                 reservation,
@@ -937,6 +954,7 @@ pub(super) async fn handle_openai(
     )?;
     enforce_codex_user_agent(&service, &headers, authenticated_key.as_ref())?;
     let key_id = authenticated_key.map(|key| key.id);
+    let account_ids = service.account_ids().await;
     tracing::debug!(
         event = "proxy.authentication.completed",
         trace_id = %trace_id,
@@ -1150,6 +1168,7 @@ pub(super) async fn handle_openai(
             .automatic_history_truncation = true;
         let mut selected = prepare_upstream(
             &state,
+            &account_ids,
             &trace_id,
             &route.mapped,
             &request.model,
@@ -1269,6 +1288,7 @@ pub(super) async fn handle_openai(
         payload,
     } = execute_upstream(
         &state,
+        &account_ids,
         &trace_id,
         &route.mapped,
         &request.model,
@@ -1302,6 +1322,7 @@ pub(super) async fn handle_openai(
             StreamProtocol::OpenAi,
             StreamContext {
                 state,
+                account_ids: Arc::clone(&account_ids),
                 lease,
                 upstream_access_token,
                 reservation,

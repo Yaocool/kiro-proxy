@@ -1000,6 +1000,15 @@ async fn multiwave_summary_input_falls_back_without_dispatching_semantic_work() 
         CompactionRequest {
             trace_id: "trace_capacity",
             key_id: None,
+            account_ids: Arc::new(
+                state
+                    .pool()
+                    .snapshot()
+                    .await
+                    .into_iter()
+                    .map(|account| account.id)
+                    .collect(),
+            ),
             source_payload: &source_payload,
             decision: &decision,
             summary_model: "mapped-tiny",
@@ -1087,6 +1096,15 @@ async fn multiwave_summary_input_falls_back_without_dispatching_semantic_work() 
         CompactionRequest {
             trace_id: "trace_oversized_current",
             key_id: None,
+            account_ids: Arc::new(
+                state
+                    .pool()
+                    .snapshot()
+                    .await
+                    .into_iter()
+                    .map(|account| account.id)
+                    .collect(),
+            ),
             source_payload: &oversized_payload,
             decision: &decision,
             summary_model: "mapped-tiny",

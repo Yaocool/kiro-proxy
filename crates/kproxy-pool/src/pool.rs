@@ -255,6 +255,26 @@ impl AccountPool {
         self.acquire(model, estimated_credits, &candidate_ids).await
     }
 
+    /// Acquires from one service's fixed account scope while excluding
+    /// accounts already attempted by the current request.
+    pub async fn acquire_scoped_excluding(
+        &self,
+        model: &str,
+        estimated_credits: f64,
+        allowed_ids: &HashSet<String>,
+        excluded_ids: &HashSet<String>,
+    ) -> Result<AccountLease, PoolError> {
+        let candidate_ids = allowed_ids
+            .iter()
+            .filter(|account_id| !excluded_ids.contains(*account_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if candidate_ids.is_empty() {
+            return Err(PoolError::NoAvailableAccount(model.into()));
+        }
+        self.acquire(model, estimated_credits, &candidate_ids).await
+    }
+
     async fn try_acquire(
         &self,
         model: &str,
@@ -483,9 +503,50 @@ impl AccountPool {
         output
     }
 
+    /// Returns the IDs of accounts matching a caller-provided scope without
+    /// cloning credentials or the rest of each account record.
+    pub async fn matching_account_ids(
+        &self,
+        matches: impl Fn(&Account) -> bool,
+    ) -> HashSet<String> {
+        let states = self
+            .accounts
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut output = HashSet::with_capacity(states.len());
+        for state in states {
+            let account = state.account.read().await;
+            if matches(&account) {
+                output.insert(account.id.clone());
+            }
+        }
+        output
+    }
+
     /// Returns true only when at least one enabled account can serve the model
     /// and every such account has a persisted or usage-derived credit stop.
     pub async fn all_matching_credit_exhausted(&self, model: &str) -> bool {
+        self.all_matching_credit_exhausted_in(model, None).await
+    }
+
+    /// Scoped variant used by one proxy service's effective account pool.
+    pub async fn all_matching_credit_exhausted_scoped(
+        &self,
+        model: &str,
+        allowed_ids: &HashSet<String>,
+    ) -> bool {
+        self.all_matching_credit_exhausted_in(model, Some(allowed_ids))
+            .await
+    }
+
+    async fn all_matching_credit_exhausted_in(
+        &self,
+        model: &str,
+        allowed_ids: Option<&HashSet<String>>,
+    ) -> bool {
         let states = self
             .accounts
             .read()
@@ -497,6 +558,9 @@ impl AccountPool {
         let mut matched = false;
         for state in states {
             let account = state.account.read().await;
+            if allowed_ids.is_some_and(|allowed| !allowed.contains(&account.id)) {
+                continue;
+            }
             if !account.enabled {
                 continue;
             }
@@ -568,6 +632,21 @@ impl AccountPool {
     ///
     /// Credit protection is kept separate from true exhaustion.
     pub async fn scheduling_counts(&self) -> AccountPoolCounts {
+        self.scheduling_counts_in(None).await
+    }
+
+    /// Count only accounts belonging to one proxy service's effective pool.
+    pub async fn scheduling_counts_scoped(
+        &self,
+        allowed_ids: &HashSet<String>,
+    ) -> AccountPoolCounts {
+        self.scheduling_counts_in(Some(allowed_ids)).await
+    }
+
+    async fn scheduling_counts_in(
+        &self,
+        allowed_ids: Option<&HashSet<String>>,
+    ) -> AccountPoolCounts {
         let states = self
             .accounts
             .read()
@@ -576,15 +655,16 @@ impl AccountPool {
             .cloned()
             .collect::<Vec<_>>();
         let config = self.config();
-        let mut counts = AccountPoolCounts {
-            total: states.len(),
-            ..AccountPoolCounts::default()
-        };
+        let mut counts = AccountPoolCounts::default();
         for state in states {
             if state.cooling_expired().await {
                 state.set_health(AccountHealth::Available);
             }
             let account = state.account.read().await;
+            if allowed_ids.is_some_and(|allowed| !allowed.contains(&account.id)) {
+                continue;
+            }
+            counts.total += 1;
             if !account.enabled {
                 counts.disabled += 1;
                 continue;
@@ -920,6 +1000,45 @@ mod tests {
             pool.acquire_excluding("claude-sonnet", 0.0, &all).await,
             Err(PoolError::NoAvailableAccount(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn scoped_acquire_never_uses_an_account_outside_the_service_pool() {
+        let pool = AccountPool::new(
+            vec![
+                account("service-a", 80.0, SubscriptionKind::Pro),
+                account("service-b", 0.0, SubscriptionKind::Pro),
+            ],
+            immediate_config(),
+        );
+        let allowed = HashSet::from(["service-a".to_string()]);
+        let lease = pool
+            .acquire_scoped_excluding("claude-sonnet", 0.0, &allowed, &HashSet::new())
+            .await
+            .expect("scoped lease");
+        assert_eq!(lease.account().await.id, "service-a");
+        drop(lease);
+
+        let counts = pool.scheduling_counts_scoped(&allowed).await;
+        assert_eq!(counts.total, 1);
+        assert_eq!(counts.available, 1);
+    }
+
+    #[tokio::test]
+    async fn scoped_credit_exhaustion_ignores_healthy_accounts_in_other_services() {
+        let pool = AccountPool::new(
+            vec![
+                account("exhausted", 100.0, SubscriptionKind::Pro),
+                account("healthy", 0.0, SubscriptionKind::Pro),
+            ],
+            immediate_config(),
+        );
+        let allowed = HashSet::from(["exhausted".to_string()]);
+        assert!(
+            pool.all_matching_credit_exhausted_scoped("claude-sonnet", &allowed)
+                .await
+        );
+        assert!(!pool.all_matching_credit_exhausted("claude-sonnet").await);
     }
 
     #[tokio::test]

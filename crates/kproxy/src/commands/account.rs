@@ -5,7 +5,8 @@ use clap::Subcommand;
 use kproxy_core::account::Account;
 use kproxy_core::ids::{new_account_id, new_machine_id};
 use kproxy_ipc::protocol::{
-    method, AccountDetail, AccountImportResult, AccountListResult, AccountSummary, ConfigShowResult,
+    method, AccountDetail, AccountImportResult, AccountListResult, AccountServiceBinding,
+    AccountServicesResult, AccountSummary, ConfigShowResult,
 };
 
 use crate::client::AdminClient;
@@ -52,9 +53,17 @@ pub enum AccountCommand {
         /// 账号 ID 或邮箱。
         id: String,
     },
+    /// 查看账号绑定的 API 代理服务。
+    #[command(
+        long_about = "查看账号当前属于哪些 API 代理服务，并显示全局池、标签或手工绑定来源。\n\n示例：\n  kproxy account services acc_7f3a2b1c\n  kproxy account services alice@example.com"
+    )]
+    Services {
+        /// 账号 ID 或邮箱。
+        id: String,
+    },
     /// 从 JSON 导入现成 token。
     #[command(
-        long_about = "导入已有凭证。id、machine_id、created_at 缺失时自动生成。\n\n示例：\n  kproxy account import --file accounts.json\n  cat accounts.json | kproxy account import --stdin"
+        long_about = "导入已有凭证。id、machine_id、created_at 缺失时自动生成；--tag 会合并到本次导入的全部账号。\n\n示例：\n  kproxy account import --file accounts.json --tag team-a\n  cat accounts.json | kproxy account import --stdin --tag team-a --tag prod"
     )]
     Import {
         /// JSON 文件路径。
@@ -63,6 +72,9 @@ pub enum AccountCommand {
         /// 从标准输入读取。
         #[arg(long)]
         stdin: bool,
+        /// 合并到全部导入账号的标签；可重复或逗号分隔。
+        #[arg(long = "tag", value_delimiter = ',', value_name = "TAG")]
+        tags: Vec<String>,
     },
     /// 导入 Kiro headless API key，从 KIRO_API_KEY 环境变量或标准输入读取。
     AddApiKey {
@@ -73,6 +85,9 @@ pub enum AccountCommand {
         /// 从标准输入读取 key，避免在命令行参数中暴露凭据。
         #[arg(long)]
         key_stdin: bool,
+        /// 新账号标签；可重复或逗号分隔。
+        #[arg(long = "tag", value_delimiter = ',', value_name = "TAG")]
+        tags: Vec<String>,
     },
     /// 导出账号 JSON；默认含凭证，仅应写入受保护位置。
     #[command(
@@ -107,6 +122,9 @@ pub enum AccountCommand {
         /// 显示浏览器窗口，便于手工处理额外验证。
         #[arg(long)]
         headful: bool,
+        /// 新账号标签；批量模式下应用到本批全部账号，可重复或逗号分隔。
+        #[arg(long = "tag", value_delimiter = ',', value_name = "TAG")]
+        tags: Vec<String>,
     },
     /// 删除一个或多个账号。
     #[command(
@@ -343,13 +361,20 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                 print_detail(&detail);
             }
         }
-        AccountCommand::Import { file, stdin } => {
+        AccountCommand::Services { id } => {
+            let result: AccountServicesResult = client
+                .call(method::ACCOUNT_SERVICES, serde_json::json!({"id":id}))
+                .await?;
+            print_account_services(&result, json)?;
+        }
+        AccountCommand::Import { file, stdin, tags } => {
+            let tags = normalize_cli_tags(tags)?;
             let raw = read_import_source(file.as_deref(), stdin).await?;
             let accounts = parse_import_payload(&raw)?;
             let result: AccountImportResult = client
                 .call(
                     method::ACCOUNT_IMPORT,
-                    serde_json::json!({"accounts": accounts}),
+                    serde_json::json!({"accounts": accounts, "tags":tags}),
                 )
                 .await?;
             if json {
@@ -369,7 +394,9 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             email,
             region,
             key_stdin,
+            tags,
         } => {
+            let tags = normalize_cli_tags(tags)?;
             let key = if key_stdin {
                 read_import_source(None, true).await?
             } else {
@@ -390,7 +417,7 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             let result: AccountImportResult = client
                 .call(
                     method::ACCOUNT_IMPORT,
-                    serde_json::json!({"accounts":accounts}),
+                    serde_json::json!({"accounts":accounts,"tags":tags}),
                 )
                 .await?;
             if json {
@@ -417,17 +444,22 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             batch,
             concurrency,
             headful,
+            tags,
         } => {
+            let tags = normalize_cli_tags(tags)?;
             let start_url = resolve_start_url(client, start_url.as_deref()).await?;
             if let Some(file) = batch {
                 run_sso_batch(
                     client,
                     &file,
-                    &start_url,
-                    &region,
-                    concurrency,
-                    headful,
-                    json,
+                    SsoBatchOptions {
+                        start_url: &start_url,
+                        region: &region,
+                        concurrency,
+                        headful,
+                        tags: &tags,
+                        json,
+                    },
                 )
                 .await?;
                 return Ok(());
@@ -445,7 +477,8 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                         "password":password,
                         "start_url":start_url,
                         "region":region,
-                        "headful":headful
+                        "headful":headful,
+                        "tags":tags
                     }),
                 )
                 .await?;
@@ -566,6 +599,21 @@ async fn resolve_start_url(client: &mut AdminClient, explicit: Option<&str>) -> 
     validate_start_url(configured)
 }
 
+fn normalize_cli_tags(tags: Vec<String>) -> Result<Vec<String>> {
+    let mut normalized = Vec::new();
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return Err(anyhow!("账号标签不能为空"));
+        }
+        if !normalized.iter().any(|existing| existing == tag) {
+            normalized.push(tag.to_owned());
+        }
+    }
+    normalized.sort();
+    Ok(normalized)
+}
+
 fn validate_start_url(url: &str) -> Result<String> {
     if !url.starts_with("https://") {
         return Err(anyhow!("SSO start URL 必须使用 https://"));
@@ -680,29 +728,37 @@ async fn read_password_line() -> Result<String> {
     Ok(password)
 }
 
+struct SsoBatchOptions<'a> {
+    start_url: &'a str,
+    region: &'a str,
+    concurrency: usize,
+    headful: bool,
+    tags: &'a [String],
+    json: bool,
+}
+
 async fn run_sso_batch(
     client: &AdminClient,
     file: &str,
-    start_url: &str,
-    region: &str,
-    concurrency: usize,
-    headful: bool,
-    json: bool,
+    options: SsoBatchOptions<'_>,
 ) -> Result<()> {
     use futures::{stream, StreamExt};
 
-    if !(1..=8).contains(&concurrency) {
+    if !(1..=8).contains(&options.concurrency) {
         return Err(anyhow!("并发数必须在 1..=8 之间"));
     }
     let raw = read_sso_batch_source(file).await?;
     let rows = parse_sso_csv(&raw)?;
     let socket = client.socket_path();
-    let start_url = start_url.to_string();
-    let region = region.to_string();
+    let start_url = options.start_url.to_string();
+    let region = options.region.to_string();
+    let tags = options.tags.to_vec();
+    let headful = options.headful;
     let results = stream::iter(rows.into_iter().map(|(email, password)| {
         let socket = socket.clone();
         let start_url = start_url.clone();
         let region = region.clone();
+        let tags = tags.clone();
         async move {
             let mut client = AdminClient::connect(socket);
             let result = client
@@ -713,20 +769,21 @@ async fn run_sso_batch(
                         "password":password,
                         "start_url":start_url,
                         "region":region,
-                        "headful":headful
+                        "headful":headful,
+                        "tags":tags
                     }),
                 )
                 .await;
             (email, result)
         }
     }))
-    .buffer_unordered(concurrency)
+    .buffer_unordered(options.concurrency)
     .collect::<Vec<_>>()
     .await;
     let mut failures = Vec::new();
     for (email, result) in results {
         match result {
-            Ok(summary) if json => print_json(&summary)?,
+            Ok(summary) if options.json => print_json(&summary)?,
             Ok(summary) => println!("已添加 {}（{}）", summary.email, summary.id),
             Err(error) => failures.push(format!("{email}: {error}")),
         }
@@ -819,6 +876,65 @@ fn parse_csv_line(line: &str) -> Result<Vec<String>> {
         return Err(anyhow!("未闭合的引号"));
     }
     Ok(fields)
+}
+
+fn print_account_services(result: &AccountServicesResult, json: bool) -> Result<()> {
+    if json {
+        return print_json(result);
+    }
+    if result.services.is_empty() {
+        println!(
+            "账号 {}（{}）未绑定任何 API 代理服务。",
+            result.account_email, result.account_id
+        );
+        return Ok(());
+    }
+    let rows = result
+        .services
+        .iter()
+        .map(|service| {
+            vec![
+                service.service_id.clone(),
+                service.service_name.clone(),
+                format!("{}:{}", service.host, service.port),
+                if service.running {
+                    "运行中".into()
+                } else if service.enabled {
+                    "未运行".into()
+                } else {
+                    "已停用".into()
+                },
+                display_binding_sources(service),
+            ]
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "账号      {}（{}）",
+        result.account_email, result.account_id
+    );
+    println!(
+        "{}",
+        render_table(&["服务 ID", "名称", "监听", "状态", "绑定来源"], &rows)
+    );
+    Ok(())
+}
+
+fn display_binding_sources(service: &AccountServiceBinding) -> String {
+    service
+        .binding_sources
+        .iter()
+        .map(|source| {
+            source
+                .strip_prefix("tag:")
+                .map(|tag| format!("标签:{tag}"))
+                .unwrap_or_else(|| match source.as_str() {
+                    "global" => "全局池".into(),
+                    "manual" => "手工".into(),
+                    other => other.to_owned(),
+                })
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn print_detail(detail: &AccountDetail) {
@@ -954,6 +1070,27 @@ mod tests {
             r#"{"id":"bad","email":"a@example.com","credentials":{"access_token":"at","region":"us-east-1","expires_at":0,"auth_method":"idc"}}"#
         )
         .is_err());
+    }
+
+    #[test]
+    fn account_creation_tags_are_trimmed_sorted_and_deduplicated() {
+        assert_eq!(
+            normalize_cli_tags(vec![" prod ".into(), "team-a".into(), "prod".into()])
+                .expect("tags"),
+            ["prod", "team-a"]
+        );
+        assert!(normalize_cli_tags(vec![" ".into()]).is_err());
+
+        let binding = AccountServiceBinding {
+            service_id: "svc_1".into(),
+            service_name: "team".into(),
+            host: "127.0.0.1".into(),
+            port: 5581,
+            enabled: true,
+            running: true,
+            binding_sources: vec!["tag:team-a".into(), "manual".into()],
+        };
+        assert_eq!(display_binding_sources(&binding), "标签:team-a,手工");
     }
 
     #[test]

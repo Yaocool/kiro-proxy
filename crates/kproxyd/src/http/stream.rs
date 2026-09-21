@@ -77,6 +77,8 @@ impl StreamProtocol {
 
 pub struct StreamContext {
     pub state: Arc<AppState>,
+    /// Fixed effective account pool for the originating proxy service.
+    pub account_ids: Arc<HashSet<String>>,
     pub lease: AccountLease,
     /// Access token used to create the currently consumed upstream response.
     pub upstream_access_token: String,

@@ -178,12 +178,9 @@ async fn sync_service_quota_inner(state: &Arc<AppState>, accounts: &[Account]) {
         .proxy_service
         .iter()
         .filter(|service| service.enabled)
-        .map(|service| service.name.trim())
-        .filter(|name| !name.is_empty())
-        .map(str::to_owned)
+        .filter(|service| !service.name.trim().is_empty())
         .collect::<Vec<_>>();
-    services.sort_by_key(|name| name.to_ascii_lowercase());
-    services.dedup_by(|left, right| left.eq_ignore_ascii_case(right));
+    services.sort_by_key(|service| service.name.to_ascii_lowercase());
     if services.is_empty() {
         state
             .notifier()
@@ -191,78 +188,96 @@ async fn sync_service_quota_inner(state: &Arc<AppState>, accounts: &[Account]) {
         state.clear_credit_transition("__service_quota__");
         return;
     }
-    let enabled = accounts
-        .iter()
-        .filter(|account| account.enabled)
-        .collect::<Vec<_>>();
-    if enabled.is_empty() {
+
+    let mut exhausted_services = Vec::new();
+    let mut has_nonempty_pool = false;
+    let mut recovery_is_authoritative = true;
+    let mut recovery_generation = None;
+    for service in services {
+        let enabled = accounts
+            .iter()
+            .filter(|account| account.enabled && service.includes_account(account))
+            .collect::<Vec<_>>();
+        if enabled.is_empty() {
+            continue;
+        }
+        has_nonempty_pool = true;
+        let observations = enabled
+            .iter()
+            .map(|account| authoritative_credit_observation(state, account, &config.pool))
+            .collect::<Vec<_>>();
+        let all_exhausted = observations.iter().all(|observation| {
+            matches!(
+                observation,
+                CreditObservation::Known {
+                    state: AccountCreditState::Exhausted,
+                    ..
+                }
+            )
+        });
+        if all_exhausted {
+            exhausted_services.push((service.name.trim().to_owned(), enabled.len()));
+            continue;
+        }
+        recovery_is_authoritative &= observations
+            .iter()
+            .all(|observation| !matches!(observation, CreditObservation::Unknown));
+        recovery_generation = observations
+            .iter()
+            .filter_map(|observation| match observation {
+                CreditObservation::Known { generation, .. } => *generation,
+                CreditObservation::Unknown => None,
+            })
+            .chain(recovery_generation)
+            .max();
+    }
+
+    if !exhausted_services.is_empty() {
+        state.clear_credit_transition("__service_quota__");
+        let service_names = exhausted_services
+            .iter()
+            .map(|(name, count)| format!("`{}`（{count} / {count}）", markdown_code(name)))
+            .collect::<Vec<_>>()
+            .join("、");
+        let exhausted = exhausted_services.len();
+        let message = format!(
+            "- **代理服务：** {service_names}\n\
+             - **账号池状态：** {exhausted} 个服务的启用账号已全部额度耗尽\n\
+             - **影响：** 上述服务没有可用额度账号，新的 API 代理请求将被拒绝\n\
+             - **处理建议：** 补充对应账号池的额度，或向服务加入有额度的账号"
+        );
+        state.notifier().emit(WebhookEvent::new(
+            WebhookEventKind::ServiceQuotaExhausted,
+            "KProxy API 代理服务额度耗尽",
+            message,
+        ));
+        return;
+    }
+
+    if !has_nonempty_pool {
         state
             .notifier()
             .resolve_incident(WebhookEventKind::ServiceQuotaExhausted, None);
         state.clear_credit_transition("__service_quota__");
         return;
     }
-    let observations = enabled
-        .iter()
-        .map(|account| authoritative_credit_observation(state, account, &config.pool))
-        .collect::<Vec<_>>();
-    let all_known = observations
-        .iter()
-        .all(|observation| !matches!(observation, CreditObservation::Unknown));
-    let all_exhausted = observations.iter().all(|observation| {
-        matches!(
-            observation,
-            CreditObservation::Known {
-                state: AccountCreditState::Exhausted,
-                ..
-            }
-        )
-    });
-    if !all_exhausted {
-        let notifier = state.notifier();
-        if !all_known {
-            return;
-        }
-        let active = notifier.incident_active(WebhookEventKind::ServiceQuotaExhausted, None);
-        let generation = observations
-            .iter()
-            .filter_map(|observation| match observation {
-                CreditObservation::Known { generation, .. } => *generation,
-                CreditObservation::Unknown => None,
-            })
-            .max();
-        if active
-            && !transition_confirmed(
-                state,
-                "__service_quota__",
-                generation,
-                AccountCreditState::Available,
-            )
-        {
-            return;
-        }
-        notifier.resolve_incident(WebhookEventKind::ServiceQuotaExhausted, None);
-        state.clear_credit_transition("__service_quota__");
+    if !recovery_is_authoritative {
         return;
     }
+    let notifier = state.notifier();
+    let active = notifier.incident_active(WebhookEventKind::ServiceQuotaExhausted, None);
+    if active
+        && !transition_confirmed(
+            state,
+            "__service_quota__",
+            recovery_generation,
+            AccountCreditState::Available,
+        )
+    {
+        return;
+    }
+    notifier.resolve_incident(WebhookEventKind::ServiceQuotaExhausted, None);
     state.clear_credit_transition("__service_quota__");
-    let exhausted = enabled.len();
-    let service_names = services
-        .iter()
-        .map(|name| format!("`{}`", markdown_code(name)))
-        .collect::<Vec<_>>()
-        .join("、");
-    let message = format!(
-        "- **代理服务：** {service_names}\n\
-         - **账号状态：** {exhausted} / {exhausted} 个启用账号额度耗尽\n\
-         - **影响：** 没有可用额度账号，新的 API 代理请求将被拒绝\n\
-         - **处理建议：** 补充账号额度，或导入并启用有额度的账号"
-    );
-    state.notifier().emit(WebhookEvent::new(
-        WebhookEventKind::ServiceQuotaExhausted,
-        "KProxy API 代理服务额度耗尽",
-        message,
-    ));
 }
 
 pub fn emit_token_refresh_failure(
@@ -370,7 +385,7 @@ fn markdown_code(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use kproxy_core::account::{AuthMethod, Credentials, Usage};
-    use kproxy_core::config::{Config, PoolConfig};
+    use kproxy_core::config::{Config, PoolConfig, ProxyServiceConfig};
     use kproxy_store::accounts::AccountStore;
     use kproxy_store::config_loader::ConfigHandle;
 
@@ -511,5 +526,64 @@ mod tests {
             ),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn service_quota_alert_uses_each_services_effective_account_pool() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = kproxy_core::paths::Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        let mut accounts = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("accounts");
+        let mut exhausted = account_with_usage(100.0, 100.0);
+        exhausted.id = "acc_00000001".into();
+        exhausted.email = "exhausted@example.com".into();
+        exhausted.tags = vec!["team-a".into()];
+        exhausted.credit_exhausted = true;
+        accounts.insert(exhausted).expect("exhausted account");
+        let mut healthy = account_with_usage(0.0, 100.0);
+        healthy.id = "acc_00000002".into();
+        healthy.email = "healthy@example.com".into();
+        healthy.tags = vec!["team-b".into()];
+        accounts.insert(healthy).expect("healthy account");
+
+        let mut config = Config::default();
+        config.proxy_service.push(ProxyServiceConfig {
+            id: "svc_team_a".into(),
+            name: "team-a".into(),
+            host: "127.0.0.1".into(),
+            port: 5580,
+            enabled: true,
+            skip_user_agent_check: false,
+            api_key_ids: Vec::new(),
+            account_tag: Some("team-a".into()),
+            account_ids: Vec::new(),
+            excluded_account_ids: Vec::new(),
+            created_at: 0,
+        });
+        config.webhook.push(
+            serde_json::from_value(serde_json::json!({
+                "name":"test",
+                "kind":"custom",
+                "url":"http://127.0.0.1:9/alerts",
+                "events":[WebhookEventKind::ServiceQuotaExhausted.as_str()]
+            }))
+            .expect("webhook config"),
+        );
+        let state = Arc::new(AppState::new(paths, ConfigHandle::new(config), accounts));
+
+        sync_service_quota(&state).await;
+
+        assert!(state
+            .notifier()
+            .incident_active(WebhookEventKind::ServiceQuotaExhausted, None));
     }
 }

@@ -1,8 +1,9 @@
 use super::{
     account_credit_state, compare_display_text, new_account_id, new_machine_id, now_secs,
     parse_params, persist_pool_snapshot, stream, summarize, to_value, warn, Account,
-    AccountCreditState, AccountDetail, AccountImportParams, AccountImportResult, AccountListParams,
-    AccountListResult, AccountPool, AccountRefParams, AccountSetEnabledParams, AccountStore,
+    AccountAddSsoParams, AccountCreditState, AccountDetail, AccountImportParams,
+    AccountImportResult, AccountListParams, AccountListResult, AccountPool, AccountRefParams,
+    AccountServiceBinding, AccountServicesResult, AccountSetEnabledParams, AccountStore,
     AccountTagParams, AppState, Arc, Handled, RpcError, StreamExt,
 };
 
@@ -146,6 +147,67 @@ pub(super) async fn handle_account_show(
     })
 }
 
+pub(super) async fn handle_account_services(
+    state: &Arc<AppState>,
+    params: serde_json::Value,
+) -> Handled {
+    let params: AccountRefParams = parse_params(params)?;
+    let account = state
+        .with_accounts(|store| store.find(&params.id).cloned())
+        .ok_or_else(|| RpcError::bad_params(format!("account not found: {}", params.id)))?;
+    let config = state.config.current();
+    let runtime = state
+        .proxy_services
+        .views(&config.proxy_service)
+        .await
+        .into_iter()
+        .map(|service| (service.id.clone(), service))
+        .collect::<std::collections::HashMap<_, _>>();
+    let mut services = config
+        .proxy_service
+        .iter()
+        .filter(|service| service.includes_account(&account))
+        .map(|service| {
+            let mut binding_sources = Vec::new();
+            if service.uses_global_account_pool() {
+                binding_sources.push("global".to_owned());
+            } else if let Some(tag) = service
+                .account_tag
+                .as_ref()
+                .filter(|tag| account.tags.iter().any(|account_tag| account_tag == *tag))
+            {
+                binding_sources.push(format!("tag:{tag}"));
+            }
+            if service
+                .account_ids
+                .iter()
+                .any(|account_id| account_id == &account.id)
+            {
+                binding_sources.push("manual".to_owned());
+            }
+            let running = runtime.get(&service.id).is_some_and(|view| view.running);
+            AccountServiceBinding {
+                service_id: service.id.clone(),
+                service_name: service.name.clone(),
+                host: service.host.clone(),
+                port: service.port,
+                enabled: service.enabled,
+                running,
+                binding_sources,
+            }
+        })
+        .collect::<Vec<_>>();
+    services.sort_by(|left, right| {
+        compare_display_text(&left.service_name, &right.service_name)
+            .then_with(|| left.service_id.cmp(&right.service_id))
+    });
+    to_value(AccountServicesResult {
+        account_id: account.id,
+        account_email: account.email,
+        services,
+    })
+}
+
 pub(super) async fn commit_account_change<F, T>(
     state: &Arc<AppState>,
     mutate: F,
@@ -153,6 +215,7 @@ pub(super) async fn commit_account_change<F, T>(
 where
     F: FnOnce(&mut AccountStore) -> Result<T, RpcError>,
 {
+    let _config_mutation = state.lock_config_mutation().await;
     let transaction = state
         .lock_account_storage()
         .await
@@ -162,6 +225,10 @@ where
         .map_err(|error| RpcError::internal(error.to_string()))?;
     state.configure_account_store(&mut next);
     let result = mutate(&mut next)?;
+    state
+        .validate_or_restore_account_store(&next)
+        .await
+        .map_err(RpcError::bad_params)?;
     next.save()
         .await
         .map_err(|error| RpcError::internal(error.to_string()))?;
@@ -179,11 +246,18 @@ pub(super) async fn handle_account_import(
     params: serde_json::Value,
 ) -> Handled {
     let params: AccountImportParams = parse_params(params)?;
+    let requested_tags = normalize_new_account_tags(params.tags)?;
     let result = commit_account_change(state, move |store| {
         let mut imported = 0usize;
         let mut skipped = Vec::new();
-        for account in params.accounts {
+        for mut account in params.accounts {
             validate_account_input(&account)?;
+            for tag in &requested_tags {
+                if !account.tags.contains(tag) {
+                    account.tags.push(tag.clone());
+                }
+            }
+            account.tags.sort();
             let id = account.id.clone();
             match store.insert(account) {
                 Ok(()) => imported += 1,
@@ -194,6 +268,21 @@ pub(super) async fn handle_account_import(
     })
     .await?;
     to_value(result)
+}
+
+fn normalize_new_account_tags(tags: Vec<String>) -> Result<Vec<String>, RpcError> {
+    let mut normalized = Vec::new();
+    for tag in tags {
+        let tag = tag.trim();
+        if tag.is_empty() {
+            return Err(RpcError::bad_params("account tag must not be empty"));
+        }
+        if !normalized.iter().any(|existing| existing == tag) {
+            normalized.push(tag.to_owned());
+        }
+    }
+    normalized.sort();
+    Ok(normalized)
 }
 
 pub(super) fn validate_account_input(account: &Account) -> Result<(), RpcError> {
@@ -253,22 +342,20 @@ pub(super) fn validate_account_input(account: &Account) -> Result<(), RpcError> 
     {
         return Err(RpcError::bad_params("profileArn must be an ARN"));
     }
+    let mut tags = std::collections::HashSet::new();
+    for tag in &account.tags {
+        if tag.trim().is_empty() || tag.as_str() != tag.trim() {
+            return Err(RpcError::bad_params(
+                "account tags must be non-empty and must not have surrounding whitespace",
+            ));
+        }
+        if !tags.insert(tag) {
+            return Err(RpcError::bad_params(
+                "account tags must not contain duplicates",
+            ));
+        }
+    }
     Ok(())
-}
-
-#[derive(serde::Deserialize)]
-struct AccountAddSsoParams {
-    email: String,
-    password: String,
-    start_url: String,
-    #[serde(default = "default_sso_region")]
-    region: String,
-    #[serde(default)]
-    headful: bool,
-}
-
-pub(super) fn default_sso_region() -> String {
-    "us-east-1".into()
 }
 
 pub(super) async fn handle_account_add_sso(
@@ -276,6 +363,7 @@ pub(super) async fn handle_account_add_sso(
     params: serde_json::Value,
 ) -> Handled {
     let params: AccountAddSsoParams = parse_params(params)?;
+    let tags = normalize_new_account_tags(params.tags)?;
     let email = params.email.trim().to_ascii_lowercase();
     if state.with_accounts(|store| store.find(&email).is_some()) {
         return Err(RpcError::bad_params(format!(
@@ -302,7 +390,7 @@ pub(super) async fn handle_account_add_sso(
         credentials,
         usage: None,
         subscription: None,
-        tags: Vec::new(),
+        tags,
         created_at: now_secs(),
         credit_exhausted: false,
     };
@@ -422,6 +510,11 @@ pub(super) async fn handle_account_remove(
     let params: AccountRefParams = parse_params(params)?;
     let id = params.id;
     let removed = commit_account_change(state, |store| {
+        let account = store
+            .find(&id)
+            .cloned()
+            .ok_or_else(|| RpcError::bad_params(format!("account not found: {id}")))?;
+        ensure_account_unbound(state, &account, "removing it")?;
         store
             .remove(&id)
             .map(|account| account.id)
@@ -468,28 +561,68 @@ pub(super) async fn handle_account_tag(
 ) -> Handled {
     let params: AccountTagParams = parse_params(params)?;
     let id = params.id;
-    let add = params.add;
-    let remove = params.remove;
-    let tags = commit_account_change(state, |store| {
-        let updated = store.update(&id, |account| {
-            for tag in &add {
-                if !account.tags.contains(tag) {
-                    account.tags.push(tag.clone());
+    let normalize_tags = |values: Vec<String>| -> Result<Vec<String>, RpcError> {
+        values
+            .into_iter()
+            .map(|tag| {
+                let tag = tag.trim().to_owned();
+                if tag.is_empty() {
+                    Err(RpcError::bad_params("account tag must not be empty"))
+                } else {
+                    Ok(tag)
                 }
-            }
-            account.tags.retain(|tag| !remove.contains(tag));
-            account.tags.sort();
-        });
-        if !updated {
-            return Err(RpcError::bad_params(format!("account not found: {id}")));
-        }
-        Ok(store
+            })
+            .collect()
+    };
+    let add = normalize_tags(params.add)?;
+    let remove = normalize_tags(params.remove)?;
+    let tags = commit_account_change(state, |store| {
+        let account = store
             .find(&id)
-            .map(|account| account.tags.clone())
-            .unwrap_or_default())
+            .cloned()
+            .ok_or_else(|| RpcError::bad_params(format!("account not found: {id}")))?;
+        let mut next_tags = account.tags.clone();
+        for tag in &add {
+            if !next_tags.contains(tag) {
+                next_tags.push(tag.clone());
+            }
+        }
+        next_tags.retain(|tag| !remove.contains(tag));
+        next_tags.sort();
+        next_tags.dedup();
+        let mut current_tags = account.tags.clone();
+        current_tags.sort();
+        current_tags.dedup();
+        if next_tags == current_tags {
+            return Ok(next_tags);
+        }
+        ensure_account_unbound(state, &account, "changing its tags")?;
+        let replacement = next_tags.clone();
+        let _changed = store.update(&id, move |account| account.tags = replacement);
+        Ok(next_tags)
     })
     .await?;
     to_value(serde_json::json!({"id": id, "tags": tags}))
+}
+
+fn ensure_account_unbound(
+    state: &AppState,
+    account: &Account,
+    operation: &str,
+) -> Result<(), RpcError> {
+    let bindings = state.account_service_bindings(account);
+    if bindings.is_empty() {
+        return Ok(());
+    }
+    Err(RpcError::bad_params(format!(
+        "account {} is bound to proxy service(s) {}; unbind it before {operation}",
+        account.id,
+        bindings
+            .iter()
+            .map(|(id, name)| format!("{name} ({id})"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )))
 }
 
 pub(super) async fn handle_regenerate_machine_id(

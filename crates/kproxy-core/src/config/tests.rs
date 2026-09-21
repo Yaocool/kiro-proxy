@@ -254,6 +254,9 @@ fn fully_populated_config() -> Config {
         enabled: true,
         skip_user_agent_check: false,
         api_key_ids: vec!["ak_example".into()],
+        account_tag: Some("team-a".into()),
+        account_ids: Vec::new(),
+        excluded_account_ids: Vec::new(),
         created_at: 1,
     });
     config
@@ -444,6 +447,9 @@ fn rejects_non_local_host_without_api_key() {
         enabled: true,
         skip_user_agent_check: false,
         api_key_ids: vec!["ak_missing".into()],
+        account_tag: None,
+        account_ids: Vec::new(),
+        excluded_account_ids: Vec::new(),
         created_at: 0,
     });
     let error = config.validate().expect_err("public bind must fail");
@@ -470,6 +476,9 @@ fn accepts_non_local_host_with_enabled_api_key() {
         enabled: true,
         skip_user_agent_check: false,
         api_key_ids: vec!["ak_test".into()],
+        account_tag: None,
+        account_ids: Vec::new(),
+        excluded_account_ids: Vec::new(),
         created_at: 0,
     });
     config.validate().expect("public bind with key must pass");
@@ -496,6 +505,9 @@ fn treats_loopback_hosts_as_local() {
             enabled: true,
             skip_user_agent_check: false,
             api_key_ids: vec!["ak_test".into()],
+            account_tag: None,
+            account_ids: Vec::new(),
+            excluded_account_ids: Vec::new(),
             created_at: 0,
         });
         config
@@ -524,6 +536,9 @@ fn rejects_disabled_api_key_as_public_credential() {
         enabled: true,
         skip_user_agent_check: false,
         api_key_ids: vec!["ak_test".into()],
+        account_tag: None,
+        account_ids: Vec::new(),
+        excluded_account_ids: Vec::new(),
         created_at: 0,
     });
     assert!(config.validate().is_err());
@@ -580,4 +595,114 @@ fn socket_path_honours_development_environment() {
         default_socket_path_from(None, None),
         "/run/kproxy/admin.sock"
     );
+}
+
+fn tagged_account(id: &str, tag: &str) -> Account {
+    Account {
+        id: id.into(),
+        email: format!("{id}@example.com"),
+        label: None,
+        enabled: true,
+        machine_id: "a".repeat(64),
+        profile_arn: None,
+        upstream_user_id: None,
+        credentials: crate::account::Credentials {
+            access_token: "secret".into(),
+            refresh_token: None,
+            client_id: None,
+            client_secret: None,
+            region: "us-east-1".into(),
+            expires_at: 0,
+            auth_method: crate::account::AuthMethod::Idc,
+        },
+        usage: None,
+        subscription: None,
+        tags: vec![tag.into()],
+        created_at: 0,
+        credit_exhausted: false,
+    }
+}
+
+#[test]
+fn proxy_service_pool_combines_tag_manual_binding_and_exclusion() {
+    let service = ProxyServiceConfig {
+        id: "svc_team".into(),
+        name: "team".into(),
+        host: "127.0.0.1".into(),
+        port: 5580,
+        enabled: true,
+        skip_user_agent_check: false,
+        api_key_ids: vec!["ak_team".into()],
+        account_tag: Some("team-a".into()),
+        account_ids: vec!["acc_manual".into()],
+        excluded_account_ids: vec!["acc_excluded".into()],
+        created_at: 0,
+    };
+
+    assert!(service.includes_account(&tagged_account("acc_tagged", "team-a")));
+    assert!(service.includes_account(&tagged_account("acc_manual", "team-b")));
+    assert!(!service.includes_account(&tagged_account("acc_other", "team-b")));
+    assert!(!service.includes_account(&tagged_account("acc_excluded", "team-a")));
+    assert!(!service.uses_global_account_pool());
+}
+
+#[test]
+fn proxy_service_without_tag_uses_global_pool_except_exclusions() {
+    let service = ProxyServiceConfig {
+        id: "svc_global".into(),
+        name: "global".into(),
+        host: "127.0.0.1".into(),
+        port: 5580,
+        enabled: true,
+        skip_user_agent_check: false,
+        api_key_ids: vec!["ak_global".into()],
+        account_tag: None,
+        account_ids: Vec::new(),
+        excluded_account_ids: vec!["acc_excluded".into()],
+        created_at: 0,
+    };
+
+    assert!(service.includes_account(&tagged_account("acc_any", "anything")));
+    assert!(!service.includes_account(&tagged_account("acc_excluded", "anything")));
+    assert!(service.uses_global_account_pool());
+}
+
+#[test]
+fn proxy_service_account_references_reject_surrounding_whitespace() {
+    let mut config = Config::default();
+    config.api_key.push(ApiKeyConfig {
+        id: Some("ak_team".into()),
+        name: "team".into(),
+        key: "sk-team".into(),
+        format: ApiKeyFormat::Sk,
+        enabled: true,
+        skip_user_agent_check: false,
+        credits_limit: None,
+    });
+    config.proxy_service.push(ProxyServiceConfig {
+        id: "svc_team".into(),
+        name: "team".into(),
+        host: "127.0.0.1".into(),
+        port: 5580,
+        enabled: false,
+        skip_user_agent_check: false,
+        api_key_ids: vec!["ak_team".into()],
+        account_tag: Some("team-a".into()),
+        account_ids: vec![" acc_manual".into()],
+        excluded_account_ids: Vec::new(),
+        created_at: 0,
+    });
+    assert!(config
+        .validate()
+        .expect_err("manual account whitespace must be rejected")
+        .to_string()
+        .contains("surrounding whitespace"));
+
+    config.proxy_service[0].account_ids.clear();
+    config.proxy_service[0].excluded_account_ids = vec!["acc_excluded ".into()];
+    assert!(config
+        .validate()
+        .expect_err("excluded account whitespace must be rejected")
+        .to_string()
+        .contains("surrounding whitespace"));
 }
