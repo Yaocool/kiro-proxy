@@ -17,12 +17,9 @@
 .DS_Store
 Thumbs.db
 
-# IDE-local state. Project settings, tasks, and recommended extensions may be shared.
+# IDE-local state. Never share editor-local settings.
 .idea/
-.vscode/*
-!/.vscode/settings.json
-!/.vscode/tasks.json
-!/.vscode/extensions.json
+.vscode/
 
 # AI-assisted development: local settings, indexes, caches, and session state.
 # Keep shareable project instructions such as AGENTS.md and CLAUDE.md tracked.
