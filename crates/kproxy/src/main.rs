@@ -1208,6 +1208,39 @@ mod tests {
     }
 
     #[test]
+    fn account_tag_accepts_one_or_multiple_accounts() {
+        let single =
+            Cli::try_parse_from(["kproxy", "account", "tag", "acc_00000001", "--add", "prod"])
+                .expect("legacy single-account tag command");
+        assert!(matches!(
+            single.command,
+            Some(Command::Account {
+                command: Some(crate::commands::account::AccountCommand::Tag { ids, add, remove })
+            }) if ids == ["acc_00000001"] && add == ["prod"] && remove.is_empty()
+        ));
+
+        let multiple = Cli::try_parse_from([
+            "kproxy",
+            "account",
+            "tag",
+            "--add",
+            "test",
+            "acc_2c36cfad",
+            "acc_332c7cb2",
+            "acc_41c6e3ad",
+        ])
+        .expect("batch account tag command");
+        assert!(matches!(
+            multiple.command,
+            Some(Command::Account {
+                command: Some(crate::commands::account::AccountCommand::Tag { ids, add, remove })
+            }) if ids == ["acc_2c36cfad", "acc_332c7cb2", "acc_41c6e3ad"]
+                && add == ["test"] && remove.is_empty()
+        ));
+        assert!(Cli::try_parse_from(["kproxy", "account", "tag", "--add", "test"]).is_err());
+    }
+
+    #[test]
     fn account_creation_accepts_tags_and_services_lookup() {
         let services = Cli::try_parse_from(["kproxy", "account", "services", "alice@example.com"])
             .expect("account services");
@@ -1479,6 +1512,52 @@ mod tests {
                 })
             })
         ));
+    }
+
+    #[test]
+    fn service_create_and_edit_accept_multiple_account_tags() {
+        let create = Cli::try_parse_from([
+            "kproxy",
+            "service",
+            "create",
+            "--name",
+            "team",
+            "--account-tag",
+            "xx1",
+            "xx2",
+        ])
+        .expect("create with multiple account tags");
+        assert!(matches!(
+            create.command,
+            Some(Command::Service {
+                command: Some(crate::commands::runtime::ServiceCommand::Create { account_tag, .. })
+            }) if account_tag == ["xx1", "xx2"]
+        ));
+
+        let edit = Cli::try_parse_from([
+            "kproxy",
+            "service",
+            "edit",
+            "team",
+            "--account-tag",
+            "xx1,xx2",
+        ])
+        .expect("edit with multiple account tags");
+        assert!(matches!(
+            edit.command,
+            Some(Command::Service {
+                command: Some(crate::commands::runtime::ServiceCommand::Edit { account_tag, .. })
+            }) if account_tag == ["xx1", "xx2"]
+        ));
+        assert!(Cli::try_parse_from([
+            "kproxy",
+            "service",
+            "create",
+            "--name",
+            "team",
+            "--account-tag"
+        ])
+        .is_err());
     }
 
     #[test]

@@ -6,7 +6,8 @@ use kproxy_core::account::Account;
 use kproxy_core::ids::{new_account_id, new_machine_id};
 use kproxy_ipc::protocol::{
     method, AccountDetail, AccountImportResult, AccountListResult, AccountServiceBinding,
-    AccountServicesResult, AccountSummary, ConfigShowResult,
+    AccountServicesResult, AccountSummary, AccountTagBatchResult, AccountTagResult,
+    ConfigShowResult,
 };
 
 use crate::client::AdminClient;
@@ -152,13 +153,14 @@ pub enum AccountCommand {
         /// 账号 ID 或邮箱。
         id: String,
     },
-    /// 增删标签。
+    /// 为一个或多个账号增删标签。
     #[command(
-        long_about = "增删标签，可同时操作。\n\n示例：\n  kproxy account tag acc_7f3a --add prod --add pro\n  kproxy account tag acc_7f3a --rm dev"
+        long_about = "为一个或多个账号增删标签，可同时添加和移除。批量修改会先校验全部账号；有账号不存在，或需要修改标签的账号已绑定代理服务时，整批不生效。\n\n示例：\n  kproxy account tag acc_7f3a --add prod --add pro\n  kproxy account tag --add test acc_2c36cfad acc_332c7cb2 acc_41c6e3ad\n  kproxy account tag --rm dev acc_7f3a acc_8b2c"
     )]
     Tag {
-        /// 账号 ID 或邮箱。
-        id: String,
+        /// 一个或多个账号 ID/邮箱，以空格分隔。
+        #[arg(required = true, num_args = 1.., value_name = "ID_OR_EMAIL")]
+        ids: Vec<String>,
         /// 添加标签，可重复。
         #[arg(long = "add", value_name = "TAG")]
         add: Vec<String>,
@@ -497,31 +499,8 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
         }
         AccountCommand::Enable { id } => set_enabled(client, &id, true, json).await?,
         AccountCommand::Disable { id } => set_enabled(client, &id, false, json).await?,
-        AccountCommand::Tag { id, add, remove } => {
-            let result: serde_json::Value = client
-                .call(
-                    method::ACCOUNT_TAG,
-                    serde_json::json!({"id": id, "add": add, "remove": remove}),
-                )
-                .await?;
-            if json {
-                print_json(&result)?;
-            } else {
-                let tags = result["tags"]
-                    .as_array()
-                    .map(|values| {
-                        values
-                            .iter()
-                            .filter_map(serde_json::Value::as_str)
-                            .collect::<Vec<_>>()
-                            .join(",")
-                    })
-                    .unwrap_or_default();
-                println!(
-                    "{id} 当前标签：{}",
-                    if tags.is_empty() { "-" } else { &tags }
-                );
-            }
+        AccountCommand::Tag { ids, add, remove } => {
+            tag_accounts(client, &ids, &add, &remove, json).await?;
         }
         AccountCommand::RegenMachineId { id } => {
             let result: serde_json::Value = client
@@ -679,6 +658,52 @@ async fn remove_accounts(client: &mut AdminClient, ids: &[String], json: bool) -
             failures.join("\n")
         ))
     }
+}
+
+async fn tag_accounts(
+    client: &mut AdminClient,
+    ids: &[String],
+    add: &[String],
+    remove: &[String],
+    json: bool,
+) -> Result<()> {
+    if let [id] = ids {
+        let result: AccountTagResult = client
+            .call(
+                method::ACCOUNT_TAG,
+                serde_json::json!({"id": id, "add": add, "remove": remove}),
+            )
+            .await?;
+        if json {
+            print_json(&result)?;
+        } else {
+            print_tag_result(&result);
+        }
+    } else {
+        let result: AccountTagBatchResult = client
+            .call(
+                method::ACCOUNT_TAG,
+                serde_json::json!({"ids": ids, "add": add, "remove": remove}),
+            )
+            .await?;
+        if json {
+            print_json(&result)?;
+        } else {
+            for account in &result.accounts {
+                print_tag_result(account);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn print_tag_result(result: &AccountTagResult) {
+    let tags = result.tags.join(",");
+    println!(
+        "{} 当前标签：{}",
+        result.id,
+        if tags.is_empty() { "-" } else { &tags }
+    );
 }
 
 async fn set_enabled(client: &mut AdminClient, id: &str, enabled: bool, json: bool) -> Result<()> {
@@ -1181,6 +1206,63 @@ mod tests {
         assert_eq!(
             server.await.expect("server task"),
             ["missing@example.com", "acc_00000002"]
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_tag_sends_one_request_with_all_account_ids() {
+        use kproxy_ipc::protocol::{decode_line, encode_line, Request, Response};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let socket = directory.path().join("admin.sock");
+        let listener = UnixListener::bind(&socket).expect("bind socket");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept client");
+            let (read_half, mut write_half) = stream.into_split();
+            let raw = BufReader::new(read_half)
+                .lines()
+                .next_line()
+                .await
+                .expect("read request")
+                .expect("request line");
+            let request: Request = decode_line(&raw).expect("decode request");
+            let response = Response::ok(
+                request.id,
+                serde_json::json!({
+                    "accounts": [
+                        {"id": "acc_00000001", "tags": ["test"]},
+                        {"id": "acc_00000002", "tags": ["test"]}
+                    ]
+                }),
+            );
+            write_half
+                .write_all(encode_line(&response).expect("encode response").as_bytes())
+                .await
+                .expect("write response");
+            request
+        });
+
+        let mut client = AdminClient::connect(socket);
+        tag_accounts(
+            &mut client,
+            &["acc_00000001".into(), "acc_00000002".into()],
+            &["test".into()],
+            &[],
+            false,
+        )
+        .await
+        .expect("batch tag");
+        let request = server.await.expect("server task");
+        assert_eq!(request.method, method::ACCOUNT_TAG);
+        assert_eq!(
+            request.params,
+            serde_json::json!({
+                "ids": ["acc_00000001", "acc_00000002"],
+                "add": ["test"],
+                "remove": []
+            })
         );
     }
 }

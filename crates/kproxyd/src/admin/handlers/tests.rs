@@ -665,6 +665,86 @@ async fn service_account_pool_combines_tag_manual_accounts_and_exclusions() {
 }
 
 #[tokio::test]
+async fn service_create_with_multiple_tags_uses_the_union_and_reports_every_source() {
+    let mut first = sample_account("acc_00000001", "a@example.com", true);
+    first.tags = vec!["team-a".into()];
+    let mut second = sample_account("acc_00000002", "b@example.com", true);
+    second.tags = vec!["team-b".into()];
+    let mut both = sample_account("acc_00000003", "c@example.com", true);
+    both.tags = vec!["team-a".into(), "team-b".into()];
+    let other = sample_account("acc_00000004", "d@example.com", true);
+    let (_directory, state) = state_with(vec![first, second, both, other]).await;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port");
+    let port = listener.local_addr().expect("address").port();
+    drop(listener);
+
+    let created: ProxyServiceCreateResult = serde_json::from_value(expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                1,
+                method::SERVICE_CREATE,
+                serde_json::json!({
+                    "name":"team",
+                    "port":port,
+                    "account_tag":["team-b","team-a"]
+                }),
+            ),
+        )
+        .await,
+    ))
+    .expect("multi-tag service");
+    assert!(created.service.account_tag.is_none());
+    assert_eq!(created.service.account_tags, ["team-a", "team-b"]);
+
+    let pool: ProxyServiceAccountsResult = serde_json::from_value(expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                2,
+                method::SERVICE_ACCOUNTS,
+                serde_json::json!({"service":"team"}),
+            ),
+        )
+        .await,
+    ))
+    .expect("multi-tag pool");
+    assert!(!pool.uses_global_pool);
+    assert_eq!(pool.account_tags, ["team-a", "team-b"]);
+    assert_eq!(
+        pool.accounts
+            .iter()
+            .map(|account| account.id.as_str())
+            .collect::<Vec<_>>(),
+        ["acc_00000001", "acc_00000002", "acc_00000003"]
+    );
+
+    let bindings: AccountServicesResult = serde_json::from_value(expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                3,
+                method::ACCOUNT_SERVICES,
+                serde_json::json!({"id":"c@example.com"}),
+            ),
+        )
+        .await,
+    ))
+    .expect("account bindings");
+    assert_eq!(bindings.services.len(), 1);
+    assert_eq!(
+        bindings.services[0].binding_sources,
+        ["tag:team-a", "tag:team-b"]
+    );
+
+    let raw = tokio::fs::read_to_string(&state.paths.config_file)
+        .await
+        .expect("saved config");
+    assert!(raw.contains("account_tag = [\"team-a\", \"team-b\"]"));
+    state.shutdown.cancel();
+}
+
+#[tokio::test]
 async fn account_services_reports_every_effective_binding_and_its_sources() {
     let mut account = sample_account("acc_00000001", "a@example.com", true);
     account.tags = vec!["team-a".into()];
@@ -801,8 +881,18 @@ async fn enabled_service_must_be_stopped_before_changing_its_account_tag() {
         )
         .await,
     );
+    let mut equivalent = state.config.current().as_ref().clone();
+    equivalent.proxy_service[0].account_tag = Some(ServiceAccountTags::Many(vec!["team-a".into()]));
+    state
+        .apply_config_transaction(&equivalent)
+        .await
+        .expect("equivalent tag representation does not change the pool");
+
     let mut changed_while_running = state.config.current().as_ref().clone();
-    changed_while_running.proxy_service[0].account_tag = Some("team-b".into());
+    changed_while_running.proxy_service[0].account_tag = Some(ServiceAccountTags::Many(vec![
+        "team-a".into(),
+        "team-b".into(),
+    ]));
     let error = state
         .apply_config_transaction(&changed_while_running)
         .await
@@ -816,16 +906,17 @@ async fn enabled_service_must_be_stopped_before_changing_its_account_tag() {
         .await
         .expect("stop service");
     let mut changed = stopped;
-    changed.proxy_service[0].account_tag = Some("team-b".into());
+    changed.proxy_service[0].account_tag = Some(ServiceAccountTags::Many(vec![
+        "team-a".into(),
+        "team-b".into(),
+    ]));
     state
         .apply_config_transaction(&changed)
         .await
         .expect("change stopped service tag");
     assert_eq!(
-        state.config.current().proxy_service[0]
-            .account_tag
-            .as_deref(),
-        Some("team-b")
+        state.config.current().proxy_service[0].selected_account_tags(),
+        ["team-a", "team-b"]
     );
     state.shutdown.cancel();
 }
@@ -995,6 +1086,156 @@ async fn account_import_rejects_malformed_tags() {
         .await;
         assert!(matches!(response, Response::Err { .. }));
     }
+}
+
+#[tokio::test]
+async fn account_tag_batch_updates_all_accounts_and_preserves_single_result() {
+    let mut first = sample_account("acc_00000001", "a@example.com", true);
+    first.tags = vec!["legacy".into()];
+    let second = sample_account("acc_00000002", "b@example.com", true);
+    let (_directory, state) = state_with(vec![first, second]).await;
+
+    let result: AccountTagBatchResult = serde_json::from_value(expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                1,
+                method::ACCOUNT_TAG,
+                serde_json::json!({
+                    "ids": ["a@example.com", "acc_00000002"],
+                    "add": [" test ", "prod"],
+                    "remove": ["legacy"]
+                }),
+            ),
+        )
+        .await,
+    ))
+    .expect("batch tag result");
+    assert_eq!(result.accounts.len(), 2);
+    assert_eq!(result.accounts[0].id, "acc_00000001");
+    assert_eq!(result.accounts[0].tags, ["prod", "test"]);
+    assert_eq!(result.accounts[1].id, "acc_00000002");
+    assert_eq!(result.accounts[1].tags, ["prod", "test"]);
+
+    let single = expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                2,
+                method::ACCOUNT_TAG,
+                serde_json::json!({"id": "a@example.com", "add": ["single"]}),
+            ),
+        )
+        .await,
+    );
+    assert_eq!(single["id"], "a@example.com");
+    assert_eq!(
+        single["tags"],
+        serde_json::json!(["prod", "single", "test"])
+    );
+    assert!(single.get("accounts").is_none());
+    assert_eq!(
+        state.with_accounts(|store| store.find("b@example.com").expect("second").tags.clone()),
+        ["prod", "test"]
+    );
+    let persisted = AccountStore::load(&state.paths.accounts_file)
+        .await
+        .expect("reload accounts");
+    assert_eq!(
+        persisted.find("a@example.com").expect("first on disk").tags,
+        ["prod", "single", "test"]
+    );
+    assert_eq!(
+        persisted
+            .find("b@example.com")
+            .expect("second on disk")
+            .tags,
+        ["prod", "test"]
+    );
+}
+
+#[tokio::test]
+async fn account_tag_batch_rejects_invalid_targets_without_partial_changes() {
+    let first = sample_account("acc_00000001", "a@example.com", true);
+    let mut bound = sample_account("acc_00000002", "b@example.com", true);
+    bound.tags = vec!["team-a".into()];
+    let (_directory, state) = state_with(vec![first, bound]).await;
+    let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("ephemeral port");
+    let port = listener.local_addr().expect("address").port();
+    drop(listener);
+    expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                1,
+                method::SERVICE_CREATE,
+                serde_json::json!({"name":"team","port":port,"account_tag":"team-a"}),
+            ),
+        )
+        .await,
+    );
+    let original_accounts = tokio::fs::read(&state.paths.accounts_file)
+        .await
+        .expect("original accounts");
+
+    for (ids, expected_error) in [
+        (
+            vec!["a@example.com", "missing@example.com"],
+            "account not found",
+        ),
+        (
+            vec!["a@example.com", "b@example.com"],
+            "bound to proxy service",
+        ),
+        (
+            vec!["a@example.com", "acc_00000001"],
+            "specified more than once",
+        ),
+    ] {
+        let response = dispatch(
+            &state,
+            Request::new(
+                2,
+                method::ACCOUNT_TAG,
+                serde_json::json!({"ids": ids, "add": ["new"]}),
+            ),
+        )
+        .await;
+        assert!(matches!(
+            response,
+            Response::Err { error, .. } if error.message.contains(expected_error)
+        ));
+        assert!(state.with_accounts(|store| store
+            .find("a@example.com")
+            .expect("first")
+            .tags
+            .is_empty()));
+        assert_eq!(
+            state.with_accounts(|store| store.find("b@example.com").expect("bound").tags.clone()),
+            ["team-a"]
+        );
+        assert_eq!(
+            tokio::fs::read(&state.paths.accounts_file)
+                .await
+                .expect("unchanged accounts"),
+            original_accounts
+        );
+    }
+    for params in [
+        serde_json::json!({"ids": [], "add": ["new"]}),
+        serde_json::json!({"id": "a@example.com", "ids": ["b@example.com"], "add": ["new"]}),
+    ] {
+        assert!(matches!(
+            dispatch(&state, Request::new(3, method::ACCOUNT_TAG, params)).await,
+            Response::Err { .. }
+        ));
+        assert!(state.with_accounts(|store| store
+            .find("a@example.com")
+            .expect("first")
+            .tags
+            .is_empty()));
+    }
+    state.shutdown.cancel();
 }
 
 #[tokio::test]

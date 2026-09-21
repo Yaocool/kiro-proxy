@@ -668,6 +668,69 @@ fn proxy_service_without_tag_uses_global_pool_except_exclusions() {
 }
 
 #[test]
+fn proxy_service_multiple_tags_match_the_union_and_roundtrip_as_an_array() {
+    let mut service = ProxyServiceConfig {
+        id: "svc_multi".into(),
+        name: "multi".into(),
+        host: "127.0.0.1".into(),
+        port: 5580,
+        enabled: false,
+        skip_user_agent_check: false,
+        api_key_ids: Vec::new(),
+        account_tag: Some(ServiceAccountTags::Many(vec![
+            "team-a".into(),
+            "team-b".into(),
+        ])),
+        account_ids: vec!["acc_manual".into()],
+        excluded_account_ids: vec!["acc_excluded".into()],
+        created_at: 0,
+    };
+    assert!(service.includes_account(&tagged_account("acc_a", "team-a")));
+    assert!(service.includes_account(&tagged_account("acc_b", "team-b")));
+    assert!(service.includes_account(&tagged_account("acc_manual", "other")));
+    assert!(!service.includes_account(&tagged_account("acc_other", "other")));
+    assert!(!service.includes_account(&tagged_account("acc_excluded", "team-b")));
+    assert!(!service.uses_global_account_pool());
+
+    let encoded = toml::to_string(&service).expect("serialize multi-tag service");
+    assert!(encoded.contains("account_tag = [\"team-a\", \"team-b\"]"));
+    let decoded: ProxyServiceConfig = toml::from_str(&encoded).expect("reload multi-tag service");
+    assert_eq!(decoded.selected_account_tags(), ["team-a", "team-b"]);
+
+    service.account_tag = Some("team-a".into());
+    let legacy = toml::to_string(&service).expect("serialize legacy service");
+    assert!(legacy.contains("account_tag = \"team-a\""));
+    let decoded: ProxyServiceConfig = toml::from_str(&legacy).expect("reload legacy service");
+    assert_eq!(decoded.selected_account_tags(), ["team-a"]);
+}
+
+#[test]
+fn proxy_service_rejects_empty_duplicate_and_malformed_account_tags() {
+    let mut config = Config::default();
+    config.proxy_service.push(ProxyServiceConfig {
+        id: "svc_multi".into(),
+        name: "multi".into(),
+        host: "127.0.0.1".into(),
+        port: 5580,
+        enabled: false,
+        skip_user_agent_check: false,
+        api_key_ids: Vec::new(),
+        account_tag: None,
+        account_ids: Vec::new(),
+        excluded_account_ids: Vec::new(),
+        created_at: 0,
+    });
+    for tags in [
+        vec![],
+        vec!["team-a".into(), "team-a".into()],
+        vec!["team-a".into(), " team-b".into()],
+    ] {
+        config.proxy_service[0].account_tag = Some(ServiceAccountTags::Many(tags));
+        assert!(config.validate().is_err());
+    }
+}
+
+#[test]
 fn proxy_service_account_references_reject_surrounding_whitespace() {
     let mut config = Config::default();
     config.api_key.push(ApiKeyConfig {

@@ -26,6 +26,10 @@ they must receive a new version rather than replacing that tag or its image.
   explicit account additions and exclusions, binding-aware account mutation
   guards, stopped-service-only tag changes, reverse account-to-service lookup,
   and tag assignment during single or batch account creation.
+- One-command tag updates across multiple existing accounts, validating every
+  target before applying the batch.
+- Multi-tag proxy-service pools with union matching via
+  `service create --account-tag xx1 xx2` and stopped-service edits.
 - OpenAI Responses JSON/SSE endpoints and aliases, bounded service/key-scoped
   `previous_response_id` state, function/custom/namespace tools, Responses Lite
   `additional_tools`, tool choice, reasoning summaries and Codex automation input

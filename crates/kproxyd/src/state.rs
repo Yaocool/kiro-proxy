@@ -1322,7 +1322,11 @@ fn validate_service_account_tag_transitions(
         else {
             continue;
         };
-        if current.account_tag != updated.account_tag && current.enabled {
+        if !same_account_tags(
+            current.selected_account_tags(),
+            updated.selected_account_tags(),
+        ) && current.enabled
+        {
             return Err(format!(
                 "proxy service {} ({}) must be disabled before changing account_tag",
                 current.name, current.id

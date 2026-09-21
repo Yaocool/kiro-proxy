@@ -92,6 +92,15 @@ cat accounts.json | kproxy account import --stdin --tag team-a --tag prod
 `id`, `machine_id`, and `created_at` may be omitted; the CLI generates them.
 Repeat `--tag` or use comma-separated values to merge tags into every account in
 this import; per-account `tags` already present in JSON are preserved.
+To tag accounts that already exist, pass multiple IDs or emails to one command:
+
+```bash
+kproxy account tag --add test acc_2c36cfad acc_332c7cb2 acc_41c6e3ad
+```
+
+Every target is validated before the batch is saved: if any account does not
+exist or needs a tag change while bound to a proxy service, none are changed.
+The existing single-account form remains available.
 
 The JSON below is a shape example, not usable credentials. Replace tokens and
 `expires_at` (Unix seconds) with values issued by the upstream provider.
@@ -208,21 +217,26 @@ kproxy ready
 kproxy models list
 ```
 
-Select an isolated account pool by tag when creating a service. A service without
-`--account-tag` continues to use the global account pool:
+Select an account pool by one or more tags when creating a service. Multiple
+tags form a union: an account with any selected tag is included. A service
+without `--account-tag` continues to use the global account pool. Tag accounts
+before they become bound to a service; if you created the global-pool `main`
+service above, exclude these accounts from it first:
 
 ```bash
+kproxy service remove-account main alice@example.com bob@example.com
 kproxy account tag alice@example.com --add team-a
-kproxy service create --name team-a --host 127.0.0.1 --port 5581 --account-tag team-a
+kproxy account tag bob@example.com --add team-b
+kproxy service create --name team-a --host 127.0.0.1 --port 5581 --account-tag team-a team-b
 kproxy service accounts team-a
 kproxy account services alice@example.com
 
 # Explicitly include an account with any tag, or exclude one from this service:
-kproxy service add-account team-a bob@example.com
+kproxy service add-account team-a carol@example.com
 kproxy service remove-account team-a alice@example.com
 ```
 
-The effective pool is “tag matches + explicit additions - exclusions”; exclusion
+The effective pool is “any selected tag matches + explicit additions - exclusions”; exclusion
 wins. Without a service tag, the base set contains every account. Health,
 readiness, model discovery, initial dispatch, retries, and compaction summaries
 all stay within the service's effective pool. An account that belongs to any
@@ -232,7 +246,7 @@ Stop a service before changing its pool tag:
 
 ```bash
 kproxy service disable team-a
-kproxy service edit team-a --account-tag team-b  # or --clear-account-tag for the global pool
+kproxy service edit team-a --account-tag team-b team-c  # or --clear-account-tag for the global pool
 kproxy service enable team-a
 ```
 

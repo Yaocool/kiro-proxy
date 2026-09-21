@@ -94,7 +94,7 @@ pub fn print(topic: Option<&str>) -> Result<()> {
         }
         "version" => "`kproxy version` 显示 CLI 版本、Rust MSRV 和默认 Kiro 上游端点。",
         "account" => {
-            "账号命令包括 list/show/services/import/add-api-key/export/add-sso/rm/enable/disable/tag/regen-machine-id/refresh/probe/reset-health。`services <ID|邮箱>` 反查账号所属代理服务；import/add-api-key/add-sso 均可用可重复的 `--tag` 设置新账号标签。删除操作会要求输入 y/yes 二次确认。"
+            "账号命令包括 list/show/services/import/add-api-key/export/add-sso/rm/enable/disable/tag/regen-machine-id/refresh/probe/reset-health。`services <ID|邮箱>` 反查账号所属代理服务；import/add-api-key/add-sso 均可用可重复的 `--tag` 设置新账号标签；`tag --add test <账号>...` 可一次给多个账号加标签，整批校验后才保存。删除操作会要求输入 y/yes 二次确认。"
         }
         "balance" => {
             "账号池评分 = active_ratio×weight_active + used_credit_ratio×weight_credit + recent_idle_penalty×weight_idle。\n分数越低越优先；随后加入小幅随机抖动，避免并发请求集中到同一账号。\n用 `kproxy pool --watch --explain` 查看实时评分明细。"
@@ -110,7 +110,7 @@ pub fn print(topic: Option<&str>) -> Result<()> {
 批量：CSV 仅含 email,password 两列，运行 `kproxy account add-sso --batch accounts.csv -c 1 --tag team-a`；也可用 `--batch - < accounts.csv` 从 stdin 读取。可重复的 `--tag` 应用于本批全部账号；`--start-url` 可覆盖全局值，`--headful` 可手工完成额外验证。默认/full 构建包含 SSO。"#
         }
         "service" => {
-            "`kproxy service list/show/create/edit/enable/disable/apikeys/accounts/add-account/remove-account/delete` 管理独立代理监听。create 可用 `--account-tag` 选择基础账号池，未指定时使用全局账号池；add-account/remove-account 管理手工加入和排除账号；edit 修改账号标签前必须先 disable。edit 也可修改监听、按 API key ID 或名称增删绑定，并用 `--skip-user-agent-check true|false` 管理该服务的 User-Agent 校验豁免；disable 会保留配置和 key；删除时仅级联删除未共享 key，并要求 y/yes 确认。"
+            "`kproxy service list/show/create/edit/enable/disable/apikeys/accounts/add-account/remove-account/delete` 管理独立代理监听。create 可用 `--account-tag xx1 xx2` 选择多个标签的账号并集，未指定时使用全局账号池；add-account/remove-account 管理手工加入和排除账号；edit 修改账号标签前必须先 disable。edit 也可修改监听、按 API key ID 或名称增删绑定，并用 `--skip-user-agent-check true|false` 管理该服务的 User-Agent 校验豁免；disable 会保留配置和 key；删除时仅级联删除未共享 key，并要求 y/yes 确认。"
         }
         "config" => {
             "配置默认位于 $KPROXY_HOME/config.toml，修改后热重载；server.host/port、admin.socket 和 TLS 监听变更需要重启。\n`kproxy config list` 列出全部顶层模块及是否允许重置；`show [模块]` 可查看完整配置或单个模块，增加 `--effective` 查看合并默认值后的结果；`edit [模块]` 可编辑完整配置或单个模块，保存时会合并、整体校验并重载。`reset [模块]` 只恢复指定模块，其他配置不变；不指定模块时恢复全部通用配置，并保留 API key、代理服务和告警配置。`validate [file]` 只校验，不应用。"

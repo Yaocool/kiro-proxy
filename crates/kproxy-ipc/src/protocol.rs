@@ -4,6 +4,8 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use kproxy_core::config::ServiceAccountTags;
+
 /// 管理面方法名。
 pub mod method {
     /// 服务状态。
@@ -364,6 +366,9 @@ pub struct ProxyServiceView {
     pub api_key_ids: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_tag: Option<String>,
+    /// Full list of base-pool tags; `account_tag` remains for single-tag clients.
+    #[serde(default)]
+    pub account_tags: Vec<String>,
     #[serde(default)]
     pub account_ids: Vec<String>,
     #[serde(default)]
@@ -390,7 +395,7 @@ pub struct ProxyServiceCreateParams {
     #[serde(default)]
     pub skip_user_agent_check: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_tag: Option<String>,
+    pub account_tag: Option<ServiceAccountTags>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -465,6 +470,9 @@ pub struct ProxyServiceAccountsResult {
     pub service_name: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_tag: Option<String>,
+    /// Full list of base-pool tags; `account_tag` remains for single-tag clients.
+    #[serde(default)]
+    pub account_tags: Vec<String>,
     pub uses_global_pool: bool,
     #[serde(default)]
     pub account_ids: Vec<String>,
@@ -874,6 +882,32 @@ pub struct AccountTagParams {
     /// 删除标签。
     #[serde(default)]
     pub remove: Vec<String>,
+}
+
+/// `account.tag` 批量参数，与单账号的 `id` 参数二选一。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountTagBatchParams {
+    /// 批量账号 ID 或邮箱。
+    pub ids: Vec<String>,
+    /// 新增标签。
+    #[serde(default)]
+    pub add: Vec<String>,
+    /// 删除标签。
+    #[serde(default)]
+    pub remove: Vec<String>,
+}
+
+/// `account.tag` 修改后的单账号标签。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountTagResult {
+    pub id: String,
+    pub tags: Vec<String>,
+}
+
+/// `account.tag` 批量修改结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountTagBatchResult {
+    pub accounts: Vec<AccountTagResult>,
 }
 
 /// `account.list` 参数。

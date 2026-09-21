@@ -22,7 +22,7 @@ use futures::FutureExt;
 use tracing::Instrument;
 use uuid::Uuid;
 
-use kproxy_core::config::ProxyServiceConfig;
+use kproxy_core::config::{ProxyServiceConfig, ServiceAccountTags};
 use kproxy_ipc::protocol::ProxyServiceView;
 
 use crate::state::AppState;
@@ -525,7 +525,12 @@ impl ProxyServiceManager {
                     skip_user_agent_check: service.skip_user_agent_check,
                     running: is_running,
                     api_key_ids: service.api_key_ids.clone(),
-                    account_tag: service.account_tag.clone(),
+                    account_tag: service
+                        .account_tag
+                        .as_ref()
+                        .and_then(ServiceAccountTags::single_tag)
+                        .map(str::to_owned),
+                    account_tags: service.selected_account_tags().to_vec(),
                     account_ids: service.account_ids.clone(),
                     excluded_account_ids: service.excluded_account_ids.clone(),
                     created_at: service.created_at,

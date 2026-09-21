@@ -36,7 +36,7 @@ pub enum ServiceCommand {
     },
     /// 创建并启动服务，同时生成首个 API key。
     #[command(
-        after_help = "示例：\n  kproxy service create --name main\n  kproxy service create --name team --host 127.0.0.1 --port 5581\n  kproxy service create --name compatible --skip-user-agent-check true"
+        after_help = "示例：\n  kproxy service create --name main\n  kproxy service create --name team --host 127.0.0.1 --port 5581 --account-tag xx1 xx2\n  kproxy service create --name compatible --skip-user-agent-check true"
     )]
     Create {
         #[arg(long)]
@@ -45,9 +45,9 @@ pub enum ServiceCommand {
         host: Option<String>,
         #[arg(long)]
         port: Option<u16>,
-        /// 使用该账号标签作为服务的基础账号池；不指定时使用全局账号池。
-        #[arg(long, value_name = "TAG")]
-        account_tag: Option<String>,
+        /// 使用一个或多个账号标签的并集作为基础账号池；不指定时使用全局账号池。
+        #[arg(long, num_args = 1.., value_delimiter = ',', value_name = "TAG")]
+        account_tag: Vec<String>,
         /// 是否允许该服务的已认证请求跳过客户端 User-Agent 校验。
         #[arg(
             long,
@@ -80,9 +80,9 @@ pub enum ServiceCommand {
         /// 设置是否允许该服务的已认证请求跳过客户端 User-Agent 校验。
         #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
         skip_user_agent_check: Option<bool>,
-        /// 修改服务的基础账号标签；服务必须先停用。
-        #[arg(long, value_name = "TAG", conflicts_with = "clear_account_tag")]
-        account_tag: Option<String>,
+        /// 修改服务的基础账号标签（可指定多个）；服务必须先停用。
+        #[arg(long, num_args = 1.., value_delimiter = ',', value_name = "TAG", conflicts_with = "clear_account_tag")]
+        account_tag: Vec<String>,
         /// 清除基础账号标签并恢复使用全局账号池；服务必须先停用。
         #[arg(long)]
         clear_account_tag: bool,
@@ -757,10 +757,10 @@ pub async fn run_service(
                                 "disabled".into()
                             },
                             service.api_key_ids.len().to_string(),
-                            service
-                                .account_tag
-                                .map(|tag| format!("tag:{tag}"))
-                                .unwrap_or_else(|| "global".into()),
+                            service_tag_label(
+                                &service.account_tags,
+                                service.account_tag.as_deref(),
+                            ),
                             service.error.unwrap_or_default(),
                         ]
                     })
@@ -785,6 +785,12 @@ pub async fn run_service(
             api_key_name,
             api_key_format,
         } => {
+            let account_tag = normalize_service_tags(&account_tag)?;
+            let account_tag = match account_tag.as_slice() {
+                [] => serde_json::Value::Null,
+                [tag] => serde_json::json!(tag),
+                tags => serde_json::json!(tags),
+            };
             let result: ProxyServiceCreateResult = client
                 .call(
                     method::SERVICE_CREATE,
@@ -834,7 +840,7 @@ pub async fn run_service(
                 && host.is_none()
                 && port.is_none()
                 && skip_user_agent_check.is_none()
-                && account_tag.is_none()
+                && account_tag.is_empty()
                 && !clear_account_tag
                 && add_api_key.is_empty()
                 && remove_api_key.is_empty()
@@ -843,6 +849,7 @@ pub async fn run_service(
                     "没有指定修改项；请使用 --rename、--host、--port、--skip-user-agent-check、--account-tag、--clear-account-tag、--add-api-key 或 --remove-api-key"
                 ));
             }
+            let account_tag = normalize_service_tags(&account_tag)?;
             let result_selector = rename.clone().unwrap_or_else(|| service.clone());
             mutate_config(client, |config| {
                 // Resolve names only after the config file lock has been
@@ -867,12 +874,8 @@ pub async fn run_service(
                 }
                 if clear_account_tag {
                     table.remove("account_tag");
-                } else if let Some(tag) = account_tag.as_ref() {
-                    let tag = tag.trim();
-                    if tag.is_empty() {
-                        return Err(anyhow!("账号标签不能为空"));
-                    }
-                    table.insert("account_tag".into(), toml::Value::String(tag.to_owned()));
+                } else if let Some(value) = service_tag_toml_value(&account_tag) {
+                    table.insert("account_tag".into(), value);
                 }
                 let key_ids = table
                     .entry("api_key_ids")
@@ -1041,17 +1044,49 @@ pub async fn run_service(
     }
 }
 
+fn normalize_service_tags(tags: &[String]) -> Result<Vec<String>> {
+    let mut normalized = tags
+        .iter()
+        .map(|tag| tag.trim().to_owned())
+        .collect::<Vec<_>>();
+    if normalized.iter().any(String::is_empty) {
+        return Err(anyhow!("账号标签不能为空"));
+    }
+    normalized.sort();
+    normalized.dedup();
+    Ok(normalized)
+}
+
+fn service_tag_toml_value(tags: &[String]) -> Option<toml::Value> {
+    match tags {
+        [] => None,
+        [tag] => Some(toml::Value::String(tag.clone())),
+        tags => Some(toml::Value::Array(
+            tags.iter().cloned().map(toml::Value::String).collect(),
+        )),
+    }
+}
+
+fn service_tag_label(tags: &[String], legacy_tag: Option<&str>) -> String {
+    let tags = if tags.is_empty() {
+        legacy_tag.into_iter().collect::<Vec<_>>()
+    } else {
+        tags.iter().map(String::as_str).collect::<Vec<_>>()
+    };
+    if tags.is_empty() {
+        "global".into()
+    } else {
+        format!("tag:{}", tags.join(","))
+    }
+}
+
 fn print_service_accounts(result: &ProxyServiceAccountsResult, json: bool) -> Result<()> {
     if json {
         return print_json(result);
     }
     println!(
         "账号池    {}",
-        result
-            .account_tag
-            .as_ref()
-            .map(|tag| format!("tag:{tag}"))
-            .unwrap_or_else(|| "global".into())
+        service_tag_label(&result.account_tags, result.account_tag.as_deref())
     );
     println!(
         "手工加入  {}",
@@ -1145,11 +1180,7 @@ async fn show_service(client: &mut AdminClient, selector: &str, json: bool) -> R
     );
     println!(
         "账号池    {}",
-        service
-            .account_tag
-            .as_ref()
-            .map(|tag| format!("tag:{tag}"))
-            .unwrap_or_else(|| "global".into())
+        service_tag_label(&service.account_tags, service.account_tag.as_deref())
     );
     println!(
         "手工账号  {}",

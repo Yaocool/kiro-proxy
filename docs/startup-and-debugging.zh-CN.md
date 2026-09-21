@@ -82,6 +82,14 @@ cat accounts.json | kproxy account import --stdin --tag team-a --tag prod
 
 `id`、`machine_id` 和 `created_at` 可以省略，CLI 会自动生成。`--tag` 可重复或使用逗号分隔，
 并会合并到本次导入的全部账号；JSON 中每个账号已有的 `tags` 会保留。
+对已经存在的账号，也可以一次传入多个 ID 或邮箱来修改标签：
+
+```bash
+kproxy account tag --add test acc_2c36cfad acc_332c7cb2 acc_41c6e3ad
+```
+
+批量操作会先校验全部账号再统一保存：只要有账号不存在，或需要修改标签的账号已绑定代理服务，
+整批都不会变更。原有的单账号用法仍可使用。
 
 下面只展示 JSON 结构，不能直接作为可用凭证导入。Token 和 `expires_at`（Unix 秒）
 必须替换为上游签发的实际值。
@@ -178,20 +186,24 @@ kproxy ready
 kproxy models list
 ```
 
-创建服务时可用账号标签建立独立账号池；未提供 `--account-tag` 的服务继续使用全局账号池：
+创建服务时可指定一个或多个账号标签；多个标签取并集，账号匹配任一标签即可进入基础账号池。
+未提供 `--account-tag` 的服务继续使用全局账号池。请在账号绑定服务前设置标签；如果已经按上面的
+示例创建了全局池服务 `main`，需要先从该服务排除这些账号：
 
 ```bash
+kproxy service remove-account main alice@example.com bob@example.com
 kproxy account tag alice@example.com --add team-a
-kproxy service create --name team-a --host 127.0.0.1 --port 5581 --account-tag team-a
+kproxy account tag bob@example.com --add team-b
+kproxy service create --name team-a --host 127.0.0.1 --port 5581 --account-tag team-a team-b
 kproxy service accounts team-a
 kproxy account services alice@example.com
 
 # 手工加入任意标签的账号，或从当前服务排除账号：
-kproxy service add-account team-a bob@example.com
+kproxy service add-account team-a carol@example.com
 kproxy service remove-account team-a alice@example.com
 ```
 
-服务的有效账号池为“标签匹配账号 + 手工加入账号 - 排除账号”；排除优先。服务未指定标签时，
+服务的有效账号池为“匹配任一所选标签的账号 + 手工加入账号 - 排除账号”；排除优先。服务未指定标签时，
 基础集合是全部账号。健康检查、就绪检查、模型列表、首次调度、重试及压缩摘要请求都限定在
 该服务的有效账号池内。账号一旦属于任意服务，就不能修改标签或删除；需要先通过
 `account services` 查看全部绑定，再通过 `service remove-account` 从所有服务解除绑定。
@@ -199,7 +211,7 @@ kproxy service remove-account team-a alice@example.com
 
 ```bash
 kproxy service disable team-a
-kproxy service edit team-a --account-tag team-b  # 或 --clear-account-tag 恢复全局池
+kproxy service edit team-a --account-tag team-b team-c  # 或 --clear-account-tag 恢复全局池
 kproxy service enable team-a
 ```
 

@@ -1,5 +1,28 @@
 use super::*;
 
+#[test]
+fn service_tags_normalize_and_use_compatible_toml_shapes() {
+    let tags = normalize_service_tags(&[" xx2 ".into(), "xx1".into(), "xx1".into()])
+        .expect("normalize tags");
+    assert_eq!(tags, ["xx1", "xx2"]);
+    assert_eq!(
+        service_tag_toml_value(&tags),
+        Some(toml::Value::Array(vec![
+            toml::Value::String("xx1".into()),
+            toml::Value::String("xx2".into()),
+        ]))
+    );
+    assert_eq!(
+        service_tag_toml_value(&tags[..1]),
+        Some(toml::Value::String("xx1".into()))
+    );
+    assert_eq!(service_tag_toml_value(&[]), None);
+    assert!(normalize_service_tags(&[" ".into()]).is_err());
+    assert_eq!(service_tag_label(&tags, None), "tag:xx1,xx2");
+    assert_eq!(service_tag_label(&[], Some("legacy")), "tag:legacy");
+    assert_eq!(service_tag_label(&[], None), "global");
+}
+
 fn pool_output_fixture() -> PoolOutput {
     PoolOutput {
         model: "claude-opus-5".into(),

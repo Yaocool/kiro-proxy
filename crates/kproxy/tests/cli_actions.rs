@@ -140,3 +140,39 @@ async fn diagnose_all_preserves_the_two_step_diagnosis_parameters() {
         json!({"all": true, "timeout_secs": 30, "concurrency": 4})
     );
 }
+
+#[tokio::test]
+async fn service_create_sends_multiple_account_tags_as_one_array() {
+    let (output, requests) = run(
+        &[
+            "service",
+            "create",
+            "--name",
+            "team",
+            "--account-tag",
+            "xx1",
+            "xx2",
+        ],
+        vec![json!({
+            "service": {
+                "id": "svc_team",
+                "name": "team",
+                "host": "127.0.0.1",
+                "port": 5581,
+                "enabled": true,
+                "running": true,
+                "api_key_ids": ["ak_team"],
+                "account_tags": ["xx1", "xx2"],
+                "account_ids": [],
+                "excluded_account_ids": [],
+                "created_at": 1
+            },
+            "api_key": {"id": "ak_team", "name": "team-default", "key": "sk-test"}
+        })],
+    )
+    .await;
+    assert_success(&output);
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method, method::SERVICE_CREATE);
+    assert_eq!(requests[0].params["account_tag"], json!(["xx1", "xx2"]));
+}

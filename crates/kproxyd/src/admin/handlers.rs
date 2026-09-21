@@ -4,14 +4,17 @@ use std::{collections::HashMap, sync::Arc};
 
 use futures::{stream, StreamExt};
 use kproxy_core::account::Account;
-use kproxy_core::config::{ApiKeyConfig, ApiKeyFormat, Config, ProxyServiceConfig};
+use kproxy_core::config::{
+    ApiKeyConfig, ApiKeyFormat, Config, ProxyServiceConfig, ServiceAccountTags,
+};
 use kproxy_core::ids::{new_account_id, new_machine_id};
 use kproxy_ipc::protocol::{
     method, AccountAddSsoParams, AccountDetail, AccountImportParams, AccountImportResult,
     AccountListParams, AccountListResult, AccountRefParams, AccountServiceBinding,
-    AccountServicesResult, AccountSetEnabledParams, AccountSummary, AccountTagParams,
-    ConfigPathResult, ConfigReloadResult, ConfigShowResult, CreatedApiKey, LogFileView,
-    LogFilesResult, LogTraceEntry, LogTraceResult, ModelResolutionAccount, ModelResolutionResult,
+    AccountServicesResult, AccountSetEnabledParams, AccountSummary, AccountTagBatchParams,
+    AccountTagBatchResult, AccountTagParams, AccountTagResult, ConfigPathResult,
+    ConfigReloadResult, ConfigShowResult, CreatedApiKey, LogFileView, LogFilesResult,
+    LogTraceEntry, LogTraceResult, ModelResolutionAccount, ModelResolutionResult,
     ProxyServiceAccountChangeParams, ProxyServiceAccountsParams, ProxyServiceAccountsResult,
     ProxyServiceApiKeyView, ProxyServiceApiKeysParams, ProxyServiceApiKeysResult,
     ProxyServiceCreateParams, ProxyServiceCreateResult, ProxyServiceDeleteParams,
@@ -1352,7 +1355,12 @@ async fn service_accounts_result(state: &Arc<AppState>, service: &ProxyServiceCo
     to_value(ProxyServiceAccountsResult {
         service_id: service.id.clone(),
         service_name: service.name.clone(),
-        account_tag: service.account_tag.clone(),
+        account_tag: service
+            .account_tag
+            .as_ref()
+            .and_then(ServiceAccountTags::single_tag)
+            .map(str::to_owned),
+        account_tags: service.selected_account_tags().to_vec(),
         uses_global_pool: service.uses_global_account_pool(),
         account_ids: service.account_ids.clone(),
         excluded_account_ids: service.excluded_account_ids.clone(),
@@ -1414,10 +1422,19 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
         )));
     }
     let account_tag = match params.account_tag {
-        Some(tag) if tag.trim().is_empty() => {
-            return Err(RpcError::bad_params("account tag must not be empty"))
+        Some(selection) => {
+            let mut tags = selection
+                .tags()
+                .iter()
+                .map(|tag| tag.trim().to_owned())
+                .collect::<Vec<_>>();
+            if tags.is_empty() || tags.iter().any(String::is_empty) {
+                return Err(RpcError::bad_params("account tags must not be empty"));
+            }
+            tags.sort();
+            tags.dedup();
+            ServiceAccountTags::from_tags(tags)
         }
-        Some(tag) => Some(tag.trim().to_owned()),
         None => None,
     };
 

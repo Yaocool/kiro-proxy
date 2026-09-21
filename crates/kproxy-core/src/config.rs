@@ -741,9 +741,9 @@ pub struct ProxyServiceConfig {
     /// 允许访问此服务的 API key ID。
     #[serde(default)]
     pub api_key_ids: Vec<String>,
-    /// 作为服务基础账号池的账号标签；未配置时使用全局账号池。
+    /// 作为服务基础账号池的一个或多个账号标签；未配置时使用全局账号池。
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub account_tag: Option<String>,
+    pub account_tag: Option<ServiceAccountTags>,
     /// 无论标签是否匹配，都手工加入服务账号池的账号 ID。
     #[serde(default)]
     pub account_ids: Vec<String>,
@@ -755,7 +755,62 @@ pub struct ProxyServiceConfig {
     pub created_at: i64,
 }
 
+/// A proxy service's tag-derived account pool, stored as a legacy scalar or a
+/// list of tags. An account matching any listed tag belongs to the base pool.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ServiceAccountTags {
+    /// Legacy single-tag configuration.
+    One(String),
+    /// Union of multiple tags.
+    Many(Vec<String>),
+}
+
+impl ServiceAccountTags {
+    pub fn tags(&self) -> &[String] {
+        match self {
+            Self::One(tag) => std::slice::from_ref(tag),
+            Self::Many(tags) => tags,
+        }
+    }
+
+    pub fn single_tag(&self) -> Option<&str> {
+        match self.tags() {
+            [tag] => Some(tag),
+            _ => None,
+        }
+    }
+
+    pub fn from_tags(mut tags: Vec<String>) -> Option<Self> {
+        match tags.len() {
+            0 => None,
+            1 => Some(Self::One(tags.remove(0))),
+            _ => Some(Self::Many(tags)),
+        }
+    }
+}
+
+impl From<String> for ServiceAccountTags {
+    fn from(tag: String) -> Self {
+        Self::One(tag)
+    }
+}
+
+impl From<&str> for ServiceAccountTags {
+    fn from(tag: &str) -> Self {
+        Self::One(tag.to_owned())
+    }
+}
+
 impl ProxyServiceConfig {
+    /// All configured base-pool tags, regardless of scalar or list storage.
+    pub fn selected_account_tags(&self) -> &[String] {
+        self.account_tag
+            .as_ref()
+            .map(ServiceAccountTags::tags)
+            .unwrap_or_default()
+    }
+
     /// Returns whether an account belongs to this service's effective pool.
     ///
     /// Exclusions override both the tag-derived base pool and explicit manual
@@ -775,9 +830,11 @@ impl ProxyServiceConfig {
         {
             return true;
         }
-        self.account_tag
-            .as_ref()
-            .is_none_or(|tag| account.tags.iter().any(|account_tag| account_tag == tag))
+        self.uses_global_account_pool()
+            || self
+                .selected_account_tags()
+                .iter()
+                .any(|tag| account.tags.iter().any(|account_tag| account_tag == tag))
     }
 
     /// Returns true when the service inherits every non-excluded account.
@@ -1244,15 +1301,25 @@ impl Config {
                     );
                 }
             }
-            if service
-                .account_tag
-                .as_ref()
-                .is_some_and(|tag| tag.trim().is_empty() || tag.as_str() != tag.trim())
-            {
-                return invalid_config(
-                    format!("{field}.account_tag"),
-                    "must be non-empty and must not have surrounding whitespace",
-                );
+            if let Some(tags) = &service.account_tag {
+                if tags.tags().is_empty() {
+                    return invalid_config(format!("{field}.account_tag"), "must not be empty");
+                }
+                let mut unique_tags = BTreeSet::new();
+                for tag in tags.tags() {
+                    if tag.trim().is_empty() || tag.as_str() != tag.trim() {
+                        return invalid_config(
+                            format!("{field}.account_tag"),
+                            "must contain non-empty tags without surrounding whitespace",
+                        );
+                    }
+                    if !unique_tags.insert(tag.as_str()) {
+                        return invalid_config(
+                            format!("{field}.account_tag"),
+                            "must not contain duplicate tags",
+                        );
+                    }
+                }
             }
             let mut manual_account_ids = BTreeSet::new();
             for account_id in &service.account_ids {
@@ -1768,8 +1835,10 @@ start_url = ""
 # skip_user_agent_check = false
 # 允许访问该服务的 API key ID；至少一个，且都必须存在于 [[api_key]]。
 # api_key_ids = ["ak_example"]
-# 可选的基础账号标签；不配置时继承全局账号池。修改已有服务的标签前必须先停用服务。
+# 可选的基础账号标签；一个标签用字符串，多个标签用数组（匹配任一标签即可）。
+# 不配置时继承全局账号池。修改已有服务的标签前必须先停用服务。
 # account_tag = "team-a"
+# 多标签时将上面的字符串值替换为 ["team-a", "team-b"]。
 # 手工加入的账号 ID；即使标签不匹配也会进入该服务账号池。
 # account_ids = ["acc_00000001"]
 # 从全局、标签或手工范围中排除的账号 ID。

@@ -4,7 +4,8 @@ use super::{
     AccountAddSsoParams, AccountCreditState, AccountDetail, AccountImportParams,
     AccountImportResult, AccountListParams, AccountListResult, AccountPool, AccountRefParams,
     AccountServiceBinding, AccountServicesResult, AccountSetEnabledParams, AccountStore,
-    AccountTagParams, AppState, Arc, Handled, RpcError, StreamExt,
+    AccountTagBatchParams, AccountTagBatchResult, AccountTagParams, AccountTagResult, AppState,
+    Arc, Handled, RpcError, StreamExt,
 };
 
 pub(super) async fn effective_account_health(
@@ -171,12 +172,14 @@ pub(super) async fn handle_account_services(
             let mut binding_sources = Vec::new();
             if service.uses_global_account_pool() {
                 binding_sources.push("global".to_owned());
-            } else if let Some(tag) = service
-                .account_tag
-                .as_ref()
-                .filter(|tag| account.tags.iter().any(|account_tag| account_tag == *tag))
-            {
-                binding_sources.push(format!("tag:{tag}"));
+            } else {
+                binding_sources.extend(
+                    service
+                        .selected_account_tags()
+                        .iter()
+                        .filter(|tag| account.tags.contains(tag))
+                        .map(|tag| format!("tag:{tag}")),
+                );
             }
             if service
                 .account_ids
@@ -559,8 +562,25 @@ pub(super) async fn handle_account_tag(
     state: &Arc<AppState>,
     params: serde_json::Value,
 ) -> Handled {
-    let params: AccountTagParams = parse_params(params)?;
-    let id = params.id;
+    if params.get("id").is_some() && params.get("ids").is_some() {
+        return Err(RpcError::bad_params(
+            "specify either id or ids, but not both",
+        ));
+    }
+    let (ids, add, remove, single_id) = if params.get("ids").is_some() {
+        let batch: AccountTagBatchParams = parse_params(params)?;
+        if batch.ids.is_empty() {
+            return Err(RpcError::bad_params("ids must not be empty"));
+        }
+        (batch.ids, batch.add, batch.remove, None)
+    } else {
+        let single: AccountTagParams = parse_params(params)?;
+        if single.id.trim().is_empty() {
+            return Err(RpcError::bad_params("id must not be empty"));
+        }
+        let id = single.id;
+        (vec![id.clone()], single.add, single.remove, Some(id))
+    };
     let normalize_tags = |values: Vec<String>| -> Result<Vec<String>, RpcError> {
         values
             .into_iter()
@@ -574,35 +594,61 @@ pub(super) async fn handle_account_tag(
             })
             .collect()
     };
-    let add = normalize_tags(params.add)?;
-    let remove = normalize_tags(params.remove)?;
-    let tags = commit_account_change(state, |store| {
-        let account = store
-            .find(&id)
-            .cloned()
-            .ok_or_else(|| RpcError::bad_params(format!("account not found: {id}")))?;
-        let mut next_tags = account.tags.clone();
-        for tag in &add {
-            if !next_tags.contains(tag) {
-                next_tags.push(tag.clone());
+    let add = normalize_tags(add)?;
+    let remove = normalize_tags(remove)?;
+    let results = commit_account_change(state, |store| {
+        let mut seen = std::collections::HashSet::new();
+        let mut changes = Vec::with_capacity(ids.len());
+        // Validate the whole batch before changing the store, so a missing or
+        // service-bound account cannot leave earlier accounts partially tagged.
+        for id in &ids {
+            let account = store
+                .find(id)
+                .cloned()
+                .ok_or_else(|| RpcError::bad_params(format!("account not found: {id}")))?;
+            if !seen.insert(account.id.clone()) {
+                return Err(RpcError::bad_params(format!(
+                    "account specified more than once: {}",
+                    account.id
+                )));
             }
+            let mut next_tags = account.tags.clone();
+            for tag in &add {
+                if !next_tags.contains(tag) {
+                    next_tags.push(tag.clone());
+                }
+            }
+            next_tags.retain(|tag| !remove.contains(tag));
+            next_tags.sort();
+            next_tags.dedup();
+            let mut current_tags = account.tags.clone();
+            current_tags.sort();
+            current_tags.dedup();
+            let changed = next_tags != current_tags;
+            if changed {
+                ensure_account_unbound(state, &account, "changing its tags")?;
+            }
+            changes.push((account.id, next_tags, changed));
         }
-        next_tags.retain(|tag| !remove.contains(tag));
-        next_tags.sort();
-        next_tags.dedup();
-        let mut current_tags = account.tags.clone();
-        current_tags.sort();
-        current_tags.dedup();
-        if next_tags == current_tags {
-            return Ok(next_tags);
+        let mut results = Vec::with_capacity(changes.len());
+        for (id, tags, changed) in changes {
+            if changed {
+                let replacement = tags.clone();
+                let _updated = store.update(&id, move |account| account.tags = replacement);
+            }
+            results.push(AccountTagResult { id, tags });
         }
-        ensure_account_unbound(state, &account, "changing its tags")?;
-        let replacement = next_tags.clone();
-        let _changed = store.update(&id, move |account| account.tags = replacement);
-        Ok(next_tags)
+        Ok(results)
     })
     .await?;
-    to_value(serde_json::json!({"id": id, "tags": tags}))
+    if let Some(id) = single_id {
+        let mut result = results.into_iter().next().expect("single account result");
+        // Keep the legacy single-account response's id equal to the selector.
+        result.id = id;
+        to_value(result)
+    } else {
+        to_value(AccountTagBatchResult { accounts: results })
+    }
 }
 
 fn ensure_account_unbound(
