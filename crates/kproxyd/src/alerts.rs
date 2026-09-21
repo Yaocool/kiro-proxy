@@ -568,6 +568,8 @@ mod tests {
             account_ids: Vec::new(),
             excluded_account_ids: Vec::new(),
             created_at: 0,
+            default_provider: String::new(),
+            allowed_providers: Vec::new(),
         });
         config.webhook.push(
             serde_json::from_value(serde_json::json!({

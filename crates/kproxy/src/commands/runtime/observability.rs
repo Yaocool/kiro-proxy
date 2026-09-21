@@ -9,6 +9,7 @@ pub async fn show_stats(
     recent: Option<usize>,
     range: (Option<u64>, Option<i64>, Option<i64>),
     by: Option<&str>,
+    provider: Option<&str>,
     json: bool,
 ) -> Result<()> {
     let (since_secs, start_secs, end_secs) = range;
@@ -23,6 +24,7 @@ pub async fn show_stats(
                 "start_secs":start_secs,
                 "end_secs":end_secs,
                 "by":by,
+                "provider":provider,
             }),
         )
         .await?;
@@ -470,6 +472,7 @@ pub async fn show_logs(
     follow: bool,
     level: Option<&str>,
     account: Option<&str>,
+    provider: Option<&str>,
     json: bool,
 ) -> Result<()> {
     let mut after_request_id: Option<String> = None;
@@ -482,7 +485,8 @@ pub async fn show_logs(
                     "tail":tail,
                     "wait_ms":if follow {30_000} else {0},
                     "level":level,
-                    "account":account
+                    "account":account,
+                    "provider":provider
                 }),
             )
             .await?;
@@ -497,10 +501,14 @@ pub async fn show_logs(
                 let account = log_account(request);
                 let models = log_model_route(request);
                 println!(
-                    "{} {:>3} {:>6}ms account={} model={}",
+                    "{} {:>3} {:>6}ms provider={} account={} model={}",
                     format_timestamp(request["timestamp"].as_i64().unwrap_or_default()),
                     request["status"].as_u64().unwrap_or_default(),
                     request["duration_ms"].as_u64().unwrap_or_default(),
+                    request["provider_id"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                        .unwrap_or("kiro"),
                     account,
                     models.original,
                 );

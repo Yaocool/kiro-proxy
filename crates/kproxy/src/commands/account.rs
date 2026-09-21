@@ -5,13 +5,13 @@ use clap::Subcommand;
 use kproxy_core::account::Account;
 use kproxy_core::ids::{new_account_id, new_machine_id};
 use kproxy_ipc::protocol::{
-    method, AccountDetail, AccountImportResult, AccountListResult, AccountServiceBinding,
-    AccountServicesResult, AccountSummary, AccountTagBatchResult, AccountTagResult,
-    ConfigShowResult,
+    method, AccountImportResult, AccountServiceBinding, AccountServicesResult, AccountSummary,
+    AccountTagBatchResult, AccountTagResult, ConfigShowResult, ProviderAccountListResult,
+    ProviderAccountSummary,
 };
 
 use crate::client::AdminClient;
-use crate::output::{format_timestamp, print_json, render_table};
+use crate::output::{print_json, render_table};
 
 /// 账号相关子命令。
 #[derive(Debug, Subcommand)]
@@ -21,6 +21,12 @@ pub enum AccountCommand {
         long_about = "列出账号，默认按邮箱排序。\n\n示例：\n  kproxy account list\n  kproxy account list --tag prod --enabled-only\n  kproxy account list --status low_credit\n  kproxy account list --sort credit"
     )]
     List {
+        /// 提供源实例 ID；默认聚合全部提供源。
+        #[arg(long, default_value = "all")]
+        provider: String,
+        /// 按提供源驱动类型筛选。
+        #[arg(long)]
+        provider_kind: Option<String>,
         /// 只显示带该标签的账号。
         #[arg(long, value_name = "TAG")]
         tag: Option<String>,
@@ -53,6 +59,25 @@ pub enum AccountCommand {
     Show {
         /// 账号 ID 或邮箱。
         id: String,
+        /// 提供源实例 ID；也可直接使用 provider/account_id。
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    /// 通过提供源统一入口添加账号。
+    #[command(
+        after_help = "示例：\n  kproxy account add --provider copilot --auth device-flow\n  printf '%s\\n' \"$GITHUB_TOKEN\" | kproxy account add --provider copilot --token-stdin"
+    )]
+    Add {
+        #[arg(long)]
+        provider: String,
+        /// 认证方式；Copilot 当前支持 device-flow。
+        #[arg(long)]
+        auth: Option<String>,
+        /// 从标准输入读取 GitHub token 并显式导入。
+        #[arg(long, conflicts_with = "auth")]
+        token_stdin: bool,
+        #[arg(long)]
+        label: Option<String>,
     },
     /// 查看账号绑定的 API 代理服务。
     #[command(
@@ -98,6 +123,9 @@ pub enum AccountCommand {
         /// 隐去 token 与 secret，适合诊断分享。
         #[arg(long)]
         redact: bool,
+        /// 提供源实例 ID，使用 all 导出全部；省略时保持旧版 Kiro 输出格式。
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// 通过 IAM Identity Center 登录并添加账号。
     #[command(
@@ -136,6 +164,9 @@ pub enum AccountCommand {
         /// 一个或多个账号 ID/邮箱，以空格分隔。
         #[arg(required = true, num_args = 1.., value_name = "ID_OR_EMAIL")]
         ids: Vec<String>,
+        /// 提供源实例 ID；也可使用 provider/account_id。
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// 启用账号。
     #[command(
@@ -144,6 +175,8 @@ pub enum AccountCommand {
     Enable {
         /// 账号 ID 或邮箱。
         id: String,
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// 停用账号。
     #[command(
@@ -152,6 +185,8 @@ pub enum AccountCommand {
     Disable {
         /// 账号 ID 或邮箱。
         id: String,
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// 为一个或多个账号增删标签。
     #[command(
@@ -167,6 +202,9 @@ pub enum AccountCommand {
         /// 移除标签，可重复。
         #[arg(long = "rm", value_name = "TAG")]
         remove: Vec<String>,
+        /// 提供源实例 ID；也可使用 provider/account_id。
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// 重新生成设备标识。
     #[command(
@@ -184,6 +222,9 @@ pub enum AccountCommand {
         id: Option<String>,
         #[arg(long, conflicts_with = "id")]
         all: bool,
+        /// 限定提供源；批量修改时必须显式提供或使用 all。
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// 探测账号可用端点与模型。
     #[command(
@@ -193,6 +234,9 @@ pub enum AccountCommand {
         id: Option<String>,
         #[arg(long, conflicts_with = "id")]
         all: bool,
+        /// 限定提供源；批量操作可显式使用 all。
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// 清除冷却、封禁与额度耗尽标记。
     #[command(
@@ -202,10 +246,14 @@ pub enum AccountCommand {
         id: Option<String>,
         #[arg(long, conflicts_with = "id")]
         all: bool,
+        /// 限定提供源；批量操作可显式使用 all。
+        #[arg(long)]
+        provider: Option<String>,
     },
 }
 
 /// 构造账号列表表格行。
+#[cfg(test)]
 pub fn build_list_rows(accounts: &[AccountSummary]) -> Vec<Vec<String>> {
     accounts
         .iter()
@@ -231,6 +279,151 @@ pub fn build_list_rows(accounts: &[AccountSummary]) -> Vec<Vec<String>> {
         .collect()
 }
 
+fn build_provider_list_rows(accounts: &[ProviderAccountSummary]) -> Vec<Vec<String>> {
+    accounts
+        .iter()
+        .map(|account| {
+            let quota = match (account.quota_current, account.quota_limit) {
+                (Some(current), Some(limit)) => format!("{current:.2}/{limit:.2}"),
+                (Some(current), None) => format!("{current:.2}"),
+                _ => "unknown".into(),
+            };
+            vec![
+                account.provider_id.clone(),
+                account.id.clone(),
+                account.display_name.clone(),
+                if account.enabled {
+                    account.health.clone()
+                } else {
+                    "disabled".into()
+                },
+                quota,
+                account
+                    .quota_unit
+                    .clone()
+                    .unwrap_or_else(|| "unknown".into()),
+                if account.tags.is_empty() {
+                    "-".into()
+                } else {
+                    account.tags.join(",")
+                },
+            ]
+        })
+        .collect()
+}
+
+fn print_provider_detail(account: &ProviderAccountSummary) {
+    println!(
+        "{}/{}   {}",
+        account.provider_id, account.id, account.display_name
+    );
+    println!("类型      {}", account.provider_kind);
+    println!("状态      {}", account.health);
+    println!("认证      {}", account.auth_state);
+    if let Some(email) = &account.email {
+        println!("邮箱      {email}");
+    }
+    if let Some(label) = &account.label {
+        println!("备注      {label}");
+    }
+    match (account.quota_current, account.quota_limit) {
+        (Some(current), Some(limit)) => println!(
+            "额度      {current:.2}/{limit:.2} {}",
+            account.quota_unit.as_deref().unwrap_or("unknown")
+        ),
+        _ => println!("额度      unknown"),
+    }
+    println!(
+        "模型      {}",
+        if account.supported_models.is_empty() {
+            "unknown".into()
+        } else {
+            account.supported_models.join(", ")
+        }
+    );
+    println!(
+        "标签      {}",
+        if account.tags.is_empty() {
+            "-".into()
+        } else {
+            account.tags.join(", ")
+        }
+    );
+    if account.details != serde_json::Value::Null {
+        println!("详情      {}", account.details);
+    }
+}
+
+async fn run_provider_login(
+    client: &mut AdminClient,
+    provider: &str,
+    auth: &str,
+    label: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let mut state: serde_json::Value = client
+        .call(
+            method::V2_LOGIN_START,
+            serde_json::json!({"provider":provider,"auth":auth,"label":label}),
+        )
+        .await?;
+    let task_id = state["id"]
+        .as_str()
+        .ok_or_else(|| anyhow!("daemon 返回的登录任务缺少 id"))?
+        .to_owned();
+    let verification_uri = state["verification_uri"].as_str().unwrap_or("-");
+    let user_code = state["user_code"].as_str().unwrap_or("-");
+    if json {
+        eprintln!("请打开 {verification_uri} 并输入代码 {user_code}");
+    } else {
+        println!("请打开 {verification_uri}");
+        println!("输入代码 {user_code}");
+        println!("等待 GitHub 授权……");
+    }
+    loop {
+        match state["status"].as_str().unwrap_or("failed") {
+            "authorized" => {
+                if json {
+                    print_json(&state)?;
+                } else {
+                    println!(
+                        "授权完成，已添加 {}/{}",
+                        provider,
+                        state["account_id"].as_str().unwrap_or("-")
+                    );
+                }
+                return Ok(());
+            }
+            "pending" => {}
+            status => {
+                return Err(anyhow!(
+                    "登录任务 {status}：{}",
+                    state["error"].as_str().unwrap_or("未知错误")
+                ));
+            }
+        }
+        let interval = state["interval_secs"].as_u64().unwrap_or(5).clamp(1, 60);
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result?;
+                let _: serde_json::Value = client.call(
+                    method::V2_LOGIN_CANCEL,
+                    serde_json::json!({"provider":provider,"task_id":task_id}),
+                ).await?;
+                return Err(anyhow!("登录已取消"));
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
+        }
+        state = client
+            .call(
+                method::V2_LOGIN_STATUS,
+                serde_json::json!({"provider":provider,"task_id":task_id}),
+            )
+            .await?;
+    }
+}
+
+#[cfg(test)]
 fn display_health(account: &AccountSummary) -> String {
     if !account.enabled {
         return "停用".into();
@@ -323,15 +516,19 @@ fn now_secs() -> i64 {
 pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) -> Result<()> {
     match command {
         AccountCommand::List {
+            provider,
+            provider_kind,
             tag,
             enabled_only,
             status,
             sort,
         } => {
-            let list: AccountListResult = client
+            let list: ProviderAccountListResult = client
                 .call(
-                    method::ACCOUNT_LIST,
+                    method::V2_ACCOUNT_LIST,
                     serde_json::json!({
+                        "provider":provider,
+                        "provider_kind":provider_kind,
                         "tag": tag,
                         "enabled_only": enabled_only.then_some(true),
                         "status":status,
@@ -342,25 +539,73 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             if json {
                 print_json(&list)?;
             } else if list.accounts.is_empty() {
-                println!("暂无账号。用 `kproxy account import` 添加。");
+                println!("暂无账号。用 `kproxy account add --provider <ID>` 添加。");
             } else {
                 print!(
                     "{}",
                     render_table(
-                        &["ID", "邮箱", "状态", "额度", "订阅", "标签"],
-                        &build_list_rows(&list.accounts),
+                        &["PROVIDER", "ID", "账号", "状态", "额度", "单位", "标签"],
+                        &build_provider_list_rows(&list.accounts),
                     )
                 );
+                for (provider, error) in &list.errors {
+                    eprintln!("{provider}: {error}");
+                }
+            }
+            if !list.complete {
+                return Err(anyhow!("部分提供源的账号查询失败"));
             }
         }
-        AccountCommand::Show { id } => {
-            let detail: AccountDetail = client
-                .call(method::ACCOUNT_SHOW, serde_json::json!({"id": id}))
+        AccountCommand::Show { id, provider } => {
+            let detail: ProviderAccountSummary = client
+                .call(
+                    method::V2_ACCOUNT_SHOW,
+                    serde_json::json!({"id": id,"provider":provider}),
+                )
                 .await?;
             if json {
                 print_json(&detail)?;
             } else {
-                print_detail(&detail);
+                print_provider_detail(&detail);
+            }
+        }
+        AccountCommand::Add {
+            provider,
+            auth,
+            token_stdin,
+            label,
+        } => {
+            if token_stdin {
+                let token = read_import_source(None, true).await?;
+                let token = token.trim();
+                if token.is_empty() || token.chars().any(char::is_whitespace) {
+                    return Err(anyhow!("GitHub token 不能为空或包含空白字符"));
+                }
+                let result: serde_json::Value = client
+                    .call(
+                        method::V2_ACCOUNT_IMPORT_TOKEN,
+                        serde_json::json!({"provider":provider,"token":token,"label":label}),
+                    )
+                    .await?;
+                if json {
+                    print_json(&result)?;
+                } else {
+                    println!(
+                        "已添加 {}/{}（{}）",
+                        result["provider_id"].as_str().unwrap_or("-"),
+                        result["id"].as_str().unwrap_or("-"),
+                        result["login"].as_str().unwrap_or("-")
+                    );
+                }
+            } else {
+                run_provider_login(
+                    client,
+                    &provider,
+                    auth.as_deref().unwrap_or("device-flow"),
+                    label.as_deref(),
+                    json,
+                )
+                .await?;
             }
         }
         AccountCommand::Services { id } => {
@@ -432,9 +677,16 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                 );
             }
         }
-        AccountCommand::Export { redact } => {
+        AccountCommand::Export { redact, provider } => {
             let accounts: serde_json::Value = client
-                .call(method::ACCOUNT_EXPORT, serde_json::json!({"redact":redact}))
+                .call(
+                    if provider.is_some() {
+                        method::V2_ACCOUNT_EXPORT
+                    } else {
+                        method::ACCOUNT_EXPORT
+                    },
+                    serde_json::json!({"redact":redact,"provider":provider}),
+                )
                 .await?;
             print_json(&accounts)?;
         }
@@ -490,17 +742,26 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                 println!("已添加 {}（{}）", result.email, result.id);
             }
         }
-        AccountCommand::Rm { ids } => {
+        AccountCommand::Rm { ids, provider } => {
             if !crate::commands::confirm(&remove_confirmation_prompt(&ids)).await? {
                 println!("已取消");
                 return Ok(());
             }
-            remove_accounts(client, &ids, json).await?;
+            remove_accounts(client, &ids, provider.as_deref(), json).await?;
         }
-        AccountCommand::Enable { id } => set_enabled(client, &id, true, json).await?,
-        AccountCommand::Disable { id } => set_enabled(client, &id, false, json).await?,
-        AccountCommand::Tag { ids, add, remove } => {
-            tag_accounts(client, &ids, &add, &remove, json).await?;
+        AccountCommand::Enable { id, provider } => {
+            set_enabled(client, &id, provider.as_deref(), true, json).await?
+        }
+        AccountCommand::Disable { id, provider } => {
+            set_enabled(client, &id, provider.as_deref(), false, json).await?
+        }
+        AccountCommand::Tag {
+            ids,
+            add,
+            remove,
+            provider,
+        } => {
+            tag_accounts(client, &ids, &add, &remove, provider.as_deref(), json).await?;
         }
         AccountCommand::RegenMachineId { id } => {
             let result: serde_json::Value = client
@@ -518,46 +779,171 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                 );
             }
         }
-        AccountCommand::Refresh { id, all } => {
+        AccountCommand::Refresh { id, all, provider } => {
             require_id_or_all(id.as_deref(), all)?;
-            let result: serde_json::Value = client
-                .call(
-                    method::ACCOUNT_REFRESH,
-                    serde_json::json!({"id":id,"all":all}),
-                )
-                .await?;
-            print_result(&result, json, "账号 token 已刷新")?;
+            if all {
+                let provider = provider.as_deref().unwrap_or("kiro");
+                let list: ProviderAccountListResult = client
+                    .call(
+                        method::V2_ACCOUNT_LIST,
+                        serde_json::json!({"provider":provider}),
+                    )
+                    .await?;
+                let mut failures = Vec::new();
+                let mut results = Vec::new();
+                for account in list.accounts {
+                    match client
+                        .call::<serde_json::Value>(
+                            method::V2_ACCOUNT_REFRESH,
+                            serde_json::json!({
+                                "provider":account.provider_id,
+                                "id":account.id
+                            }),
+                        )
+                        .await
+                    {
+                        Ok(result) => results.push(result),
+                        Err(error) => failures.push(error.to_string()),
+                    }
+                }
+                if json {
+                    print_json(&serde_json::json!({"results":results,"errors":failures}))?;
+                } else {
+                    println!("已刷新 {} 个账号", results.len());
+                }
+                if !failures.is_empty() {
+                    return Err(anyhow!(
+                        "{} 个账号刷新失败：{}",
+                        failures.len(),
+                        failures.join("; ")
+                    ));
+                }
+            } else {
+                let result: serde_json::Value = client
+                    .call(
+                        method::V2_ACCOUNT_REFRESH,
+                        serde_json::json!({"id":id,"provider":provider}),
+                    )
+                    .await?;
+                print_result(&result, json, "账号 token 已刷新")?;
+            }
         }
-        AccountCommand::Probe { id, all } => {
+        AccountCommand::Probe { id, all, provider } => {
             require_id_or_all(id.as_deref(), all)?;
-            let result: serde_json::Value = client
-                .call(
-                    method::ACCOUNT_PROBE,
-                    serde_json::json!({"id":id,"all":all}),
+            let result = if all {
+                run_provider_account_batch(
+                    client,
+                    method::V2_ACCOUNT_PROBE,
+                    provider.as_deref().unwrap_or("kiro"),
                 )
-                .await?;
+                .await?
+            } else {
+                client
+                    .call(
+                        method::V2_ACCOUNT_PROBE,
+                        serde_json::json!({"id":id,"provider":provider}),
+                    )
+                    .await?
+            };
             if json {
                 print_json(&result)?;
             } else {
+                let model_count = result["models"].as_array().map_or_else(
+                    || {
+                        result["results"].as_array().map_or(0, |results| {
+                            results
+                                .iter()
+                                .map(|entry| entry["models"].as_array().map_or(0, Vec::len))
+                                .sum()
+                        })
+                    },
+                    Vec::len,
+                );
                 println!(
                     "账号 {} 探测成功，可用模型 {} 个",
                     id.as_deref().unwrap_or("all"),
-                    result["models"].as_array().map_or(0, Vec::len)
+                    model_count
                 );
             }
+            fail_provider_account_batch(&result, "探测")?;
         }
-        AccountCommand::ResetHealth { id, all } => {
+        AccountCommand::ResetHealth { id, all, provider } => {
             require_id_or_all(id.as_deref(), all)?;
-            let result: serde_json::Value = client
-                .call(
-                    method::ACCOUNT_RESET_HEALTH,
-                    serde_json::json!({"id":id,"all":all}),
+            let result = if all {
+                run_provider_account_batch(
+                    client,
+                    method::V2_ACCOUNT_RESET_HEALTH,
+                    provider.as_deref().unwrap_or("kiro"),
                 )
-                .await?;
+                .await?
+            } else {
+                client
+                    .call(
+                        method::V2_ACCOUNT_RESET_HEALTH,
+                        serde_json::json!({"id":id,"provider":provider}),
+                    )
+                    .await?
+            };
             print_result(&result, json, "账号健康状态已重置")?;
+            fail_provider_account_batch(&result, "重置健康状态")?;
         }
     }
     Ok(())
+}
+
+async fn run_provider_account_batch(
+    client: &mut AdminClient,
+    method_name: &str,
+    provider: &str,
+) -> Result<serde_json::Value> {
+    let list: ProviderAccountListResult = client
+        .call(
+            method::V2_ACCOUNT_LIST,
+            serde_json::json!({"provider":provider}),
+        )
+        .await?;
+    let mut results = Vec::new();
+    let mut errors = Vec::new();
+    for account in list.accounts {
+        match client
+            .call::<serde_json::Value>(
+                method_name,
+                serde_json::json!({
+                    "provider":account.provider_id,
+                    "id":account.id
+                }),
+            )
+            .await
+        {
+            Ok(result) => results.push(result),
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    Ok(serde_json::json!({
+        "scope":{"provider":provider},
+        "results":results,
+        "errors":errors,
+        "complete":errors.is_empty()
+    }))
+}
+
+fn fail_provider_account_batch(value: &serde_json::Value, operation: &str) -> Result<()> {
+    let errors = value["errors"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(anyhow!(
+            "{} 个账号{}失败：{}",
+            errors.len(),
+            operation,
+            errors.join("; ")
+        ))
+    }
 }
 
 async fn resolve_start_url(client: &mut AdminClient, explicit: Option<&str>) -> Result<String> {
@@ -625,10 +1011,18 @@ fn remove_confirmation_prompt(ids: &[String]) -> String {
     }
 }
 
-async fn remove_accounts(client: &mut AdminClient, ids: &[String], json: bool) -> Result<()> {
+async fn remove_accounts(
+    client: &mut AdminClient,
+    ids: &[String],
+    provider: Option<&str>,
+    json: bool,
+) -> Result<()> {
     if let [id] = ids {
         let result: serde_json::Value = client
-            .call(method::ACCOUNT_REMOVE, serde_json::json!({"id": id}))
+            .call(
+                method::V2_ACCOUNT_REMOVE,
+                serde_json::json!({"id": id,"provider":provider}),
+            )
             .await?;
         if json {
             print_json(&result)?;
@@ -641,7 +1035,10 @@ async fn remove_accounts(client: &mut AdminClient, ids: &[String], json: bool) -
     let mut failures = Vec::new();
     for id in ids {
         match client
-            .call::<serde_json::Value>(method::ACCOUNT_REMOVE, serde_json::json!({"id": id}))
+            .call::<serde_json::Value>(
+                method::V2_ACCOUNT_REMOVE,
+                serde_json::json!({"id": id,"provider":provider}),
+            )
             .await
         {
             Ok(result) if json => print_json(&result)?,
@@ -660,14 +1057,45 @@ async fn remove_accounts(client: &mut AdminClient, ids: &[String], json: bool) -
     }
 }
 
+/// Tag one or more accounts.
+///
+/// A provider-qualified reference resolves per account through the v2 method,
+/// which is single-account only; the unqualified Kiro path keeps the batch
+/// method so a batch stays all-or-nothing.
 async fn tag_accounts(
     client: &mut AdminClient,
     ids: &[String],
     add: &[String],
     remove: &[String],
+    provider: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    if let [id] = ids {
+    let provider_qualified =
+        provider.is_some() || ids.iter().any(|id| id.split_once('/').is_some());
+    if provider_qualified {
+        let mut results = Vec::with_capacity(ids.len());
+        for id in ids {
+            let result: AccountTagResult = client
+                .call(
+                    method::V2_ACCOUNT_TAG,
+                    serde_json::json!({
+                        "id": id,
+                        "add": add,
+                        "remove": remove,
+                        "provider": provider,
+                    }),
+                )
+                .await?;
+            results.push(result);
+        }
+        if json {
+            print_json(&AccountTagBatchResult { accounts: results })?;
+        } else {
+            for result in &results {
+                print_tag_result(result);
+            }
+        }
+    } else if let [id] = ids {
         let result: AccountTagResult = client
             .call(
                 method::ACCOUNT_TAG,
@@ -706,11 +1134,17 @@ fn print_tag_result(result: &AccountTagResult) {
     );
 }
 
-async fn set_enabled(client: &mut AdminClient, id: &str, enabled: bool, json: bool) -> Result<()> {
+async fn set_enabled(
+    client: &mut AdminClient,
+    id: &str,
+    provider: Option<&str>,
+    enabled: bool,
+    json: bool,
+) -> Result<()> {
     let result: serde_json::Value = client
         .call(
-            method::ACCOUNT_SET_ENABLED,
-            serde_json::json!({"id": id, "enabled": enabled}),
+            method::V2_ACCOUNT_SET_ENABLED,
+            serde_json::json!({"id": id, "provider":provider, "enabled": enabled}),
         )
         .await?;
     if json {
@@ -962,68 +1396,6 @@ fn display_binding_sources(service: &AccountServiceBinding) -> String {
         .join(",")
 }
 
-fn print_detail(detail: &AccountDetail) {
-    let summary = &detail.summary;
-    let tags = if summary.tags.is_empty() {
-        "-".to_string()
-    } else {
-        summary.tags.join(", ")
-    };
-    println!("{}   {}   [{}]", summary.id, summary.email, tags);
-    if let Some(label) = &summary.label {
-        println!("备注      {label}");
-    }
-    let status = display_health(summary);
-    println!("状态      {status}");
-    println!(
-        "订阅      {}",
-        summary.subscription.clone().unwrap_or_else(|| "-".into())
-    );
-    match (summary.credit_current, summary.credit_limit) {
-        (Some(current), Some(limit)) if limit > 0.0 => println!(
-            "额度      {current:.2} / {limit:.2}（{:.0}% 已用）",
-            current / limit * 100.0
-        ),
-        _ => println!("额度      -（尚未拉取）"),
-    }
-    if detail.auth_method == "ApiKey" || detail.auth_method == "api_key" {
-        println!("凭证      Kiro API key（无 OAuth 自动刷新；撤销后需重新导入）");
-    } else {
-        println!(
-            "凭证      {} 过期",
-            format_timestamp(summary.token_expires_at)
-        );
-    }
-    println!("区域      {}", detail.region);
-    println!("认证      {}", detail.auth_method);
-    println!(
-        "模型      {}",
-        if detail.supported_models.is_empty() {
-            "-".into()
-        } else {
-            detail.supported_models.join(", ")
-        }
-    );
-    println!(
-        "端点      {}",
-        detail.preferred_endpoint.as_deref().unwrap_or("尚未缓存")
-    );
-    println!(
-        "并发      {} 进行中 / 上限 {}",
-        detail.active_requests, detail.max_concurrent_requests
-    );
-    println!(
-        "近期错误  {}",
-        if detail.recent_errors.is_empty() {
-            "无".into()
-        } else {
-            detail.recent_errors.join(" | ")
-        }
-    );
-    println!("machineId {}", detail.machine_id);
-    println!("创建      {}", format_timestamp(detail.created_at));
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1198,6 +1570,7 @@ mod tests {
         let error = remove_accounts(
             &mut client,
             &["missing@example.com".into(), "acc_00000002".into()],
+            None,
             false,
         )
         .await
@@ -1250,6 +1623,7 @@ mod tests {
             &["acc_00000001".into(), "acc_00000002".into()],
             &["test".into()],
             &[],
+            None,
             false,
         )
         .await

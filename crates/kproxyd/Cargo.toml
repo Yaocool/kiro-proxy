@@ -15,6 +15,8 @@ path = "src/main.rs"
 
 [dependencies]
 kproxy-core.workspace = true
+kproxy-provider.workspace = true
+kproxy-copilot.workspace = true
 kproxy-store.workspace = true
 kproxy-ipc.workspace = true
 kproxy-translate.workspace = true
@@ -22,6 +24,7 @@ kproxy-kiro.workspace = true
 kproxy-pool.workspace = true
 kproxy-notify.workspace = true
 anyhow.workspace = true
+async-trait.workspace = true
 async-stream.workspace = true
 axum.workspace = true
 axum-server.workspace = true

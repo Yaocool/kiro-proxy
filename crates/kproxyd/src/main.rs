@@ -5,6 +5,7 @@ mod alerts;
 mod http;
 mod logging;
 mod meter;
+mod providers;
 mod sso;
 mod state;
 mod stats;

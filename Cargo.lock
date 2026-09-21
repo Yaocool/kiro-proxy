@@ -143,13 +143,13 @@ dependencies = [
 
 [[package]]
 name = "async-trait"
-version = "0.1.91"
+version = "0.1.82"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ae36dc4177970ef04fde5178d3e2429882def40e57a451f919c098f72baa6cec"
+checksum = "a27b8a3a6e1a44fa4c8baf1f653e4172e81486d4941f2237e20dc2d0cf4ddff1"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 3.0.3",
+ "syn 2.0.119",
 ]
 
 [[package]]
@@ -1102,6 +1102,30 @@ dependencies = [
 ]
 
 [[package]]
+name = "kproxy-copilot"
+version = "1.1.0"
+dependencies = [
+ "async-stream",
+ "async-trait",
+ "bytes",
+ "futures",
+ "http",
+ "kproxy-core",
+ "kproxy-provider",
+ "kproxy-store",
+ "reqwest 0.12.7",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.63",
+ "tokio",
+ "tracing",
+ "url",
+ "uuid",
+ "wiremock",
+]
+
+[[package]]
 name = "kproxy-core"
 version = "1.1.0"
 dependencies = [
@@ -1196,6 +1220,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kproxy-provider"
+version = "1.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures",
+ "http",
+ "kproxy-core",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.63",
+ "tokio",
+]
+
+[[package]]
 name = "kproxy-store"
 version = "1.1.0"
 dependencies = [
@@ -1248,6 +1287,7 @@ version = "1.1.0"
 dependencies = [
  "anyhow",
  "async-stream",
+ "async-trait",
  "axum",
  "axum-server",
  "base64 0.22.1",
@@ -1260,11 +1300,13 @@ dependencies = [
  "http",
  "hyper",
  "hyper-util",
+ "kproxy-copilot",
  "kproxy-core",
  "kproxy-ipc",
  "kproxy-kiro",
  "kproxy-notify",
  "kproxy-pool",
+ "kproxy-provider",
  "kproxy-store",
  "kproxy-translate",
  "rand 0.8.5",

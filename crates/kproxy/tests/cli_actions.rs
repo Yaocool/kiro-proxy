@@ -76,13 +76,21 @@ async fn explicit_list_actions_use_the_existing_methods() {
 
     let (models, requests) = run(
         &["models", "list", "--refresh"],
-        vec![json!({"ran": true}), json!([])],
+        vec![json!({
+            "schema_version": 2,
+            "scope": {"provider": "all"},
+            "models": [],
+            "errors": {},
+            "complete": true
+        })],
     )
     .await;
     assert_success(&models);
-    assert_eq!(requests[0].method, method::TASK_RUN);
-    assert_eq!(requests[0].params, json!({"name": "model_cache_refresh"}));
-    assert_eq!(requests[1].method, method::MODELS);
+    assert_eq!(requests[0].method, method::V2_MODELS);
+    assert_eq!(
+        requests[0].params,
+        json!({"provider": "all", "provider_kind": null, "refresh": true})
+    );
 }
 
 #[tokio::test]
@@ -110,7 +118,8 @@ async fn explicit_log_action_preserves_the_existing_query_parameters() {
             "tail": 25,
             "wait_ms": 0,
             "level": "error",
-            "account": "alice@example.com"
+            "account": "alice@example.com",
+            "provider": null
         })
     );
 }

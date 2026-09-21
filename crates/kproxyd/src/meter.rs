@@ -53,8 +53,27 @@ impl UsageBucket {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderBilling {
+    /// Version of this local envelope, independent of the upstream payload.
+    pub schema_version: u32,
+    /// Provider-native payload name, for example `copilot_usage`.
+    pub source: String,
+    /// Unit for `amount`; absent when the upstream schema is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unit: Option<String>,
+    /// Exact integer amount in `unit`, when the upstream supplied one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amount: Option<u64>,
+    /// Original provider billing object. It is intentionally not converted to
+    /// Kiro credits or a floating-point currency amount.
+    pub raw: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UsageRecord {
     pub timestamp: i64,
+    #[serde(default)]
+    pub provider_id: String,
     pub model: String,
     pub original_model: Option<String>,
     pub kiro_model: Option<String>,
@@ -65,6 +84,8 @@ pub struct UsageRecord {
     pub cache_write_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
     pub token_usage_source: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_billing: Option<ProviderBilling>,
     pub path: String,
 }
 
@@ -75,6 +96,10 @@ pub struct ApiKeyUsage {
     pub total_input_tokens: u64,
     pub total_output_tokens: u64,
     pub daily: BTreeMap<String, UsageBucket>,
+    #[serde(default)]
+    pub by_provider: HashMap<String, UsageBucket>,
+    #[serde(default)]
+    pub provider_details: HashMap<String, ProviderApiKeyUsage>,
     pub by_model: HashMap<String, UsageBucket>,
     pub by_original_model: HashMap<String, UsageBucket>,
     pub by_kiro_model: HashMap<String, UsageBucket>,
@@ -83,7 +108,42 @@ pub struct ApiKeyUsage {
 }
 
 impl ApiKeyUsage {
+    fn migrate_legacy_kiro_dimensions(&mut self) {
+        // Before provider-aware accounting every persisted usage record was a
+        // Kiro request. Preserve that exact aggregate when upgrading instead
+        // of making `--provider kiro` appear empty after a restart.
+        if self.total_requests == 0
+            || !self.by_provider.is_empty()
+            || !self.provider_details.is_empty()
+        {
+            return;
+        }
+        let total = UsageBucket {
+            requests: self.total_requests,
+            credits: self.total_credits,
+            input_tokens: self.total_input_tokens,
+            output_tokens: self.total_output_tokens,
+        };
+        self.by_provider.insert("kiro".into(), total.clone());
+        self.provider_details.insert(
+            "kiro".into(),
+            ProviderApiKeyUsage {
+                total,
+                daily: self.daily.clone(),
+                by_model: self.by_model.clone(),
+                by_original_model: self.by_original_model.clone(),
+                by_kiro_model: self.by_kiro_model.clone(),
+                by_path: self.by_path.clone(),
+            },
+        );
+    }
+
     fn add(&mut self, record: UsageRecord) {
+        let provider = if record.provider_id.is_empty() {
+            "kiro"
+        } else {
+            &record.provider_id
+        };
         self.total_requests += 1;
         self.total_credits += record.credits;
         self.total_input_tokens += record.input_tokens;
@@ -95,6 +155,8 @@ impl ApiKeyUsage {
         while self.daily.len() > MAX_USAGE_DAYS {
             self.daily.pop_first();
         }
+        usage_dimension_entry(&mut self.by_provider, provider).add(&record);
+        provider_usage_entry(&mut self.provider_details, provider).add(&record);
         usage_dimension_entry(&mut self.by_model, &record.model).add(&record);
         if let Some(model) = &record.original_model {
             usage_dimension_entry(&mut self.by_original_model, model).add(&record);
@@ -114,12 +176,106 @@ impl ApiKeyUsage {
             self.daily.pop_first();
         }
         bound_usage_dimensions(&mut self.by_model);
+        bound_usage_dimensions(&mut self.by_provider);
+        bound_provider_usage(&mut self.provider_details);
         bound_usage_dimensions(&mut self.by_original_model);
         bound_usage_dimensions(&mut self.by_kiro_model);
         bound_usage_dimensions(&mut self.by_path);
         while self.history.len() > 100 {
             self.history.pop_front();
         }
+    }
+
+    pub fn retain_provider(&mut self, provider: &str) {
+        let fallback = self.by_provider.get(provider).cloned().unwrap_or_default();
+        let details = self.provider_details.get(provider).cloned();
+        let total = details
+            .as_ref()
+            .map_or(fallback, |details| details.total.clone());
+        self.total_requests = total.requests;
+        self.total_credits = total.credits;
+        self.total_input_tokens = total.input_tokens;
+        self.total_output_tokens = total.output_tokens;
+        self.by_provider
+            .retain(|candidate, _| candidate == provider);
+        self.provider_details
+            .retain(|candidate, _| candidate == provider);
+        if let Some(details) = details {
+            self.daily = details.daily;
+            self.by_model = details.by_model;
+            self.by_original_model = details.by_original_model;
+            self.by_kiro_model = details.by_kiro_model;
+            self.by_path = details.by_path;
+        } else {
+            self.daily.clear();
+            self.by_model.clear();
+            self.by_original_model.clear();
+            self.by_kiro_model.clear();
+            self.by_path.clear();
+        }
+        self.history.retain(|record| {
+            let record_provider = if record.provider_id.is_empty() {
+                "kiro"
+            } else {
+                &record.provider_id
+            };
+            record_provider == provider
+        });
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProviderApiKeyUsage {
+    pub total: UsageBucket,
+    pub daily: BTreeMap<String, UsageBucket>,
+    pub by_model: HashMap<String, UsageBucket>,
+    pub by_original_model: HashMap<String, UsageBucket>,
+    pub by_kiro_model: HashMap<String, UsageBucket>,
+    pub by_path: HashMap<String, UsageBucket>,
+}
+
+impl ProviderApiKeyUsage {
+    fn add(&mut self, record: &UsageRecord) {
+        self.total.add(record);
+        self.daily
+            .entry(utc_day(record.timestamp))
+            .or_default()
+            .add(record);
+        while self.daily.len() > MAX_USAGE_DAYS {
+            self.daily.pop_first();
+        }
+        usage_dimension_entry(&mut self.by_model, &record.model).add(record);
+        if let Some(model) = &record.original_model {
+            usage_dimension_entry(&mut self.by_original_model, model).add(record);
+        }
+        if let Some(model) = &record.kiro_model {
+            usage_dimension_entry(&mut self.by_kiro_model, model).add(record);
+        }
+        usage_dimension_entry(&mut self.by_path, &record.path).add(record);
+    }
+
+    fn merge(&mut self, other: &Self) {
+        self.total.merge(&other.total);
+        for (day, bucket) in &other.daily {
+            self.daily.entry(day.clone()).or_default().merge(bucket);
+        }
+        while self.daily.len() > MAX_USAGE_DAYS {
+            self.daily.pop_first();
+        }
+        merge_usage_dimensions(&mut self.by_model, &other.by_model);
+        merge_usage_dimensions(&mut self.by_original_model, &other.by_original_model);
+        merge_usage_dimensions(&mut self.by_kiro_model, &other.by_kiro_model);
+        merge_usage_dimensions(&mut self.by_path, &other.by_path);
+    }
+
+    fn bound(&mut self) {
+        while self.daily.len() > MAX_USAGE_DAYS {
+            self.daily.pop_first();
+        }
+        bound_usage_dimensions(&mut self.by_model);
+        bound_usage_dimensions(&mut self.by_original_model);
+        bound_usage_dimensions(&mut self.by_kiro_model);
+        bound_usage_dimensions(&mut self.by_path);
     }
 }
 
@@ -148,6 +304,46 @@ fn bound_usage_dimensions(dimensions: &mut HashMap<String, UsageBucket>) {
     }
 }
 
+fn merge_usage_dimensions(
+    target: &mut HashMap<String, UsageBucket>,
+    source: &HashMap<String, UsageBucket>,
+) {
+    for (key, bucket) in source {
+        usage_dimension_entry(target, key).merge(bucket);
+    }
+}
+
+fn provider_usage_entry<'a>(
+    dimensions: &'a mut HashMap<String, ProviderApiKeyUsage>,
+    provider: &str,
+) -> &'a mut ProviderApiKeyUsage {
+    let bounded_provider = if dimensions.contains_key(provider)
+        || (provider != OTHER_USAGE_DIMENSION
+            && dimensions.len() < MAX_USAGE_DIMENSION_KEYS.saturating_sub(1))
+    {
+        provider
+    } else {
+        OTHER_USAGE_DIMENSION
+    };
+    dimensions.entry(bounded_provider.into()).or_default()
+}
+
+fn bound_provider_usage(dimensions: &mut HashMap<String, ProviderApiKeyUsage>) {
+    if dimensions.len() < MAX_USAGE_DIMENSION_KEYS {
+        for usage in dimensions.values_mut() {
+            usage.bound();
+        }
+        return;
+    }
+    let entries = std::mem::take(dimensions);
+    for (provider, usage) in entries {
+        provider_usage_entry(dimensions, &provider).merge(&usage);
+    }
+    for usage in dimensions.values_mut() {
+        usage.bound();
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiKeyView {
     pub id: String,
@@ -155,6 +351,8 @@ pub struct ApiKeyView {
     pub enabled: bool,
     pub skip_user_agent_check: bool,
     pub credits_limit: Option<f64>,
+    pub allowed_providers: Vec<String>,
+    pub allowed_models: Vec<String>,
     pub reserved_credits: f64,
     pub usage: ApiKeyUsage,
 }
@@ -163,6 +361,8 @@ pub struct ApiKeyView {
 pub struct AuthenticatedApiKey {
     pub id: String,
     pub skip_user_agent_check: bool,
+    pub allowed_providers: Vec<String>,
+    pub allowed_models: Vec<String>,
 }
 
 struct KeyState {
@@ -317,6 +517,7 @@ impl Meter {
                     })
                     .cloned()
                     .unwrap_or_default();
+                usage.migrate_legacy_kiro_dimensions();
                 usage.bound();
                 (
                     id.clone(),
@@ -394,6 +595,8 @@ impl Meter {
                 Some(AuthenticatedApiKey {
                     id: state.id.clone(),
                     skip_user_agent_check: state.config.skip_user_agent_check,
+                    allowed_providers: state.config.allowed_providers.clone(),
+                    allowed_models: state.config.allowed_models.clone(),
                 })
             })
             .ok_or(MeterError::Unauthorized)
@@ -453,6 +656,8 @@ impl Meter {
                 enabled: state.config.enabled,
                 skip_user_agent_check: state.config.skip_user_agent_check,
                 credits_limit: state.config.credits_limit,
+                allowed_providers: state.config.allowed_providers.clone(),
+                allowed_models: state.config.allowed_models.clone(),
                 reserved_credits: state.reserved,
                 usage: state.usage.clone(),
             })
@@ -720,6 +925,7 @@ mod tests {
     fn usage(credits: f64) -> UsageRecord {
         UsageRecord {
             timestamp: now_secs(),
+            provider_id: "kiro".into(),
             model: "mapped".into(),
             original_model: Some("client".into()),
             kiro_model: Some("kiro".into()),
@@ -730,6 +936,7 @@ mod tests {
             cache_write_tokens: None,
             reasoning_tokens: None,
             token_usage_source: "server".into(),
+            provider_billing: None,
             path: "/v1/messages".into(),
         }
     }
@@ -755,6 +962,64 @@ mod tests {
         assert_eq!(aggregate.history.len(), 100);
     }
 
+    #[test]
+    fn provider_filter_rebuilds_exact_usage_and_preserves_native_billing() {
+        let mut aggregate = ApiKeyUsage::default();
+        aggregate.add(usage(2.5));
+
+        let mut copilot = usage(0.0);
+        copilot.provider_id = "copilot".into();
+        copilot.model = "gpt-5-mini".into();
+        copilot.original_model = Some("team-fast".into());
+        copilot.kiro_model = None;
+        copilot.input_tokens = 12;
+        copilot.output_tokens = 7;
+        copilot.provider_billing = Some(ProviderBilling {
+            schema_version: 1,
+            source: "copilot_usage".into(),
+            unit: Some("nano_aiu".into()),
+            amount: Some(42),
+            raw: serde_json::json!({"total_nano_aiu": 42}),
+        });
+        aggregate.add(copilot);
+
+        aggregate.retain_provider("copilot");
+
+        assert_eq!(aggregate.total_requests, 1);
+        assert_eq!(aggregate.total_credits, 0.0);
+        assert_eq!(aggregate.total_input_tokens, 12);
+        assert_eq!(aggregate.total_output_tokens, 7);
+        assert_eq!(aggregate.by_provider.len(), 1);
+        assert!(aggregate.by_provider.contains_key("copilot"));
+        assert_eq!(aggregate.by_model["gpt-5-mini"].requests, 1);
+        assert_eq!(aggregate.by_original_model["team-fast"].requests, 1);
+        assert!(aggregate.by_kiro_model.is_empty());
+        assert_eq!(aggregate.history.len(), 1);
+        let billing = aggregate.history[0]
+            .provider_billing
+            .as_ref()
+            .expect("provider billing");
+        assert_eq!(billing.unit.as_deref(), Some("nano_aiu"));
+        assert_eq!(billing.amount, Some(42));
+    }
+
+    #[test]
+    fn legacy_usage_is_backfilled_as_kiro_before_provider_filtering() {
+        let mut aggregate = ApiKeyUsage::default();
+        aggregate.add(usage(2.5));
+        aggregate.by_provider.clear();
+        aggregate.provider_details.clear();
+
+        aggregate.migrate_legacy_kiro_dimensions();
+        aggregate.retain_provider("kiro");
+
+        assert_eq!(aggregate.total_requests, 1);
+        assert_eq!(aggregate.total_credits, 2.5);
+        assert_eq!(aggregate.total_input_tokens, 100);
+        assert_eq!(aggregate.by_model["mapped"].requests, 1);
+        assert_eq!(aggregate.by_path["/v1/messages"].requests, 1);
+    }
+
     #[tokio::test]
     async fn reservations_prevent_concurrent_limit_overshoot() {
         let directory = tempfile::tempdir().expect("tempdir");
@@ -768,6 +1033,7 @@ mod tests {
                 enabled: true,
                 skip_user_agent_check: false,
                 credits_limit: Some(10.0),
+                ..ApiKeyConfig::default()
             }],
         )
         .await
@@ -797,6 +1063,7 @@ mod tests {
             enabled: true,
             skip_user_agent_check: false,
             credits_limit: None,
+            ..ApiKeyConfig::default()
         });
         let meter = Meter::load(&directory.path().join("daily.json"), &configs)
             .await
@@ -878,6 +1145,7 @@ mod tests {
             enabled: true,
             skip_user_agent_check: false,
             credits_limit: Some(10.0),
+            ..ApiKeyConfig::default()
         };
         let meter = Meter::load(&path, std::slice::from_ref(&config))
             .await

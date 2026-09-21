@@ -151,6 +151,8 @@ pub struct AppState {
     pub web_search_replay: WebSearchReplayCodec,
     pub stats: Arc<StatsStore>,
     pub models: Arc<ModelCache>,
+    /// Registered Kiro, Copilot, and future provider runtimes.
+    pub providers: Arc<crate::providers::ProviderManager>,
     model_refresh: tokio::sync::Notify,
     refresher: RwLock<TokenRefresher>,
     tls_config: RwLock<Option<axum_server::tls_rustls::RustlsConfig>>,
@@ -242,7 +244,14 @@ impl AppState {
         };
         let web_search_replay =
             load_or_regenerate_replay_key(&paths.web_search_replay_key_file).await;
-        Self::build(paths, config, accounts, meter, stats, web_search_replay)
+        let state = Self::build(paths, config, accounts, meter, stats, web_search_replay)?;
+        let current = state.config.current();
+        state
+            .providers
+            .reconcile(&current, &state.paths.data_dir)
+            .await
+            .map_err(anyhow::Error::msg)?;
+        Ok(state)
     }
 
     fn build(
@@ -279,6 +288,8 @@ impl AppState {
         );
         let admission_limit = current.server.max_concurrent_requests.max(1);
         let connection_limit = current.server.max_connections.max(1);
+        let models = Arc::new(ModelCache::default());
+        let providers = Arc::new(crate::providers::ProviderManager::new(Arc::clone(&models)));
         Ok(Self {
             config,
             accounts: Arc::new(RwLock::new(accounts)),
@@ -290,7 +301,8 @@ impl AppState {
             tokenizer: TokenCountCache::new(512).map_err(anyhow::Error::msg)?,
             web_search_replay,
             stats,
-            models: Arc::new(ModelCache::default()),
+            models,
+            providers,
             model_refresh: tokio::sync::Notify::new(),
             refresher: RwLock::new(refresher),
             tls_config: RwLock::new(None),
@@ -529,6 +541,21 @@ impl AppState {
         validate_service_account_references(next, &accounts)?;
         self.config.replace(next.clone());
         self.apply_runtime_config(next);
+        if let Err(error) = self.providers.reconcile(next, &self.paths.data_dir).await {
+            self.config.replace(previous.clone());
+            self.apply_runtime_config(&previous);
+            let rollback_error = self
+                .providers
+                .reconcile(&previous, &self.paths.data_dir)
+                .await
+                .err();
+            return Err(match rollback_error {
+                Some(rollback_error) => format!(
+                    "provider apply failed ({error}); provider rollback also failed: {rollback_error}"
+                ),
+                None => format!("provider apply failed; previous config restored: {error}"),
+            });
+        }
         let failures = self.reconcile_proxy_services(next).await;
         if failures.is_empty() {
             crate::alerts::sync_quota_incidents(self).await;
@@ -538,16 +565,22 @@ impl AppState {
         let apply_error = format_service_failures(&failures);
         self.config.replace(previous.clone());
         self.apply_runtime_config(&previous);
+        let provider_rollback_error = self
+            .providers
+            .reconcile(&previous, &self.paths.data_dir)
+            .await
+            .err();
         let rollback_failures = self.reconcile_proxy_services(&previous).await;
         crate::alerts::sync_quota_incidents(self).await;
-        if rollback_failures.is_empty() {
+        if rollback_failures.is_empty() && provider_rollback_error.is_none() {
             Err(format!(
                 "proxy service apply failed; previous config restored: {apply_error}"
             ))
         } else {
             Err(format!(
-                "proxy service apply failed ({apply_error}); rollback also failed: {}",
-                format_service_failures(&rollback_failures)
+                "proxy service apply failed ({apply_error}); rollback also failed: services={}, providers={}",
+                format_service_failures(&rollback_failures),
+                provider_rollback_error.unwrap_or_else(|| "ok".into())
             ))
         }
     }
@@ -1361,6 +1394,10 @@ impl AdmissionGate {
         self.maximum.load(Ordering::Acquire)
     }
 
+    pub fn current(&self) -> usize {
+        self.current.load(Ordering::Acquire)
+    }
+
     pub fn set_maximum(&self, maximum: usize) {
         self.maximum.store(maximum.max(1), Ordering::Release);
     }
@@ -1547,6 +1584,8 @@ mod tests {
                 account_ids: Vec::new(),
                 excluded_account_ids: Vec::new(),
                 created_at: 0,
+                default_provider: String::new(),
+                allowed_providers: Vec::new(),
             });
         let state = AppState::new(paths.clone(), ConfigHandle::new(config), accounts);
 

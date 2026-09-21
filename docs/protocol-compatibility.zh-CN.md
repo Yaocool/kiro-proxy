@@ -58,6 +58,36 @@ V3/KAS 是其他请求路径，不能只更换 UA 中的 service 名称就完成
 保留非 null 的真实 format Schema/task budget 回归，覆盖 Messages 别名、counting、JSON/SSE，
 并断言它们不进入 Kiro payload；不能用 null 绕开兼容性验证。
 
+## 模型发现响应协议
+
+OpenAI 和 Anthropic 在各自 API 域名下都使用 `GET /v1/models`，因此代理复用该路径并提供
+`/models` 别名，再根据已认证客户端的请求头选择响应协议。Codex
+获得 [OpenAI 模型列表格式](https://developers.openai.com/api/reference/resources/models/methods/list)：
+顶层包含 `object: "list"`，模型项包含 `id`、`object`、`created`、`owned_by`，不混入
+Anthropic 专属字段。
+
+Claude Code 获得 [Anthropic 模型列表格式](https://platform.claude.com/docs/en/api/models/list)。
+支持 `limit`（默认 20，范围 1–1000）、`after_id` 和 `before_id`，响应包含 `data`、
+`first_id`、`has_more`、`last_id`。每个模型包含 `type`、`id`、`created_at`、
+`display_name`、`capabilities`、`max_input_tokens`、`max_tokens`；不返回 OpenAI 字段和
+Kiro 的 description 扩展。Kiro 模型发现不提供发布日期和 Anthropic 能力矩阵，因此
+`created_at` 使用协议明确允许的 Unix epoch，`capabilities` 为 `null`。动态发现返回的
+`tokenLimits.maxInputTokens`、`maxOutputTokens` 分别映射到两个 Anthropic 上限字段；静态或
+配置回退模型返回 `null`，不虚构上限。游标使用客户端实际看到的模型 ID，包括非 Claude
+Kiro 模型使用的 `anthropic.` 前缀。动态发现保留 Kiro 返回顺序，不再改成字母序；回退
+模型保留人工维护的目录顺序，因为 Kiro 不提供发布日期。
+
+如果 Codex/Claude Code User-Agent 和 `anthropic-version` 都无法识别协议，通过鉴权的请求
+会获得联合响应：同时返回 OpenAI 的 `object`、模型 `object`、`created`、`owned_by`，以及
+Anthropic 的分页和模型元数据字段。联合响应使用 Claude 兼容的发现 ID，保证非 Claude 的
+Kiro 模型仍可见；OpenAI 生成接口的模型解析也接受该 ID。联合响应默认返回完整列表，显式
+提供 `limit`、`after_id`、`before_id` 时才分页。API Key 鉴权仍优先执行。模型发现只使用
+User-Agent 协商响应结构，不会因缺失或无法识别的 User-Agent 被客户端准入检查拒绝；生成
+接口仍遵循原有准入策略。
+
+这里的兼容范围仅包括列表；OpenAI/Anthropic 独立的模型详情接口
+`GET /v1/models/{model_id}` 尚未实现。
+
 ## 工具调用参数
 
 上游原生工具调用（包括 MCP 工具）在 Claude/OpenAI、流式/非流式、开启/关闭缓冲时，

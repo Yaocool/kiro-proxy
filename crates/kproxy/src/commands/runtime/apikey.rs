@@ -10,10 +10,16 @@ pub async fn run_apikey(
     json: bool,
 ) -> Result<()> {
     match command {
-        ApiKeyCommand::List { detail } => show_key_list(client, detail, json).await,
-        ApiKeyCommand::Show { id } => show_keys(client, Some(&id), None, json).await,
-        ApiKeyCommand::Usage { id } => show_keys(client, Some(&id), None, json).await,
-        ApiKeyCommand::History { id, tail } => show_keys(client, Some(&id), Some(tail), json).await,
+        ApiKeyCommand::List { detail, provider } => {
+            show_key_list(client, detail, provider.as_deref(), json).await
+        }
+        ApiKeyCommand::Show { id } => show_keys(client, Some(&id), None, None, json).await,
+        ApiKeyCommand::Usage { id, provider } => {
+            show_keys(client, Some(&id), None, provider.as_deref(), json).await
+        }
+        ApiKeyCommand::History { id, tail, provider } => {
+            show_keys(client, Some(&id), Some(tail), provider.as_deref(), json).await
+        }
         ApiKeyCommand::ResetUsage { id } => {
             if !crate::commands::confirm(&format!("确认重置 API key {id} 的全部用量统计？")).await?
             {
@@ -34,6 +40,8 @@ pub async fn run_apikey(
             key,
             credits_limit,
             skip_user_agent_check,
+            providers,
+            models,
         } => {
             let key = resolve_api_key_value(&format, key.as_deref())?;
             let id = key_id(&key);
@@ -51,6 +59,15 @@ pub async fn run_apikey(
                 if let Some(limit) = credits_limit {
                     table.insert("credits_limit".into(), toml::Value::Float(limit));
                 }
+                if !providers.is_empty() {
+                    table.insert(
+                        "allowed_providers".into(),
+                        super::string_array_value(&providers),
+                    );
+                }
+                if !models.is_empty() {
+                    table.insert("allowed_models".into(), super::string_array_value(&models));
+                }
                 array.push(toml::Value::Table(table));
                 Ok(())
             })
@@ -65,15 +82,45 @@ pub async fn run_apikey(
         ApiKeyCommand::Edit {
             id,
             skip_user_agent_check,
+            providers,
+            clear_providers,
+            models,
+            clear_models,
         } => {
-            mutate_key_and_reload(
-                client,
-                &id,
-                "skip_user_agent_check",
-                toml::Value::Boolean(skip_user_agent_check),
-            )
+            if skip_user_agent_check.is_none()
+                && providers.is_empty()
+                && !clear_providers
+                && models.is_empty()
+                && !clear_models
+            {
+                return Err(anyhow!("没有指定修改项"));
+            }
+            mutate_config_array(client, "api_key", |array| {
+                let table = array
+                    .iter_mut()
+                    .find(|item| matches_key(item, &id))
+                    .and_then(toml::Value::as_table_mut)
+                    .ok_or_else(|| anyhow!("API key not found: {id}"))?;
+                if let Some(skip) = skip_user_agent_check {
+                    table.insert("skip_user_agent_check".into(), toml::Value::Boolean(skip));
+                }
+                if clear_providers {
+                    table.remove("allowed_providers");
+                } else if !providers.is_empty() {
+                    table.insert(
+                        "allowed_providers".into(),
+                        super::string_array_value(&providers),
+                    );
+                }
+                if clear_models {
+                    table.remove("allowed_models");
+                } else if !models.is_empty() {
+                    table.insert("allowed_models".into(), super::string_array_value(&models));
+                }
+                Ok(())
+            })
             .await?;
-            report_apikey_change(client, &id, "已更新 User-Agent 校验策略", json).await
+            report_apikey_change(client, &id, "已更新", json).await
         }
         ApiKeyCommand::Rm { id } => {
             if !crate::commands::confirm(&format!("确认删除 API key {id}？")).await? {
@@ -146,7 +193,7 @@ async fn report_apikey_change(
     json: bool,
 ) -> Result<()> {
     if json {
-        show_keys(client, Some(id), None, true).await
+        show_keys(client, Some(id), None, None, true).await
     } else {
         println!("{message} API key {id}");
         Ok(())
@@ -209,9 +256,17 @@ impl ApiKeyListSummary {
     }
 }
 
-async fn show_key_list(client: &mut AdminClient, detail: bool, json: bool) -> Result<()> {
+async fn show_key_list(
+    client: &mut AdminClient,
+    detail: bool,
+    provider: Option<&str>,
+    json: bool,
+) -> Result<()> {
     let value: serde_json::Value = client
-        .call(method::APIKEY_LIST, serde_json::json!({}))
+        .call(
+            method::APIKEY_LIST,
+            serde_json::json!({"provider":provider}),
+        )
         .await?;
     let mut entries = serde_json::from_value::<Vec<ApiKeyListEntry>>(value)
         .context("daemon 返回的 API key 列表无效")?;

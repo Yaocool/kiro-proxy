@@ -5,6 +5,22 @@ use std::time::Duration;
 use super::*;
 
 #[test]
+fn token_count_authorization_uses_the_resolved_kiro_model() {
+    let available = vec![
+        "claude-sonnet-4-6".to_string(),
+        "claude-haiku-4-5".to_string(),
+    ];
+    assert_eq!(
+        resolve_kiro_authorization_model("sonnet4.6", "", &available),
+        "claude-sonnet-4-6"
+    );
+    assert_eq!(
+        resolve_kiro_authorization_model("unknown", "claude-haiku-4-5", &available),
+        "claude-haiku-4-5"
+    );
+}
+
+#[test]
 fn conversation_fallback_is_stable_uuid_and_isolated_by_client() {
     let first = vec![serde_json::json!({"role":"user","content":"hello"})];
     let extended = vec![
@@ -1009,6 +1025,8 @@ async fn multiwave_summary_input_falls_back_without_dispatching_semantic_work() 
                     .map(|account| account.id)
                     .collect(),
             ),
+            allowed_models: &[],
+            service_id: None,
             source_payload: &source_payload,
             decision: &decision,
             summary_model: "mapped-tiny",
@@ -1105,6 +1123,8 @@ async fn multiwave_summary_input_falls_back_without_dispatching_semantic_work() 
                     .map(|account| account.id)
                     .collect(),
             ),
+            allowed_models: &[],
+            service_id: None,
             source_payload: &oversized_payload,
             decision: &decision,
             summary_model: "mapped-tiny",
@@ -1308,6 +1328,16 @@ fn fallback_models_use_catalog_and_keep_configured_targets() {
     let mut config = kproxy_core::config::Config::default();
     config.features.default_model_id = "private-model".into();
     let models = fallback_models(&config);
+    assert_eq!(
+        models.first().map(|model| model.model_id.as_str()),
+        kproxy_kiro::static_models()
+            .first()
+            .map(|model| model.model_id.as_str())
+    );
+    assert_eq!(
+        models.last().map(|model| model.model_id.as_str()),
+        Some("private-model")
+    );
     assert!(models.iter().any(|model| model.model_id == "auto"));
     assert!(models
         .iter()

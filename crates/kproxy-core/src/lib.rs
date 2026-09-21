@@ -6,3 +6,4 @@ pub mod account;
 pub mod config;
 pub mod ids;
 pub mod paths;
+pub mod provider;

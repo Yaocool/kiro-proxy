@@ -3,13 +3,14 @@
 [English](README.md) | [简体中文](README.zh-CN.md) | [Documentation](#documentation)
 
 `kiro-proxy` exposes Claude Messages, OpenAI Chat Completions, and OpenAI Responses
-compatible APIs over Kiro. The Rust daemon `kproxyd` handles generation and account
-scheduling; `kproxy` manages it through a local Unix socket.
+compatible APIs through a multi-provider architecture with built-in Kiro and GitHub
+Copilot adapters. The Rust daemon `kproxyd` handles routing, generation, and account
+scheduling; `kproxy` manages all providers, or one provider, through a local Unix socket.
 
-It supports enterprise SSO credentials (AWS IAM Identity Center/IdC) and explicitly
-imported Kiro headless API keys (`ksk_...`). Personal/social OAuth login is not
-supported. Upstream credentials and the proxy's client API keys are separate.
-The project has no GUI, MITM, or local Kiro application configuration rewriting.
+Kiro supports enterprise SSO credentials (AWS IAM Identity Center/IdC) and imported
+headless API keys (`ksk_...`). Copilot supports GitHub Device Flow or token import from
+standard input. Upstream credentials and the proxy's client API keys are separate.
+The project has no GUI, MITM, or local client configuration rewriting.
 
 > Documentation follows the current source, whose workspace version is `0.2.4`.
 > It includes **unreleased changes after the `v0.2.4` tag**, including the CLI
@@ -21,9 +22,9 @@ The project has no GUI, MITM, or local Kiro application configuration rewriting.
 | Area | Current behavior |
 | --- | --- |
 | APIs | Messages, token counting, Chat Completions, Responses, model discovery; JSON and SSE generation. |
-| Accounts | Weighted scheduling, per-account concurrency, cooldowns, quota protection, enterprise token refresh. |
-| Upstream routing | Regional Q/CodeWhisperer/Kiro runtime, endpoint failover, isolated GovCloud routing. |
-| Models and tools | Dynamic discovery, aliases and conditional mappings, tool replay, Claude Tool Search and Web Search. |
+| Accounts | Provider-isolated pools, per-account concurrency, enable/disable, tags, probes and refresh; Kiro quota scheduling and Copilot Device Flow. |
+| Upstream routing | Regional Kiro runtimes and GovCloud isolation; Copilot short-lived API tokens, dynamic endpoints and native protocol forwarding. |
+| Models and tools | Cross-provider discovery, conditional mapping and access scopes; Kiro tool replay, Claude Tool Search and Web Search. |
 | Operations | Hot-reloaded TOML, API-key quotas, TLS, webhooks, trace logs, persisted statistics, Docker and systemd. |
 | Compatibility limits | Format/strict hints do not guarantee structured output. Responses state expires and is lost on restart. Hosted tools and automatic compaction differ by protocol. |
 
@@ -163,12 +164,13 @@ for configuration, log retention, Docker lifecycle commands and systemd.
 | Deployment, CLI migration, logs and recovery | [English](docs/startup-and-debugging.md) · [中文](docs/startup-and-debugging.zh-CN.md) |
 | Protocol limits, model controls and compaction | [English](docs/protocol-compatibility.md) · [中文](docs/protocol-compatibility.zh-CN.md) |
 | Responses, Codex and stateful continuation | [Integration guide (中文)](docs/openai-responses.md) |
+| Multi-provider routing and GitHub Copilot | [Integration guide (中文)](docs/providers-and-copilot.zh-CN.md) |
 | 1.0 readiness, remediation and release procedure | [Release plan (中文)](docs/release-readiness-1.0.0.zh-CN.md) |
 
 ## Development
 
-The nine workspace crates separate domain/configuration, storage, IPC,
-translation, upstream access, scheduling, notifications, the daemon and the CLI.
+The workspace crates separate domain/configuration, storage, IPC, translation,
+provider adapters, upstream access, scheduling, notifications, the daemon and the CLI.
 See [contributor guidance](CONTRIBUTING.md) and [architecture notes](CLAUDE.md).
 
 ```bash

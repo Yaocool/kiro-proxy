@@ -4,17 +4,20 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
-use axum::extract::{OriginalUri, Request, State};
+use axum::extract::{OriginalUri, RawQuery, Request, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use base64::Engine;
 use bytes::BytesMut;
 use futures::StreamExt;
+use kproxy_core::provider::{ProviderId, ProviderModel, ProviderProtocol};
 use kproxy_kiro::{EventStreamDecoder, KiroError, KiroEvent, KiroResponse};
 use kproxy_pool::{AccountLease, PoolError};
 use kproxy_translate::error::log_model;
-use kproxy_translate::model::{map_model, resolve_dynamic_model};
+use kproxy_translate::model::{
+    map_model_for_provider, resolve_dynamic_model, ModelMappingContext, ModelRoute,
+};
 use kproxy_translate::{
     apply_context_management_edits, claude_loaded_tools, claude_pending_server_tool_uses,
     claude_to_kiro, compact_trigger_tokens, compaction_summary_payload, error_envelope,
@@ -263,6 +266,8 @@ struct CompactionRequest<'a> {
     trace_id: &'a str,
     key_id: Option<&'a str>,
     account_ids: Arc<HashSet<String>>,
+    allowed_models: &'a [String],
+    service_id: Option<&'a str>,
     source_payload: &'a KiroPayload,
     decision: &'a CompactionDecision,
     summary_model: &'a str,
@@ -277,6 +282,7 @@ use entrypoints::{attempt_diagnostics, read_bounded_body, record_failed_request}
 pub use entrypoints::{claude_messages, health, openai_chat, readiness, root};
 
 mod chat;
+mod provider_gateway;
 mod request;
 
 use request::{handle_claude, handle_openai};
@@ -318,6 +324,7 @@ use compaction::{
 
 #[derive(Debug, Default)]
 struct RequestLogContext {
+    provider_id: String,
     account_id: String,
     account_name: String,
     endpoint: String,
@@ -360,9 +367,55 @@ struct PreparedUpstream {
 enum ExecuteError {
     Pool(PoolError),
     Upstream(KiroError),
-    Dispatch(DispatchFailure),
+    Dispatch(Box<DispatchFailure>),
     Meter(MeterError),
     ContextLimit(ContextLimitError),
+    ModelNotAllowed {
+        provider_id: String,
+        model: String,
+    },
+    CrossProviderRoute {
+        source_provider: String,
+        target_provider: String,
+        model: String,
+    },
+}
+
+pub(crate) fn model_is_allowed(allowed_models: &[String], provider_id: &str, model: &str) -> bool {
+    if allowed_models.is_empty() {
+        return true;
+    }
+    let qualified = format!("{provider_id}/{model}");
+    allowed_models.iter().any(|pattern| {
+        kproxy_translate::model::model_glob_matches(pattern, model)
+            || kproxy_translate::model::model_glob_matches(pattern, &qualified)
+    })
+}
+
+fn filter_kiro_models_for_key(
+    mut models: Vec<kproxy_kiro::ModelInfo>,
+    authenticated_key: Option<&AuthenticatedApiKey>,
+) -> Vec<kproxy_kiro::ModelInfo> {
+    if let Some(key) = authenticated_key {
+        models.retain(|model| model_is_allowed(&key.allowed_models, "kiro", &model.model_id));
+    }
+    models
+}
+
+fn resolve_kiro_authorization_model(
+    requested: &str,
+    default_model: &str,
+    available: &[String],
+) -> String {
+    resolve_dynamic_model(requested, available)
+        .or_else(|| {
+            if default_model.trim().is_empty() {
+                None
+            } else {
+                resolve_dynamic_model(default_model, available)
+            }
+        })
+        .unwrap_or_else(|| requested.to_owned())
 }
 
 pub(super) struct ContextLimitError {
@@ -393,10 +446,16 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
     let path = request.uri().path().to_string();
     let trace_id = request_trace_id(&request);
     let started = Instant::now();
+    let default_provider = state
+        .config
+        .current()
+        .default_provider_for_service(&service.service)
+        .to_owned();
     let _connection_guard = match state.connections.try_acquire() {
         Some(guard) => guard,
         None => {
-            let error = ApiError::overloaded(ErrorFormat::Claude);
+            let error =
+                ApiError::overloaded(ErrorFormat::Claude).with_provider_id(&default_provider);
             record_failed_request(&state, &trace_id, &path, "", started, &error);
             return error.with_request_id(&trace_id).into_response();
         }
@@ -404,22 +463,60 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
     let _admission_guard = match state.admission.try_acquire() {
         Some(guard) => guard,
         None => {
-            let error = ApiError::overloaded(ErrorFormat::Claude);
+            let error =
+                ApiError::overloaded(ErrorFormat::Claude).with_provider_id(&default_provider);
             record_failed_request(&state, &trace_id, &path, "", started, &error);
             return error.with_request_id(&trace_id).into_response();
         }
     };
     let result = async {
         let (headers, body, _body_reservations) =
-            read_bounded_body(&state, request, ErrorFormat::Claude).await?;
+            read_bounded_body(&state, request, ErrorFormat::Claude)
+                .await
+                .map_err(|error| error.with_provider_id_if_empty(&default_provider))?;
+        let provider_hint = provider_gateway::request_provider_hint(
+            &state.config.current(),
+            &service.service,
+            &body,
+        );
         let authenticated_key = authenticate(
             &state,
             &service.allowed_api_key_ids,
             &headers,
             ErrorFormat::Claude,
+        )
+        .map_err(|error| error.with_provider_id_if_empty(&provider_hint))?;
+        enforce_claude_user_agent(&service, &headers, authenticated_key.as_ref())
+            .map_err(|error| error.with_provider_id_if_empty(&provider_hint))?;
+        let provider_route = provider_gateway::select_provider_route(
+            &state.config.current(),
+            &service.service,
+            authenticated_key.as_ref(),
+            &body,
+            ErrorFormat::Claude,
         )?;
-        enforce_claude_user_agent(&service, &headers, authenticated_key.as_ref())?;
-        let key_id = authenticated_key.map(|key| key.id);
+        let key_id = authenticated_key.as_ref().map(|key| key.id.clone());
+        if provider_route.provider_kind != "kiro" {
+            return provider_gateway::execute_provider(
+                service,
+                provider_route,
+                ProviderProtocol::ClaudeMessages,
+                path.clone(),
+                headers,
+                trace_id.clone(),
+                key_id,
+                _connection_guard,
+                _admission_guard,
+                ErrorFormat::Claude,
+                true,
+            )
+            .await;
+        }
+        let lock_kiro_mapping = provider_route.lock_kiro_mapping;
+        let locked_original_model = provider_route.original_model.clone();
+        let locked_upstream_model = provider_route.upstream_model.clone();
+        let locked_mapping_name = provider_route.mapping_rule.clone();
+        let body = provider_route.body;
         tracing::debug!(
             trace_id = %trace_id,
             protocol = "claude_count_tokens",
@@ -450,6 +547,9 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
                     ErrorFormat::Claude,
                 )
             })?;
+        if lock_kiro_mapping {
+            original_request.model.clone_from(&locked_original_model);
+        }
         let conversation_fingerprint = conversation_fingerprint(&original_request.messages);
         let conversation_id = stable_conversation_id(
             &headers,
@@ -545,13 +645,47 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
                 ErrorFormat::Claude,
             ));
         }
-        let route = map_model(
-            &request.model,
-            &config.model_mapping,
-            key_id.as_deref(),
-            None,
-            "",
+        let route = if lock_kiro_mapping {
+            ModelRoute {
+                original: locked_original_model,
+                mapped: locked_upstream_model,
+                rule: locked_mapping_name,
+                rule_index: None,
+            }
+        } else {
+            map_model_for_provider(
+                &request.model,
+                &config.model_mapping,
+                ModelMappingContext {
+                    provider_id: "kiro",
+                    service_id: Some(&service.service.id),
+                    api_key_id: key_id.as_deref(),
+                    remaining_percent: None,
+                },
+                "",
+            )
+        };
+        let (cached_models, _) = state.models.get(config.models.cache_ttl_ms);
+        let authorization_models = if cached_models.is_empty() {
+            fallback_models(&config)
+        } else {
+            cached_models
+        };
+        let available_models = authorization_models
+            .iter()
+            .map(|model| model.model_id.clone())
+            .collect::<Vec<_>>();
+        let authorization_model = resolve_kiro_authorization_model(
+            &route.mapped,
+            &config.features.default_model_id,
+            &available_models,
         );
+        provider_gateway::authorize_model(
+            authenticated_key.as_ref(),
+            "kiro",
+            &authorization_model,
+            ErrorFormat::Claude,
+        )?;
         let mut normal = TranslationOptions::new(route.mapped.clone(), "AI_EDITOR");
         normal.enhance_system_prompt = config.features.enhance_system_prompt && !client_compaction;
         normal.enable_prompt_cache = config.features.enable_prompt_cache;
@@ -608,6 +742,7 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
             trace_id: trace_id.clone(),
             request_id: format!("req_{}", Uuid::new_v4().simple()),
             path: path.clone(),
+            provider_id: "kiro".into(),
             model: route.mapped.clone(),
             original_model: request.model.clone(),
             kiro_model: route.mapped.clone(),
@@ -656,29 +791,121 @@ pub async fn count_tokens(State(service): State<ServiceHttpState>, request: Requ
     }
 }
 
-pub async fn models(State(service): State<ServiceHttpState>, headers: HeaderMap) -> Response {
+pub async fn models(
+    State(service): State<ServiceHttpState>,
+    headers: HeaderMap,
+    RawQuery(raw_query): RawQuery,
+) -> Response {
     let state = Arc::clone(&service.app);
-    let agent = headers
-        .get(header::USER_AGENT)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    // This endpoint is shared. An additive Anthropic header must not
-    // override a positively identified Codex client or change its model IDs.
-    let claude = is_claude_user_agent(agent)
-        || (!is_codex_user_agent(agent) && headers.contains_key("anthropic-version"));
-    let format = if claude {
-        ErrorFormat::Claude
-    } else {
-        ErrorFormat::OpenAi
-    };
+    let protocol = model_list_protocol(&headers);
+    let format = protocol.error_format();
     let result = async {
-        let authenticated_key =
-            authenticate(&state, &service.allowed_api_key_ids, &headers, format)?;
-        enforce_client_user_agent(&service, &headers, format, authenticated_key.as_ref())?;
+        let authenticated = authenticate(&state, &service.allowed_api_key_ids, &headers, format)?;
+        // Model discovery shares one URL across protocols, so User-Agent is
+        // content negotiation here rather than an admission requirement.
+        let query = match protocol {
+            ModelListProtocol::OpenAi => None,
+            ModelListProtocol::Anthropic => Some(parse_model_list_query(
+                raw_query.as_deref(),
+                ANTHROPIC_MODEL_LIST_DEFAULT_LIMIT,
+                format,
+            )?),
+            ModelListProtocol::Hybrid => Some(parse_model_list_query(
+                raw_query.as_deref(),
+                usize::MAX,
+                format,
+            )?),
+        };
         let account_ids = service.account_ids().await;
         let config = state.config.current();
+        let effective_providers = config.effective_providers();
+        let service_allowed = config.allowed_providers_for_service(&service.service);
+        let key_allowed = authenticated
+            .as_ref()
+            .map(|key| {
+                if key.allowed_providers.is_empty() {
+                    vec!["kiro"]
+                } else {
+                    key.allowed_providers.iter().map(String::as_str).collect()
+                }
+            })
+            .unwrap_or_else(|| service_allowed.clone());
+        let allowed = effective_providers
+            .iter()
+            .filter(|provider| {
+                provider.enabled
+                    && service_allowed.contains(&provider.id.as_str())
+                    && key_allowed.contains(&provider.id.as_str())
+            })
+            .collect::<Vec<_>>();
+        let legacy_kiro_only =
+            allowed.len() == 1 && allowed[0].id == "kiro" && allowed[0].kind == "kiro";
+        if !legacy_kiro_only {
+            if allowed.is_empty() {
+                return Err(ApiError::new(
+                    StatusCode::FORBIDDEN,
+                    "no provider is allowed for this service and API key",
+                    format,
+                ));
+            }
+            if allowed.iter().any(|provider| provider.kind == "kiro")
+                && config.models.dynamic_discovery
+            {
+                let (_, fresh) = state.models.get(config.models.cache_ttl_ms);
+                if !fresh && state.models.begin_refresh() {
+                    let refresh_state = Arc::clone(&state);
+                    tokio::spawn(async move {
+                        if let Err(error) =
+                            crate::tasks::refresh_models_for(&refresh_state, Some("kiro")).await
+                        {
+                            tracing::warn!(%error, "on-demand Kiro model discovery failed");
+                        }
+                    });
+                }
+            }
+            let provider_ids = allowed
+                .iter()
+                .map(|provider| ProviderId::parse(provider.id.clone()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| {
+                    ApiError::new(StatusCode::INTERNAL_SERVER_ERROR, error.to_string(), format)
+                })?;
+            let (mut models, errors) = state.providers.models(&provider_ids, false).await;
+            if let Some(key) = authenticated
+                .as_ref()
+                .filter(|key| !key.allowed_models.is_empty())
+            {
+                models.retain(|model| {
+                    let qualified = format!("{}/{}", model.provider_id, model.id);
+                    key.allowed_models.iter().any(|pattern| {
+                        kproxy_translate::model::model_glob_matches(pattern, &model.id)
+                            || kproxy_translate::model::model_glob_matches(pattern, &qualified)
+                    })
+                });
+            }
+            if models.is_empty() && !errors.is_empty() {
+                return Err(ApiError::new(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!(
+                        "model discovery failed: {}",
+                        errors
+                            .iter()
+                            .map(|(provider, error)| format!("{provider}: {error}"))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ),
+                    format,
+                ));
+            }
+            for (provider, error) in errors {
+                tracing::warn!(%provider, %error, "provider model discovery failed");
+            }
+            return provider_model_list(models, allowed.len() > 1, protocol, query.as_ref());
+        }
         if !config.models.dynamic_discovery {
-            return Ok::<_, ApiError>(model_list(fallback_models(&config), claude));
+            let models =
+                filter_kiro_models_for_key(fallback_models(&config), authenticated.as_ref());
+            return model_list(models, protocol, query.as_ref());
         }
         let (cached, fresh) = state.models.get(config.models.cache_ttl_ms);
         let (has_enabled_accounts, scoped_catalog_ready) =
@@ -701,7 +928,8 @@ pub async fn models(State(service): State<ServiceHttpState>, headers: HeaderMap)
             cached
         };
         let models = service_models(&state, &account_ids, models).await;
-        Ok::<_, ApiError>(model_list(models, claude))
+        let models = filter_kiro_models_for_key(models, authenticated.as_ref());
+        model_list(models, protocol, query.as_ref())
     }
     .await;
     result.unwrap_or_else(IntoResponse::into_response)
@@ -783,35 +1011,462 @@ async fn service_models(
     models.retain(|model| supported.contains(&model.model_id));
     models
 }
+const ANTHROPIC_MODEL_LIST_DEFAULT_LIMIT: usize = 20;
+const ANTHROPIC_MODEL_LIST_MAX_LIMIT: usize = 1_000;
+const UNKNOWN_MODEL_CREATED_AT: &str = "1970-01-01T00:00:00Z";
 
-fn model_list(models: Vec<kproxy_kiro::ModelInfo>, claude: bool) -> Response {
-    let created = now_secs();
-    let data = models.into_iter().map(|model| {
-        let mut entry = json!({
-            "id": if claude { kproxy_translate::model::claude_discovery_model_id(&model.model_id) }
-                else { model.model_id.clone() },
-            "object":"model", "created":created, "owned_by":"kiro"
-        });
-        if claude {
-            entry["type"] = json!("model");
-            if !model.model_name.is_empty() { entry["display_name"] = json!(model.model_name); }
-            if !model.description.is_empty() { entry["description"] = json!(model.description); }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ModelListProtocol {
+    OpenAi,
+    Anthropic,
+    Hybrid,
+}
+
+impl ModelListProtocol {
+    fn error_format(self) -> ErrorFormat {
+        match self {
+            Self::Anthropic => ErrorFormat::Claude,
+            Self::OpenAi | Self::Hybrid => ErrorFormat::OpenAi,
         }
-        entry
-    }).collect::<Vec<_>>();
-    let mut result = json!({"object":"list", "data":data});
-    if claude {
-        result["has_more"] = json!(false);
-        result["first_id"] = data
-            .first()
-            .map(|entry| entry["id"].clone())
-            .unwrap_or(Value::Null);
-        result["last_id"] = data
-            .last()
-            .map(|entry| entry["id"].clone())
-            .unwrap_or(Value::Null);
     }
-    Json(result).into_response()
+}
+
+fn model_list_protocol(headers: &HeaderMap) -> ModelListProtocol {
+    let agent = headers
+        .get(header::USER_AGENT)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    // This endpoint is shared. A positively identified client takes priority;
+    // otherwise Anthropic's version header is an explicit protocol signal.
+    if is_claude_user_agent(agent) {
+        ModelListProtocol::Anthropic
+    } else if is_codex_user_agent(agent) {
+        ModelListProtocol::OpenAi
+    } else if headers.contains_key("anthropic-version") {
+        ModelListProtocol::Anthropic
+    } else {
+        ModelListProtocol::Hybrid
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AnthropicModelListQuery {
+    after_id: Option<String>,
+    before_id: Option<String>,
+    limit: usize,
+}
+
+impl Default for AnthropicModelListQuery {
+    fn default() -> Self {
+        Self {
+            after_id: None,
+            before_id: None,
+            limit: ANTHROPIC_MODEL_LIST_DEFAULT_LIMIT,
+        }
+    }
+}
+
+#[derive(serde::Serialize)]
+struct OpenAiModelListResponse {
+    object: &'static str,
+    data: Vec<OpenAiModelResponse>,
+}
+
+#[derive(serde::Serialize)]
+struct OpenAiModelResponse {
+    id: String,
+    object: &'static str,
+    created: i64,
+    owned_by: String,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct AnthropicModelResponse {
+    r#type: &'static str,
+    id: String,
+    capabilities: Value,
+    created_at: &'static str,
+    display_name: String,
+    max_input_tokens: Option<u64>,
+    max_tokens: Option<u64>,
+}
+
+#[derive(serde::Serialize)]
+struct AnthropicModelListResponse {
+    data: Vec<AnthropicModelResponse>,
+    first_id: Option<String>,
+    has_more: bool,
+    last_id: Option<String>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct HybridModelResponse {
+    id: String,
+    object: &'static str,
+    created: i64,
+    owned_by: String,
+    r#type: &'static str,
+    capabilities: Value,
+    created_at: &'static str,
+    display_name: String,
+    max_input_tokens: Option<u64>,
+    max_tokens: Option<u64>,
+}
+
+#[derive(serde::Serialize)]
+struct HybridModelListResponse {
+    object: &'static str,
+    data: Vec<HybridModelResponse>,
+    first_id: Option<String>,
+    has_more: bool,
+    last_id: Option<String>,
+}
+
+fn parse_model_list_query(
+    raw_query: Option<&str>,
+    default_limit: usize,
+    format: ErrorFormat,
+) -> Result<AnthropicModelListQuery, ApiError> {
+    let mut query = AnthropicModelListQuery {
+        limit: default_limit,
+        ..AnthropicModelListQuery::default()
+    };
+    for (name, value) in url::form_urlencoded::parse(raw_query.unwrap_or_default().as_bytes()) {
+        match name.as_ref() {
+            "after_id" => {
+                if query.after_id.is_some() || value.is_empty() {
+                    return Err(invalid_model_list_query(
+                        "after_id must be a non-empty model ID and may appear only once",
+                        format,
+                    ));
+                }
+                query.after_id = Some(value.into_owned());
+            }
+            "before_id" => {
+                if query.before_id.is_some() || value.is_empty() {
+                    return Err(invalid_model_list_query(
+                        "before_id must be a non-empty model ID and may appear only once",
+                        format,
+                    ));
+                }
+                query.before_id = Some(value.into_owned());
+            }
+            "limit" => {
+                let limit = value.parse::<usize>().map_err(|_| {
+                    invalid_model_list_query("limit must be an integer from 1 to 1000", format)
+                })?;
+                if !(1..=ANTHROPIC_MODEL_LIST_MAX_LIMIT).contains(&limit) {
+                    return Err(invalid_model_list_query(
+                        "limit must be an integer from 1 to 1000",
+                        format,
+                    ));
+                }
+                query.limit = limit;
+            }
+            _ => {}
+        }
+    }
+    if query.after_id.is_some() && query.before_id.is_some() {
+        return Err(invalid_model_list_query(
+            "after_id and before_id cannot be used together",
+            format,
+        ));
+    }
+    Ok(query)
+}
+
+fn invalid_model_list_query(message: &str, format: ErrorFormat) -> ApiError {
+    ApiError::new(StatusCode::BAD_REQUEST, message, format)
+}
+
+fn model_list(
+    models: Vec<kproxy_kiro::ModelInfo>,
+    protocol: ModelListProtocol,
+    query: Option<&AnthropicModelListQuery>,
+) -> Result<Response, ApiError> {
+    match protocol {
+        ModelListProtocol::OpenAi => Ok(openai_model_list(models)),
+        ModelListProtocol::Anthropic => {
+            anthropic_model_list(models, query.cloned().unwrap_or_default())
+        }
+        ModelListProtocol::Hybrid => hybrid_model_list(
+            models,
+            query.cloned().unwrap_or(AnthropicModelListQuery {
+                limit: usize::MAX,
+                ..AnthropicModelListQuery::default()
+            }),
+        ),
+    }
+}
+
+fn provider_model_list(
+    models: Vec<ProviderModel>,
+    qualify: bool,
+    protocol: ModelListProtocol,
+    query: Option<&AnthropicModelListQuery>,
+) -> Result<Response, ApiError> {
+    let models = models
+        .into_iter()
+        .filter(|model| match protocol {
+            ModelListProtocol::Anthropic => {
+                model.protocols.contains(&ProviderProtocol::ClaudeMessages)
+            }
+            ModelListProtocol::OpenAi => model.protocols.iter().any(|protocol| {
+                matches!(
+                    protocol,
+                    ProviderProtocol::OpenAiChat | ProviderProtocol::OpenAiResponses
+                )
+            }),
+            ModelListProtocol::Hybrid => true,
+        })
+        .map(|model| {
+            let local_id =
+                if model.provider_id.as_str() == "kiro" && protocol != ModelListProtocol::OpenAi {
+                    kproxy_translate::model::claude_discovery_model_id(&model.id)
+                } else {
+                    model.id.clone()
+                };
+            let id = if qualify {
+                format!("{}/{}", model.provider_id, local_id)
+            } else {
+                local_id
+            };
+            (model, id)
+        })
+        .collect::<Vec<_>>();
+    match protocol {
+        ModelListProtocol::OpenAi => {
+            let created = now_secs();
+            Ok(Json(OpenAiModelListResponse {
+                object: "list",
+                data: models
+                    .into_iter()
+                    .map(|(model, id)| OpenAiModelResponse {
+                        id,
+                        object: "model",
+                        created,
+                        owned_by: model.provider_id.to_string(),
+                    })
+                    .collect(),
+            })
+            .into_response())
+        }
+        ModelListProtocol::Anthropic => {
+            let data = models
+                .into_iter()
+                .map(|(model, id)| AnthropicModelResponse {
+                    r#type: "model",
+                    display_name: if model.display_name.trim().is_empty() {
+                        id.clone()
+                    } else {
+                        model.display_name
+                    },
+                    id,
+                    capabilities: model.capabilities,
+                    created_at: UNKNOWN_MODEL_CREATED_AT,
+                    max_input_tokens: model.max_input_tokens,
+                    max_tokens: model.max_output_tokens,
+                })
+                .collect::<Vec<_>>();
+            let query = query.cloned().unwrap_or_default();
+            let (start, end, has_more) =
+                model_page_bounds(&data, &query, ErrorFormat::Claude, |model| {
+                    model.id.as_str()
+                })?;
+            let page = data[start..end].to_vec();
+            Ok(Json(AnthropicModelListResponse {
+                first_id: page.first().map(|model| model.id.clone()),
+                last_id: page.last().map(|model| model.id.clone()),
+                data: page,
+                has_more,
+            })
+            .into_response())
+        }
+        ModelListProtocol::Hybrid => {
+            let created = now_secs();
+            let data = models
+                .into_iter()
+                .map(|(model, id)| HybridModelResponse {
+                    id: id.clone(),
+                    object: "model",
+                    created,
+                    owned_by: model.provider_id.to_string(),
+                    r#type: "model",
+                    capabilities: model.capabilities,
+                    created_at: UNKNOWN_MODEL_CREATED_AT,
+                    display_name: if model.display_name.trim().is_empty() {
+                        id
+                    } else {
+                        model.display_name
+                    },
+                    max_input_tokens: model.max_input_tokens,
+                    max_tokens: model.max_output_tokens,
+                })
+                .collect::<Vec<_>>();
+            let query = query.cloned().unwrap_or(AnthropicModelListQuery {
+                limit: usize::MAX,
+                ..AnthropicModelListQuery::default()
+            });
+            let (start, end, has_more) =
+                model_page_bounds(&data, &query, ErrorFormat::OpenAi, |model| {
+                    model.id.as_str()
+                })?;
+            let page = data[start..end].to_vec();
+            Ok(Json(HybridModelListResponse {
+                object: "list",
+                first_id: page.first().map(|model| model.id.clone()),
+                last_id: page.last().map(|model| model.id.clone()),
+                data: page,
+                has_more,
+            })
+            .into_response())
+        }
+    }
+}
+
+fn openai_model_list(models: Vec<kproxy_kiro::ModelInfo>) -> Response {
+    let created = now_secs();
+    let data = models
+        .into_iter()
+        .map(|model| OpenAiModelResponse {
+            id: model.model_id,
+            object: "model",
+            created,
+            owned_by: "kiro".into(),
+        })
+        .collect();
+    Json(OpenAiModelListResponse {
+        object: "list",
+        data,
+    })
+    .into_response()
+}
+
+fn anthropic_model_list(
+    models: Vec<kproxy_kiro::ModelInfo>,
+    query: AnthropicModelListQuery,
+) -> Result<Response, ApiError> {
+    let data = models
+        .into_iter()
+        .map(|model| {
+            let id = kproxy_translate::model::claude_discovery_model_id(&model.model_id);
+            let (max_input_tokens, max_tokens) = model
+                .token_limits
+                .map(|limits| (limits.max_input_tokens, limits.max_output_tokens))
+                .unwrap_or_default();
+            AnthropicModelResponse {
+                r#type: "model",
+                display_name: if model.model_name.trim().is_empty() {
+                    id.clone()
+                } else {
+                    model.model_name
+                },
+                id,
+                capabilities: Value::Null,
+                created_at: UNKNOWN_MODEL_CREATED_AT,
+                max_input_tokens: max_input_tokens.map(u64::from),
+                max_tokens: max_tokens.map(u64::from),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let (start, end, has_more) = model_page_bounds(&data, &query, ErrorFormat::Claude, |model| {
+        model.id.as_str()
+    })?;
+    let page = data[start..end].to_vec();
+    let first_id = page.first().map(|model| model.id.clone());
+    let last_id = page.last().map(|model| model.id.clone());
+    Ok(Json(AnthropicModelListResponse {
+        data: page,
+        first_id,
+        has_more,
+        last_id,
+    })
+    .into_response())
+}
+
+fn hybrid_model_list(
+    models: Vec<kproxy_kiro::ModelInfo>,
+    query: AnthropicModelListQuery,
+) -> Result<Response, ApiError> {
+    let created = now_secs();
+    let data = models
+        .into_iter()
+        .map(|model| {
+            let id = kproxy_translate::model::claude_discovery_model_id(&model.model_id);
+            let (max_input_tokens, max_tokens) = model
+                .token_limits
+                .map(|limits| (limits.max_input_tokens, limits.max_output_tokens))
+                .unwrap_or_default();
+            HybridModelResponse {
+                object: "model",
+                created,
+                owned_by: "kiro".into(),
+                r#type: "model",
+                capabilities: Value::Null,
+                created_at: UNKNOWN_MODEL_CREATED_AT,
+                display_name: if model.model_name.trim().is_empty() {
+                    id.clone()
+                } else {
+                    model.model_name
+                },
+                id,
+                max_input_tokens: max_input_tokens.map(u64::from),
+                max_tokens: max_tokens.map(u64::from),
+            }
+        })
+        .collect::<Vec<_>>();
+    let (start, end, has_more) = model_page_bounds(&data, &query, ErrorFormat::OpenAi, |model| {
+        model.id.as_str()
+    })?;
+    let page = data[start..end].to_vec();
+    let first_id = page.first().map(|model| model.id.clone());
+    let last_id = page.last().map(|model| model.id.clone());
+    Ok(Json(HybridModelListResponse {
+        object: "list",
+        data: page,
+        first_id,
+        has_more,
+        last_id,
+    })
+    .into_response())
+}
+
+fn model_page_bounds<T>(
+    data: &[T],
+    query: &AnthropicModelListQuery,
+    format: ErrorFormat,
+    id: impl Fn(&T) -> &str,
+) -> Result<(usize, usize, bool), ApiError> {
+    if let Some(after_id) = query.after_id.as_deref() {
+        let start = model_cursor_index(data, after_id, "after_id", format, &id)? + 1;
+        let end = start.saturating_add(query.limit).min(data.len());
+        Ok((start, end, end < data.len()))
+    } else if let Some(before_id) = query.before_id.as_deref() {
+        let end = model_cursor_index(data, before_id, "before_id", format, &id)?;
+        let start = end.saturating_sub(query.limit);
+        Ok((start, end, start > 0))
+    } else {
+        let end = query.limit.min(data.len());
+        Ok((0, end, end < data.len()))
+    }
+}
+
+fn model_cursor_index<T>(
+    data: &[T],
+    cursor: &str,
+    parameter: &str,
+    format: ErrorFormat,
+    id: impl Fn(&T) -> &str,
+) -> Result<usize, ApiError> {
+    data.iter()
+        .position(|model| id(model) == cursor)
+        .ok_or_else(|| {
+            invalid_model_list_query(
+                &format!("invalid pagination cursor for '{parameter}'"),
+                format,
+            )
+        })
 }
 
 pub async fn event_logging(
@@ -851,26 +1506,28 @@ pub async fn not_found(OriginalUri(uri): OriginalUri) -> Response {
 }
 
 pub(crate) fn fallback_models(config: &kproxy_core::config::Config) -> Vec<kproxy_kiro::ModelInfo> {
-    let mut models = kproxy_kiro::static_models()
-        .into_iter()
-        .map(|model| (model.model_id.clone(), model))
-        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut models = kproxy_kiro::static_models();
+    let mut model_ids = models
+        .iter()
+        .map(|model| model.model_id.clone())
+        .collect::<HashSet<_>>();
     let configured_ids = config
         .model_mapping
         .iter()
         .flat_map(|rule| rule.target_models.iter().cloned())
         .collect::<Vec<_>>();
     if !config.features.default_model_id.trim().is_empty() {
-        models
-            .entry(config.features.default_model_id.clone())
-            .or_insert_with(|| configured_model_info(config.features.default_model_id.clone()));
+        let model_id = config.features.default_model_id.clone();
+        if model_ids.insert(model_id.clone()) {
+            models.push(configured_model_info(model_id));
+        }
     }
     for model_id in configured_ids {
-        models
-            .entry(model_id.clone())
-            .or_insert_with(|| configured_model_info(model_id));
+        if model_ids.insert(model_id.clone()) {
+            models.push(configured_model_info(model_id));
+        }
     }
-    models.into_values().collect()
+    models
 }
 
 fn configured_model_info(model_id: String) -> kproxy_kiro::ModelInfo {
@@ -1407,6 +2064,24 @@ fn upstream_error(error: ExecuteError, format: ErrorFormat) -> ApiError {
             error.log_context.model_path = vec![limit.model];
             error
         }
+        ExecuteError::ModelNotAllowed { provider_id, model } => ApiError::new(
+            StatusCode::FORBIDDEN,
+            format!("model {provider_id}/{model} is not allowed for this API key"),
+            format,
+        )
+        .with_provider_id(&provider_id),
+        ExecuteError::CrossProviderRoute {
+            source_provider,
+            target_provider,
+            model,
+        } => ApiError::new(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "internal {source_provider} request cannot route model {model} to provider {target_provider}"
+            ),
+            format,
+        )
+        .with_provider_id(&source_provider),
         ExecuteError::Upstream(error) => {
             upstream_api_error(error, RequestLogContext::default(), format)
         }
@@ -1586,6 +2261,18 @@ impl ApiError {
 
     fn with_request_id(mut self, request_id: &str) -> Self {
         self.request_id = Some(request_id.into());
+        self
+    }
+
+    fn with_provider_id(mut self, provider_id: &str) -> Self {
+        self.log_context.provider_id = provider_id.to_owned();
+        self
+    }
+
+    fn with_provider_id_if_empty(mut self, provider_id: &str) -> Self {
+        if self.log_context.provider_id.is_empty() {
+            self.log_context.provider_id = provider_id.to_owned();
+        }
         self
     }
 

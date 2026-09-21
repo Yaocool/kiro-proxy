@@ -1,5 +1,5 @@
 use kproxy_core::account::{Account, AuthMethod, Credentials, Usage};
-use kproxy_core::config::Config;
+use kproxy_core::config::{Config, ProviderConfig};
 use kproxy_core::paths::Paths;
 use kproxy_store::accounts::AccountStore;
 use kproxy_store::config_loader::ConfigHandle;
@@ -105,6 +105,11 @@ async fn state_with(accounts: Vec<Account>) -> (TempDir, Arc<AppState>) {
         ConfigHandle::new(Config::default()),
         store,
     ));
+    state
+        .providers
+        .reconcile(&state.config.current(), &state.paths.data_dir)
+        .await
+        .expect("reconcile providers");
     (directory, state)
 }
 
@@ -143,6 +148,10 @@ async fn status_reports_counts_and_empty_hint() {
     ])
     .await;
     state.admission.set_maximum(123);
+    let admission_guard = state
+        .admission
+        .try_acquire()
+        .expect("legacy admission slot");
     let status: StatusResult = serde_json::from_value(expect_ok(
         dispatch(
             &state,
@@ -161,11 +170,13 @@ async fn status_reports_counts_and_empty_hint() {
     assert_eq!(status.proxy_service_total, 0);
     assert_eq!(status.proxy_service_running, 0);
     assert_eq!(status.max_concurrent_requests, 123);
+    assert_eq!(status.active_requests, 0);
     assert!(!status.ready);
     assert!(status
         .readiness_reasons
         .iter()
         .any(|reason| reason.contains("proxy service")));
+    drop(admission_guard);
 
     let truncated: StatusResult = serde_json::from_value(expect_ok(
         dispatch(
@@ -195,7 +206,78 @@ async fn status_reports_counts_and_empty_hint() {
     ))
     .expect("empty status");
     assert!(empty_status.hint.is_some());
+    assert_eq!(
+        empty_status.hint.as_deref(),
+        Some("无可用账号，请先添加：kproxy account import")
+    );
     assert!(!empty_status.ready);
+}
+
+#[tokio::test]
+async fn an_unused_broken_provider_does_not_degrade_kiro_readiness() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let paths = Paths::from_env_values(
+        Some(directory.path().to_str().expect("utf8")),
+        None,
+        None,
+        None,
+    );
+    kproxy_store::bootstrap::ensure_layout(&paths)
+        .await
+        .expect("bootstrap");
+    let provider_dir = paths.data_dir.join("providers/copilot");
+    tokio::fs::create_dir_all(&provider_dir)
+        .await
+        .expect("provider directory");
+    tokio::fs::write(provider_dir.join("accounts.json"), "{broken-json")
+        .await
+        .expect("broken provider state");
+
+    let mut store = AccountStore::load(&paths.accounts_file)
+        .await
+        .expect("load accounts");
+    store
+        .insert(sample_account("acc_00000001", "kiro@example.com", true))
+        .expect("insert Kiro account");
+    let config = Config {
+        provider: vec![
+            ProviderConfig::default(),
+            ProviderConfig {
+                id: "copilot".into(),
+                kind: "copilot".into(),
+                ..ProviderConfig::default()
+            },
+        ],
+        ..Config::default()
+    };
+    let state = Arc::new(AppState::new(paths, ConfigHandle::new(config), store));
+    state
+        .providers
+        .reconcile(&state.config.current(), &state.paths.data_dir)
+        .await
+        .expect("provider reconciliation remains available");
+
+    let status: StatusResult = serde_json::from_value(expect_ok(
+        dispatch(
+            &state,
+            Request::new(1, method::STATUS, serde_json::json!({})),
+        )
+        .await,
+    ))
+    .expect("status");
+
+    assert!(status
+        .providers
+        .iter()
+        .any(|provider| provider.id == "kiro" && provider.status == "ready"));
+    assert!(status
+        .providers
+        .iter()
+        .any(|provider| provider.id == "copilot" && provider.status == "unavailable"));
+    assert!(!status
+        .readiness_reasons
+        .iter()
+        .any(|reason| reason.contains("provider copilot")));
 }
 
 #[tokio::test]
@@ -293,6 +375,7 @@ async fn stats_default_is_compact_and_detail_restores_recent_requests() {
         trace_id: "trace_stats".into(),
         request_id: "req_stats".into(),
         path: "/v1/messages".into(),
+        provider_id: "kiro".into(),
         model: "claude-sonnet-4.6".into(),
         original_model: "claude-4.6-sonnet".into(),
         kiro_model: "claude-sonnet-4.6".into(),
@@ -972,6 +1055,7 @@ fn service_key_cleanup_preserves_keys_shared_with_other_services() {
         enabled: true,
         skip_user_agent_check: false,
         credits_limit: None,
+        ..ApiKeyConfig::default()
     };
     let shared = ApiKeyConfig {
         id: Some("ak_shared".into()),
@@ -981,6 +1065,7 @@ fn service_key_cleanup_preserves_keys_shared_with_other_services() {
         enabled: true,
         skip_user_agent_check: false,
         credits_limit: None,
+        ..ApiKeyConfig::default()
     };
     let removed = ProxyServiceConfig {
         id: "svc_removed".into(),
@@ -994,6 +1079,7 @@ fn service_key_cleanup_preserves_keys_shared_with_other_services() {
         account_ids: Vec::new(),
         excluded_account_ids: Vec::new(),
         created_at: 0,
+        ..ProxyServiceConfig::default()
     };
     let remaining = ProxyServiceConfig {
         id: "svc_remaining".into(),
@@ -1007,6 +1093,7 @@ fn service_key_cleanup_preserves_keys_shared_with_other_services() {
         account_ids: Vec::new(),
         excluded_account_ids: Vec::new(),
         created_at: 0,
+        ..ProxyServiceConfig::default()
     };
     let mut config = Config {
         api_key: vec![exclusive, shared],
@@ -1376,6 +1463,7 @@ async fn administrative_lists_use_stable_name_order() {
         enabled: true,
         skip_user_agent_check: false,
         credits_limit: None,
+        ..ApiKeyConfig::default()
     })
     .into();
     config.proxy_service = [
@@ -1394,6 +1482,7 @@ async fn administrative_lists_use_stable_name_order() {
         account_ids: Vec::new(),
         excluded_account_ids: Vec::new(),
         created_at: 0,
+        ..ProxyServiceConfig::default()
     })
     .into();
     state.config.replace(config);
@@ -1655,6 +1744,7 @@ async fn config_reload_rolls_back_when_proxy_listener_cannot_start() {
         enabled: true,
         skip_user_agent_check: false,
         credits_limit: None,
+        ..ApiKeyConfig::default()
     });
     next.proxy_service.push(ProxyServiceConfig {
         id: "svc_reload".into(),
@@ -1668,6 +1758,7 @@ async fn config_reload_rolls_back_when_proxy_listener_cannot_start() {
         account_ids: Vec::new(),
         excluded_account_ids: Vec::new(),
         created_at: 0,
+        ..ProxyServiceConfig::default()
     });
     tokio::fs::write(
         &state.paths.config_file,

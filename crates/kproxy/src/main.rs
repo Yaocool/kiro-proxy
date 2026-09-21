@@ -5,14 +5,14 @@ mod client;
 mod commands;
 mod output;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use kproxy_ipc::protocol::{method, ConfigPathResult, ConfigReloadResult, StatusResult};
 use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
 
 use crate::client::{resolve_socket, AdminClient};
-use crate::output::{format_relative, format_timestamp, print_json};
+use crate::output::{format_relative, format_timestamp, print_json, render_table};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -49,6 +49,14 @@ struct TimeRangeArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// 模型提供源实例管理。
+    #[command(
+        after_help = "示例：\n  kproxy provider list\n  kproxy provider show copilot\n  kproxy provider list --provider-kind copilot"
+    )]
+    Provider {
+        #[command(subcommand)]
+        command: Option<ProviderCommand>,
+    },
     /// 服务总览。
     #[command(
         after_help = "示例：\n  kproxy status\n  kproxy status --since 30m\n  kproxy status --start 2026-08-27T10:00:00+08:00 --end 2026-08-27T12:00:00+08:00\n  kproxy status --watch"
@@ -59,13 +67,20 @@ enum Command {
         watch: bool,
         #[command(flatten)]
         range: TimeRangeArgs,
+        /// 仅显示一个提供源实例；省略时聚合全部。
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// 供容器和 systemd 使用的健康检查。
     #[command(after_help = "示例：\n  kproxy health\n  kproxy --json health")]
     Health,
     /// 检查业务代理是否已具备接收请求的条件。
     #[command(after_help = "示例：\n  kproxy ready\n  kproxy --json ready")]
-    Ready,
+    Ready {
+        /// 只检查引用该提供源的服务及账号。
+        #[arg(long)]
+        provider: Option<String>,
+    },
     /// 显示版本与默认上游端点。
     #[command(after_help = "示例：\n  kproxy version\n  kproxy --json version")]
     Version,
@@ -114,6 +129,9 @@ enum Command {
         after_help = "示例：\n  kproxy pool --explain\n  kproxy pool --model claude-sonnet-4 --watch"
     )]
     Pool {
+        /// 查看指定提供源的账号池；默认 Kiro。
+        #[arg(long, default_value = "kiro")]
+        provider: String,
         /// 按该模型检查账号是否可调度。
         #[arg(long, default_value = "minimax-m2.5")]
         model: String,
@@ -133,8 +151,15 @@ enum Command {
         command: Option<DiagnoseCommand>,
     },
     /// 查询上游可用订阅计划。
-    #[command(after_help = "示例：\n  kproxy subscriptions\n  kproxy subscriptions acc_7f3a2b1c")]
-    Subscriptions { id: Option<String> },
+    #[command(
+        after_help = "示例：\n  kproxy subscriptions\n  kproxy subscriptions --provider all\n  kproxy subscriptions acc_7f3a2b1c --provider kiro"
+    )]
+    Subscriptions {
+        id: Option<String>,
+        /// 查询指定提供源；`all` 汇总并标明不支持订阅查询的来源。
+        #[arg(long, default_value = "kiro")]
+        provider: String,
+    },
     /// 显示或手动运行周期任务。
     #[command(
         after_help = "示例：\n  kproxy tasks list\n  kproxy tasks run status_check\n\n操作说明：kproxy guide tasks"
@@ -155,9 +180,12 @@ enum Command {
         recent: Option<usize>,
         #[command(flatten)]
         range: TimeRangeArgs,
-        /// 分组维度：model/account/apikey/endpoint。
+        /// 分组维度：provider/model/account/apikey/endpoint。
         #[arg(long, requires = "detail")]
         by: Option<String>,
+        /// 仅统计一个提供源实例；`all` 等同于不筛选。
+        #[arg(long)]
+        provider: Option<String>,
     },
     /// 查看请求日志，发现 daemon 日志文件及其路径。
     #[command(
@@ -247,10 +275,66 @@ enum CompletionShell {
 }
 
 #[derive(Debug, Subcommand)]
-enum ModelsCommand {
-    /// 列出账号自动探测到的 Kiro 模型、输入上下文与输出上限。
+enum ProviderCommand {
+    /// 列出所有提供源实例及运行状态。
+    List {
+        #[arg(long)]
+        provider_kind: Option<String>,
+    },
+    /// 显示一个提供源实例。
+    Show { id: String },
+    /// 添加一个提供源实例。
     #[command(
-        after_help = "示例：\n  kproxy models list\n  kproxy models list --mapped\n  kproxy models list --refresh"
+        visible_alias = "create",
+        after_help = "示例：\n  kproxy provider add --id copilot --kind copilot --setting client_id='\"Iv1.example\"'\n  kproxy provider add --id copilot-team --kind copilot --setting github_host='\"github.example.com\"'"
+    )]
+    Add {
+        #[arg(long)]
+        id: String,
+        #[arg(long)]
+        kind: String,
+        /// 驱动设置，格式为 KEY=TOML_VALUE，可重复。
+        #[arg(long = "setting", value_name = "KEY=VALUE")]
+        settings: Vec<String>,
+        #[arg(long)]
+        max_concurrent_per_account: Option<usize>,
+        #[arg(long)]
+        default_model: Option<String>,
+        #[arg(long)]
+        disabled: bool,
+    },
+    /// 修改提供源实例的驱动设置和路由默认值。
+    Edit {
+        id: String,
+        /// 设置或覆盖驱动设置，格式为 KEY=TOML_VALUE，可重复。
+        #[arg(long = "setting", value_name = "KEY=VALUE")]
+        settings: Vec<String>,
+        /// 删除驱动设置，可重复或逗号分隔。
+        #[arg(long = "remove-setting", value_delimiter = ',')]
+        remove_settings: Vec<String>,
+        #[arg(long)]
+        max_concurrent_per_account: Option<usize>,
+        #[arg(long)]
+        default_model: Option<String>,
+        #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
+        enable_model_fallback: Option<bool>,
+        #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
+        allow_cross_provider_fallback: Option<bool>,
+    },
+    /// 启用提供源实例。
+    Enable { id: String },
+    /// 停用提供源实例，但保留配置和账号。
+    Disable { id: String },
+    /// 删除提供源实例的配置；账号文件保留在数据目录中。
+    #[command(name = "delete", visible_alias = "rm")]
+    Delete { id: String },
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelsCommand {
+    /// 列出一个或全部提供源发现的模型、输入上下文与输出上限。
+    #[command(
+        after_help = "示例：\n  kproxy models list\n  kproxy models list --mapped\n  kproxy models list --provider copilot --refresh"
     )]
     List {
         /// 同时显示每个模型经过映射规则后的结果。
@@ -259,10 +343,16 @@ enum ModelsCommand {
         /// 先立即执行一次上游模型发现，再显示结果。
         #[arg(long)]
         refresh: bool,
+        /// 仅显示一个提供源实例；默认聚合全部来源。
+        #[arg(long, default_value = "all")]
+        provider: String,
+        /// 按驱动类型筛选。
+        #[arg(long)]
+        provider_kind: Option<String>,
     },
-    /// 查询一个客户端 model ID 最终会解析成哪个 Kiro 模型。
+    /// 查询客户端 model ID 在指定提供源中的映射与最终模型。
     #[command(
-        after_help = "示例：\n  kproxy models resolve opus5\n  kproxy models resolve claude-4.6-sonnet --refresh\n  kproxy --json models resolve opus5 --api-key production"
+        after_help = "示例：\n  kproxy models resolve opus5\n  kproxy models resolve team-fast --provider copilot --refresh\n  kproxy --json models resolve opus5 --api-key production"
     )]
     Resolve {
         /// 客户端传入的 model ID。
@@ -273,6 +363,9 @@ enum ModelsCommand {
         /// 查询前先刷新账号模型缓存。
         #[arg(long)]
         refresh: bool,
+        /// 指定提供源实例；默认保持 Kiro v1 解析语义。
+        #[arg(long)]
+        provider: Option<String>,
     },
 }
 
@@ -287,6 +380,9 @@ struct RequestLogArgs {
     /// 按账号 ID、邮箱或名称过滤。
     #[arg(long)]
     account: Option<String>,
+    /// 按提供源实例 ID 过滤。
+    #[arg(long)]
+    provider: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -352,8 +448,14 @@ enum LogsCommand {
 #[derive(Debug, Subcommand)]
 enum ModelMapCommand {
     /// 列出全部映射规则。
-    #[command(after_help = "示例：\n  kproxy model-map list\n  kproxy --json model-map list")]
-    List,
+    #[command(
+        after_help = "示例：\n  kproxy model-map list\n  kproxy model-map list --provider copilot\n  kproxy --json model-map list"
+    )]
+    List {
+        /// 仅显示会作用于该提供源的规则；未指定时显示全部。
+        #[arg(long)]
+        provider: Option<String>,
+    },
     /// 添加模型映射规则。
     #[command(
         after_help = "示例：\n  kproxy model-map add --name low-credit --source 'claude-opus-*' --target claude-sonnet-4 --below-credits-percent 10"
@@ -376,6 +478,12 @@ enum ModelMapCommand {
         below_credits_percent: Option<f64>,
         #[arg(long = "api-key", value_delimiter = ',')]
         api_key_ids: Vec<String>,
+        /// 规则作用的提供源，可重复或逗号分隔；省略时保持旧版 Kiro 范围。
+        #[arg(long = "provider", value_delimiter = ',')]
+        providers: Vec<String>,
+        /// 规则作用的代理服务，可重复或逗号分隔。
+        #[arg(long = "service", value_delimiter = ',')]
+        service_ids: Vec<String>,
         #[arg(long)]
         disabled: bool,
     },
@@ -405,6 +513,14 @@ enum ModelMapCommand {
         api_key_ids: Vec<String>,
         #[arg(long)]
         clear_api_keys: bool,
+        #[arg(long = "provider", value_delimiter = ',')]
+        providers: Vec<String>,
+        #[arg(long)]
+        clear_providers: bool,
+        #[arg(long = "service", value_delimiter = ',')]
+        service_ids: Vec<String>,
+        #[arg(long)]
+        clear_services: bool,
         #[arg(long, conflicts_with = "disable")]
         enable: bool,
         #[arg(long, conflicts_with = "enable")]
@@ -423,6 +539,12 @@ enum ModelMapCommand {
         remaining_credits_percent: Option<f64>,
         #[arg(long)]
         api_key: Option<String>,
+        /// 按该提供源测试；默认保持旧版 Kiro 语义。
+        #[arg(long, default_value = "kiro")]
+        provider: String,
+        /// 按该代理服务测试服务范围规则。
+        #[arg(long)]
+        service: Option<String>,
     },
 }
 
@@ -433,9 +555,14 @@ enum TaskCommand {
     List,
     /// 立即运行一个任务。
     #[command(
-        after_help = "示例：\n  kproxy tasks run status_check\n  kproxy tasks run model_cache_refresh\n  kproxy tasks run proxy_service_reconcile"
+        after_help = "示例：\n  kproxy tasks run status_check\n  kproxy tasks run model_cache_refresh --provider copilot\n  kproxy tasks run proxy_service_reconcile"
     )]
-    Run { name: String },
+    Run {
+        name: String,
+        /// 限定模型缓存刷新提供源；其他任务不接受该参数。
+        #[arg(long)]
+        provider: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -609,7 +736,11 @@ async fn main() -> Result<()> {
     let mut client = AdminClient::connect(socket);
 
     match command {
-        Command::Status { watch, range } => {
+        Command::Status {
+            watch,
+            range,
+            provider,
+        } => {
             let (since_secs, start_secs, end_secs) = parse_time_range_args(&range)?;
             loop {
                 let status: StatusResult = client
@@ -618,7 +749,8 @@ async fn main() -> Result<()> {
                         serde_json::json!({
                             "since_secs":since_secs,
                             "start_secs":start_secs,
-                            "end_secs":end_secs
+                            "end_secs":end_secs,
+                            "provider":provider
                         }),
                     )
                     .await?;
@@ -644,8 +776,10 @@ async fn main() -> Result<()> {
                 println!("ok");
             }
         }
-        Command::Ready => {
-            let status: StatusResult = client.call(method::STATUS, serde_json::json!({})).await?;
+        Command::Ready { provider } => {
+            let status: StatusResult = client
+                .call(method::STATUS, serde_json::json!({"provider":provider}))
+                .await?;
             if cli.json {
                 print_json(&serde_json::json!({
                     "ready":status.ready,
@@ -664,6 +798,81 @@ async fn main() -> Result<()> {
         Command::Version => unreachable!("version returned before runtime setup"),
         Command::Restart | Command::Stop | Command::Uninstall { .. } => {
             unreachable!("host lifecycle commands returned before connecting to the daemon")
+        }
+        Command::Provider {
+            command: Some(ProviderCommand::List { provider_kind }),
+        } => {
+            show_providers(&mut client, None, provider_kind.as_deref(), cli.json).await?;
+        }
+        Command::Provider {
+            command: Some(ProviderCommand::Show { id }),
+        } => {
+            show_providers(&mut client, Some(&id), None, cli.json).await?;
+        }
+        Command::Provider {
+            command:
+                Some(ProviderCommand::Add {
+                    id,
+                    kind,
+                    settings,
+                    max_concurrent_per_account,
+                    default_model,
+                    disabled,
+                }),
+        } => {
+            crate::commands::runtime::add_provider(
+                &mut client,
+                &id,
+                &kind,
+                &settings,
+                max_concurrent_per_account,
+                default_model.as_deref(),
+                disabled,
+                cli.json,
+            )
+            .await?;
+        }
+        Command::Provider {
+            command:
+                Some(ProviderCommand::Edit {
+                    id,
+                    settings,
+                    remove_settings,
+                    max_concurrent_per_account,
+                    default_model,
+                    enable_model_fallback,
+                    allow_cross_provider_fallback,
+                }),
+        } => {
+            crate::commands::runtime::edit_provider(
+                &mut client,
+                &id,
+                &settings,
+                &remove_settings,
+                max_concurrent_per_account,
+                default_model.as_deref(),
+                enable_model_fallback,
+                allow_cross_provider_fallback,
+                cli.json,
+            )
+            .await?;
+        }
+        Command::Provider {
+            command: Some(ProviderCommand::Enable { id }),
+        } => {
+            crate::commands::runtime::set_provider_enabled(&mut client, &id, true, cli.json)
+                .await?;
+        }
+        Command::Provider {
+            command: Some(ProviderCommand::Disable { id }),
+        } => {
+            crate::commands::runtime::set_provider_enabled(&mut client, &id, false, cli.json)
+                .await?;
+        }
+        Command::Provider {
+            command: Some(ProviderCommand::Delete { id }),
+        } => {
+            crate::commands::runtime::delete_provider(&mut client, &id, cli.json).await?;
         }
         Command::Config {
             command: Some(ConfigCommand::List),
@@ -767,6 +976,7 @@ async fn main() -> Result<()> {
             crate::commands::account::run(&mut client, command, cli.json).await?;
         }
         Command::Pool {
+            provider,
             model,
             watch,
             explain,
@@ -777,7 +987,14 @@ async fn main() -> Result<()> {
                     print!("\x1b[2J\x1b[H");
                     std::io::stdout().flush()?;
                 }
-                crate::commands::runtime::show_pool(&mut client, &model, explain, cli.json).await?;
+                crate::commands::runtime::show_pool(
+                    &mut client,
+                    &provider,
+                    &model,
+                    explain,
+                    cli.json,
+                )
+                .await?;
                 if !watch {
                     break;
                 }
@@ -842,11 +1059,11 @@ async fn main() -> Result<()> {
             }
             None => unreachable!("empty diagnose group returned before runtime setup"),
         },
-        Command::Subscriptions { id } => {
+        Command::Subscriptions { id, provider } => {
             crate::commands::runtime::simple_rpc(
                 &mut client,
                 method::SUBSCRIPTIONS,
-                serde_json::json!({"id":id}),
+                serde_json::json!({"id":id,"provider":provider}),
                 cli.json,
             )
             .await?;
@@ -854,9 +1071,10 @@ async fn main() -> Result<()> {
         Command::Tasks { command } => {
             let (method_name, params) = match command {
                 Some(TaskCommand::List) => (method::TASKS, serde_json::json!({})),
-                Some(TaskCommand::Run { name }) => {
-                    (method::TASK_RUN, serde_json::json!({"name":name}))
-                }
+                Some(TaskCommand::Run { name, provider }) => (
+                    method::TASK_RUN,
+                    serde_json::json!({"name":name,"provider":provider}),
+                ),
                 None => unreachable!("empty tasks group returned before runtime setup"),
             };
             crate::commands::runtime::simple_rpc(&mut client, method_name, params, cli.json)
@@ -867,6 +1085,7 @@ async fn main() -> Result<()> {
             recent,
             range,
             by,
+            provider,
         } => {
             let range = parse_time_range_args(&range)?;
             crate::commands::runtime::show_stats(
@@ -875,6 +1094,7 @@ async fn main() -> Result<()> {
                 recent,
                 range,
                 by.as_deref(),
+                provider.as_deref(),
                 cli.json,
             )
             .await?;
@@ -887,6 +1107,7 @@ async fn main() -> Result<()> {
                     false,
                     query.level.as_deref(),
                     query.account.as_deref(),
+                    query.provider.as_deref(),
                     cli.json,
                 )
                 .await?;
@@ -898,6 +1119,7 @@ async fn main() -> Result<()> {
                     true,
                     query.level.as_deref(),
                     query.account.as_deref(),
+                    query.provider.as_deref(),
                     cli.json,
                 )
                 .await?;
@@ -946,29 +1168,57 @@ async fn main() -> Result<()> {
             crate::commands::runtime::run_alert(&mut client, command, cli.json).await?;
         }
         Command::Models { command } => match command {
-            Some(ModelsCommand::List { mapped, refresh }) => {
-                show_models(&mut client, mapped, refresh, cli.json).await?;
+            Some(ModelsCommand::List {
+                mapped,
+                refresh,
+                provider,
+                provider_kind,
+            }) => {
+                if provider == "kiro" && provider_kind.is_none() {
+                    if refresh {
+                        refresh_kiro_models(&mut client).await?;
+                    }
+                    crate::commands::runtime::show_models(&mut client, mapped, cli.json).await?;
+                } else {
+                    show_provider_models(
+                        &mut client,
+                        mapped,
+                        refresh,
+                        &provider,
+                        provider_kind.as_deref(),
+                        cli.json,
+                    )
+                    .await?;
+                }
             }
             Some(ModelsCommand::Resolve {
                 model,
                 api_key,
                 refresh,
+                provider,
             }) => {
-                if refresh {
-                    let _: serde_json::Value = client
-                        .call(
-                            method::TASK_RUN,
-                            serde_json::json!({"name":"model_cache_refresh"}),
-                        )
-                        .await?;
+                if let Some(provider) = provider {
+                    show_provider_model_resolution(
+                        &mut client,
+                        &provider,
+                        &model,
+                        api_key.as_deref(),
+                        refresh,
+                        cli.json,
+                    )
+                    .await?;
+                } else {
+                    if refresh {
+                        refresh_kiro_models(&mut client).await?;
+                    }
+                    crate::commands::runtime::show_model_resolution(
+                        &mut client,
+                        &model,
+                        api_key.as_deref(),
+                        cli.json,
+                    )
+                    .await?;
                 }
-                crate::commands::runtime::show_model_resolution(
-                    &mut client,
-                    &model,
-                    api_key.as_deref(),
-                    cli.json,
-                )
-                .await?;
             }
             None => unreachable!("empty models group returned before runtime setup"),
         },
@@ -978,6 +1228,7 @@ async fn main() -> Result<()> {
             crate::commands::runtime::run_model_map(&mut client, command, cli.json).await?;
         }
         Command::Config { command: None }
+        | Command::Provider { command: None }
         | Command::Account { command: None }
         | Command::ApiKey { command: None }
         | Command::Service { command: None }
@@ -992,21 +1243,351 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn show_models(
+async fn show_providers(
+    client: &mut AdminClient,
+    provider: Option<&str>,
+    provider_kind: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    if let Some(provider) = provider {
+        let value: kproxy_core::provider::ProviderDescriptor = client
+            .call(
+                method::V2_PROVIDER_SHOW,
+                serde_json::json!({"provider":provider}),
+            )
+            .await?;
+        if json {
+            return print_json(&value);
+        }
+        println!("{}   {}   {}", value.id, value.kind, value.status);
+        println!("启用      {}", if value.enabled { "是" } else { "否" });
+        println!(
+            "协议      {}",
+            value
+                .capabilities
+                .protocols
+                .iter()
+                .map(|protocol| protocol.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        println!(
+            "认证      device-flow={} token-import={}",
+            value.capabilities.device_flow, value.capabilities.token_import
+        );
+        if let Some(error) = value.error {
+            println!("错误      {error}");
+        }
+        return Ok(());
+    }
+    let value: serde_json::Value = client
+        .call(
+            method::V2_PROVIDER_LIST,
+            serde_json::json!({"provider_kind":provider_kind}),
+        )
+        .await?;
+    if json {
+        return print_json(&value);
+    }
+    let providers = value["providers"]
+        .as_array()
+        .ok_or_else(|| anyhow::anyhow!("daemon 返回的 provider 列表无效"))?;
+    let rows = providers
+        .iter()
+        .map(|provider| {
+            let protocols = provider["capabilities"]["protocols"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(serde_json::Value::as_str)
+                .collect::<Vec<_>>()
+                .join(",");
+            vec![
+                provider["id"].as_str().unwrap_or("-").into(),
+                provider["kind"].as_str().unwrap_or("-").into(),
+                if provider["enabled"].as_bool().unwrap_or(false) {
+                    "是".into()
+                } else {
+                    "否".into()
+                },
+                provider["status"].as_str().unwrap_or("unknown").into(),
+                protocols,
+                provider["error"].as_str().unwrap_or("").into(),
+            ]
+        })
+        .collect::<Vec<_>>();
+    println!(
+        "{}",
+        render_table(&["PROVIDER", "KIND", "启用", "状态", "协议", "错误"], &rows)
+    );
+    Ok(())
+}
+
+async fn show_provider_models(
     client: &mut AdminClient,
     mapped: bool,
     refresh: bool,
+    provider: &str,
+    provider_kind: Option<&str>,
     json: bool,
 ) -> Result<()> {
-    if refresh {
-        let _: serde_json::Value = client
-            .call(
-                method::TASK_RUN,
-                serde_json::json!({"name":"model_cache_refresh"}),
-            )
+    let result: kproxy_ipc::protocol::ProviderModelListResult = client
+        .call(
+            method::V2_MODELS,
+            serde_json::json!({
+                "provider":provider,
+                "provider_kind":provider_kind,
+                "refresh":refresh
+            }),
+        )
+        .await?;
+    let config = if mapped {
+        let show: kproxy_ipc::protocol::ConfigShowResult = client
+            .call(method::CONFIG_SHOW, serde_json::json!({}))
             .await?;
+        Some(
+            serde_json::from_value::<kproxy_core::config::Config>(show.effective_json)
+                .context("daemon 返回的生效配置无效")?,
+        )
+    } else {
+        None
+    };
+    let enriched = result
+        .models
+        .iter()
+        .map(|model| {
+            let route = config.as_ref().map(|config| {
+                let default_model = config
+                    .effective_providers()
+                    .into_iter()
+                    .find(|provider| provider.id == model.provider_id.as_str())
+                    .map(|provider| provider.routing.default_model_id)
+                    .unwrap_or_default();
+                kproxy_translate::model::map_model_for_provider(
+                    &model.id,
+                    &config.model_mapping,
+                    kproxy_translate::model::ModelMappingContext {
+                        provider_id: model.provider_id.as_str(),
+                        service_id: None,
+                        api_key_id: None,
+                        remaining_percent: None,
+                    },
+                    &default_model,
+                )
+            });
+            serde_json::json!({
+                "provider_id":model.provider_id,
+                "id":model.id,
+                "display_name":model.display_name,
+                "vendor":model.vendor,
+                "max_input_tokens":model.max_input_tokens,
+                "max_output_tokens":model.max_output_tokens,
+                "protocols":model.protocols,
+                "capabilities":model.capabilities,
+                "mapped_model":route.as_ref().map(|route| route.mapped.as_str()),
+                "mapping_rule":route.and_then(|route| route.rule),
+            })
+        })
+        .collect::<Vec<_>>();
+    if json {
+        print_json(&serde_json::json!({
+            "schema_version":result.schema_version,
+            "scope":result.scope,
+            "models":enriched,
+            "errors":result.errors,
+            "complete":result.complete
+        }))?;
+    } else {
+        let rows = enriched
+            .iter()
+            .map(|model| {
+                vec![
+                    model["provider_id"].as_str().unwrap_or("-").into(),
+                    model["id"].as_str().unwrap_or("-").into(),
+                    format_token_limit(model["max_input_tokens"].as_u64()),
+                    format_token_limit(model["max_output_tokens"].as_u64()),
+                    model["protocols"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(serde_json::Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    model["mapped_model"].as_str().unwrap_or("-").into(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            render_table(
+                &[
+                    "PROVIDER",
+                    "MODEL",
+                    "输入上限",
+                    "输出上限",
+                    "协议",
+                    "映射后"
+                ],
+                &rows,
+            )
+        );
+        for (provider, error) in &result.errors {
+            eprintln!("{provider}: {error}");
+        }
     }
-    crate::commands::runtime::show_models(client, mapped, json).await
+    if result.complete {
+        Ok(())
+    } else {
+        anyhow::bail!("部分提供源的模型发现失败")
+    }
+}
+
+async fn refresh_kiro_models(client: &mut AdminClient) -> Result<()> {
+    let result: kproxy_ipc::protocol::ProviderModelListResult = client
+        .call(
+            method::V2_MODELS,
+            serde_json::json!({"provider":"kiro","refresh":true}),
+        )
+        .await?;
+    if result.complete {
+        return Ok(());
+    }
+    let message = result
+        .errors
+        .get("kiro")
+        .cloned()
+        .unwrap_or_else(|| "Kiro 模型刷新失败".into());
+    Err(anyhow::anyhow!(message))
+}
+
+async fn show_provider_model_resolution(
+    client: &mut AdminClient,
+    provider: &str,
+    model: &str,
+    api_key: Option<&str>,
+    refresh: bool,
+    json: bool,
+) -> Result<()> {
+    let show: kproxy_ipc::protocol::ConfigShowResult = client
+        .call(method::CONFIG_SHOW, serde_json::json!({}))
+        .await?;
+    let config: kproxy_core::config::Config =
+        serde_json::from_value(show.effective_json).context("daemon 返回的生效配置无效")?;
+    let api_key_id = api_key
+        .map(|selector| {
+            config
+                .api_key
+                .iter()
+                .find(|key| key.id.as_deref() == Some(selector) || key.name == selector)
+                .and_then(|key| key.id.clone())
+                .ok_or_else(|| anyhow::anyhow!("API key 不存在：{selector}"))
+        })
+        .transpose()?;
+    let providers = config.effective_providers();
+    let provider_config = providers
+        .iter()
+        .find(|item| item.id == provider)
+        .ok_or_else(|| anyhow::anyhow!("provider 不存在：{provider}"))?;
+    let source_model = model.strip_prefix(&format!("{provider}/")).unwrap_or(model);
+    let route = kproxy_translate::model::map_model_for_provider(
+        source_model,
+        &config.model_mapping,
+        kproxy_translate::model::ModelMappingContext {
+            provider_id: provider,
+            service_id: None,
+            api_key_id: api_key_id.as_deref(),
+            remaining_percent: None,
+        },
+        &provider_config.routing.default_model_id,
+    );
+    let (resolved_provider, target) = mapped_provider_target(&providers, provider, &route.mapped);
+    let resolved_provider_config = providers
+        .iter()
+        .find(|item| item.id == resolved_provider)
+        .ok_or_else(|| anyhow::anyhow!("映射目标 provider 不存在：{resolved_provider}"))?;
+    let catalog: kproxy_ipc::protocol::ProviderModelListResult = client
+        .call(
+            method::V2_MODELS,
+            serde_json::json!({"provider":resolved_provider,"refresh":refresh}),
+        )
+        .await?;
+    let resolved_model = if resolved_provider_config.kind == "kiro" {
+        let available = catalog
+            .models
+            .iter()
+            .map(|candidate| candidate.id.clone())
+            .collect::<Vec<_>>();
+        kproxy_translate::model::resolve_dynamic_model(target, &available)
+    } else {
+        catalog
+            .models
+            .iter()
+            .find(|candidate| candidate.id == target)
+            .map(|candidate| candidate.id.clone())
+    };
+    let available =
+        provider_config.enabled && resolved_provider_config.enabled && resolved_model.is_some();
+    let value = serde_json::json!({
+        "provider_id":provider,
+        "input_model":model,
+        "mapped_model":route.mapped,
+        "mapping_rule":route.rule,
+        "resolved_provider_id":resolved_provider,
+        "resolved_model":available.then_some(resolved_model).flatten(),
+        "available":available,
+        "provider_enabled":provider_config.enabled,
+        "resolved_provider_enabled":resolved_provider_config.enabled,
+        "catalog_size":catalog.models.len(),
+        "catalog_complete":catalog.complete,
+        "errors":catalog.errors,
+    });
+    if json {
+        print_json(&value)
+    } else {
+        println!("提供源    {provider}");
+        println!("输入模型  {model}");
+        println!(
+            "映射结果  {}",
+            value["mapped_model"].as_str().unwrap_or("-")
+        );
+        println!(
+            "命中规则  {}",
+            value["mapping_rule"].as_str().unwrap_or("-")
+        );
+        println!(
+            "实际源    {}",
+            value["resolved_provider_id"].as_str().unwrap_or("-")
+        );
+        println!(
+            "实际模型  {}",
+            value["resolved_model"].as_str().unwrap_or("不可用")
+        );
+        Ok(())
+    }
+}
+
+fn mapped_provider_target<'a>(
+    providers: &'a [kproxy_core::config::ProviderConfig],
+    source_provider: &'a str,
+    mapped_model: &'a str,
+) -> (&'a str, &'a str) {
+    mapped_model
+        .split_once('/')
+        .filter(|(provider, _)| providers.iter().any(|candidate| candidate.id == *provider))
+        .unwrap_or((source_provider, mapped_model))
+}
+
+fn format_token_limit(value: Option<u64>) -> String {
+    let Some(value) = value else {
+        return "unknown".into();
+    };
+    if value >= 1_000_000 && value.is_multiple_of(1_000_000) {
+        format!("{}M", value / 1_000_000)
+    } else if value >= 1_000 && value.is_multiple_of(1_000) {
+        format!("{}K", value / 1_000)
+    } else {
+        value.to_string()
+    }
 }
 
 fn parse_time_range_args(range: &TimeRangeArgs) -> Result<(Option<u64>, Option<i64>, Option<i64>)> {
@@ -1049,6 +1630,25 @@ fn print_status(status: &StatusResult) {
         "代理    {} 个（{} 运行）",
         status.proxy_service_total, status.proxy_service_running
     );
+    if !status.providers.is_empty() {
+        let rows = status
+            .providers
+            .iter()
+            .map(|provider| {
+                vec![
+                    provider.id.clone(),
+                    provider.kind.clone(),
+                    provider.status.clone(),
+                    format!("{}/{}", provider.account_available, provider.account_total),
+                    provider.error.clone().unwrap_or_default(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            render_table(&["提供源", "驱动", "状态", "可用/账号", "错误"], &rows)
+        );
+    }
     println!(
         "账号    {} 个（{} 可调度 / {} 额度保护 / {} 冷却 / {} 额度耗尽 / {} 封禁 / {} 刷新中 / {} 停用）",
         status.account_total,
@@ -1117,6 +1717,31 @@ fn print_status(status: &StatusResult) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_resolution_checks_the_mapped_provider_catalog() {
+        let providers = vec![
+            kproxy_core::config::ProviderConfig::default(),
+            kproxy_core::config::ProviderConfig {
+                id: "copilot".into(),
+                kind: "copilot".into(),
+                ..kproxy_core::config::ProviderConfig::default()
+            },
+        ];
+
+        assert_eq!(
+            mapped_provider_target(&providers, "kiro", "copilot/gpt-test"),
+            ("copilot", "gpt-test")
+        );
+        assert_eq!(
+            mapped_provider_target(&providers, "kiro", "claude-sonnet-test"),
+            ("kiro", "claude-sonnet-test")
+        );
+        assert_eq!(
+            mapped_provider_target(&providers, "kiro", "vendor/model"),
+            ("kiro", "vendor/model")
+        );
+    }
 
     #[test]
     fn config_reset_is_available_as_a_subcommand() {
@@ -1190,7 +1815,7 @@ mod tests {
         assert!(matches!(
             single.command,
             Some(Command::Account {
-                command: Some(crate::commands::account::AccountCommand::Rm { ids })
+                command: Some(crate::commands::account::AccountCommand::Rm { ids, .. })
             }) if ids == ["acc_00000001"]
         ));
 
@@ -1200,7 +1825,7 @@ mod tests {
         assert!(matches!(
             multiple.command,
             Some(Command::Account {
-                command: Some(crate::commands::account::AccountCommand::Rm { ids })
+                command: Some(crate::commands::account::AccountCommand::Rm { ids, .. })
             }) if ids == ["acc_00000001", "a@example.com"]
         ));
 
@@ -1215,7 +1840,12 @@ mod tests {
         assert!(matches!(
             single.command,
             Some(Command::Account {
-                command: Some(crate::commands::account::AccountCommand::Tag { ids, add, remove })
+                command: Some(crate::commands::account::AccountCommand::Tag {
+                    ids,
+                    add,
+                    remove,
+                    ..
+                })
             }) if ids == ["acc_00000001"] && add == ["prod"] && remove.is_empty()
         ));
 
@@ -1233,7 +1863,12 @@ mod tests {
         assert!(matches!(
             multiple.command,
             Some(Command::Account {
-                command: Some(crate::commands::account::AccountCommand::Tag { ids, add, remove })
+                command: Some(crate::commands::account::AccountCommand::Tag {
+                    ids,
+                    add,
+                    remove,
+                    ..
+                })
             }) if ids == ["acc_2c36cfad", "acc_332c7cb2", "acc_41c6e3ad"]
                 && add == ["test"] && remove.is_empty()
         ));
@@ -1350,6 +1985,7 @@ mod tests {
                 command: Some(ModelsCommand::List {
                     mapped: true,
                     refresh: true,
+                    ..
                 })
             })
         ));
@@ -1370,6 +2006,7 @@ mod tests {
                     model,
                     api_key,
                     refresh: true,
+                    ..
                 }),
         }) = resolve.command
         else {
@@ -1494,7 +2131,7 @@ mod tests {
             key.command,
             Some(Command::ApiKey {
                 command: Some(crate::commands::runtime::ApiKeyCommand::Edit {
-                    skip_user_agent_check: true,
+                    skip_user_agent_check: Some(true),
                     ..
                 })
             })

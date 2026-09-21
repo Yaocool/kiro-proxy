@@ -1,6 +1,9 @@
 //! 管理面各方法实现。
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{BTreeSet, HashMap},
+    sync::Arc,
+};
 
 use futures::{stream, StreamExt};
 use kproxy_core::account::Account;
@@ -15,10 +18,11 @@ use kproxy_ipc::protocol::{
     AccountTagBatchResult, AccountTagParams, AccountTagResult, ConfigPathResult,
     ConfigReloadResult, ConfigShowResult, CreatedApiKey, LogFileView, LogFilesResult,
     LogTraceEntry, LogTraceResult, ModelResolutionAccount, ModelResolutionResult,
-    ProxyServiceAccountChangeParams, ProxyServiceAccountsParams, ProxyServiceAccountsResult,
-    ProxyServiceApiKeyView, ProxyServiceApiKeysParams, ProxyServiceApiKeysResult,
-    ProxyServiceCreateParams, ProxyServiceCreateResult, ProxyServiceDeleteParams,
-    ProxyServiceDeleteResult, ProxyServiceListResult, Request, Response, RpcError, StatusResult,
+    ProviderAccountListResult, ProviderStatusView, ProxyServiceAccountChangeParams,
+    ProxyServiceAccountsParams, ProxyServiceAccountsResult, ProxyServiceApiKeyView,
+    ProxyServiceApiKeysParams, ProxyServiceApiKeysResult, ProxyServiceCreateParams,
+    ProxyServiceCreateResult, ProxyServiceDeleteParams, ProxyServiceDeleteResult,
+    ProxyServiceListResult, Request, Response, RpcError, StatusResult,
 };
 use kproxy_pool::{account_credit_state, AccountCreditState, AccountPool};
 use kproxy_store::accounts::AccountStore;
@@ -31,10 +35,37 @@ use crate::state::AppState;
 
 type Handled = Result<serde_json::Value, RpcError>;
 
+mod providers;
+
 /// 分发一个 RPC 请求。
 pub async fn dispatch(state: &Arc<AppState>, request: Request) -> Response {
     let id = request.id;
     let outcome = match request.method.as_str() {
+        method::V2_CAPABILITIES => providers::handle_capabilities(state).await,
+        method::V2_PROVIDER_LIST => providers::handle_provider_list(state, request.params).await,
+        method::V2_PROVIDER_SHOW => providers::handle_provider_show(state, request.params).await,
+        method::V2_ACCOUNT_LIST => providers::handle_account_list(state, request.params).await,
+        method::V2_ACCOUNT_SHOW => providers::handle_account_show(state, request.params).await,
+        method::V2_ACCOUNT_IMPORT_TOKEN => {
+            providers::handle_account_import_token(state, request.params).await
+        }
+        method::V2_LOGIN_START => providers::handle_login_start(state, request.params).await,
+        method::V2_LOGIN_STATUS => providers::handle_login_status(state, request.params).await,
+        method::V2_LOGIN_CANCEL => providers::handle_login_cancel(state, request.params).await,
+        method::V2_ACCOUNT_SET_ENABLED => {
+            providers::handle_account_set_enabled(state, request.params).await
+        }
+        method::V2_ACCOUNT_REMOVE => providers::handle_account_remove(state, request.params).await,
+        method::V2_ACCOUNT_REFRESH => {
+            providers::handle_account_refresh(state, request.params).await
+        }
+        method::V2_ACCOUNT_TAG => providers::handle_account_tag(state, request.params).await,
+        method::V2_ACCOUNT_PROBE => providers::handle_account_probe(state, request.params).await,
+        method::V2_ACCOUNT_RESET_HEALTH => {
+            providers::handle_account_reset_health(state, request.params).await
+        }
+        method::V2_ACCOUNT_EXPORT => providers::handle_account_export(state, request.params).await,
+        method::V2_MODELS => providers::handle_models(state, request.params).await,
         method::STATUS => handle_status(state, request.params).await,
         method::CONFIG_SHOW => handle_config_show(state).await,
         method::CONFIG_PATH => to_value(handle_config_path(state)),
@@ -67,9 +98,9 @@ pub async fn dispatch(state: &Arc<AppState>, request: Request) -> Response {
         method::LOG_TRACE => handle_log_trace(state, request.params).await,
         method::MODELS => handle_models(state).await,
         method::MODEL_RESOLVE => handle_model_resolve(state, request.params).await,
-        method::APIKEY_LIST => to_value(state.meter.list()),
+        method::APIKEY_LIST => handle_apikey_list(state, request.params).await,
         method::APIKEY_RESET_USAGE => handle_apikey_reset(state, request.params).await,
-        method::SERVICE_LIST => handle_service_list(state).await,
+        method::SERVICE_LIST => handle_service_list(state, request.params).await,
         method::SERVICE_CREATE => handle_service_create(state, request.params).await,
         method::SERVICE_DELETE => handle_service_delete(state, request.params).await,
         method::SERVICE_APIKEYS => handle_service_apikeys(state, request.params),
@@ -101,6 +132,7 @@ async fn handle_logs(state: &Arc<AppState>, params: serde_json::Value) -> Handle
         wait_ms: u64,
         level: Option<String>,
         account: Option<String>,
+        provider: Option<String>,
     }
     fn default_tail() -> usize {
         50
@@ -114,6 +146,7 @@ async fn handle_logs(state: &Arc<AppState>, params: serde_json::Value) -> Handle
             params.wait_ms,
             params.level.as_deref(),
             params.account.as_deref(),
+            params.provider.as_deref(),
         )
         .await;
     to_value(serde_json::json!({"entries":entries}))
@@ -271,7 +304,7 @@ fn handle_webhook_list(state: &Arc<AppState>) -> Handled {
     to_value(targets)
 }
 
-fn handle_account_export(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
+pub(super) fn handle_account_export(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
     #[derive(serde::Deserialize, Default)]
     struct Params {
         #[serde(default)]
@@ -356,19 +389,59 @@ async fn handle_subscriptions(state: &Arc<AppState>, params: serde_json::Value) 
     #[derive(serde::Deserialize)]
     struct Params {
         id: Option<String>,
+        provider: Option<String>,
     }
     let params: Params = parse_params(params)?;
+    let provider = params.provider.as_deref().unwrap_or("kiro");
+    let configured = state.config.current().effective_providers();
+    if provider == "all" {
+        let mut providers = Vec::new();
+        for candidate in configured.into_iter().filter(|candidate| candidate.enabled) {
+            if candidate.kind == "kiro" {
+                match kiro_subscriptions(state, params.id.as_deref()).await {
+                    Ok(value) => providers.push(serde_json::json!({
+                        "provider_id":candidate.id,
+                        "supported":true,
+                        "result":value
+                    })),
+                    Err(error) => providers.push(serde_json::json!({
+                        "provider_id":candidate.id,
+                        "supported":true,
+                        "error":error.message
+                    })),
+                }
+            } else {
+                providers.push(serde_json::json!({
+                    "provider_id":candidate.id,
+                    "supported":false,
+                    "reason":format!("{} does not expose authoritative subscription data", candidate.kind)
+                }));
+            }
+        }
+        return to_value(serde_json::json!({"providers":providers}));
+    }
+    let candidate = configured
+        .iter()
+        .find(|candidate| candidate.id == provider)
+        .ok_or_else(|| RpcError::bad_params(format!("unknown provider {provider}")))?;
+    if candidate.kind != "kiro" {
+        return to_value(serde_json::json!({
+            "provider_id":candidate.id,
+            "supported":false,
+            "reason":format!("{} does not expose authoritative subscription data", candidate.kind)
+        }));
+    }
+    kiro_subscriptions(state, params.id.as_deref()).await
+}
+
+async fn kiro_subscriptions(state: &Arc<AppState>, id: Option<&str>) -> Handled {
     let account = state
         .pool()
         .snapshot()
         .await
         .into_iter()
         .find(|account| {
-            account.enabled
-                && params
-                    .id
-                    .as_deref()
-                    .is_none_or(|id| account.id == id || account.email == id)
+            account.enabled && id.is_none_or(|id| account.id == id || account.email == id)
         })
         .ok_or_else(|| RpcError::bad_params("no matching enabled account"))?;
     let subscriptions = state
@@ -379,6 +452,8 @@ async fn handle_subscriptions(state: &Arc<AppState>, params: serde_json::Value) 
             RpcError::internal(kproxy_translate::sanitize_error_message(&error.to_string()))
         })?;
     to_value(serde_json::json!({
+        "provider_id":"kiro",
+        "supported":true,
         "account_id":account.id,
         "plans":subscriptions.subscription_plans,
         "disclaimer":subscriptions.disclaimer
@@ -404,6 +479,13 @@ struct TimeRangeParams {
     since_secs: Option<u64>,
     start_secs: Option<i64>,
     end_secs: Option<i64>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+struct StatusParams {
+    #[serde(flatten)]
+    range: TimeRangeParams,
+    provider: Option<String>,
 }
 
 #[derive(Debug)]
@@ -467,15 +549,33 @@ fn resolve_time_range(
 }
 
 async fn handle_status(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
-    let params: TimeRangeParams = if params.is_null() {
-        TimeRangeParams::default()
+    let params: StatusParams = if params.is_null() {
+        StatusParams::default()
     } else {
         parse_params(params)?
     };
+    let provider_filter = validated_provider_filter(state, params.provider.as_deref()).await?;
     let session_started_at = state.stats.session_started_at();
-    let range = resolve_time_range(&params, Some(session_started_at), Some(session_started_at))?;
+    let range = resolve_time_range(
+        &params.range,
+        Some(session_started_at),
+        Some(session_started_at),
+    )?;
     let config = state.config.current();
-    let services = state.proxy_services.views(&config.proxy_service).await;
+    let legacy_kiro_only = config.provider.is_empty();
+    let mut services = state.proxy_services.views(&config.proxy_service).await;
+    if let Some(provider) = provider_filter.as_deref() {
+        services.retain(|service| {
+            if service.allowed_providers.is_empty() {
+                provider == "kiro"
+            } else {
+                service
+                    .allowed_providers
+                    .iter()
+                    .any(|allowed| allowed == provider)
+            }
+        });
+    }
     let running_services = services
         .iter()
         .filter(|service| service.running)
@@ -489,28 +589,58 @@ async fn handle_status(state: &Arc<AppState>, params: serde_json::Value) -> Hand
             .collect::<Vec<_>>()
             .join(",")
     };
-    let (total, enabled) = state.with_accounts(|store| {
-        (
-            store.len(),
-            store.all().iter().filter(|account| account.enabled).count(),
+    let account_list: ProviderAccountListResult = serde_json::from_value(
+        providers::handle_account_list(
+            state,
+            serde_json::json!({"provider":provider_filter.as_deref().unwrap_or("all")}),
         )
-    });
+        .await?,
+    )
+    .map_err(|error| RpcError::internal(error.to_string()))?;
+    let total = account_list.accounts.len();
+    let enabled = account_list
+        .accounts
+        .iter()
+        .filter(|account| account.enabled)
+        .count();
+    let count_health = |health: &str| {
+        account_list
+            .accounts
+            .iter()
+            .filter(|account| account.health == health)
+            .count()
+    };
+    let available_accounts = account_list
+        .accounts
+        .iter()
+        .filter(|account| account.enabled && account.health == "available")
+        .map(|account| account.provider_id.as_str())
+        .collect::<BTreeSet<_>>();
     let hint = if total == 0 {
-        Some("无可用账号，请先添加：kproxy account import".to_string())
+        if legacy_kiro_only {
+            Some("无可用账号，请先添加：kproxy account import".to_string())
+        } else {
+            Some(format!(
+                "提供源 {} 没有账号，请先使用 kproxy account add/import",
+                provider_filter.as_deref().unwrap_or("all")
+            ))
+        }
     } else if enabled == 0 {
         Some("所有账号均已停用，代理无法服务请求".to_string())
     } else {
         None
     };
     let pool = state.pool();
-    let account_counts = pool.scheduling_counts().await;
-    let stats = if range.filtered {
+    let mut stats = if range.filtered {
         state.stats.session_window(range.start, range.end, None)
     } else {
         // The default status view is the full process session and can use the
         // O(1) cumulative counter instead of walking every retained minute.
         state.stats.session_window(None, None, None)
     };
+    if let Some(provider) = provider_filter.as_deref() {
+        stats.retain_provider(provider);
+    }
     let request_count = stats.total.requests;
     let success_rate = if request_count == 0 {
         0.0
@@ -534,13 +664,88 @@ async fn handle_status(state: &Arc<AppState>, params: serde_json::Value) -> Hand
             running_services.len()
         ));
     }
-    if account_counts.available == 0 {
-        readiness_reasons.push("no account is currently available".to_string());
+    let mut readiness_providers = BTreeSet::new();
+    if legacy_kiro_only {
+        if enabled_services > 0 && !available_accounts.contains("kiro") {
+            readiness_reasons.push("no account is currently available".to_string());
+        }
+        readiness_providers.insert("kiro".to_string());
+    } else {
+        for service in services.iter().filter(|service| service.enabled) {
+            let allowed = if service.allowed_providers.is_empty() {
+                vec!["kiro"]
+            } else {
+                service
+                    .allowed_providers
+                    .iter()
+                    .map(String::as_str)
+                    .collect::<Vec<_>>()
+            };
+            let relevant = allowed
+                .into_iter()
+                .filter(|provider| {
+                    provider_filter
+                        .as_deref()
+                        .is_none_or(|selected| *provider == selected)
+                })
+                .collect::<Vec<_>>();
+            readiness_providers.extend(relevant.iter().map(|provider| (*provider).to_string()));
+            if !relevant
+                .iter()
+                .any(|provider| available_accounts.contains(*provider))
+            {
+                readiness_reasons.push(format!(
+                    "proxy service {} has no available account in its provider scope",
+                    service.name
+                ));
+            }
+        }
+    }
+    for (provider, error) in &account_list.errors {
+        if readiness_providers.contains(provider) {
+            readiness_reasons.push(format!(
+                "provider {provider} account status failed: {error}"
+            ));
+        }
     }
     if let Some(error) = state.meter.recovery_error() {
         readiness_reasons.push(format!("metering recovery required: {error}"));
     }
     let ready = readiness_reasons.is_empty();
+    let descriptors = state
+        .providers
+        .descriptors()
+        .await
+        .into_iter()
+        .filter(|descriptor| {
+            provider_filter
+                .as_deref()
+                .is_none_or(|provider| descriptor.id.as_str() == provider)
+        })
+        .collect::<Vec<_>>();
+    let provider_views = descriptors
+        .into_iter()
+        .map(|descriptor| {
+            let accounts = account_list
+                .accounts
+                .iter()
+                .filter(|account| account.provider_id == descriptor.id.as_str())
+                .collect::<Vec<_>>();
+            ProviderStatusView {
+                id: descriptor.id.to_string(),
+                kind: descriptor.kind,
+                enabled: descriptor.enabled,
+                status: descriptor.status,
+                error: descriptor.error,
+                account_total: accounts.len(),
+                account_enabled: accounts.iter().filter(|account| account.enabled).count(),
+                account_available: accounts
+                    .iter()
+                    .filter(|account| account.enabled && account.health == "available")
+                    .count(),
+            }
+        })
+        .collect();
     to_value(StatusResult {
         version: env!("CARGO_PKG_VERSION").to_string(),
         pid: std::process::id(),
@@ -551,13 +756,17 @@ async fn handle_status(state: &Arc<AppState>, params: serde_json::Value) -> Hand
         admin_socket: state.admin_socket().display().to_string(),
         account_total: total,
         account_enabled: enabled,
-        account_available: account_counts.available,
-        account_protected: account_counts.protected,
-        account_cooling: account_counts.cooling,
-        account_exhausted: account_counts.exhausted,
-        account_banned: account_counts.banned,
-        account_refreshing: account_counts.refreshing,
-        active_requests: pool.active().await,
+        account_available: count_health("available"),
+        account_protected: count_health("low_credit"),
+        account_cooling: count_health("cooling"),
+        account_exhausted: count_health("exhausted"),
+        account_banned: count_health("banned"),
+        account_refreshing: count_health("refreshing"),
+        active_requests: if legacy_kiro_only || provider_filter.as_deref() == Some("kiro") {
+            pool.active().await
+        } else {
+            state.admission.current()
+        },
         max_concurrent_requests: state.admission.maximum(),
         queued_requests: pool.queued(),
         request_count,
@@ -578,6 +787,8 @@ async fn handle_status(state: &Arc<AppState>, params: serde_json::Value) -> Hand
         hint,
         ready,
         readiness_reasons,
+        provider_scope: provider_filter.unwrap_or_else(|| "all".into()),
+        providers: provider_views,
     })
 }
 
@@ -767,15 +978,34 @@ struct StatsParams {
     range: TimeRangeParams,
     by: Option<String>,
     account: Option<String>,
+    provider: Option<String>,
     level: Option<String>,
 }
 
 async fn handle_stats(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
-    let params: StatsParams = if params.is_null() {
+    let mut params: StatsParams = if params.is_null() {
         StatsParams::default()
     } else {
         parse_params(params)?
     };
+    if params.provider.as_deref() == Some("all") {
+        params.provider = None;
+    }
+    if let Some(provider) = params.provider.as_deref() {
+        let provider = kproxy_core::provider::ProviderId::parse(provider)
+            .map_err(|error| RpcError::bad_params(error.to_string()))?;
+        if !state
+            .providers
+            .descriptors()
+            .await
+            .iter()
+            .any(|descriptor| descriptor.id == provider)
+        {
+            return Err(RpcError::bad_params(format!(
+                "provider not found: {provider}"
+            )));
+        }
+    }
     let range = resolve_time_range(&params.range, None, None)?;
     if params.by.as_deref() == Some("apikey") {
         if !params.detail {
@@ -786,10 +1016,16 @@ async fn handle_stats(state: &Arc<AppState>, params: serde_json::Value) -> Handl
                 "time ranges are not supported for API key usage grouping; use `kproxy apikey history`",
             ));
         }
+        let by_apikey = if let Some(provider) = params.provider.as_deref() {
+            handle_apikey_list(state, serde_json::json!({"provider":provider})).await?
+        } else {
+            serde_json::to_value(state.meter.list())
+                .map_err(|error| RpcError::internal(error.to_string()))?
+        };
         return to_value(serde_json::json!({
             "scope":"persistent",
             "range":{"start":null,"end":null,"resolution_secs":60,"truncated":false},
-            "by_apikey":state.meter.list()
+            "by_apikey":by_apikey
         }));
     }
     let available_start = state.stats.persistent_history_started_at();
@@ -806,6 +1042,9 @@ async fn handle_stats(state: &Arc<AppState>, params: serde_json::Value) -> Handl
         .window_between(range.start, range.end, requested_recent)
         .await
         .map_err(|error| RpcError::internal(format!("read statistics history: {error}")))?;
+    if let Some(provider) = params.provider.as_deref() {
+        stats.retain_provider(provider);
+    }
     let missing_ranges = if range.filtered {
         stats
             .history_gaps
@@ -824,12 +1063,20 @@ async fn handle_stats(state: &Arc<AppState>, params: serde_json::Value) -> Handl
         && available_start
             .is_none_or(|available| range.start.is_none_or(|start| start < available));
     let truncated = range.filtered && (prefix_truncated || !missing_ranges.is_empty());
-    if params.account.is_some() || params.level.is_some() {
+    if params.account.is_some() || params.provider.is_some() || params.level.is_some() {
         stats.recent_requests.retain(|request| {
             params
                 .account
                 .as_deref()
                 .is_none_or(|account| request.account_id == account)
+                && params.provider.as_deref().is_none_or(|provider| {
+                    let request_provider = if request.provider_id.is_empty() {
+                        "kiro"
+                    } else {
+                        &request.provider_id
+                    };
+                    request_provider == provider
+                })
                 && params.level.as_deref().is_none_or(|level| match level {
                     "error" => request.status >= 500,
                     "warn" => request.status >= 400,
@@ -869,6 +1116,7 @@ async fn handle_stats(state: &Arc<AppState>, params: serde_json::Value) -> Handl
         }));
     }
     let grouped = match params.by.as_deref() {
+        Some("provider") => serde_json::to_value(&stats.by_provider),
         Some("account") => serde_json::to_value(&stats.by_account),
         Some("endpoint") => serde_json::to_value(&stats.by_endpoint),
         Some("model") => serde_json::to_value(&stats.by_model),
@@ -892,10 +1140,31 @@ async fn handle_stats(state: &Arc<AppState>, params: serde_json::Value) -> Handl
 #[derive(serde::Deserialize)]
 struct TaskRunParams {
     name: String,
+    provider: Option<String>,
 }
 
 async fn handle_task_run(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
     let params: TaskRunParams = parse_params(params)?;
+    if params.name == "model_cache_refresh" {
+        let result = crate::tasks::refresh_models_for(state, params.provider.as_deref())
+            .await
+            .map_err(|error| RpcError::bad_params(error.to_string()))?;
+        state.task_registry.record(&params.name, result.clone());
+        return to_value(serde_json::json!({
+            "name":params.name,
+            "provider":params.provider.unwrap_or_else(|| "all".into()),
+            "result":result
+        }));
+    }
+    if params
+        .provider
+        .as_deref()
+        .is_some_and(|provider| provider != "all")
+    {
+        return Err(RpcError::bad_params(
+            "--provider is only supported for model_cache_refresh",
+        ));
+    }
     crate::tasks::run_named(state, &params.name)
         .await
         .map_err(|error| RpcError::bad_params(error.to_string()))
@@ -1144,13 +1413,85 @@ fn handle_webhook_logs(state: &Arc<AppState>, params: serde_json::Value) -> Hand
     to_value(state.notifier().logs(params.tail))
 }
 
-async fn handle_service_list(state: &Arc<AppState>) -> Handled {
+async fn handle_apikey_list(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
+    #[derive(Default, serde::Deserialize)]
+    struct Params {
+        provider: Option<String>,
+    }
+    let params: Params = if params.is_null() {
+        Params::default()
+    } else {
+        parse_params(params)?
+    };
+    let provider = validated_provider_filter(state, params.provider.as_deref()).await?;
+    let mut keys = state.meter.list();
+    if let Some(provider) = provider.as_deref() {
+        keys.retain(|key| {
+            if key.allowed_providers.is_empty() {
+                provider == "kiro"
+            } else {
+                key.allowed_providers
+                    .iter()
+                    .any(|allowed| allowed == provider)
+            }
+        });
+        for key in &mut keys {
+            key.usage.retain_provider(provider);
+        }
+    }
+    to_value(keys)
+}
+
+async fn handle_service_list(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
+    #[derive(Default, serde::Deserialize)]
+    struct Params {
+        provider: Option<String>,
+    }
+    let params: Params = if params.is_null() {
+        Params::default()
+    } else {
+        parse_params(params)?
+    };
+    let provider = validated_provider_filter(state, params.provider.as_deref()).await?;
     let config = state.config.current();
     let mut services = state.proxy_services.views(&config.proxy_service).await;
+    if let Some(provider) = provider.as_deref() {
+        services.retain(|service| {
+            if service.allowed_providers.is_empty() {
+                provider == "kiro"
+            } else {
+                service
+                    .allowed_providers
+                    .iter()
+                    .any(|allowed| allowed == provider)
+            }
+        });
+    }
     services.sort_by(|left, right| {
         compare_display_text(&left.name, &right.name).then_with(|| left.id.cmp(&right.id))
     });
     to_value(ProxyServiceListResult { services })
+}
+
+async fn validated_provider_filter(
+    state: &Arc<AppState>,
+    provider: Option<&str>,
+) -> Result<Option<String>, RpcError> {
+    let Some(provider) = provider.filter(|provider| *provider != "all") else {
+        return Ok(None);
+    };
+    let id = kproxy_core::provider::ProviderId::parse(provider)
+        .map_err(|error| RpcError::bad_params(error.to_string()))?;
+    if !state
+        .providers
+        .descriptors()
+        .await
+        .iter()
+        .any(|descriptor| descriptor.id == id)
+    {
+        return Err(RpcError::bad_params(format!("provider not found: {id}")));
+    }
+    Ok(Some(id.to_string()))
 }
 
 fn handle_service_apikeys(state: &Arc<AppState>, params: serde_json::Value) -> Handled {
@@ -1455,6 +1796,12 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
         .api_key_name
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| format!("{name}-default"));
+    let allowed_providers = params.allowed_providers;
+    let default_provider = params
+        .default_provider
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| allowed_providers.first().cloned())
+        .unwrap_or_else(|| "kiro".into());
     let service = ProxyServiceConfig {
         id: format!("svc_{}", uuid::Uuid::new_v4().simple()),
         name: name.to_string(),
@@ -1466,6 +1813,8 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
         account_tag,
         account_ids: Vec::new(),
         excluded_account_ids: Vec::new(),
+        default_provider,
+        allowed_providers: allowed_providers.clone(),
         created_at: now_secs(),
     };
     let key_config = ApiKeyConfig {
@@ -1476,6 +1825,8 @@ async fn handle_service_create(state: &Arc<AppState>, params: serde_json::Value)
         enabled: true,
         skip_user_agent_check: false,
         credits_limit: None,
+        allowed_providers,
+        allowed_models: Vec::new(),
     };
 
     let mut next = previous.clone();

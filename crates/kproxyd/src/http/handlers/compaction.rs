@@ -21,11 +21,14 @@ fn compaction_summary_concurrency(state: &AppState) -> usize {
         .clamp(1, 2)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn generate_compaction_summary(
     state: &Arc<AppState>,
     account_ids: Arc<std::collections::HashSet<String>>,
     trace_id: &str,
     key_id: Option<&str>,
+    allowed_models: &[String],
+    service_id: Option<&str>,
     summary_model: &str,
     payloads: Vec<KiroPayload>,
     timeout_ms: u64,
@@ -34,6 +37,8 @@ async fn generate_compaction_summary(
     let owned_account_ids = account_ids;
     let owned_trace_id = trace_id.to_owned();
     let owned_key_id = key_id.map(str::to_owned);
+    let owned_allowed_models = allowed_models.to_vec();
+    let owned_service_id = service_id.map(str::to_owned);
     let owned_summary_model = summary_model.to_owned();
     let concurrency = compaction_summary_concurrency(state);
     let cancel = CancellationToken::new();
@@ -56,6 +61,8 @@ async fn generate_compaction_summary(
                 let account_ids = &owned_account_ids;
                 let trace_id = &owned_trace_id;
                 let key_id = owned_key_id.as_deref();
+                let allowed_models = owned_allowed_models.as_slice();
+                let service_id = owned_service_id.as_deref();
                 let model = &owned_summary_model;
                 let cancel = task_cancel.clone();
                 let failed = &failed;
@@ -74,6 +81,8 @@ async fn generate_compaction_summary(
                             account_ids,
                             trace_id,
                             key_id,
+                            allowed_models,
+                            service_id,
                             model,
                             payload,
                             cancel,
@@ -249,11 +258,14 @@ fn log_late_compaction_result(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn generate_compaction_summary_inner(
     state: &Arc<AppState>,
     account_ids: &std::collections::HashSet<String>,
     trace_id: &str,
     key_id: Option<&str>,
+    allowed_models: &[String],
+    service_id: Option<&str>,
     summary_model: &str,
     payload: kproxy_translate::KiroPayload,
     cancel: CancellationToken,
@@ -279,7 +291,10 @@ async fn generate_compaction_summary_inner(
             summary_model,
             summary_model,
             key_id,
+            allowed_models,
+            service_id,
             &default_model,
+            None,
             estimate,
             input_tokens,
             true,
@@ -744,6 +759,8 @@ pub(super) async fn run_compaction(
         trace_id,
         key_id,
         account_ids,
+        allowed_models,
+        service_id,
         source_payload,
         decision,
         summary_model,
@@ -857,6 +874,8 @@ pub(super) async fn run_compaction(
                 Arc::clone(&account_ids),
                 trace_id,
                 key_id,
+                allowed_models,
+                service_id,
                 summary_model,
                 summary_parts,
                 summary_timeout_ms,
@@ -1121,6 +1140,16 @@ fn execute_error_message(error: ExecuteError) -> String {
         ExecuteError::ContextLimit(limit) => format!(
             "compaction summary input is too long for {}: {} > {}",
             limit.model, limit.input_tokens, limit.maximum
+        ),
+        ExecuteError::ModelNotAllowed { provider_id, model } => {
+            format!("model {provider_id}/{model} is not allowed for this API key")
+        }
+        ExecuteError::CrossProviderRoute {
+            source_provider,
+            target_provider,
+            model,
+        } => format!(
+            "internal {source_provider} request cannot route model {model} to provider {target_provider}"
         ),
     }
 }
