@@ -85,11 +85,13 @@ own a socket: stale sockets are cleaned up, but reachable sockets are preserved.
 Import enterprise SSO credentials from a JSON file or stdin:
 
 ```bash
-kproxy account import --file accounts.json
-cat accounts.json | kproxy account import --stdin
+kproxy account import --file accounts.json --tag team-a
+cat accounts.json | kproxy account import --stdin --tag team-a --tag prod
 ```
 
 `id`, `machine_id`, and `created_at` may be omitted; the CLI generates them.
+Repeat `--tag` or use comma-separated values to merge tags into every account in
+this import; per-account `tags` already present in JSON are preserved.
 
 The JSON below is a shape example, not usable credentials. Replace tokens and
 `expires_at` (Unix seconds) with values issued by the upstream provider.
@@ -117,7 +119,7 @@ Set `KIRO_API_KEY` securely in the CLI's environment, then import it without
 putting the secret in a command argument:
 
 ```bash
-kproxy account add-api-key --email ci@example.com --region us-east-1
+kproxy account add-api-key --email ci@example.com --region us-east-1 --tag ci
 # Alternatively read the key from standard input:
 kproxy account add-api-key --email ci@example.com --region eu-central-1 --key-stdin < /secure/kiro-key
 ```
@@ -165,9 +167,10 @@ Manual account additions can then omit `--start-url`:
 ```bash
 printf '%s\n' "$PASSWORD" | kproxy account add-sso \
   --email user@example.com \
+  --tag team-a \
   --password-stdin
 
-kproxy account add-sso --batch accounts.csv -c 1
+kproxy account add-sso --batch accounts.csv -c 1 --tag team-a
 
 # Read explicitly from stdin for pipelines and automation:
 kproxy account add-sso --batch - -c 1 < accounts.csv
@@ -181,7 +184,8 @@ The Docker host wrapper automatically recognizes a readable host CSV and
 streams it into the container through stdin, without copying or retaining a
 password file. A container path is still read normally when no host file with
 the same name exists. Passwords are accepted only from stdin or a two-column
-CSV file. Add
+CSV file. In batch mode, every `--tag` supplied on the command is applied to all
+accounts in that batch. Add
 `--headful` when MFA or an upstream page change requires manual interaction.
 Every login uses a dedicated incognito Chromium context and temporary profile,
 which are destroyed before the next account is processed. Before saving an
@@ -202,6 +206,34 @@ kproxy service list
 kproxy service apikeys main
 kproxy ready
 kproxy models list
+```
+
+Select an isolated account pool by tag when creating a service. A service without
+`--account-tag` continues to use the global account pool:
+
+```bash
+kproxy account tag alice@example.com --add team-a
+kproxy service create --name team-a --host 127.0.0.1 --port 5581 --account-tag team-a
+kproxy service accounts team-a
+kproxy account services alice@example.com
+
+# Explicitly include an account with any tag, or exclude one from this service:
+kproxy service add-account team-a bob@example.com
+kproxy service remove-account team-a alice@example.com
+```
+
+The effective pool is “tag matches + explicit additions - exclusions”; exclusion
+wins. Without a service tag, the base set contains every account. Health,
+readiness, model discovery, initial dispatch, retries, and compaction summaries
+all stay within the service's effective pool. An account that belongs to any
+service cannot have its tags changed or be deleted; inspect every binding with
+`account services`, then unbind it from each service with `service remove-account`.
+Stop a service before changing its pool tag:
+
+```bash
+kproxy service disable team-a
+kproxy service edit team-a --account-tag team-b  # or --clear-account-tag for the global pool
+kproxy service enable team-a
 ```
 
 Omitting `--host` defaults to `0.0.0.0`. Key listings expose metadata unless

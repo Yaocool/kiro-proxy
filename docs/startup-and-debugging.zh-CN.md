@@ -76,11 +76,12 @@ cargo run -p kproxyd
 从 JSON 文件或 stdin 导入企业 SSO 凭证：
 
 ```bash
-kproxy account import --file accounts.json
-cat accounts.json | kproxy account import --stdin
+kproxy account import --file accounts.json --tag team-a
+cat accounts.json | kproxy account import --stdin --tag team-a --tag prod
 ```
 
-`id`、`machine_id` 和 `created_at` 可以省略，CLI 会自动生成。
+`id`、`machine_id` 和 `created_at` 可以省略，CLI 会自动生成。`--tag` 可重复或使用逗号分隔，
+并会合并到本次导入的全部账号；JSON 中每个账号已有的 `tags` 会保留。
 
 下面只展示 JSON 结构，不能直接作为可用凭证导入。Token 和 `expires_at`（Unix 秒）
 必须替换为上游签发的实际值。
@@ -107,7 +108,7 @@ cat accounts.json | kproxy account import --stdin
 先在 CLI 环境中安全设置 `KIRO_API_KEY`，再导入；也可从标准输入读取，避免把密钥写进命令参数：
 
 ```bash
-kproxy account add-api-key --email ci@example.com --region us-east-1
+kproxy account add-api-key --email ci@example.com --region us-east-1 --tag ci
 kproxy account add-api-key --email ci@example.com --region eu-central-1 --key-stdin < /secure/kiro-key
 ```
 
@@ -145,9 +146,10 @@ start_url = "https://example.awsapps.com/start"
 ```bash
 printf '%s\n' "$PASSWORD" | kproxy account add-sso \
   --email user@example.com \
+  --tag team-a \
   --password-stdin
 
-kproxy account add-sso --batch accounts.csv -c 1
+kproxy account add-sso --batch accounts.csv -c 1 --tag team-a
 
 # 显式从 stdin 读取，适合管道和自动化：
 kproxy account add-sso --batch - -c 1 < accounts.csv
@@ -157,7 +159,7 @@ kproxy account add-sso --batch - -c 1 < accounts.csv
 `cargo build --workspace --no-default-features` 或 Docker 的 `runtime-slim` target。
 Docker 宿主机 wrapper 会自动识别可读的宿主机 CSV，并通过 stdin 流式传入容器，不复制或
 残留密码文件；容器内路径在宿主机没有同名文件时仍按原样读取。密码只从 stdin 或两列 CSV
-文件读取。遇到 MFA 或上游页面变化需要手工操作时，增加
+文件读取。批量模式下，命令上的全部 `--tag` 会应用到本批所有账号。遇到 MFA 或上游页面变化需要手工操作时，增加
 `--headful`。每个账号都会使用独立的 Chromium 无痕 context 和临时 profile，并在处理下一个
 账号前销毁；写入账号前会记录 Kiro 返回的稳定用户 ID，并拒绝把同一真实身份重复登记到
 其他邮箱。IAM Identity Center 的显示名不一定与登录邮箱一致，因此显示名仅用于诊断，不作为
@@ -174,6 +176,31 @@ kproxy service list
 kproxy service apikeys main
 kproxy ready
 kproxy models list
+```
+
+创建服务时可用账号标签建立独立账号池；未提供 `--account-tag` 的服务继续使用全局账号池：
+
+```bash
+kproxy account tag alice@example.com --add team-a
+kproxy service create --name team-a --host 127.0.0.1 --port 5581 --account-tag team-a
+kproxy service accounts team-a
+kproxy account services alice@example.com
+
+# 手工加入任意标签的账号，或从当前服务排除账号：
+kproxy service add-account team-a bob@example.com
+kproxy service remove-account team-a alice@example.com
+```
+
+服务的有效账号池为“标签匹配账号 + 手工加入账号 - 排除账号”；排除优先。服务未指定标签时，
+基础集合是全部账号。健康检查、就绪检查、模型列表、首次调度、重试及压缩摘要请求都限定在
+该服务的有效账号池内。账号一旦属于任意服务，就不能修改标签或删除；需要先通过
+`account services` 查看全部绑定，再通过 `service remove-account` 从所有服务解除绑定。
+修改服务的账号标签必须先停用服务：
+
+```bash
+kproxy service disable team-a
+kproxy service edit team-a --account-tag team-b  # 或 --clear-account-tag 恢复全局池
+kproxy service enable team-a
 ```
 
 省略 `--host` 时默认绑定 `0.0.0.0`。Key 元数据默认不含明文，显式 `--show-secret` 才显示。
