@@ -758,14 +758,9 @@ pub fn response(
                         let account = new_lease.account().await;
                         let mut incompatible = false;
                         if let Some(runtime) = context.state.pool().get(&account.id).await {
-                        let remaining = account
-                            .usage
-                            .as_ref()
-                            .filter(|usage| usage.limit > 0.0)
-                            .map(|usage| {
-                                ((usage.limit - usage.current) / usage.limit * 100.0)
-                                    .clamp(0.0, 100.0)
-                            });
+                        let remaining = account.usage.as_ref().and_then(|usage| {
+                            kproxy_pool::remaining_credit_percent(usage, &config.pool)
+                        });
                         context.mapped_model = retry_mapped_model(
                             context.lock_model_mapping,
                             &context.mapped_model,

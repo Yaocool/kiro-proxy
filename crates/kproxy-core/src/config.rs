@@ -309,6 +309,10 @@ pub struct PoolConfig {
     pub queue_full_wait_ms: u64,
     /// 低额度绝对值阈值。
     pub low_credit_min_remaining: f64,
+    /// 允许 Kiro 超额使用；开启时不按本地额度余额暂停账号。
+    pub enable_overage: bool,
+    /// 每个账号最多使用的 Kiro 超额 credits；None 表示仅遵循上游上限。
+    pub max_overage_credits_per_account: Option<f64>,
     /// 每日额度上限；0 表示不限。
     pub daily_credit_limit: f64,
     /// 每 1,000 个估算 token 预留的 credits。
@@ -331,6 +335,8 @@ impl Default for PoolConfig {
             max_queue_wait_ms: 30_000,
             queue_full_wait_ms: 5_000,
             low_credit_min_remaining: 4.0,
+            enable_overage: false,
+            max_overage_credits_per_account: None,
             daily_credit_limit: 0.0,
             credit_estimate_per_1k_tokens: 1.0,
             credit_estimate_output_token_cap: 8_192,
@@ -1215,6 +1221,16 @@ impl Config {
                 return invalid_config(field, "must be a finite non-negative number");
             }
         }
+        if self
+            .pool
+            .max_overage_credits_per_account
+            .is_some_and(|value| !value.is_finite() || value < 0.0)
+        {
+            return invalid_config(
+                "pool.max_overage_credits_per_account",
+                "must be a finite non-negative number",
+            );
+        }
         for (field, value) in [
             (
                 "pool.balance.weight_active",
@@ -1996,6 +2012,10 @@ max_queue_wait_ms = 30000
 queue_full_wait_ms = 5000
 # 按剩余 credits 绝对值停用账号；剩余值小于等于该值时不再分配请求，0 表示关闭。
 low_credit_min_remaining = 4.0
+# 允许使用 Kiro 超额额度；开启后跳过代理侧低额度保护和余额耗尽拦截。
+enable_overage = false
+# 每个账号最多使用的 Kiro 超额 credits；不设置时仅遵循 Kiro 上游上限。
+# max_overage_credits_per_account = 500.0
 # 整个代理服务每天最多消耗的 credits；0 表示不限，按 UTC 自然日重置。
 daily_credit_limit = 0.0
 # 上游返回真实 usage 前，每 1,000 个估算 token 预留的 credits。

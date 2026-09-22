@@ -275,10 +275,7 @@ async fn dispatch_upstream(
                 let remaining = account
                     .usage
                     .as_ref()
-                    .filter(|usage| usage.limit > 0.0)
-                    .map(|usage| {
-                        ((usage.limit - usage.current) / usage.limit * 100.0).clamp(0.0, 100.0)
-                    });
+                    .and_then(|usage| kproxy_pool::remaining_credit_percent(usage, &config.pool));
                 if let Some(fallback) = fallback_model.clone() {
                     mapped_model = fallback;
                 } else if let Some(rule) = locked_mapping_rule {

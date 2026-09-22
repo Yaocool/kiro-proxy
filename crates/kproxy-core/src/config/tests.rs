@@ -17,6 +17,8 @@ fn defaults_match_the_spec() {
     assert_eq!(config.pool.max_queue_wait_ms, 30_000);
     assert_eq!(config.pool.queue_full_wait_ms, 5_000);
     assert_eq!(config.pool.low_credit_min_remaining, 4.0);
+    assert!(!config.pool.enable_overage);
+    assert_eq!(config.pool.max_overage_credits_per_account, None);
     assert_eq!(config.pool.credit_estimate_per_1k_tokens, 1.0);
     assert_eq!(config.pool.credit_estimate_output_token_cap, 8_192);
     assert!(config.pool.auto_switch_on_quota_exhausted);
@@ -221,6 +223,26 @@ fn legacy_credit_ratio_setting_is_ignored() {
 }
 
 #[test]
+fn overage_is_disabled_by_default_and_can_be_enabled_for_the_pool() {
+    let default: Config = toml::from_str("[pool]\n").expect("default pool config");
+    assert!(!default.pool.enable_overage);
+    assert_eq!(default.pool.max_overage_credits_per_account, None);
+
+    let enabled: Config =
+        toml::from_str("[pool]\nenable_overage = true\nmax_overage_credits_per_account = 500.0\n")
+            .expect("overage pool config");
+    assert!(enabled.pool.enable_overage);
+    assert_eq!(enabled.pool.max_overage_credits_per_account, Some(500.0));
+    enabled.validate().expect("valid overage cap");
+
+    for invalid in [-1.0, f64::NAN, f64::INFINITY] {
+        let mut config = enabled.clone();
+        config.pool.max_overage_credits_per_account = Some(invalid);
+        assert!(config.validate().is_err(), "invalid cap {invalid}");
+    }
+}
+
+#[test]
 fn documented_default_covers_every_config_field() {
     let documented: toml::Value = toml::from_str(&uncomment_documented_settings())
         .expect("all documented settings must form valid TOML");
@@ -247,6 +269,7 @@ fn uncomment_documented_settings() -> String {
 
 fn fully_populated_config() -> Config {
     let mut config = Config::default();
+    config.pool.max_overage_credits_per_account = Some(500.0);
     let mut provider = ProviderConfig {
         id: "copilot".into(),
         kind: "copilot".into(),

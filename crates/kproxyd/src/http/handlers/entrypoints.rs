@@ -73,7 +73,10 @@ async fn service_account_health(service: &ServiceHttpState) -> ServiceAccountHea
                     .iter()
                     .filter_map(|account| account.usage.as_ref())
                     .fold((0.0, 0.0), |(used, total), usage| {
-                        (used + usage.current, total + usage.limit)
+                        (
+                            used + usage.current,
+                            total + kproxy_pool::effective_credit_limit(usage, &config.pool),
+                        )
                     });
                 health.used_credits += used;
                 health.total_credits += total;

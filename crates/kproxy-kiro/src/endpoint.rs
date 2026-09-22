@@ -477,6 +477,7 @@ mod tests {
             usage: Some(Usage {
                 current: 0.0,
                 limit: 100.0,
+                overage_cap: None,
                 percent_used: 0.0,
                 next_reset_date: None,
                 updated_at: 0,

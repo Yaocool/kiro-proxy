@@ -59,7 +59,7 @@ pub(super) async fn handle_account_list(
         })
         .filter(|account| !params.enabled_only.unwrap_or(false) || account.enabled)
     {
-        let mut summary = summarize(account);
+        let mut summary = summarize(account, &pool_config);
         summary.health = Some(effective_account_health(&pool, account, &pool_config).await);
         if params
             .status
@@ -102,10 +102,9 @@ pub(super) async fn handle_account_show(
         .ok_or_else(|| RpcError::bad_params(format!("account not found: {}", params.id)))?;
     let pool = state.pool();
     let runtime = pool.get(&account.id).await;
-    let mut summary = summarize(&account);
-    summary.health = Some(
-        effective_account_health(&pool, &account, &state.runtime_config_snapshot().pool).await,
-    );
+    let pool_config = state.runtime_config_snapshot().pool;
+    let mut summary = summarize(&account, &pool_config);
+    summary.health = Some(effective_account_health(&pool, &account, &pool_config).await);
     let (supported_models, active_requests) = if let Some(runtime) = runtime {
         (runtime.supported_models().await, runtime.active())
     } else {
@@ -432,11 +431,12 @@ pub(super) async fn handle_account_add_sso(
     }
     account.upstream_user_id = Some(upstream_user_id);
     if let Some(usage) = limits.normalized_usage(now_secs()) {
-        account.credit_exhausted = usage.limit > 0.0 && usage.current >= usage.limit;
+        account.credit_exhausted =
+            kproxy_pool::usage_credit_exhausted(&usage, &state.runtime_config_snapshot().pool);
         account.usage = Some(usage);
     }
     account.subscription = limits.normalized_subscription();
-    let summary = summarize(&account);
+    let summary = summarize(&account, &state.runtime_config_snapshot().pool);
     commit_account_change(state, move |store| {
         store
             .insert(account)

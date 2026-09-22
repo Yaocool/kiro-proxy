@@ -5,7 +5,7 @@ use std::sync::{Arc, RwLock as StdRwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use indexmap::IndexMap;
-use kproxy_core::account::Account;
+use kproxy_core::account::{Account, Usage};
 use kproxy_core::config::PoolConfig;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -53,16 +53,31 @@ pub struct AccountPoolCounts {
 
 /// 使用与调度器相同的规则判断账号额度状态。
 pub fn account_credit_state(account: &Account, config: &PoolConfig) -> AccountCreditState {
+    if config.enable_overage {
+        if config.max_overage_credits_per_account.is_some()
+            && account
+                .usage
+                .as_ref()
+                .is_some_and(|usage| usage_credit_exhausted(usage, config))
+        {
+            return AccountCreditState::Exhausted;
+        }
+        return AccountCreditState::Available;
+    }
     if account.credit_exhausted {
         return AccountCreditState::Exhausted;
     }
     let Some(usage) = &account.usage else {
         return AccountCreditState::Available;
     };
-    if usage.limit <= 0.0 {
+    let limit = usage.limit_without_overage();
+    if limit <= 0.0 && usage.overage_cap.is_some() {
+        return AccountCreditState::Exhausted;
+    }
+    if limit <= 0.0 {
         return AccountCreditState::Available;
     }
-    let remaining = (usage.limit - usage.current).max(0.0);
+    let remaining = (limit - usage.current).max(0.0);
     if remaining <= 0.0 {
         return AccountCreditState::Exhausted;
     }
@@ -71,6 +86,30 @@ pub fn account_credit_state(account: &Account, config: &PoolConfig) -> AccountCr
     } else {
         AccountCreditState::Available
     }
+}
+
+/// 代理当前允许单个账号使用的总 credits，包括上游额度内的超额部分。
+pub fn effective_credit_limit(usage: &Usage, config: &PoolConfig) -> f64 {
+    let base = usage.limit_without_overage();
+    if !config.enable_overage {
+        return base;
+    }
+    match (usage.overage_cap, config.max_overage_credits_per_account) {
+        (Some(upstream_cap), Some(local_cap)) => base + upstream_cap.min(local_cap),
+        _ => usage.limit,
+    }
+}
+
+/// 按代理当前允许的总额度计算剩余百分比。
+pub fn remaining_credit_percent(usage: &Usage, config: &PoolConfig) -> Option<f64> {
+    let limit = effective_credit_limit(usage, config);
+    (limit > 0.0).then(|| ((limit - usage.current) / limit * 100.0).clamp(0.0, 100.0))
+}
+
+/// 根据当前额度策略更新持久化的耗尽标记。
+pub fn usage_credit_exhausted(usage: &Usage, config: &PoolConfig) -> bool {
+    let limit = effective_credit_limit(usage, config);
+    (limit > 0.0 && usage.current >= limit) || (limit <= 0.0 && usage.overage_cap.is_some())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -328,7 +367,7 @@ impl AccountPool {
             return false;
         }
         let account = state.account.read().await;
-        if !account.enabled || account.credit_exhausted {
+        if !account.enabled {
             return false;
         }
         if account_credit_state(&account, &self.config()) != AccountCreditState::Available {
@@ -356,8 +395,14 @@ impl AccountPool {
         let credit_factor = account
             .usage
             .as_ref()
-            .filter(|usage| usage.limit > 0.0)
-            .map(|usage| (usage.current / usage.limit).clamp(0.0, 1.0))
+            .map(|usage| {
+                let limit = effective_credit_limit(usage, &config);
+                if limit > 0.0 {
+                    (usage.current / limit).clamp(0.0, 1.0)
+                } else {
+                    0.0
+                }
+            })
             .unwrap_or(0.0);
         let idle_ms = now_ms().saturating_sub(state.last_used_ms());
         let idle_factor =
@@ -527,7 +572,7 @@ impl AccountPool {
     }
 
     /// Returns true only when at least one enabled account can serve the model
-    /// and every such account has a persisted or usage-derived credit stop.
+    /// and every such account has a persisted, usage-derived, or upstream quota stop.
     pub async fn all_matching_credit_exhausted(&self, model: &str) -> bool {
         self.all_matching_credit_exhausted_in(model, None).await
     }
@@ -576,7 +621,9 @@ impl AccountPool {
                 continue;
             }
             matched = true;
-            if account_credit_state(&account, &config) == AccountCreditState::Available {
+            if state.health() != AccountHealth::Exhausted
+                && account_credit_state(&account, &config) == AccountCreditState::Available
+            {
                 return false;
             }
         }
@@ -602,7 +649,9 @@ impl AccountPool {
                 continue;
             }
             enabled = true;
-            if account_credit_state(&account, &config) != AccountCreditState::Exhausted {
+            if state.health() != AccountHealth::Exhausted
+                && account_credit_state(&account, &config) != AccountCreditState::Exhausted
+            {
                 return false;
             }
         }
@@ -767,6 +816,7 @@ mod tests {
             usage: Some(Usage {
                 current: used,
                 limit: 100.0,
+                overage_cap: None,
                 percent_used: used,
                 next_reset_date: None,
                 updated_at: 0,
@@ -811,12 +861,191 @@ mod tests {
     }
 
     #[test]
+    fn overage_switch_bypasses_local_credit_gates() {
+        let mut account = account("overage", 95.0, SubscriptionKind::Enterprise);
+        let usage = account.usage.as_mut().expect("usage");
+        usage.limit = 200.0;
+        usage.overage_cap = Some(100.0);
+        let mut config = PoolConfig::default();
+
+        assert_eq!(
+            account_credit_state(&account, &config),
+            AccountCreditState::Available
+        );
+        account.usage.as_mut().expect("usage").current = 97.0;
+        assert_eq!(
+            account_credit_state(&account, &config),
+            AccountCreditState::Protected
+        );
+        account.usage.as_mut().expect("usage").current = 100.0;
+        assert_eq!(
+            account_credit_state(&account, &config),
+            AccountCreditState::Exhausted
+        );
+        assert!(usage_credit_exhausted(
+            account.usage.as_ref().expect("usage"),
+            &config
+        ));
+
+        config.enable_overage = true;
+        account.credit_exhausted = true;
+        assert_eq!(
+            account_credit_state(&account, &config),
+            AccountCreditState::Available
+        );
+        assert!(!usage_credit_exhausted(
+            account.usage.as_ref().expect("usage"),
+            &config
+        ));
+        account.usage.as_mut().expect("usage").current = 200.0;
+        assert_eq!(
+            account_credit_state(&account, &config),
+            AccountCreditState::Available
+        );
+        assert!(usage_credit_exhausted(
+            account.usage.as_ref().expect("usage"),
+            &config
+        ));
+    }
+
+    #[test]
+    fn configured_overage_cap_limits_each_account_without_low_credit_protection() {
+        let mut account = account("overage", 10_000.0, SubscriptionKind::Enterprise);
+        account.usage = Some(Usage {
+            current: 10_000.0,
+            limit: 20_000.0,
+            overage_cap: Some(10_000.0),
+            percent_used: 50.0,
+            next_reset_date: None,
+            updated_at: 0,
+        });
+        let mut config = PoolConfig {
+            enable_overage: true,
+            max_overage_credits_per_account: Some(500.0),
+            ..PoolConfig::default()
+        };
+        let usage = account.usage.as_ref().expect("usage");
+        assert_eq!(effective_credit_limit(usage, &config), 10_500.0);
+        assert!(
+            (remaining_credit_percent(usage, &config).expect("remaining")
+                - 500.0 / 10_500.0 * 100.0)
+                .abs()
+                < f64::EPSILON
+        );
+        assert_eq!(
+            account_credit_state(&account, &config),
+            AccountCreditState::Available
+        );
+
+        account.usage.as_mut().expect("usage").current = 10_499.0;
+        account.credit_exhausted = true;
+        assert_eq!(
+            account_credit_state(&account, &config),
+            AccountCreditState::Available
+        );
+        account.usage.as_mut().expect("usage").current = 10_500.0;
+        assert_eq!(
+            account_credit_state(&account, &config),
+            AccountCreditState::Exhausted
+        );
+        assert!(usage_credit_exhausted(
+            account.usage.as_ref().expect("usage"),
+            &config
+        ));
+
+        config.max_overage_credits_per_account = Some(20_000.0);
+        assert_eq!(
+            effective_credit_limit(account.usage.as_ref().expect("usage"), &config),
+            20_000.0
+        );
+        assert_eq!(
+            account_credit_state(&account, &config),
+            AccountCreditState::Available
+        );
+        config.max_overage_credits_per_account = Some(0.0);
+        assert_eq!(
+            effective_credit_limit(account.usage.as_ref().expect("usage"), &config),
+            10_000.0
+        );
+        assert_eq!(
+            account_credit_state(&account, &config),
+            AccountCreditState::Exhausted
+        );
+    }
+
+    #[tokio::test]
+    async fn configured_overage_cap_is_applied_to_each_account_in_the_pool() {
+        let mut available = account("available", 10_499.0, SubscriptionKind::Enterprise);
+        let mut exhausted = account("exhausted", 10_500.0, SubscriptionKind::Enterprise);
+        for account in [&mut available, &mut exhausted] {
+            let usage = account.usage.as_mut().expect("usage");
+            usage.limit = 20_000.0;
+            usage.overage_cap = Some(10_000.0);
+        }
+        let pool = AccountPool::new(
+            vec![available, exhausted],
+            PoolConfig {
+                enable_overage: true,
+                max_overage_credits_per_account: Some(500.0),
+                ..immediate_config()
+            },
+        );
+        let explanation = pool.explain("claude-sonnet").await;
+        assert_eq!(
+            explanation
+                .iter()
+                .filter(|account| account.eligible)
+                .count(),
+            1
+        );
+        assert_eq!(
+            pool.acquire("claude-sonnet", 0.0, &[])
+                .await
+                .expect("available account")
+                .account()
+                .await
+                .id,
+            "available"
+        );
+    }
+
+    #[tokio::test]
+    async fn overage_switch_schedules_persisted_exhausted_account() {
+        let mut exhausted = account("overage", 100.0, SubscriptionKind::Enterprise);
+        exhausted.credit_exhausted = true;
+        let pool = AccountPool::new(vec![exhausted], immediate_config());
+        assert!(matches!(
+            pool.acquire("claude-sonnet", 0.0, &[]).await,
+            Err(PoolError::NoAvailableAccount(_))
+        ));
+
+        pool.update_config(PoolConfig {
+            enable_overage: true,
+            ..immediate_config()
+        });
+        assert!(pool.acquire("claude-sonnet", 0.0, &[]).await.is_ok());
+        assert!(!pool.all_matching_credit_exhausted("claude-sonnet").await);
+
+        pool.get("overage")
+            .await
+            .expect("account")
+            .set_health(AccountHealth::Exhausted);
+        assert!(matches!(
+            pool.acquire("claude-sonnet", 0.0, &[]).await,
+            Err(PoolError::NoAvailableAccount(_))
+        ));
+        assert!(pool.all_matching_credit_exhausted("claude-sonnet").await);
+        assert!(pool.all_enabled_credit_exhausted().await);
+    }
+
+    #[test]
     fn credit_protection_uses_absolute_remaining_credits_only() {
         let config = PoolConfig::default();
         let mut account = account("low-percent", 0.0, SubscriptionKind::Pro);
         account.usage = Some(Usage {
             current: 995.0,
             limit: 1_000.0,
+            overage_cap: None,
             percent_used: 99.5,
             next_reset_date: None,
             updated_at: 0,

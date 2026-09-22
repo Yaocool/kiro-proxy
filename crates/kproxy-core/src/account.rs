@@ -90,6 +90,9 @@ pub struct Usage {
     pub current: f64,
     /// 总 credits。
     pub limit: f64,
+    /// 已计入总额度的 Kiro 超额额度上限。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overage_cap: Option<f64>,
     /// 使用百分比。
     pub percent_used: f64,
     /// 上游提供的下次重置日期。
@@ -97,6 +100,13 @@ pub struct Usage {
     pub next_reset_date: Option<String>,
     /// 更新时间，Unix 秒。
     pub updated_at: i64,
+}
+
+impl Usage {
+    /// 不使用 Kiro 超额额度时可用的总额度。
+    pub fn limit_without_overage(&self) -> f64 {
+        (self.limit - self.overage_cap.unwrap_or(0.0)).max(0.0)
+    }
 }
 
 /// 账号订阅信息。
@@ -258,6 +268,7 @@ mod tests {
         account.usage = Some(Usage {
             current: 120.0,
             limit: 500.0,
+            overage_cap: None,
             percent_used: 24.0,
             next_reset_date: Some("2026-09-01".into()),
             updated_at: 42,
@@ -304,5 +315,14 @@ mod tests {
         assert!(account.label.is_none());
         assert!(account.profile_arn.is_none());
         assert!(!account.credit_exhausted);
+    }
+
+    #[test]
+    fn legacy_usage_without_overage_cap_keeps_its_limit() {
+        let usage: Usage =
+            serde_json::from_str(r#"{"current":10,"limit":100,"percent_used":10,"updated_at":1}"#)
+                .expect("legacy usage");
+        assert_eq!(usage.overage_cap, None);
+        assert_eq!(usage.limit_without_overage(), 100.0);
     }
 }

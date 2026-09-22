@@ -69,8 +69,7 @@ pub(super) async fn handle_account_list(state: &Arc<AppState>, params: Value) ->
         #[serde(flatten)]
         selector: ProviderSelector,
         tag: Option<String>,
-        #[serde(default)]
-        enabled_only: bool,
+        enabled_only: Option<bool>,
         status: Option<String>,
         sort: Option<String>,
     }
@@ -130,7 +129,7 @@ pub(super) async fn handle_account_list(state: &Arc<AppState>, params: Value) ->
             .tag
             .as_ref()
             .is_none_or(|tag| account.tags.contains(tag))
-            && (!params.enabled_only || account.enabled)
+            && (!params.enabled_only.unwrap_or(false) || account.enabled)
             && params
                 .status
                 .as_ref()
@@ -556,13 +555,29 @@ async fn kiro_accounts(
             .into(),
             tags: account.tags.clone(),
             quota_current: account.usage.as_ref().map(|usage| usage.current),
-            quota_limit: account.usage.as_ref().map(|usage| usage.limit),
+            quota_limit: account
+                .usage
+                .as_ref()
+                .map(|usage| kproxy_pool::effective_credit_limit(usage, &config.pool)),
             quota_unit: Some("kiro_credits".into()),
             supported_models,
             details: json!({
                 "region":account.credentials.region,
                 "auth_method":account.credentials.auth_method,
                 "machine_id":account.machine_id,
+                "overage_enabled":config.pool.enable_overage,
+                "overage_cap":account.usage.as_ref().and_then(|usage| usage.overage_cap),
+                "kiro_overage_cap":account.usage.as_ref().and_then(|usage| usage.overage_cap),
+                "kiro_overage_total_limit":account.usage.as_ref().and_then(|usage| {
+                    usage.overage_cap.map(|_| usage.limit)
+                }),
+                "max_overage_credits_per_account":config.pool.max_overage_credits_per_account,
+                "effective_overage_cap":account.usage.as_ref().and_then(|usage| {
+                    usage.overage_cap.map(|_| {
+                        kproxy_pool::effective_credit_limit(usage, &config.pool)
+                            - usage.limit_without_overage()
+                    })
+                }),
                 "created_at":account.created_at
             }),
         });

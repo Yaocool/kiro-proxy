@@ -8,7 +8,7 @@ use std::{
 use futures::{stream, StreamExt};
 use kproxy_core::account::Account;
 use kproxy_core::config::{
-    ApiKeyConfig, ApiKeyFormat, Config, ProxyServiceConfig, ServiceAccountTags,
+    ApiKeyConfig, ApiKeyFormat, Config, PoolConfig, ProxyServiceConfig, ServiceAccountTags,
 };
 use kproxy_core::ids::{new_account_id, new_machine_id};
 use kproxy_ipc::protocol::{
@@ -24,7 +24,10 @@ use kproxy_ipc::protocol::{
     ProxyServiceCreateResult, ProxyServiceDeleteParams, ProxyServiceDeleteResult,
     ProxyServiceListResult, Request, Response, RpcError, StatusResult,
 };
-use kproxy_pool::{account_credit_state, AccountCreditState, AccountPool};
+use kproxy_pool::{
+    account_credit_state, effective_credit_limit, remaining_credit_percent, AccountCreditState,
+    AccountPool,
+};
 use kproxy_store::accounts::AccountStore;
 use kproxy_store::config_loader::{load_config, merge_hot_reload};
 use rand::RngCore;
@@ -877,7 +880,7 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
-fn summarize(account: &Account) -> AccountSummary {
+fn summarize(account: &Account, pool: &PoolConfig) -> AccountSummary {
     let mut tags = account.tags.clone();
     tags.sort();
     AccountSummary {
@@ -892,7 +895,10 @@ fn summarize(account: &Account) -> AccountSummary {
             .as_ref()
             .map(|subscription| format!("{:?}", subscription.kind)),
         credit_current: account.usage.as_ref().map(|usage| usage.current),
-        credit_limit: account.usage.as_ref().map(|usage| usage.limit),
+        credit_limit: account
+            .usage
+            .as_ref()
+            .map(|usage| effective_credit_limit(usage, pool)),
         token_expires_at: account.credentials.expires_at,
         credit_exhausted: account.credit_exhausted,
     }
@@ -1266,8 +1272,7 @@ async fn handle_model_resolve(state: &Arc<AppState>, params: serde_json::Value) 
         let remaining = account
             .usage
             .as_ref()
-            .filter(|usage| usage.limit > 0.0)
-            .map(|usage| ((usage.limit - usage.current) / usage.limit * 100.0).clamp(0.0, 100.0));
+            .and_then(|usage| remaining_credit_percent(usage, &config.pool));
         let route = kproxy_translate::model::map_model(
             input_model,
             &config.model_mapping,
@@ -1686,7 +1691,7 @@ async fn service_accounts_result(state: &Arc<AppState>, service: &ProxyServiceCo
         .iter()
         .filter(|account| service.includes_account(account))
     {
-        let mut summary = summarize(account);
+        let mut summary = summarize(account, &pool_config);
         summary.health = Some(effective_account_health(&pool, account, &pool_config).await);
         accounts.push(summary);
     }

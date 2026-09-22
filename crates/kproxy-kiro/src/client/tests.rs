@@ -1157,6 +1157,49 @@ fn usage_limits_normalize_base_trial_bonus_and_subscription() {
 }
 
 #[test]
+fn usage_limits_include_enabled_overage_capacity() {
+    let mut response = serde_json::json!({
+        "overageConfiguration":{"overageStatus":"ENABLED"},
+        "usageBreakdownList":[{
+            "resourceType":"CREDIT",
+            "currentUsageWithPrecision":10000.0,
+            "usageLimitWithPrecision":10000.0,
+            "currentOveragesWithPrecision":0.0,
+            "overageCapWithPrecision":10000.0
+        }]
+    });
+    let normalize = |response: &serde_json::Value| {
+        serde_json::from_value::<UsageLimits>(response.clone())
+            .expect("usage response")
+            .normalized_usage(123)
+            .expect("credit usage")
+    };
+
+    let available = normalize(&response);
+    assert_eq!(available.current, 10000.0);
+    assert_eq!(available.limit, 20000.0);
+    assert_eq!(available.overage_cap, Some(10000.0));
+    assert_eq!(available.limit_without_overage(), 10000.0);
+    assert_eq!(available.percent_used, 50.0);
+
+    response["usageBreakdownList"][0]["currentUsageWithPrecision"] = serde_json::json!(13000.0);
+    response["usageBreakdownList"][0]["currentOveragesWithPrecision"] = serde_json::json!(3000.0);
+    let spending_overage = normalize(&response);
+    assert_eq!(spending_overage.current, 13000.0);
+    assert_eq!(spending_overage.limit, 20000.0);
+
+    response["usageBreakdownList"][0]["currentUsageWithPrecision"] = serde_json::json!(20000.0);
+    assert_eq!(normalize(&response).current, normalize(&response).limit);
+
+    response["usageBreakdownList"][0]["currentUsageWithPrecision"] = serde_json::json!(10000.0);
+    response["overageConfiguration"]["overageStatus"] = serde_json::json!("DISABLED");
+    let disabled = normalize(&response);
+    assert_eq!(disabled.current, 10000.0);
+    assert_eq!(disabled.limit, 10000.0);
+    assert_eq!(disabled.overage_cap, None);
+}
+
+#[test]
 fn framed_error_text_is_classified_like_http_statuses() {
     let auth = KiroError {
         status: None,

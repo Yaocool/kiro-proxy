@@ -842,7 +842,8 @@ pub(crate) async fn refresh_account_usage(
         account.upstream_user_id = Some(user_id);
     }
     if let Some(usage) = usage {
-        account.credit_exhausted = usage.limit > 0.0 && usage.current >= usage.limit;
+        account.credit_exhausted =
+            kproxy_pool::usage_credit_exhausted(&usage, &state.runtime_config_snapshot().pool);
         account.usage = Some(usage);
     }
     if let Some(subscription) = subscription {

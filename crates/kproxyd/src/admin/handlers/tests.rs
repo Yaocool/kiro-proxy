@@ -128,6 +128,7 @@ async fn status_reports_counts_and_empty_hint() {
     protected.usage = Some(Usage {
         current: 97.0,
         limit: 100.0,
+        overage_cap: None,
         percent_used: 97.0,
         next_reset_date: None,
         updated_at: 0,
@@ -136,6 +137,7 @@ async fn status_reports_counts_and_empty_hint() {
     exhausted.usage = Some(Usage {
         current: 100.0,
         limit: 100.0,
+        overage_cap: None,
         percent_used: 100.0,
         next_reset_date: None,
         updated_at: 0,
@@ -1436,6 +1438,26 @@ async fn account_lists_and_exports_default_to_email_order() {
 }
 
 #[tokio::test]
+async fn provider_account_list_accepts_null_enabled_filter_from_existing_clients() {
+    let (_directory, state) =
+        state_with(vec![sample_account("acc_00000001", "a@example.com", true)]).await;
+
+    let result: ProviderAccountListResult = serde_json::from_value(expect_ok(
+        dispatch(
+            &state,
+            Request::new(
+                1,
+                method::V2_ACCOUNT_LIST,
+                serde_json::json!({"provider":"kiro","enabled_only":null}),
+            ),
+        )
+        .await,
+    ))
+    .expect("provider account list");
+    assert_eq!(result.accounts.len(), 1);
+}
+
+#[tokio::test]
 async fn administrative_lists_use_stable_name_order() {
     let (_directory, state) = state_with(vec![]).await;
     let mut config = Config::default();
@@ -1566,6 +1588,7 @@ async fn account_list_distinguishes_low_credit_from_exhaustion() {
     protected.usage = Some(Usage {
         current: 97.0,
         limit: 100.0,
+        overage_cap: None,
         percent_used: 97.0,
         next_reset_date: None,
         updated_at: 0,
@@ -1574,6 +1597,7 @@ async fn account_list_distinguishes_low_credit_from_exhaustion() {
     exhausted.usage = Some(Usage {
         current: 100.0,
         limit: 100.0,
+        overage_cap: None,
         percent_used: 100.0,
         next_reset_date: None,
         updated_at: 0,
@@ -1628,12 +1652,110 @@ async fn account_list_distinguishes_low_credit_from_exhaustion() {
 }
 
 #[tokio::test]
+async fn overage_config_switch_updates_account_health_and_visible_limit() {
+    let mut account = sample_account("acc_00000001", "overage@example.com", true);
+    account.usage = Some(Usage {
+        current: 10_000.0,
+        limit: 20_000.0,
+        overage_cap: Some(10_000.0),
+        percent_used: 50.0,
+        next_reset_date: None,
+        updated_at: 1,
+    });
+    account.credit_exhausted = true;
+    let (_directory, state) = state_with(vec![account]).await;
+    let list = |id| Request::new(id, method::ACCOUNT_LIST, serde_json::json!({}));
+
+    let disabled: AccountListResult =
+        serde_json::from_value(expect_ok(dispatch(&state, list(1)).await)).expect("account list");
+    assert_eq!(disabled.accounts[0].health.as_deref(), Some("exhausted"));
+    assert_eq!(disabled.accounts[0].credit_limit, Some(10_000.0));
+    let v2_disabled: ProviderAccountListResult = serde_json::from_value(expect_ok(
+        dispatch(
+            &state,
+            Request::new(3, method::V2_ACCOUNT_LIST, serde_json::json!({})),
+        )
+        .await,
+    ))
+    .expect("provider account list");
+    assert_eq!(v2_disabled.accounts[0].quota_limit, Some(10_000.0));
+
+    let mut enabled_config = state.runtime_config_snapshot();
+    enabled_config.pool.enable_overage = true;
+    state
+        .apply_config_transaction(&enabled_config)
+        .await
+        .expect("apply overage config");
+    let enabled: AccountListResult =
+        serde_json::from_value(expect_ok(dispatch(&state, list(2)).await)).expect("account list");
+    assert_eq!(enabled.accounts[0].health.as_deref(), Some("available"));
+    assert_eq!(enabled.accounts[0].credit_limit, Some(20_000.0));
+    let v2_enabled: ProviderAccountListResult = serde_json::from_value(expect_ok(
+        dispatch(
+            &state,
+            Request::new(4, method::V2_ACCOUNT_LIST, serde_json::json!({})),
+        )
+        .await,
+    ))
+    .expect("provider account list");
+    assert_eq!(v2_enabled.accounts[0].quota_limit, Some(20_000.0));
+    assert_eq!(v2_enabled.accounts[0].details["overage_enabled"], true);
+
+    enabled_config.pool.max_overage_credits_per_account = Some(500.0);
+    state
+        .apply_config_transaction(&enabled_config)
+        .await
+        .expect("apply per-account overage cap");
+    let capped: AccountListResult =
+        serde_json::from_value(expect_ok(dispatch(&state, list(5)).await)).expect("capped list");
+    assert_eq!(capped.accounts[0].health.as_deref(), Some("available"));
+    assert_eq!(capped.accounts[0].credit_limit, Some(10_500.0));
+    let v2_capped: ProviderAccountListResult = serde_json::from_value(expect_ok(
+        dispatch(
+            &state,
+            Request::new(6, method::V2_ACCOUNT_LIST, serde_json::json!({})),
+        )
+        .await,
+    ))
+    .expect("capped provider account list");
+    assert_eq!(v2_capped.accounts[0].quota_limit, Some(10_500.0));
+    assert_eq!(
+        v2_capped.accounts[0].details["max_overage_credits_per_account"],
+        500.0
+    );
+    assert_eq!(v2_capped.accounts[0].details["overage_cap"], 10_000.0);
+    assert_eq!(v2_capped.accounts[0].details["kiro_overage_cap"], 10_000.0);
+    assert_eq!(
+        v2_capped.accounts[0].details["kiro_overage_total_limit"],
+        20_000.0
+    );
+    assert_eq!(
+        v2_capped.accounts[0].details["effective_overage_cap"],
+        500.0
+    );
+
+    enabled_config.pool.max_overage_credits_per_account = Some(0.0);
+    state
+        .apply_config_transaction(&enabled_config)
+        .await
+        .expect("apply zero overage cap");
+    let capped_to_zero: AccountListResult =
+        serde_json::from_value(expect_ok(dispatch(&state, list(7)).await)).expect("zero cap list");
+    assert_eq!(
+        capped_to_zero.accounts[0].health.as_deref(),
+        Some("exhausted")
+    );
+    assert_eq!(capped_to_zero.accounts[0].credit_limit, Some(10_000.0));
+}
+
+#[tokio::test]
 async fn model_resolution_uses_each_accounts_real_model_cache() {
     let account = sample_account("acc_00000001", "enterprise@example.com", true);
     let mut protected = sample_account("acc_00000002", "protected@example.com", true);
     protected.usage = Some(Usage {
         current: 99.0,
         limit: 100.0,
+        overage_cap: None,
         percent_used: 99.0,
         next_reset_date: None,
         updated_at: 0,

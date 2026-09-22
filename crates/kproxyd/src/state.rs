@@ -1928,6 +1928,7 @@ mod tests {
             stale.usage = Some(Usage {
                 current: 42.0,
                 limit: 100.0,
+                overage_cap: None,
                 percent_used: 42.0,
                 next_reset_date: None,
                 updated_at: 123,

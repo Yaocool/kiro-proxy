@@ -772,6 +772,7 @@ mod tests {
             Some(Usage {
                 current: 0.0,
                 limit: 100.0,
+                overage_cap: None,
                 percent_used: 0.0,
                 updated_at: 1,
                 next_reset_date: None,
@@ -970,6 +971,7 @@ mod tests {
                 Some(Usage {
                     current: 1.25,
                     limit: 10.0,
+                    overage_cap: None,
                     percent_used: 12.5,
                     next_reset_date: None,
                     updated_at: 1,
@@ -984,6 +986,7 @@ mod tests {
                 Some(Usage {
                     current: 2.75,
                     limit: 20.0,
+                    overage_cap: None,
                     percent_used: 13.75,
                     next_reset_date: None,
                     updated_at: 2,

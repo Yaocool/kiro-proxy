@@ -307,6 +307,8 @@ pub struct UsageLimits {
     #[serde(default)]
     pub usage_breakdown_list: Vec<UsageBreakdown>,
     #[serde(default)]
+    pub overage_configuration: Option<OverageConfiguration>,
+    #[serde(default)]
     pub next_date_reset: Option<serde_json::Value>,
     #[serde(default)]
     pub days_until_reset: Option<i64>,
@@ -339,11 +341,22 @@ pub struct UsageBreakdown {
     #[serde(default)]
     pub usage_limit_with_precision: Option<f64>,
     #[serde(default)]
+    pub overage_cap: Option<f64>,
+    #[serde(default)]
+    pub overage_cap_with_precision: Option<f64>,
+    #[serde(default)]
     pub free_trial_info: Option<UsageAllowance>,
     #[serde(default)]
     pub free_trial_usage: Option<UsageAllowance>,
     #[serde(default)]
     pub bonuses: Vec<UsageAllowance>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OverageConfiguration {
+    #[serde(default)]
+    pub overage_status: String,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -393,9 +406,25 @@ impl UsageLimits {
             current += precise(bonus.current_usage_with_precision, bonus.current_usage);
             limit += precise(bonus.usage_limit_with_precision, bonus.usage_limit);
         }
+        let mut overage_cap = None;
+        if self
+            .overage_configuration
+            .as_ref()
+            .is_some_and(|configuration| {
+                configuration.overage_status.eq_ignore_ascii_case("ENABLED")
+            })
+        {
+            let cap = precise(credit.overage_cap_with_precision, credit.overage_cap);
+            if cap.is_finite() && cap > 0.0 {
+                // Kiro includes consumed overage in currentUsage; only the cap extends capacity.
+                limit += cap;
+                overage_cap = Some(cap);
+            }
+        }
         Some(Usage {
             current,
             limit,
+            overage_cap,
             percent_used: if limit > 0.0 {
                 (current / limit * 100.0).clamp(0.0, 100.0)
             } else {
