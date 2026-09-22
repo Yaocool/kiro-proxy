@@ -40,8 +40,12 @@ pub async fn run_alert(client: &mut AdminClient, command: AlertCommand, json: bo
                 Ok(())
             })
             .await?;
-            println!("已添加告警目标 {name}");
-            Ok(())
+            if json {
+                print_json(&serde_json::json!({"name": name, "created": true}))
+            } else {
+                println!("已添加告警目标 {name}");
+                Ok(())
+            }
         }
         AlertCommand::Edit {
             target,
@@ -60,6 +64,22 @@ pub async fn run_alert(client: &mut AdminClient, command: AlertCommand, json: bo
             custom_template,
             clear_custom_template,
         } => {
+            if rename.is_none()
+                && platform.is_none()
+                && webhook_url.is_none()
+                && events.is_empty()
+                && !clear_events
+                && !enable
+                && !disable
+                && dingtalk_sign.is_none()
+                && !clear_dingtalk_sign
+                && telegram_chat_id.is_none()
+                && !clear_telegram_chat_id
+                && custom_template.is_none()
+                && !clear_custom_template
+            {
+                return Err(anyhow!("没有指定修改项；请至少提供一个 edit 选项"));
+            }
             let name = target
                 .or(name)
                 .ok_or_else(|| anyhow!("需指定告警目标名称"))?;
@@ -97,20 +117,45 @@ pub async fn run_alert(client: &mut AdminClient, command: AlertCommand, json: bo
                 Ok(())
             })
             .await?;
-            println!("已更新告警目标 {name}");
-            Ok(())
+            if json {
+                print_json(&serde_json::json!({
+                    "name": name,
+                    "renamed_to": rename,
+                    "updated": true
+                }))
+            } else {
+                if let Some(rename) = rename {
+                    println!("已更新告警目标 {name} -> {rename}");
+                } else {
+                    println!("已更新告警目标 {name}");
+                }
+                Ok(())
+            }
         }
-        AlertCommand::Delete { name } => {
-            if !crate::commands::confirm(&format!("确认删除告警目标 {name}？")).await? {
-                println!("已取消");
+        AlertCommand::Delete { name, yes } => {
+            if !crate::commands::confirm_unless(yes, &format!("确认删除告警目标 {name}？")).await?
+            {
+                if json {
+                    print_json(&serde_json::json!({
+                        "name": name,
+                        "deleted": false,
+                        "cancelled": true
+                    }))?;
+                } else {
+                    println!("已取消");
+                }
                 return Ok(());
             }
             mutate_config_array(client, "webhook", |array| {
                 remove_named_value(array, &name, "告警目标")
             })
             .await?;
-            println!("已删除告警目标 {name}");
-            Ok(())
+            if json {
+                print_json(&serde_json::json!({"name": name, "deleted": true}))
+            } else {
+                println!("已删除告警目标 {name}");
+                Ok(())
+            }
         }
         AlertCommand::Test { name, all } => {
             if name.is_none() && !all {
@@ -147,16 +192,17 @@ fn alert_event_catalog() -> [AlertEventInfo; 4] {
         AlertEventInfo {
             event: AlertEvent::AccountCreditProtected.as_str(),
             condition:
-                "单个启用账号仍有额度，但达到 pool.low_credit_min_remaining 保护阈值并暂停调度；额度恢复后才允许再次告警。",
+                "overage 关闭时，单个启用账号达到 pool.low_credit_min_remaining 保护阈值并暂停调度；overage 开启时不触发此保护告警。",
         },
         AlertEventInfo {
             event: AlertEvent::AccountQuotaExhausted.as_str(),
             condition:
-                "单个启用账号的额度完全耗尽；同一次异常只告警一次，额度恢复后才允许再次告警。",
+                "单个启用账号达到代理有效额度上限，或 Kiro 上游实际返回额度耗尽；同一次异常只告警一次，恢复后才允许再次告警。",
         },
         AlertEventInfo {
             event: AlertEvent::ServiceQuotaExhausted.as_str(),
-            condition: "API 代理服务共享的全部启用账号额度完全耗尽；服务恢复前只告警一次。",
+            condition:
+                "API 代理服务共享的全部启用账号达到各自有效额度上限或被 Kiro 判定额度耗尽；服务恢复前只告警一次。",
         },
         AlertEventInfo {
             event: AlertEvent::TokenRefreshFailed.as_str(),
@@ -244,7 +290,7 @@ pub fn show_alert_platforms(json: bool) -> Result<()> {
     Ok(())
 }
 
-fn show_alert_config(json: bool) -> Result<()> {
+pub fn show_alert_config(json: bool) -> Result<()> {
     if json {
         return print_json(&serde_json::json!({
             "mode":"once_until_recovery",

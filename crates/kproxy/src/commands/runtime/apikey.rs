@@ -20,10 +20,22 @@ pub async fn run_apikey(
         ApiKeyCommand::History { id, tail, provider } => {
             show_keys(client, Some(&id), Some(tail), provider.as_deref(), json).await
         }
-        ApiKeyCommand::ResetUsage { id } => {
-            if !crate::commands::confirm(&format!("确认重置 API key {id} 的全部用量统计？")).await?
+        ApiKeyCommand::ResetUsage { id, yes } => {
+            if !crate::commands::confirm_unless(
+                yes,
+                &format!("确认重置 API key {id} 的全部用量统计？"),
+            )
+            .await?
             {
-                println!("已取消");
+                if json {
+                    print_json(&serde_json::json!({
+                        "id": id,
+                        "reset": false,
+                        "cancelled": true
+                    }))?;
+                } else {
+                    println!("已取消");
+                }
                 return Ok(());
             }
             simple_rpc(
@@ -122,9 +134,18 @@ pub async fn run_apikey(
             .await?;
             report_apikey_change(client, &id, "已更新", json).await
         }
-        ApiKeyCommand::Rm { id } => {
-            if !crate::commands::confirm(&format!("确认删除 API key {id}？")).await? {
-                println!("已取消");
+        ApiKeyCommand::Rm { id, yes } => {
+            if !crate::commands::confirm_unless(yes, &format!("确认删除 API key {id}？")).await?
+            {
+                if json {
+                    print_json(&serde_json::json!({
+                        "id": id,
+                        "removed": false,
+                        "cancelled": true
+                    }))?;
+                } else {
+                    println!("已取消");
+                }
                 return Ok(());
             }
             mutate_config_array(client, "api_key", |array| {
@@ -291,11 +312,16 @@ async fn show_key_list(
             let mut row = vec![
                 entry.id.clone(),
                 entry.name.clone(),
-                if entry.enabled { "enabled" } else { "disabled" }.into(),
-                if entry.skip_user_agent_check {
-                    "skip".into()
+                if entry.enabled {
+                    "已启用"
                 } else {
-                    "enforce".into()
+                    "已停用"
+                }
+                .into(),
+                if entry.skip_user_agent_check {
+                    "跳过".into()
+                } else {
+                    "校验".into()
                 },
                 entry
                     .credits_limit

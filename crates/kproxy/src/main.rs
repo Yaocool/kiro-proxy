@@ -118,7 +118,7 @@ enum Command {
     },
     /// 账号管理。
     #[command(
-        after_help = "示例：\n  kproxy account list\n  kproxy account show user@example.com\n  kproxy account services user@example.com\n  kproxy account probe --all\n\n操作说明：kproxy guide account 或 kproxy guide sso"
+        after_help = "示例：\n  kproxy account list\n  kproxy account show user@example.com\n  kproxy account overage\n  kproxy account services user@example.com\n  kproxy account probe --all\n\n操作说明：kproxy guide account 或 kproxy guide sso"
     )]
     Account {
         #[command(subcommand)]
@@ -181,8 +181,8 @@ enum Command {
         #[command(flatten)]
         range: TimeRangeArgs,
         /// 分组维度：provider/model/account/apikey/endpoint。
-        #[arg(long, requires = "detail")]
-        by: Option<String>,
+        #[arg(long, requires = "detail", value_enum)]
+        by: Option<StatsGroup>,
         /// 仅统计一个提供源实例；`all` 等同于不筛选。
         #[arg(long)]
         provider: Option<String>,
@@ -274,6 +274,29 @@ enum CompletionShell {
     Fish,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lowercase")]
+enum StatsGroup {
+    Provider,
+    Model,
+    Account,
+    #[value(name = "apikey")]
+    ApiKey,
+    Endpoint,
+}
+
+impl StatsGroup {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Provider => "provider",
+            Self::Model => "model",
+            Self::Account => "account",
+            Self::ApiKey => "apikey",
+            Self::Endpoint => "endpoint",
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum ProviderCommand {
     /// 列出所有提供源实例及运行状态。
@@ -296,6 +319,7 @@ enum ProviderCommand {
         /// 驱动设置，格式为 KEY=TOML_VALUE，可重复。
         #[arg(long = "setting", value_name = "KEY=VALUE")]
         settings: Vec<String>,
+        /// 单账号并发上限；0 表示继承全局账号池上限。
         #[arg(long)]
         max_concurrent_per_account: Option<usize>,
         #[arg(long)]
@@ -312,6 +336,7 @@ enum ProviderCommand {
         /// 删除驱动设置，可重复或逗号分隔。
         #[arg(long = "remove-setting", value_delimiter = ',')]
         remove_settings: Vec<String>,
+        /// 单账号并发上限；0 表示继承全局账号池上限。
         #[arg(long)]
         max_concurrent_per_account: Option<usize>,
         #[arg(long)]
@@ -327,7 +352,12 @@ enum ProviderCommand {
     Disable { id: String },
     /// 删除提供源实例的配置；账号文件保留在数据目录中。
     #[command(name = "delete", visible_alias = "rm")]
-    Delete { id: String },
+    Delete {
+        id: String,
+        /// 跳过交互确认，用于自动化。
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -369,14 +399,37 @@ enum ModelsCommand {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lowercase")]
+enum RequestLogLevel {
+    /// 显示全部请求；`info` 是兼容别名。
+    #[value(alias = "info")]
+    All,
+    /// 只显示 HTTP 4xx/5xx 请求；`warning` 是兼容别名。
+    #[value(alias = "warning")]
+    Warn,
+    /// 只显示 HTTP 5xx 请求。
+    Error,
+}
+
+impl RequestLogLevel {
+    fn as_filter(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Warn => Some("warn"),
+            Self::Error => Some("error"),
+        }
+    }
+}
+
 #[derive(Debug, Args)]
 struct RequestLogArgs {
     /// 最多显示多少条最近请求（1～1000）。
     #[arg(long, default_value_t = 50, value_parser = parse_log_tail)]
     tail: usize,
-    /// 只显示指定级别，例如 error。
-    #[arg(long)]
-    level: Option<String>,
+    /// 请求范围：all/info 显示全部，warn 显示 4xx/5xx，error 显示 5xx。
+    #[arg(long, value_enum)]
+    level: Option<RequestLogLevel>,
     /// 按账号 ID、邮箱或名称过滤。
     #[arg(long)]
     account: Option<String>,
@@ -463,7 +516,11 @@ enum ModelMapCommand {
     Add {
         #[arg(long)]
         name: String,
-        #[arg(long, default_value = "replace")]
+        #[arg(
+            long,
+            default_value = "replace",
+            value_parser = ["replace", "alias", "loadbalance"]
+        )]
         kind: String,
         #[arg(long = "source", value_delimiter = ',', required = true)]
         source_models: Vec<String>,
@@ -474,7 +531,7 @@ enum ModelMapCommand {
         #[arg(long = "weight", value_delimiter = ',')]
         weights: Vec<u32>,
         /// 账号剩余 credits 百分比低于此值时生效。
-        #[arg(long)]
+        #[arg(long, value_parser = parse_percent)]
         below_credits_percent: Option<f64>,
         #[arg(long = "api-key", value_delimiter = ',')]
         api_key_ids: Vec<String>,
@@ -493,7 +550,7 @@ enum ModelMapCommand {
         name: String,
         #[arg(long)]
         rename: Option<String>,
-        #[arg(long)]
+        #[arg(long, value_parser = ["replace", "alias", "loadbalance"])]
         kind: Option<String>,
         #[arg(long = "source", value_delimiter = ',')]
         source_models: Vec<String>,
@@ -505,7 +562,7 @@ enum ModelMapCommand {
         weights: Vec<u32>,
         #[arg(long)]
         clear_weights: bool,
-        #[arg(long)]
+        #[arg(long, value_parser = parse_percent)]
         below_credits_percent: Option<f64>,
         #[arg(long)]
         clear_credits_threshold: bool,
@@ -528,14 +585,19 @@ enum ModelMapCommand {
     },
     /// 删除模型映射规则，执行前需输入 y 或 yes 确认。
     #[command(name = "delete", visible_alias = "rm")]
-    Delete { name: String },
+    Delete {
+        name: String,
+        /// 跳过交互确认，用于自动化。
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// 测试客户端模型名会命中的规则。
     #[command(
         after_help = "示例：\n  kproxy model-map test claude-sonnet-4\n  kproxy model-map test claude-opus-4 --remaining-credits-percent 8"
     )]
     Test {
         model: String,
-        #[arg(long)]
+        #[arg(long, value_parser = parse_percent)]
         remaining_credits_percent: Option<f64>,
         #[arg(long)]
         api_key: Option<String>,
@@ -648,6 +710,17 @@ fn parse_log_tail(value: &str) -> std::result::Result<usize, String> {
     }
 }
 
+fn parse_percent(value: &str) -> std::result::Result<f64, String> {
+    let percent = value
+        .parse::<f64>()
+        .map_err(|_| "百分比必须是数字".to_owned())?;
+    if percent.is_finite() && (0.0..=100.0).contains(&percent) {
+        Ok(percent)
+    } else {
+        Err("百分比必须是 0..=100 的有限数值".to_owned())
+    }
+}
+
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
     /// 列出可查看和编辑的配置模块。
@@ -685,6 +758,9 @@ enum ConfigCommand {
     Reset {
         /// 只重置指定模块；使用 `kproxy config list` 查看模块名。
         module: Option<String>,
+        /// 跳过交互确认，用于自动化。
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// 只校验配置，不应用。
     #[command(
@@ -697,7 +773,7 @@ enum ConfigCommand {
 async fn main() -> Result<()> {
     let raw_args: Vec<OsString> = std::env::args_os().collect();
     let preliminary = crate::cli::parse_or_exit(raw_args.clone());
-    if crate::cli::handle_local(&preliminary)? {
+    if crate::cli::handle_local(&preliminary).await? {
         return Ok(());
     }
 
@@ -706,22 +782,6 @@ async fn main() -> Result<()> {
     let Some(command) = cli.command else {
         unreachable!("local navigation returned before runtime setup")
     };
-    if let Command::Alert {
-        command: Some(alert_command),
-    } = &command
-    {
-        match alert_command {
-            crate::commands::runtime::AlertCommand::Events => {
-                crate::commands::runtime::show_alert_events(cli.json)?;
-                return Ok(());
-            }
-            crate::commands::runtime::AlertCommand::Platforms => {
-                crate::commands::runtime::show_alert_platforms(cli.json)?;
-                return Ok(());
-            }
-            _ => {}
-        }
-    }
     if matches!(
         &command,
         Command::Restart | Command::Stop | Command::Uninstall { .. }
@@ -870,9 +930,9 @@ async fn main() -> Result<()> {
                 .await?;
         }
         Command::Provider {
-            command: Some(ProviderCommand::Delete { id }),
+            command: Some(ProviderCommand::Delete { id, yes }),
         } => {
-            crate::commands::runtime::delete_provider(&mut client, &id, cli.json).await?;
+            crate::commands::runtime::delete_provider(&mut client, &id, yes, cli.json).await?;
         }
         Command::Config {
             command: Some(ConfigCommand::List),
@@ -933,10 +993,10 @@ async fn main() -> Result<()> {
             crate::commands::runtime::edit_config(&mut client, module.as_deref()).await?;
         }
         Command::Config {
-            command: Some(ConfigCommand::Reset { module }),
+            command: Some(ConfigCommand::Reset { module, yes }),
         } => {
             if let Some(result) =
-                crate::commands::runtime::reset_config(&mut client, module.as_deref()).await?
+                crate::commands::runtime::reset_config(&mut client, module.as_deref(), yes).await?
             {
                 if cli.json {
                     print_json(&serde_json::json!({
@@ -968,7 +1028,7 @@ async fn main() -> Result<()> {
         Command::Config {
             command: Some(ConfigCommand::Validate { file }),
         } => {
-            crate::commands::runtime::validate_config(file.as_deref()).await?;
+            crate::commands::runtime::validate_config(file.as_deref(), cli.json).await?;
         }
         Command::Account {
             command: Some(command),
@@ -1026,9 +1086,7 @@ async fn main() -> Result<()> {
                         }),
                     )
                     .await?;
-                print_json(&serde_json::json!({
-                    "endpoints":endpoints,"accounts":accounts
-                }))?;
+                crate::commands::runtime::print_diagnose_all(&endpoints, &accounts, cli.json)?;
             }
             Some(DiagnoseCommand::Endpoints { region }) => {
                 crate::commands::runtime::simple_rpc(
@@ -1093,7 +1151,7 @@ async fn main() -> Result<()> {
                 detail,
                 recent,
                 range,
-                by.as_deref(),
+                by.map(StatsGroup::as_str),
                 provider.as_deref(),
                 cli.json,
             )
@@ -1105,7 +1163,7 @@ async fn main() -> Result<()> {
                     &mut client,
                     query.tail,
                     false,
-                    query.level.as_deref(),
+                    query.level.and_then(RequestLogLevel::as_filter),
                     query.account.as_deref(),
                     query.provider.as_deref(),
                     cli.json,
@@ -1117,7 +1175,7 @@ async fn main() -> Result<()> {
                     &mut client,
                     query.tail,
                     true,
-                    query.level.as_deref(),
+                    query.level.and_then(RequestLogLevel::as_filter),
                     query.account.as_deref(),
                     query.provider.as_deref(),
                     cli.json,
@@ -1259,7 +1317,12 @@ async fn show_providers(
         if json {
             return print_json(&value);
         }
-        println!("{}   {}   {}", value.id, value.kind, value.status);
+        println!(
+            "{}   {}   {}",
+            value.id,
+            value.kind,
+            display_runtime_status(&value.status)
+        );
         println!("启用      {}", if value.enabled { "是" } else { "否" });
         println!(
             "协议      {}",
@@ -1310,7 +1373,7 @@ async fn show_providers(
                 } else {
                     "否".into()
                 },
-                provider["status"].as_str().unwrap_or("unknown").into(),
+                display_runtime_status(provider["status"].as_str().unwrap_or("unknown")).into(),
                 protocols,
                 provider["error"].as_str().unwrap_or("").into(),
             ]
@@ -1321,6 +1384,19 @@ async fn show_providers(
         render_table(&["PROVIDER", "KIND", "启用", "状态", "协议", "错误"], &rows)
     );
     Ok(())
+}
+
+fn display_runtime_status(status: &str) -> &str {
+    match status {
+        "ready" | "available" | "running" => "可用",
+        "disabled" => "已停用",
+        "unavailable" | "stopped" => "不可用",
+        "unsupported" => "不支持",
+        "not_ready" => "未就绪",
+        "error" => "异常",
+        "unknown" => "未知",
+        other => other,
+    }
 }
 
 async fn show_provider_models(
@@ -1579,7 +1655,7 @@ fn mapped_provider_target<'a>(
 
 fn format_token_limit(value: Option<u64>) -> String {
     let Some(value) = value else {
-        return "unknown".into();
+        return "-".into();
     };
     if value >= 1_000_000 && value.is_multiple_of(1_000_000) {
         format!("{}M", value / 1_000_000)
@@ -1749,7 +1825,10 @@ mod tests {
         assert!(matches!(
             cli.command,
             Some(Command::Config {
-                command: Some(ConfigCommand::Reset { module: None })
+                command: Some(ConfigCommand::Reset {
+                    module: None,
+                    yes: false,
+                })
             })
         ));
 
@@ -1760,8 +1839,31 @@ mod tests {
             Some(Command::Config {
                 command: Some(ConfigCommand::Reset {
                     module: Some(module),
+                    yes: false,
                 })
             }) if module == "pool"
+        ));
+    }
+
+    #[test]
+    fn provider_concurrency_zero_keeps_the_inherit_semantics() {
+        let cli = Cli::try_parse_from([
+            "kproxy",
+            "provider",
+            "edit",
+            "kiro",
+            "--max-concurrent-per-account",
+            "0",
+        ])
+        .expect("zero inherits global limit");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Provider {
+                command: Some(ProviderCommand::Edit {
+                    max_concurrent_per_account: Some(0),
+                    ..
+                })
+            })
         ));
     }
 
@@ -1830,6 +1932,90 @@ mod tests {
         ));
 
         assert!(Cli::try_parse_from(["kproxy", "account", "rm"]).is_err());
+    }
+
+    #[test]
+    fn account_overage_commands_are_explicit_and_scriptable() {
+        let show =
+            Cli::try_parse_from(["kproxy", "account", "overage"]).expect("default overage view");
+        assert!(matches!(
+            show.command,
+            Some(Command::Account {
+                command: Some(crate::commands::account::AccountCommand::Overage { command: None })
+            })
+        ));
+
+        let refresh = Cli::try_parse_from(["kproxy", "account", "overage", "show", "--refresh"])
+            .expect("refresh overage view");
+        assert!(matches!(
+            refresh.command,
+            Some(Command::Account {
+                command: Some(crate::commands::account::AccountCommand::Overage {
+                    command: Some(crate::commands::account::AccountOverageCommand::Show {
+                        refresh: true
+                    })
+                })
+            })
+        ));
+
+        let enable = Cli::try_parse_from([
+            "kproxy",
+            "account",
+            "overage",
+            "enable",
+            "--max-credits",
+            "500",
+            "--no-refresh",
+        ])
+        .expect("enable overage with local limit");
+        assert!(matches!(
+            enable.command,
+            Some(Command::Account {
+                command: Some(crate::commands::account::AccountCommand::Overage {
+                    command: Some(crate::commands::account::AccountOverageCommand::Enable {
+                        max_credits: Some(500.0),
+                        kiro_limit: false,
+                        no_refresh: true
+                    })
+                })
+            })
+        ));
+
+        let kiro_limit =
+            Cli::try_parse_from(["kproxy", "account", "overage", "enable", "--kiro-limit"])
+                .expect("enable overage with Kiro limit");
+        assert!(matches!(
+            kiro_limit.command,
+            Some(Command::Account {
+                command: Some(crate::commands::account::AccountCommand::Overage {
+                    command: Some(crate::commands::account::AccountOverageCommand::Enable {
+                        max_credits: None,
+                        kiro_limit: true,
+                        no_refresh: false
+                    })
+                })
+            })
+        ));
+
+        assert!(Cli::try_parse_from([
+            "kproxy",
+            "account",
+            "overage",
+            "enable",
+            "--max-credits",
+            "-1"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "kproxy",
+            "account",
+            "overage",
+            "enable",
+            "--max-credits",
+            "500",
+            "--kiro-limit"
+        ])
+        .is_err());
     }
 
     #[test]

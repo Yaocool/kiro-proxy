@@ -40,6 +40,7 @@ fn bare_command_groups_show_help_without_loading_the_environment() {
         .expect("write malformed .env");
 
     for group in [
+        "provider",
         "config",
         "account",
         "diagnose",
@@ -78,6 +79,7 @@ fn bare_command_groups_show_help_without_loading_the_environment() {
 fn json_requires_an_explicit_group_action() {
     let workspace = tempfile::tempdir().expect("tempdir");
     for group in [
+        "provider",
         "config",
         "account",
         "diagnose",
@@ -257,12 +259,184 @@ fn bounded_numeric_arguments_are_validated_before_any_runtime_setup() {
             "--tail",
             "1001",
         ][..],
+        &[
+            "model-map",
+            "add",
+            "--name",
+            "x",
+            "--source",
+            "a",
+            "--target",
+            "b",
+            "--below-credits-percent",
+            "101",
+        ][..],
+        &[
+            "model-map",
+            "test",
+            "a",
+            "--remaining-credits-percent",
+            "NaN",
+        ][..],
+        &["apikey", "add", "--name", "x", "--credits-limit", "-1"][..],
+        &["apikey", "limit", "x", "--credits", "inf"][..],
+        &["apikey", "history", "x", "--tail", "0"][..],
+        &["alert", "logs", "--tail", "1001"][..],
+        &["service", "create", "--name", "x", "--port", "1023"][..],
+        &["service", "edit", "x", "--port", "0"][..],
     ] {
         let output = run(workspace.path(), args);
         assert_eq!(output.status.code(), Some(2), "{args:?}");
         assert!(stdout(&output).is_empty(), "{args:?}");
         assert!(!stderr(&output).contains("unterminated"), "{args:?}");
     }
+}
+
+#[test]
+fn required_targets_and_sources_are_validated_before_runtime_setup() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    std::fs::write(workspace.path().join(".env"), "BROKEN='unterminated\n")
+        .expect("write malformed .env");
+
+    for args in [
+        &["account", "import"][..],
+        &["account", "add-sso"][..],
+        &["account", "add-sso", "--email", "alice@example.com"][..],
+        &["account", "add-sso", "--password-stdin"][..],
+        &[
+            "account",
+            "add-sso",
+            "--batch",
+            "accounts.csv",
+            "--concurrency",
+            "9",
+        ][..],
+        &["account", "tag", "acc_00000001"][..],
+        &["account", "refresh"][..],
+        &["account", "probe"][..],
+        &["account", "reset-health"][..],
+        &["alert", "test"][..],
+    ] {
+        let output = run(workspace.path(), args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(stdout(&output).is_empty(), "{args:?}");
+        let error = stderr(&output);
+        assert!(!error.contains("unterminated"), "{args:?}: {error}");
+    }
+}
+
+#[test]
+fn constrained_enums_reject_typos_before_runtime_setup() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    std::fs::write(workspace.path().join(".env"), "BROKEN='unterminated\n")
+        .expect("write malformed .env");
+
+    for args in [
+        &["stats", "--detail", "--by", "api-key"][..],
+        &["logs", "show", "--level", "warningg"][..],
+        &["apikey", "add", "--name", "x", "--format", "bearer"][..],
+        &[
+            "service",
+            "create",
+            "--name",
+            "x",
+            "--api-key-format",
+            "bearer",
+        ][..],
+        &[
+            "model-map",
+            "add",
+            "--name",
+            "x",
+            "--kind",
+            "random",
+            "--source",
+            "a",
+            "--target",
+            "b",
+        ][..],
+    ] {
+        let output = run(workspace.path(), args);
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(stdout(&output).is_empty(), "{args:?}");
+        let error = stderr(&output);
+        assert!(error.contains("possible values"), "{args:?}: {error}");
+        assert!(!error.contains("unterminated"), "{args:?}: {error}");
+    }
+}
+
+#[test]
+fn destructive_commands_expose_a_non_interactive_yes_flag() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    for args in [
+        &["provider", "delete", "--help"][..],
+        &["config", "reset", "--help"][..],
+        &["account", "rm", "--help"][..],
+        &["apikey", "rm", "--help"][..],
+        &["apikey", "reset-usage", "--help"][..],
+        &["service", "delete", "--help"][..],
+        &["alert", "delete", "--help"][..],
+        &["model-map", "delete", "--help"][..],
+    ] {
+        let output = run(workspace.path(), args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        let help = stdout(&output);
+        assert!(help.contains("-y, --yes"), "{args:?}: {help}");
+    }
+}
+
+#[test]
+fn config_validate_honors_json_output() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let config = workspace.path().join("config.toml");
+    std::fs::write(&config, "").expect("write config");
+    let output = run(
+        workspace.path(),
+        &[
+            "--json",
+            "config",
+            "validate",
+            config.to_str().expect("UTF-8 path"),
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    let value: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("valid JSON output");
+    assert_eq!(value["valid"], true);
+    assert_eq!(value["config_file"], config.to_string_lossy().as_ref());
+
+    let missing = workspace.path().join("missing.toml");
+    let output = run(
+        workspace.path(),
+        &["config", "validate", missing.to_str().expect("UTF-8 path")],
+    );
+    assert!(!output.status.success());
+    assert!(stderr(&output).contains("配置文件不存在或无法访问"));
+}
+
+#[test]
+fn offline_catalogs_and_explicit_validation_ignore_broken_runtime_environment() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    std::fs::write(workspace.path().join(".env"), "BROKEN='unterminated\n")
+        .expect("write malformed .env");
+    let config = workspace.path().join("candidate.toml");
+    std::fs::write(&config, "").expect("write config");
+
+    for args in [
+        vec!["config", "list"],
+        vec!["config", "validate", config.to_str().expect("UTF-8 path")],
+        vec!["alert", "config"],
+        vec!["alert", "events"],
+        vec!["alert", "platforms"],
+    ] {
+        let output = run(workspace.path(), &args);
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+        assert!(!stdout(&output).is_empty(), "{args:?}");
+    }
+
+    let runtime_command = run(workspace.path(), &["config", "show"]);
+    assert!(!runtime_command.status.success());
+    assert!(stderr(&runtime_command).contains("unterminated"));
 }
 
 #[test]
@@ -306,6 +480,21 @@ fn wrapper_local_mode_rejects_business_commands() {
         .expect("run local-only help");
     assert!(help.status.success(), "{}", stderr(&help));
     assert!(stdout(&help).contains("logs show"));
+
+    for args in [
+        &["config", "list"][..],
+        &["alert", "config"][..],
+        &["alert", "events"][..],
+        &["alert", "platforms"][..],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_kproxy"))
+            .args(args)
+            .current_dir(workspace.path())
+            .env("KPROXY_WRAPPER_LOCAL_ONLY", "1")
+            .output()
+            .expect("run offline command");
+        assert!(output.status.success(), "{args:?}: {}", stderr(&output));
+    }
 }
 
 #[test]

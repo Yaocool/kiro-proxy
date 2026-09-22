@@ -13,6 +13,42 @@ use kproxy_ipc::protocol::{
 use crate::client::AdminClient;
 use crate::output::{print_json, render_table};
 
+/// Kiro 账号池 overage 配置。
+#[derive(Debug, Subcommand)]
+pub enum AccountOverageCommand {
+    /// 显示全局策略和各 Kiro 账号额度。
+    #[command(
+        after_help = "示例：\n  kproxy account overage show\n  kproxy account overage show --refresh"
+    )]
+    Show {
+        /// 显示前立即向 Kiro 刷新账号额度。
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// 开启 overage，并可同时设置每账号上限。
+    #[command(
+        after_help = "示例：\n  kproxy account overage enable --max-credits 500\n  kproxy account overage enable --kiro-limit\n\n未传额度参数时复用已有的每账号上限；尚未配置上限时必须显式选择其中一种方式。"
+    )]
+    Enable {
+        /// 每个账号最多使用的 overage credits。
+        #[arg(
+            long,
+            value_name = "CREDITS",
+            value_parser = parse_non_negative_credits,
+            conflicts_with = "kiro_limit"
+        )]
+        max_credits: Option<f64>,
+        /// 不设置本地上限，完全遵循 Kiro 返回的 overage 上限。
+        #[arg(long, conflicts_with = "max_credits")]
+        kiro_limit: bool,
+        /// 配置生效后不立即向 Kiro 刷新账号额度。
+        #[arg(long)]
+        no_refresh: bool,
+    },
+    /// 关闭代理侧 overage；保留已配置的每账号上限供下次启用。
+    Disable,
+}
+
 /// 账号相关子命令。
 #[derive(Debug, Subcommand)]
 pub enum AccountCommand {
@@ -52,6 +88,14 @@ pub enum AccountCommand {
         #[arg(long, value_parser = ["email", "credit", "id"])]
         sort: Option<String>,
     },
+    /// 查看或配置整个 Kiro 账号池的 overage 策略。
+    #[command(
+        long_about = "查看或配置整个 Kiro 账号池的 overage 策略。修改操作会原子更新配置并自动重载。\n\n示例：\n  kproxy account overage\n  kproxy account overage show\n  kproxy account overage enable --max-credits 500\n  kproxy account overage disable"
+    )]
+    Overage {
+        #[command(subcommand)]
+        command: Option<AccountOverageCommand>,
+    },
     /// 显示单账号详情。
     #[command(
         long_about = "显示账号详情，不显示 token。\n\n示例：\n  kproxy account show acc_7f3a\n  kproxy account show alice@example.com"
@@ -89,7 +133,8 @@ pub enum AccountCommand {
     },
     /// 从 JSON 导入现成 token。
     #[command(
-        long_about = "导入已有凭证。id、machine_id、created_at 缺失时自动生成；--tag 会合并到本次导入的全部账号。\n\n示例：\n  kproxy account import --file accounts.json --tag team-a\n  cat accounts.json | kproxy account import --stdin --tag team-a --tag prod"
+        long_about = "导入已有凭证。id、machine_id、created_at 缺失时自动生成；--tag 会合并到本次导入的全部账号。\n\n示例：\n  kproxy account import --file accounts.json --tag team-a\n  cat accounts.json | kproxy account import --stdin --tag team-a --tag prod",
+        group(clap::ArgGroup::new("import_source").required(true).multiple(false).args(["file", "stdin"]))
     )]
     Import {
         /// JSON 文件路径。
@@ -132,7 +177,8 @@ pub enum AccountCommand {
         after_help = "示例：\n  printf '%s\\n' \"$PASSWORD\" | kproxy account add-sso --email user@example.com --start-url https://example.awsapps.com/start --password-stdin\n  kproxy account add-sso --batch accounts.csv --start-url https://example.awsapps.com/start\n  kproxy account add-sso --batch - --start-url https://example.awsapps.com/start < accounts.csv"
     )]
     AddSso {
-        #[arg(long)]
+        /// 单账号登录邮箱；需同时使用 --password-stdin。
+        #[arg(long, required_unless_present = "batch", requires = "password_stdin")]
         email: Option<String>,
         /// IAM Identity Center start URL；未提供时读取 `[sso].start_url`。
         #[arg(long)]
@@ -140,14 +186,19 @@ pub enum AccountCommand {
         #[arg(long, default_value = "us-east-1")]
         region: String,
         /// 必须显式声明，从标准输入读取一行密码；密码不会进入命令行历史。
-        #[arg(long)]
+        #[arg(long, required_unless_present = "batch", requires = "email")]
         password_stdin: bool,
         /// 两列 CSV（email,password）批量登录；PATH 为 - 时从 stdin 读取。
         #[arg(long, value_name = "PATH", conflicts_with_all = ["email", "password_stdin"])]
         batch: Option<String>,
-        /// 批量登录并发数，范围 1..8。
-        #[arg(short = 'c', long, default_value_t = 1)]
-        concurrency: usize,
+        /// 批量登录并发数，范围 1..8，默认 1。
+        #[arg(
+            short = 'c',
+            long,
+            requires = "batch",
+            value_parser = parse_sso_concurrency
+        )]
+        concurrency: Option<usize>,
         /// 显示浏览器窗口，便于手工处理额外验证。
         #[arg(long)]
         headful: bool,
@@ -167,6 +218,9 @@ pub enum AccountCommand {
         /// 提供源实例 ID；也可使用 provider/account_id。
         #[arg(long)]
         provider: Option<String>,
+        /// 跳过交互确认，用于自动化。
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// 启用账号。
     #[command(
@@ -190,7 +244,8 @@ pub enum AccountCommand {
     },
     /// 为一个或多个账号增删标签。
     #[command(
-        long_about = "为一个或多个账号增删标签，可同时添加和移除。批量修改会先校验全部账号；有账号不存在，或需要修改标签的账号已绑定代理服务时，整批不生效。\n\n示例：\n  kproxy account tag acc_7f3a --add prod --add pro\n  kproxy account tag --add test acc_2c36cfad acc_332c7cb2 acc_41c6e3ad\n  kproxy account tag --rm dev acc_7f3a acc_8b2c"
+        long_about = "为一个或多个账号增删标签，可同时添加和移除。批量修改会先校验全部账号；有账号不存在，或需要修改标签的账号已绑定代理服务时，整批不生效。\n\n示例：\n  kproxy account tag acc_7f3a --add prod --add pro\n  kproxy account tag --add test acc_2c36cfad acc_332c7cb2 acc_41c6e3ad\n  kproxy account tag --rm dev acc_7f3a acc_8b2c",
+        group(clap::ArgGroup::new("tag_change").required(true).multiple(true).args(["add", "remove"]))
     )]
     Tag {
         /// 一个或多个账号 ID/邮箱，以空格分隔。
@@ -216,19 +271,21 @@ pub enum AccountCommand {
     },
     /// 立即刷新账号 token。
     #[command(
-        after_help = "示例：\n  kproxy account refresh acc_7f3a2b1c\n  kproxy account refresh --all"
+        after_help = "示例：\n  kproxy account refresh acc_7f3a2b1c\n  kproxy account refresh --all",
+        group(clap::ArgGroup::new("refresh_target").required(true).multiple(false).args(["id", "all"]))
     )]
     Refresh {
         id: Option<String>,
         #[arg(long, conflicts_with = "id")]
         all: bool,
-        /// 限定提供源；批量修改时必须显式提供或使用 all。
+        /// 限定提供源；--all 时默认 kiro，也可指定 all 聚合全部。
         #[arg(long)]
         provider: Option<String>,
     },
     /// 探测账号可用端点与模型。
     #[command(
-        after_help = "示例：\n  kproxy account probe acc_7f3a2b1c\n  kproxy account probe --all"
+        after_help = "示例：\n  kproxy account probe acc_7f3a2b1c\n  kproxy account probe --all",
+        group(clap::ArgGroup::new("probe_target").required(true).multiple(false).args(["id", "all"]))
     )]
     Probe {
         id: Option<String>,
@@ -240,7 +297,8 @@ pub enum AccountCommand {
     },
     /// 清除冷却、封禁与额度耗尽标记。
     #[command(
-        after_help = "示例：\n  kproxy account reset-health acc_7f3a2b1c\n  kproxy account reset-health --all"
+        after_help = "示例：\n  kproxy account reset-health acc_7f3a2b1c\n  kproxy account reset-health --all",
+        group(clap::ArgGroup::new("reset_health_target").required(true).multiple(false).args(["id", "all"]))
     )]
     ResetHealth {
         id: Option<String>,
@@ -283,25 +341,47 @@ fn build_provider_list_rows(accounts: &[ProviderAccountSummary]) -> Vec<Vec<Stri
     accounts
         .iter()
         .map(|account| {
-            let quota = match (account.quota_current, account.quota_limit) {
-                (Some(current), Some(limit)) => format!("{current:.2}/{limit:.2}"),
-                (Some(current), None) => format!("{current:.2}"),
-                _ => "unknown".into(),
+            let kiro_total = account.details["kiro_overage_total_limit"].as_f64();
+            let quota = match (account.quota_current, account.quota_limit, kiro_total) {
+                (Some(current), Some(limit), Some(kiro_total)) => {
+                    format!("{current:.2}/{limit:.2}/{kiro_total:.2}")
+                }
+                (Some(current), Some(limit), None) => format!("{current:.2}/{limit:.2}"),
+                (Some(current), None, _) => format!("{current:.2}"),
+                _ => "未知".into(),
             };
+            let overage_enabled = account.details["overage_enabled"].as_bool();
+            let configured_cap = account.details["max_overage_credits_per_account"].as_f64();
+            let configured_overage = match overage_enabled {
+                Some(false) => configured_cap
+                    .map(|value| format!("关闭({value:.2})"))
+                    .unwrap_or_else(|| "关闭".into()),
+                Some(true) => account.details["max_overage_credits_per_account"]
+                    .as_f64()
+                    .map(|value| format!("{value:.2}"))
+                    .unwrap_or_else(|| "Kiro上限".into()),
+                None => "-".into(),
+            };
+            let kiro_overage = account.details["kiro_overage_cap"]
+                .as_f64()
+                .or_else(|| account.details["overage_cap"].as_f64())
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "-".into());
             vec![
                 account.provider_id.clone(),
                 account.id.clone(),
                 account.display_name.clone(),
                 if account.enabled {
-                    account.health.clone()
+                    display_provider_health(&account.health)
                 } else {
-                    "disabled".into()
+                    "停用".into()
                 },
                 quota,
-                account
-                    .quota_unit
-                    .clone()
-                    .unwrap_or_else(|| "unknown".into()),
+                if overage_enabled.is_some() {
+                    format!("{configured_overage}/{kiro_overage}")
+                } else {
+                    "-".into()
+                },
                 if account.tags.is_empty() {
                     "-".into()
                 } else {
@@ -312,13 +392,28 @@ fn build_provider_list_rows(accounts: &[ProviderAccountSummary]) -> Vec<Vec<Stri
         .collect()
 }
 
+fn display_provider_health(health: &str) -> String {
+    match health {
+        "available" => "可用",
+        "low_credit" => "低额度保护",
+        "disabled" => "停用",
+        "exhausted" => "额度耗尽",
+        "cooling" => "冷却",
+        "banned" => "已封禁",
+        "refreshing" => "刷新中",
+        "unavailable" => "不可用",
+        other => other,
+    }
+    .into()
+}
+
 fn print_provider_detail(account: &ProviderAccountSummary) {
     println!(
         "{}/{}   {}",
         account.provider_id, account.id, account.display_name
     );
     println!("类型      {}", account.provider_kind);
-    println!("状态      {}", account.health);
+    println!("状态      {}", display_provider_health(&account.health));
     println!("认证      {}", account.auth_state);
     if let Some(email) = &account.email {
         println!("邮箱      {email}");
@@ -326,17 +421,42 @@ fn print_provider_detail(account: &ProviderAccountSummary) {
     if let Some(label) = &account.label {
         println!("备注      {label}");
     }
-    match (account.quota_current, account.quota_limit) {
-        (Some(current), Some(limit)) => println!(
+    match (
+        account.quota_current,
+        account.quota_limit,
+        account.details["kiro_overage_total_limit"].as_f64(),
+    ) {
+        (Some(current), Some(limit), Some(kiro_total)) => println!(
+            "额度      {current:.2}/{limit:.2}/{kiro_total:.2} {}（当前已用/配置总额/Kiro总额）",
+            account.quota_unit.as_deref().unwrap_or("unknown")
+        ),
+        (Some(current), Some(limit), None) => println!(
             "额度      {current:.2}/{limit:.2} {}",
             account.quota_unit.as_deref().unwrap_or("unknown")
         ),
-        _ => println!("额度      unknown"),
+        _ => println!("额度      未知"),
+    }
+    if let Some(enabled) = account.details["overage_enabled"].as_bool() {
+        println!("超额开关  {}", if enabled { "开启" } else { "关闭" });
+        let configured = account.details["max_overage_credits_per_account"]
+            .as_f64()
+            .map(|value| format!("{value:.2} credits/账号"))
+            .unwrap_or_else(|| "遵循 Kiro 上限".into());
+        println!("超额配置  {configured}");
+        if let Some(value) = account.details["kiro_overage_cap"]
+            .as_f64()
+            .or_else(|| account.details["overage_cap"].as_f64())
+        {
+            println!("Kiro超额  {value:.2} credits");
+        }
+        if let Some(value) = account.details["effective_overage_cap"].as_f64() {
+            println!("有效超额  {value:.2} credits");
+        }
     }
     println!(
         "模型      {}",
         if account.supported_models.is_empty() {
-            "unknown".into()
+            "未知".into()
         } else {
             account.supported_models.join(", ")
         }
@@ -512,6 +632,289 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+fn parse_non_negative_credits(value: &str) -> std::result::Result<f64, String> {
+    let credits = value
+        .parse::<f64>()
+        .map_err(|_| "额度必须是数字".to_owned())?;
+    if credits.is_finite() && credits >= 0.0 {
+        Ok(credits)
+    } else {
+        Err("额度必须是有限的非负数".to_owned())
+    }
+}
+
+fn parse_sso_concurrency(value: &str) -> std::result::Result<usize, String> {
+    let concurrency = value
+        .parse::<usize>()
+        .map_err(|_| "并发数必须是整数".to_owned())?;
+    if (1..=8).contains(&concurrency) {
+        Ok(concurrency)
+    } else {
+        Err("并发数必须在 1..=8 之间".to_owned())
+    }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OverageAccountView {
+    id: String,
+    account: String,
+    enabled: bool,
+    health: String,
+    current: Option<f64>,
+    proxy_total: Option<f64>,
+    kiro_total: Option<f64>,
+    effective_overage: Option<f64>,
+    kiro_overage: Option<f64>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct OverageView {
+    enabled: bool,
+    max_credits_per_account: Option<f64>,
+    accounts: Vec<OverageAccountView>,
+    complete: bool,
+    errors: std::collections::BTreeMap<String, String>,
+}
+
+async fn fetch_overage_view(client: &mut AdminClient) -> Result<OverageView> {
+    let config = crate::commands::runtime::effective_config(client).await?;
+    let list: ProviderAccountListResult = client
+        .call(
+            method::V2_ACCOUNT_LIST,
+            serde_json::json!({
+                "provider":"kiro",
+                "enabled_only":false,
+            }),
+        )
+        .await?;
+    let accounts = list
+        .accounts
+        .into_iter()
+        .filter(|account| account.provider_kind == "kiro")
+        .map(|account| OverageAccountView {
+            id: account.id,
+            account: account.display_name,
+            enabled: account.enabled,
+            health: account.health,
+            current: account.quota_current,
+            proxy_total: account.quota_limit,
+            kiro_total: account.details["kiro_overage_total_limit"].as_f64(),
+            effective_overage: account.details["effective_overage_cap"].as_f64(),
+            kiro_overage: account.details["kiro_overage_cap"]
+                .as_f64()
+                .or_else(|| account.details["overage_cap"].as_f64()),
+        })
+        .collect();
+    Ok(OverageView {
+        enabled: config.pool.enable_overage,
+        max_credits_per_account: config.pool.max_overage_credits_per_account,
+        accounts,
+        complete: list.complete,
+        errors: list.errors,
+    })
+}
+
+fn joined_credit_values(values: &[Option<f64>]) -> String {
+    values
+        .iter()
+        .map(|value| {
+            value
+                .map(|value| format!("{value:.2}"))
+                .unwrap_or_else(|| "-".into())
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn build_overage_rows(accounts: &[OverageAccountView]) -> Vec<Vec<String>> {
+    accounts
+        .iter()
+        .map(|account| {
+            vec![
+                account.id.clone(),
+                account.account.clone(),
+                if account.enabled {
+                    display_provider_health(&account.health)
+                } else {
+                    "停用".into()
+                },
+                joined_credit_values(&[account.current, account.proxy_total, account.kiro_total]),
+                joined_credit_values(&[account.effective_overage, account.kiro_overage]),
+            ]
+        })
+        .collect()
+}
+
+fn print_overage_view(
+    view: &OverageView,
+    action: Option<&str>,
+    refresh: Option<&serde_json::Value>,
+    json: bool,
+) -> Result<()> {
+    if json {
+        let mut value = serde_json::to_value(view)?;
+        let object = value
+            .as_object_mut()
+            .expect("serialized overage view is an object");
+        if let Some(action) = action {
+            object.insert("action".into(), serde_json::Value::String(action.into()));
+        }
+        if let Some(refresh) = refresh {
+            object.insert("refresh".into(), refresh.clone());
+        }
+        return print_json(&value);
+    }
+
+    if let Some(action) = action {
+        println!("{action}");
+    }
+    if let Some(refresh) = refresh {
+        if refresh["ok"].as_bool() == Some(false) {
+            println!(
+                "额度刷新  失败：{}",
+                refresh["error"].as_str().unwrap_or("unknown")
+            );
+        } else {
+            println!(
+                "额度刷新  {}",
+                refresh["result"].as_str().unwrap_or("已完成")
+            );
+        }
+    }
+    println!("Overage  {}", if view.enabled { "开启" } else { "关闭" });
+    println!(
+        "每账号上限  {}",
+        view.max_credits_per_account
+            .map(|value| format!("{value:.2} credits"))
+            .unwrap_or_else(|| "遵循 Kiro 上限".into())
+    );
+    println!("Kiro 账号  {}", view.accounts.len());
+    if view.accounts.is_empty() {
+        println!("暂无 Kiro 账号额度数据");
+    } else {
+        println!(
+            "{}",
+            render_table(
+                &[
+                    "ID",
+                    "账号",
+                    "状态",
+                    "额度(已用/代理/Kiro)",
+                    "Overage(有效/Kiro)",
+                ],
+                &build_overage_rows(&view.accounts),
+            )
+        );
+    }
+    for (provider, error) in &view.errors {
+        eprintln!("{provider}: {error}");
+    }
+    Ok(())
+}
+
+async fn refresh_overage_usage(client: &mut AdminClient) -> serde_json::Value {
+    match client
+        .call::<serde_json::Value>(
+            method::TASK_RUN,
+            serde_json::json!({"name":"status_check","provider":null}),
+        )
+        .await
+    {
+        Ok(value) => serde_json::json!({"ok":true,"result":value["result"]}),
+        Err(error) => serde_json::json!({
+            "ok":false,
+            "error":error.to_string(),
+            "hint":"可稍后运行 kproxy tasks run status_check"
+        }),
+    }
+}
+
+async fn run_overage(
+    client: &mut AdminClient,
+    command: Option<AccountOverageCommand>,
+    json: bool,
+) -> Result<()> {
+    let (action, refresh) = match command.unwrap_or(AccountOverageCommand::Show { refresh: false })
+    {
+        AccountOverageCommand::Show { refresh } => {
+            let refresh = if refresh {
+                Some(refresh_overage_usage(client).await)
+            } else {
+                None
+            };
+            (None, refresh)
+        }
+        AccountOverageCommand::Enable {
+            max_credits,
+            kiro_limit,
+            no_refresh,
+        } => {
+            let limit = if let Some(value) = max_credits {
+                crate::commands::runtime::OverageLimitUpdate::Set(value)
+            } else if kiro_limit {
+                crate::commands::runtime::OverageLimitUpdate::Clear
+            } else {
+                let current = crate::commands::runtime::effective_config(client).await?;
+                if current.pool.max_overage_credits_per_account.is_some() {
+                    crate::commands::runtime::OverageLimitUpdate::Preserve
+                } else {
+                    return Err(anyhow!(
+                        "尚未配置每账号 overage 上限；请使用 --max-credits <CREDITS>，或显式使用 --kiro-limit"
+                    ));
+                }
+            };
+            crate::commands::runtime::update_pool_overage_config(client, true, limit).await?;
+            let refresh = if no_refresh {
+                None
+            } else {
+                Some(refresh_overage_usage(client).await)
+            };
+            (Some("enabled"), refresh)
+        }
+        AccountOverageCommand::Disable => {
+            crate::commands::runtime::update_pool_overage_config(
+                client,
+                false,
+                crate::commands::runtime::OverageLimitUpdate::Preserve,
+            )
+            .await?;
+            (Some("disabled"), None)
+        }
+    };
+    let view = fetch_overage_view(client).await.with_context(|| {
+        if action.is_some() {
+            "overage 配置已生效，但读取更新后的账号额度失败"
+        } else {
+            "读取 overage 配置和账号额度失败"
+        }
+    })?;
+    let human_action = action.map(|action| match action {
+        "enabled" => "Kiro overage 已开启，配置已重载",
+        "disabled" => "Kiro overage 已关闭，配置已重载",
+        _ => action,
+    });
+    print_overage_view(
+        &view,
+        if json { action } else { human_action },
+        refresh.as_ref(),
+        json,
+    )?;
+    if !view.complete {
+        return Err(anyhow!("Kiro 账号额度查询不完整"));
+    }
+    if refresh
+        .as_ref()
+        .is_some_and(|result| result["ok"].as_bool() == Some(false))
+    {
+        if action.is_some() {
+            eprintln!("额度刷新失败；配置已生效，可稍后运行 `kproxy tasks run status_check`");
+        } else {
+            eprintln!("额度刷新失败；可稍后运行 `kproxy tasks run status_check`");
+        }
+    }
+    Ok(())
+}
+
 /// 执行账号子命令。
 pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) -> Result<()> {
     match command {
@@ -523,6 +926,11 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             status,
             sort,
         } => {
+            let has_filters = tag.is_some()
+                || status.is_some()
+                || provider_kind.is_some()
+                || enabled_only
+                || provider.as_str() != "all";
             let list: ProviderAccountListResult = client
                 .call(
                     method::V2_ACCOUNT_LIST,
@@ -530,7 +938,7 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                         "provider":provider,
                         "provider_kind":provider_kind,
                         "tag": tag,
-                        "enabled_only": enabled_only.then_some(true),
+                        "enabled_only": enabled_only,
                         "status":status,
                         "sort":sort,
                     }),
@@ -539,15 +947,29 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             if json {
                 print_json(&list)?;
             } else if list.accounts.is_empty() {
-                println!("暂无账号。用 `kproxy account add --provider <ID>` 添加。");
+                if has_filters {
+                    println!("没有符合筛选条件的账号。");
+                } else {
+                    println!("暂无账号。用 `kproxy account add --provider <ID>` 添加。");
+                }
             } else {
                 print!(
                     "{}",
                     render_table(
-                        &["PROVIDER", "ID", "账号", "状态", "额度", "单位", "标签"],
+                        &[
+                            "PROVIDER",
+                            "ID",
+                            "账号",
+                            "状态",
+                            "额度(已用/代理/Kiro)",
+                            "Overage(配置/Kiro)",
+                            "标签",
+                        ],
                         &build_provider_list_rows(&list.accounts),
                     )
                 );
+            }
+            if !json {
                 for (provider, error) in &list.errors {
                     eprintln!("{provider}: {error}");
                 }
@@ -556,6 +978,7 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                 return Err(anyhow!("部分提供源的账号查询失败"));
             }
         }
+        AccountCommand::Overage { command } => run_overage(client, command, json).await?,
         AccountCommand::Show { id, provider } => {
             let detail: ProviderAccountSummary = client
                 .call(
@@ -703,6 +1126,7 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             let tags = normalize_cli_tags(tags)?;
             let start_url = resolve_start_url(client, start_url.as_deref()).await?;
             if let Some(file) = batch {
+                let concurrency = concurrency.unwrap_or(1);
                 run_sso_batch(
                     client,
                     &file,
@@ -742,9 +1166,17 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                 println!("已添加 {}（{}）", result.email, result.id);
             }
         }
-        AccountCommand::Rm { ids, provider } => {
-            if !crate::commands::confirm(&remove_confirmation_prompt(&ids)).await? {
-                println!("已取消");
+        AccountCommand::Rm { ids, provider, yes } => {
+            if !crate::commands::confirm_unless(yes, &remove_confirmation_prompt(&ids)).await? {
+                if json {
+                    print_json(&serde_json::json!({
+                        "removed": false,
+                        "cancelled": true,
+                        "accounts": ids
+                    }))?;
+                } else {
+                    println!("已取消");
+                }
                 return Ok(());
             }
             remove_accounts(client, &ids, provider.as_deref(), json).await?;
@@ -780,7 +1212,6 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             }
         }
         AccountCommand::Refresh { id, all, provider } => {
-            require_id_or_all(id.as_deref(), all)?;
             if all {
                 let provider = provider.as_deref().unwrap_or("kiro");
                 let list: ProviderAccountListResult = client
@@ -829,7 +1260,6 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             }
         }
         AccountCommand::Probe { id, all, provider } => {
-            require_id_or_all(id.as_deref(), all)?;
             let result = if all {
                 run_provider_account_batch(
                     client,
@@ -868,7 +1298,6 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             fail_provider_account_batch(&result, "探测")?;
         }
         AccountCommand::ResetHealth { id, all, provider } => {
-            require_id_or_all(id.as_deref(), all)?;
             let result = if all {
                 run_provider_account_batch(
                     client,
@@ -986,14 +1415,6 @@ fn validate_start_url(url: &str) -> Result<String> {
     Ok(url.to_owned())
 }
 
-fn require_id_or_all(id: Option<&str>, all: bool) -> Result<()> {
-    if id.is_some() || all {
-        Ok(())
-    } else {
-        Err(anyhow!("需指定账号 ID 或 --all"))
-    }
-}
-
 fn print_result(value: &serde_json::Value, json: bool, message: &str) -> Result<()> {
     if json {
         print_json(value)?;
@@ -1033,6 +1454,7 @@ async fn remove_accounts(
     }
 
     let mut failures = Vec::new();
+    let mut results = Vec::new();
     for id in ids {
         match client
             .call::<serde_json::Value>(
@@ -1041,10 +1463,21 @@ async fn remove_accounts(
             )
             .await
         {
-            Ok(result) if json => print_json(&result)?,
-            Ok(_) => println!("已删除 {id}"),
+            Ok(result) => {
+                if !json {
+                    println!("已删除 {id}");
+                }
+                results.push(result);
+            }
             Err(error) => failures.push(format!("{id}: {error}")),
         }
+    }
+    if json {
+        print_json(&serde_json::json!({
+            "results": results,
+            "errors": failures,
+            "complete": failures.is_empty()
+        }))?;
     }
     if failures.is_empty() {
         Ok(())
@@ -1240,12 +1673,24 @@ async fn run_sso_batch(
     .collect::<Vec<_>>()
     .await;
     let mut failures = Vec::new();
+    let mut successes = Vec::new();
     for (email, result) in results {
         match result {
-            Ok(summary) if options.json => print_json(&summary)?,
-            Ok(summary) => println!("已添加 {}（{}）", summary.email, summary.id),
+            Ok(summary) => {
+                if !options.json {
+                    println!("已添加 {}（{}）", summary.email, summary.id);
+                }
+                successes.push(summary);
+            }
             Err(error) => failures.push(format!("{email}: {error}")),
         }
+    }
+    if options.json {
+        print_json(&serde_json::json!({
+            "accounts": successes,
+            "errors": failures,
+            "complete": failures.is_empty()
+        }))?;
     }
     if failures.is_empty() {
         Ok(())
@@ -1434,6 +1879,101 @@ mod tests {
         let mut protected = summary(true);
         protected.health = Some("low_credit".into());
         assert_eq!(build_list_rows(&[protected])[0][2], "低额度保护");
+    }
+
+    #[test]
+    fn provider_list_rows_show_configured_and_kiro_overage_caps() {
+        let account = ProviderAccountSummary {
+            provider_id: "kiro".into(),
+            provider_kind: "kiro".into(),
+            id: "acc_00000001".into(),
+            display_name: "a@example.com".into(),
+            email: Some("a@example.com".into()),
+            label: None,
+            enabled: true,
+            health: "available".into(),
+            auth_state: "ready".into(),
+            tags: vec!["prod".into()],
+            quota_current: Some(10_000.01),
+            quota_limit: Some(10_500.0),
+            quota_unit: Some("kiro_credits".into()),
+            supported_models: Vec::new(),
+            details: serde_json::json!({
+                "overage_enabled": true,
+                "max_overage_credits_per_account": 500.0,
+                "kiro_overage_cap": 10_000.0,
+                "kiro_overage_total_limit": 20_000.0,
+                "effective_overage_cap": 500.0
+            }),
+        };
+        let rows = build_provider_list_rows(&[account]);
+        assert_eq!(rows[0][3], "可用");
+        assert_eq!(rows[0][4], "10000.01/10500.00/20000.00");
+        assert_eq!(rows[0][5], "500.00/10000.00");
+        assert_eq!(rows[0][6], "prod");
+    }
+
+    #[test]
+    fn provider_list_rows_distinguish_disabled_and_uncapped_overage() {
+        let account = |enabled, cap| ProviderAccountSummary {
+            provider_id: "kiro".into(),
+            provider_kind: "kiro".into(),
+            id: "acc_00000001".into(),
+            display_name: "a@example.com".into(),
+            email: Some("a@example.com".into()),
+            label: None,
+            enabled: true,
+            health: "available".into(),
+            auth_state: "ready".into(),
+            tags: Vec::new(),
+            quota_current: Some(10_000.0),
+            quota_limit: Some(20_000.0),
+            quota_unit: Some("kiro_credits".into()),
+            supported_models: Vec::new(),
+            details: serde_json::json!({
+                "overage_enabled": enabled,
+                "max_overage_credits_per_account": cap,
+                "kiro_overage_cap": 10_000.0
+            }),
+        };
+        let rows = build_provider_list_rows(&[
+            account(false, Some(500.0)),
+            account(true, Option::<f64>::None),
+        ]);
+        assert_eq!(rows[0][5], "关闭(500.00)/10000.00");
+        assert_eq!(rows[1][5], "Kiro上限/10000.00");
+    }
+
+    #[test]
+    fn overage_credit_parser_rejects_negative_and_non_finite_values() {
+        assert_eq!(parse_non_negative_credits("0").expect("zero"), 0.0);
+        assert_eq!(
+            parse_non_negative_credits("500.25").expect("credits"),
+            500.25
+        );
+        assert!(parse_non_negative_credits("-0.01").is_err());
+        assert!(parse_non_negative_credits("NaN").is_err());
+        assert!(parse_non_negative_credits("inf").is_err());
+        assert!(parse_non_negative_credits("lots").is_err());
+    }
+
+    #[test]
+    fn overage_rows_keep_machine_values_raw_and_human_status_localized() {
+        let account = OverageAccountView {
+            id: "acc_00000001".into(),
+            account: "a@example.com".into(),
+            enabled: true,
+            health: "available".into(),
+            current: Some(10_000.01),
+            proxy_total: Some(10_500.0),
+            kiro_total: Some(20_000.0),
+            effective_overage: Some(500.0),
+            kiro_overage: Some(10_000.0),
+        };
+        let rows = build_overage_rows(&[account]);
+        assert_eq!(rows[0][2], "可用");
+        assert_eq!(rows[0][3], "10000.01/10500.00/20000.00");
+        assert_eq!(rows[0][4], "500.00/10000.00");
     }
 
     #[test]

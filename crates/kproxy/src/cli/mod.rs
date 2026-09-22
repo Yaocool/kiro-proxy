@@ -8,15 +8,15 @@ use anyhow::Result;
 use clap::Parser;
 use std::ffi::OsString;
 
-use crate::{Cli, Command};
+use crate::{Cli, Command, ConfigCommand};
 
 /// Parse one CLI invocation and preserve Clap's stdout/stderr and exit-code contract.
 pub fn parse_or_exit(args: impl IntoIterator<Item = OsString>) -> Cli {
     Cli::try_parse_from(args).unwrap_or_else(|error| error.exit())
 }
 
-/// Handle commands that never need configuration or a running daemon.
-pub fn handle_local(cli: &Cli) -> Result<bool> {
+/// Handle commands that do not need a running daemon.
+pub async fn handle_local(cli: &Cli) -> Result<bool> {
     match &cli.command {
         None => {
             help::print_command_help(&[])?;
@@ -42,6 +42,39 @@ pub fn handle_local(cli: &Cli) -> Result<bool> {
             print_version(cli.json)?;
             Ok(true)
         }
+        Some(Command::Config {
+            command: Some(ConfigCommand::List),
+        }) => {
+            crate::commands::runtime::list_config_modules(cli.json)?;
+            Ok(true)
+        }
+        Some(Command::Config {
+            command: Some(ConfigCommand::Validate { file }),
+        }) => {
+            if file.is_none() {
+                kproxy_store::environment::load_dotenv()?;
+            }
+            crate::commands::runtime::validate_config(file.as_deref(), cli.json).await?;
+            Ok(true)
+        }
+        Some(Command::Alert {
+            command: Some(crate::commands::runtime::AlertCommand::Config),
+        }) => {
+            crate::commands::runtime::show_alert_config(cli.json)?;
+            Ok(true)
+        }
+        Some(Command::Alert {
+            command: Some(crate::commands::runtime::AlertCommand::Events),
+        }) => {
+            crate::commands::runtime::show_alert_events(cli.json)?;
+            Ok(true)
+        }
+        Some(Command::Alert {
+            command: Some(crate::commands::runtime::AlertCommand::Platforms),
+        }) => {
+            crate::commands::runtime::show_alert_platforms(cli.json)?;
+            Ok(true)
+        }
         Some(command) => {
             if let Some(path) = help::empty_group_path(command) {
                 if cli.json {
@@ -52,7 +85,7 @@ pub fn handle_local(cli: &Cli) -> Result<bool> {
             }
             if wrapper_local_only() {
                 eprintln!(
-                    "kproxy: kproxyd 未运行；当前只能使用 help、guide、completions、version 或无参命令组帮助"
+                    "kproxy: kproxyd 未运行；当前可使用 help、guide、completions、version、config list/validate、alert config/events/platforms 或无参命令组帮助"
                 );
                 std::process::exit(1);
             }

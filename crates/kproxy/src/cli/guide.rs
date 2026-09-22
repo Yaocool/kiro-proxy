@@ -94,7 +94,7 @@ pub fn print(topic: Option<&str>) -> Result<()> {
         }
         "version" => "`kproxy version` 显示 CLI 版本、Rust MSRV 和默认 Kiro 上游端点。",
         "account" => {
-            "账号命令包括 list/show/services/import/add-api-key/export/add-sso/rm/enable/disable/tag/regen-machine-id/refresh/probe/reset-health。`services <ID|邮箱>` 反查账号所属代理服务；import/add-api-key/add-sso 均可用可重复的 `--tag` 设置新账号标签；`tag --add test <账号>...` 可一次给多个账号加标签，整批校验后才保存。删除操作会要求输入 y/yes 二次确认。"
+            "账号命令包括 list/show/overage/services/import/add-api-key/export/add-sso/rm/enable/disable/tag/regen-machine-id/refresh/probe/reset-health。`overage` 查看全局策略和 Kiro 返回的额度；`overage enable --max-credits 500` 原子更新配置、自动重载并刷新额度。`services <ID|邮箱>` 反查账号所属代理服务；import 必须选择 `--file` 或 `--stdin`，import/add-api-key/add-sso 均可用可重复的 `--tag` 设置新账号标签；`tag --add test <账号>...` 可一次给多个账号加标签，整批校验后才保存。删除操作会要求输入 y/yes 二次确认，自动化可显式传入 `--yes`。"
         }
         "balance" => {
             "账号池评分 = active_ratio×weight_active + used_credit_ratio×weight_credit + recent_idle_penalty×weight_idle。\n分数越低越优先；随后加入小幅随机抖动，避免并发请求集中到同一账号。\n用 `kproxy pool --watch --explain` 查看实时评分明细。"
@@ -103,20 +103,20 @@ pub fn print(topic: Option<&str>) -> Result<()> {
             "`kproxy pool --model <model>` 查看当前账号池可用性；`--explain` 展示调度评分，`--watch` 持续刷新。评分原理见 `kproxy guide balance`。"
         }
         "model-map" => {
-            "模型映射按 priority 从小到大匹配。source_models 支持 `*`；replace/alias 选首个目标，loadbalance 按 weights 随机。\n用 add/edit/delete 管理规则；`--below-credits-percent` 让规则仅在账号剩余额度低于阈值时全天生效，额度恢复后自动停止命中。"
+            "模型映射按 priority 从小到大匹配。source_models 支持 `*`；replace/alias 选首个目标，loadbalance 按 weights 随机。\n用 add/edit/delete 管理规则；`--below-credits-percent` 接受 0..=100，让规则仅在账号剩余额度低于阈值时全天生效，额度恢复后自动停止命中。删除时自动化可显式传入 `--yes`。"
         }
         "sso" => {
             r#"先在配置中设置 `[sso] start_url = "https://..."`。单账号：`printf '%s\n' "$PASSWORD" | kproxy account add-sso --email user@example.com --password-stdin`。
 批量：CSV 仅含 email,password 两列，运行 `kproxy account add-sso --batch accounts.csv -c 1 --tag team-a`；也可用 `--batch - < accounts.csv` 从 stdin 读取。可重复的 `--tag` 应用于本批全部账号；`--start-url` 可覆盖全局值，`--headful` 可手工完成额外验证。默认/full 构建包含 SSO。"#
         }
         "service" => {
-            "`kproxy service list/show/create/edit/enable/disable/apikeys/accounts/add-account/remove-account/delete` 管理独立代理监听。create 可用 `--account-tag xx1 xx2` 选择多个标签的账号并集，未指定时使用全局账号池；add-account/remove-account 管理手工加入和排除账号；edit 修改账号标签前必须先 disable。edit 也可修改监听、按 API key ID 或名称增删绑定，并用 `--skip-user-agent-check true|false` 管理该服务的 User-Agent 校验豁免；disable 会保留配置和 key；删除时仅级联删除未共享 key，并要求 y/yes 确认。"
+            "`kproxy service list/show/create/edit/enable/disable/apikeys/accounts/add-account/remove-account/delete` 管理独立代理监听。create 可用 `--account-tag xx1 xx2` 选择多个标签的账号并集，未指定时使用全局账号池；add-account/remove-account 管理手工加入和排除账号；edit 修改账号标签前必须先 disable。edit 也可修改监听、按 API key ID 或名称增删绑定，并用 `--skip-user-agent-check true|false` 管理该服务的 User-Agent 校验豁免；disable 会保留配置和 key；删除时仅级联删除未共享 key，并要求 y/yes 确认，自动化可显式传入 `--yes`。"
         }
         "config" => {
-            "配置默认位于 $KPROXY_HOME/config.toml，修改后热重载；server.host/port、admin.socket 和 TLS 监听变更需要重启。\n`kproxy config list` 列出全部顶层模块及是否允许重置；`show [模块]` 可查看完整配置或单个模块，增加 `--effective` 查看合并默认值后的结果；`edit [模块]` 可编辑完整配置或单个模块，保存时会合并、整体校验并重载。`reset [模块]` 只恢复指定模块，其他配置不变；不指定模块时恢复全部通用配置，并保留 API key、代理服务和告警配置。`validate [file]` 只校验，不应用。"
+            "配置默认位于 $KPROXY_HOME/config.toml，修改后热重载；server.host/port、admin.socket 和 TLS 监听变更需要重启。\n`kproxy config list` 列出全部顶层模块及是否允许重置；`show [模块]` 可查看完整配置或单个模块，增加 `--effective` 查看合并默认值后的结果；`edit [模块]` 可编辑完整配置或单个模块，保存时会合并、整体校验并重载。`reset [模块]` 只恢复指定模块，其他配置不变；不指定模块时恢复全部通用配置，并保留 API key、代理服务和告警配置；自动化可显式传入 `--yes`。`validate [file]` 只校验，不应用，并支持 `--json`。"
         }
         "apikey" => {
-            "API key 限额采用在途预留：请求进入时预留估算 credits，结束后按上游实际用量结算，避免并发突破限额。\n`kproxy apikey show <ID|名称>` 查看单项，`list --detail` 查看 token/credits 消耗；`edit <ID|名称> --skip-user-agent-check true|false` 管理该 key 的 User-Agent 校验豁免；`limit <ID|名称> --clear` 可恢复不限，`rm`/`delete` 均可删除。日维度、模型、路径和历史可用 `usage` 与 `history` 查询。"
+            "API key 限额采用在途预留：请求进入时预留估算 credits，结束后按上游实际用量结算，避免并发突破限额。\n`kproxy apikey show <ID|名称>` 查看单项，`list --detail` 查看 token/credits 消耗；`edit <ID|名称> --skip-user-agent-check true|false` 管理该 key 的 User-Agent 校验豁免；`limit <ID|名称> --clear` 可恢复不限，`rm`/`delete` 均可删除，删除和 reset-usage 在自动化中可显式传入 `--yes`。日维度、模型、路径和历史可用 `usage` 与 `history` 查询。"
         }
         "diagnose" => {
             "`kproxy diagnose all` 依次检查 CodeWhisperer/AmazonQ/OIDC 端点，并对全部账号发起真实推理；也可分别使用 `kproxy diagnose endpoints` 和 `kproxy diagnose account <id|--all>`。"
@@ -128,13 +128,13 @@ pub fn print(topic: Option<&str>) -> Result<()> {
             "`kproxy tasks list` 查看 token 刷新、状态探测、统计持久化、模型缓存等周期任务；`kproxy tasks run <name>` 立即执行。"
         }
         "stats" => {
-            "`kproxy stats` 默认显示跨 daemon 重启的持久化累计统计；可用 `--since 1h` 或带时区的 `--start/--end` 查询时间段。`--detail` 显示最近请求，并可用 `--by provider|model|account|endpoint` 分组。"
+            "`kproxy stats` 默认显示跨 daemon 重启的持久化累计统计；可用 `--since 1h` 或带时区的 `--start/--end` 查询时间段。`--detail` 显示最近请求，并可用 `--by provider|model|account|apikey|endpoint` 分组。"
         }
         "logs" => {
-            "`kproxy logs show` 查看内存中的结构化请求日志，`follow` 持续跟踪；支持 `--level`、`--account` 和 `--tail`。`kproxy logs trace <TRACE_ID>` 默认跨日期和全部精确级别分片查询完整链路，可用 `--level error` 限定级别。info 文件只包含 INFO，WARN/ERROR 分别写入 warn/error 文件。`kproxy logs files [--level error]` 列出实际日志文件，`logs path` 显示目录、基础路径和当前日志配置。"
+            "`kproxy logs show` 查看内存中的结构化请求日志，`follow` 持续跟踪；`--level all|info` 显示全部请求，warn 显示 HTTP 4xx/5xx，error 显示 HTTP 5xx，并支持 `--account` 和 `--tail`。`kproxy logs trace <TRACE_ID>` 默认跨日期和全部精确级别分片查询完整链路，可用 `--level error` 限定级别。info 文件只包含 INFO，WARN/ERROR 分别写入 warn/error 文件。`kproxy logs files [--level error]` 列出实际日志文件，`logs path` 显示目录、基础路径和当前日志配置。"
         }
         "alert" => {
-            "`kproxy alert events` 列出四类异常事件和触发条件，`kproxy alert platforms` 说明 --platform 支持的通知平台和平台专用参数；`kproxy alert config` 查看一次性告警策略。同类型的多账号事件会聚合为一条 Markdown 告警；每个账号或服务恢复后才允许再次告警。`kproxy alert add/edit/delete/list/test/logs` 管理告警目标。"
+            "`kproxy alert events` 列出四类异常事件和触发条件，`kproxy alert platforms` 说明 --platform 支持的通知平台和平台专用参数；`kproxy alert config` 查看一次性告警策略。同类型的多账号事件会聚合为一条 Markdown 告警；每个账号或服务恢复后才允许再次告警。`kproxy alert add/edit/delete/list/test/logs` 管理告警目标；delete 在自动化中可显式传入 `--yes`。"
         }
         "models" => {
             "`kproxy models list` 默认聚合全部提供源发现的模型、最大输入上下文和最大输出 token，两者按 K/M 缩写；`-` 表示上游未返回对应元数据。用 `--provider <ID>` 或 `--provider-kind <KIND>` 限定来源，`--refresh` 先刷新对应缓存，`--mapped` 同时显示显式映射结果及映射后模型的输入/输出上限。`kproxy models resolve <MODEL_ID>` 显示指定提供源中的显式映射与最终模型；可配合 `--provider`、`--api-key` 和 `--refresh`。"

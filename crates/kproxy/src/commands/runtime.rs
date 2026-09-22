@@ -47,7 +47,8 @@ pub enum ServiceCommand {
         name: String,
         #[arg(long)]
         host: Option<String>,
-        #[arg(long)]
+        /// 监听端口，范围 1024..=65535。
+        #[arg(long, value_parser = parse_service_port)]
         port: Option<u16>,
         /// 使用一个或多个账号标签的并集作为基础账号池；不指定时使用全局账号池。
         #[arg(long, num_args = 1.., value_delimiter = ',', value_name = "TAG")]
@@ -62,7 +63,11 @@ pub enum ServiceCommand {
         skip_user_agent_check: bool,
         #[arg(long)]
         api_key_name: Option<String>,
-        #[arg(long, default_value = "sk")]
+        #[arg(
+            long,
+            default_value = "sk",
+            value_parser = ["sk", "token", "simple"]
+        )]
         api_key_format: String,
         /// 服务和首个 API key 允许使用的提供源，可重复或逗号分隔。
         #[arg(long = "provider", value_delimiter = ',')]
@@ -84,8 +89,8 @@ pub enum ServiceCommand {
         /// 新监听地址。
         #[arg(long)]
         host: Option<String>,
-        /// 新监听端口。
-        #[arg(long)]
+        /// 新监听端口，范围 1024..=65535。
+        #[arg(long, value_parser = parse_service_port)]
         port: Option<u16>,
         /// 设置是否允许该服务的已认证请求跳过客户端 User-Agent 校验。
         #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
@@ -133,6 +138,9 @@ pub enum ServiceCommand {
     Delete {
         /// 服务 ID 或名称。
         service: String,
+        /// 跳过交互确认，用于自动化。
+        #[arg(short = 'y', long)]
+        yes: bool,
     },
     /// 查看服务绑定的 API key；明文需要显式授权输出。
     #[command(
@@ -205,12 +213,16 @@ pub enum ApiKeyCommand {
     Add {
         #[arg(long)]
         name: String,
-        #[arg(long, default_value = "sk")]
+        #[arg(
+            long,
+            default_value = "sk",
+            value_parser = ["sk", "token", "simple"]
+        )]
         format: String,
         /// 使用指定的 API key 明文，而不是随机生成。
         #[arg(long, value_name = "API_KEY")]
         key: Option<String>,
-        #[arg(long)]
+        #[arg(long, value_parser = parse_non_negative_credits)]
         credits_limit: Option<f64>,
         /// 是否允许该 key 在所有已绑定服务上跳过客户端 User-Agent 校验。
         #[arg(
@@ -252,7 +264,12 @@ pub enum ApiKeyCommand {
         visible_alias = "delete",
         after_help = "参数接受 API key ID 或名称。\n\n示例：\n  kproxy apikey rm ak_ab12\n  kproxy apikey delete ci\n\n执行前需输入 y 或 yes 确认。"
     )]
-    Rm { id: String },
+    Rm {
+        id: String,
+        /// 跳过交互确认，用于自动化。
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// 启用 API key。
     #[command(
         after_help = "示例：\n  kproxy apikey enable ak_ab12\n  kproxy --json apikey enable ak_ab12"
@@ -269,7 +286,12 @@ pub enum ApiKeyCommand {
     )]
     Limit {
         id: String,
-        #[arg(long, required_unless_present = "clear", conflicts_with = "clear")]
+        #[arg(
+            long,
+            required_unless_present = "clear",
+            conflicts_with = "clear",
+            value_parser = parse_non_negative_credits
+        )]
         credits: Option<f64>,
         /// 删除累计 credits 上限，恢复为不限。
         #[arg(long)]
@@ -290,7 +312,7 @@ pub enum ApiKeyCommand {
     )]
     History {
         id: String,
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 50, value_parser = parse_cli_tail)]
         tail: usize,
         #[arg(long)]
         provider: Option<String>,
@@ -299,7 +321,12 @@ pub enum ApiKeyCommand {
     #[command(
         after_help = "示例：\n  kproxy apikey reset-usage ak_ab12\n\n执行前需输入 y 或 yes 确认。"
     )]
-    ResetUsage { id: String },
+    ResetUsage {
+        id: String,
+        /// 跳过交互确认，用于自动化。
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -464,9 +491,17 @@ pub enum AlertCommand {
     },
     /// 删除告警目标，执行前需输入 y 或 yes 确认。
     #[command(name = "delete", visible_alias = "rm")]
-    Delete { name: String },
+    Delete {
+        name: String,
+        /// 跳过交互确认，用于自动化。
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
     /// 向一个或全部目标发送测试通知。
-    #[command(after_help = "示例：\n  kproxy alert test alerts\n  kproxy alert test --all")]
+    #[command(
+        after_help = "示例：\n  kproxy alert test alerts\n  kproxy alert test --all",
+        group(clap::ArgGroup::new("alert_test_target").required(true).multiple(false).args(["name", "all"]))
+    )]
     Test {
         name: Option<String>,
         #[arg(long, conflicts_with = "name")]
@@ -475,9 +510,42 @@ pub enum AlertCommand {
     /// 查看最近的告警投递记录。
     #[command(after_help = "示例：\n  kproxy alert logs\n  kproxy alert logs --tail 200")]
     Logs {
-        #[arg(long, default_value_t = 50)]
+        #[arg(long, default_value_t = 50, value_parser = parse_cli_tail)]
         tail: usize,
     },
+}
+
+pub(crate) fn parse_non_negative_credits(value: &str) -> std::result::Result<f64, String> {
+    let credits = value
+        .parse::<f64>()
+        .map_err(|_| "额度必须是数字".to_owned())?;
+    if credits.is_finite() && credits >= 0.0 {
+        Ok(credits)
+    } else {
+        Err("额度必须是有限的非负数".to_owned())
+    }
+}
+
+fn parse_cli_tail(value: &str) -> std::result::Result<usize, String> {
+    let tail = value
+        .parse::<usize>()
+        .map_err(|_| "条数必须是整数".to_owned())?;
+    if (1..=1_000).contains(&tail) {
+        Ok(tail)
+    } else {
+        Err("条数必须在 1..=1000 之间".to_owned())
+    }
+}
+
+fn parse_service_port(value: &str) -> std::result::Result<u16, String> {
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| "端口必须是 1024..=65535 的整数".to_owned())?;
+    if port >= 1024 {
+        Ok(port)
+    } else {
+        Err("端口必须在 1024..=65535 之间".to_owned())
+    }
 }
 
 pub async fn simple_rpc(
@@ -492,6 +560,24 @@ pub async fn simple_rpc(
     } else {
         print_human_value(&value);
     }
+    Ok(())
+}
+
+pub fn print_diagnose_all(
+    endpoints: &serde_json::Value,
+    accounts: &serde_json::Value,
+    json: bool,
+) -> Result<()> {
+    if json {
+        return print_json(&serde_json::json!({
+            "endpoints": endpoints,
+            "accounts": accounts
+        }));
+    }
+    println!("端点诊断");
+    print_human_value(endpoints);
+    println!("\n账号诊断");
+    print_human_value(accounts);
     Ok(())
 }
 
@@ -819,7 +905,7 @@ pub use observability::{
 
 mod alert;
 
-pub use alert::{run_alert, show_alert_events, show_alert_platforms};
+pub use alert::{run_alert, show_alert_config, show_alert_events, show_alert_platforms};
 
 mod apikey;
 
@@ -855,11 +941,11 @@ pub async fn run_service(
                             service.name,
                             format!("{}:{}", service.host, service.port),
                             if service.running {
-                                "running".into()
+                                "运行中".into()
                             } else if service.enabled {
-                                "error".into()
+                                "异常".into()
                             } else {
-                                "disabled".into()
+                                "已停用".into()
                             },
                             service.api_key_ids.len().to_string(),
                             service_tag_label(
@@ -1061,13 +1147,22 @@ pub async fn run_service(
                 Ok(())
             }
         }
-        ServiceCommand::Delete { service } => {
-            if !crate::commands::confirm(&format!(
-                "确认删除 API 代理服务 {service} 及其专用 API key？"
-            ))
+        ServiceCommand::Delete { service, yes } => {
+            if !crate::commands::confirm_unless(
+                yes,
+                &format!("确认删除 API 代理服务 {service} 及其专用 API key？"),
+            )
             .await?
             {
-                println!("已取消");
+                if json {
+                    print_json(&serde_json::json!({
+                        "service": service,
+                        "deleted": false,
+                        "cancelled": true
+                    }))?;
+                } else {
+                    println!("已取消");
+                }
                 return Ok(());
             }
             let result: ProxyServiceDeleteResult = client
@@ -1121,16 +1216,21 @@ pub async fn run_service(
                             key.id,
                             key.name,
                             key.format,
-                            if key.enabled { "enabled" } else { "disabled" }.into(),
-                            if key.user_agent_check_enforced {
-                                "enforced".into()
+                            if key.enabled {
+                                "已启用"
                             } else {
-                                format!("skipped ({})", key.user_agent_check_reason)
+                                "已停用"
+                            }
+                            .into(),
+                            if key.user_agent_check_enforced {
+                                "校验".into()
+                            } else {
+                                format!("跳过 ({})", key.user_agent_check_reason)
                             },
                             key.credits_limit
                                 .map(format_credits)
                                 .unwrap_or_else(|| "-".into()),
-                            key.key.unwrap_or_else(|| "<hidden>".into()),
+                            key.key.unwrap_or_else(|| "<隐藏>".into()),
                         ]
                     })
                     .collect::<Vec<_>>();
@@ -1290,25 +1390,25 @@ async fn show_service(client: &mut AdminClient, selector: &str, json: bool) -> R
     println!(
         "UA 校验   {}",
         if service.skip_user_agent_check {
-            "skipped for this service"
+            "该服务跳过"
         } else {
-            "inherits global/key policy"
+            "继承全局/API key 策略"
         }
     );
     println!(
         "配置状态  {}",
         if service.enabled {
-            "enabled"
+            "已启用"
         } else {
-            "disabled"
+            "已停用"
         }
     );
     println!(
         "运行状态  {}",
         if service.running {
-            "running"
+            "运行中"
         } else {
-            "stopped"
+            "未运行"
         }
     );
     println!(
@@ -1576,6 +1676,17 @@ pub async fn edit_provider(
     allow_cross_provider_fallback: Option<bool>,
     json: bool,
 ) -> Result<()> {
+    if settings.is_empty()
+        && remove_settings.is_empty()
+        && max_concurrent_per_account.is_none()
+        && default_model.is_none()
+        && enable_model_fallback.is_none()
+        && allow_cross_provider_fallback.is_none()
+    {
+        return Err(anyhow!(
+            "没有指定修改项；请使用 --setting、--remove-setting、--max-concurrent-per-account、--default-model、--enable-model-fallback 或 --allow-cross-provider-fallback"
+        ));
+    }
     let settings = parse_provider_settings(settings)?;
     mutate_config_array(client, "provider", |array| {
         materialize_implicit_kiro(array, id);
@@ -1649,8 +1760,14 @@ pub async fn set_provider_enabled(
     }
 }
 
-pub async fn delete_provider(client: &mut AdminClient, id: &str, json: bool) -> Result<()> {
-    if !crate::commands::confirm(&format!("确认删除提供源 {id} 的配置？")).await? {
+pub async fn delete_provider(
+    client: &mut AdminClient,
+    id: &str,
+    yes: bool,
+    json: bool,
+) -> Result<()> {
+    if !crate::commands::confirm_unless(yes, &format!("确认删除提供源 {id} 的配置？")).await?
+    {
         if json {
             return print_json(
                 &serde_json::json!({"provider":id,"deleted":false,"cancelled":true}),
@@ -1747,6 +1864,55 @@ fn ensure_table<'a>(
         .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
         .as_table_mut()
         .ok_or_else(|| anyhow!("provider.{key} must be a table"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) enum OverageLimitUpdate {
+    Preserve,
+    Set(f64),
+    Clear,
+}
+
+pub(crate) async fn update_pool_overage_config(
+    client: &mut AdminClient,
+    enabled: bool,
+    limit: OverageLimitUpdate,
+) -> Result<()> {
+    mutate_config(client, |root| {
+        apply_pool_overage_update(root, enabled, limit)
+    })
+    .await
+}
+
+fn apply_pool_overage_update(
+    root: &mut toml::map::Map<String, toml::Value>,
+    enabled: bool,
+    limit: OverageLimitUpdate,
+) -> Result<()> {
+    let pool = root
+        .entry("pool")
+        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()))
+        .as_table_mut()
+        .ok_or_else(|| anyhow!("pool must be a table"))?;
+    pool.insert("enable_overage".into(), toml::Value::Boolean(enabled));
+    match limit {
+        OverageLimitUpdate::Preserve => {}
+        OverageLimitUpdate::Set(value) => {
+            if !value.is_finite() || value < 0.0 {
+                return Err(anyhow!(
+                    "overage credits must be a finite non-negative number"
+                ));
+            }
+            pool.insert(
+                "max_overage_credits_per_account".into(),
+                toml::Value::Float(value),
+            );
+        }
+        OverageLimitUpdate::Clear => {
+            pool.remove("max_overage_credits_per_account");
+        }
+    }
+    Ok(())
 }
 
 async fn mutate_config(
@@ -2296,18 +2462,33 @@ async fn reload_config_while_locked(client: &mut AdminClient) -> Result<ConfigRe
         .await
 }
 
-pub async fn validate_config(file: Option<&str>) -> Result<()> {
+pub async fn validate_config(file: Option<&str>, json: bool) -> Result<()> {
     let path = file
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| Paths::from_env().config_file);
+    if file.is_some() {
+        let metadata = tokio::fs::metadata(&path)
+            .await
+            .with_context(|| format!("配置文件不存在或无法访问：{}", path.display()))?;
+        if !metadata.is_file() {
+            return Err(anyhow!("配置路径不是文件：{}", path.display()));
+        }
+    }
     let config = kproxy_store::config_loader::load_config(&path)
         .await
         .with_context(|| format!("读取或解析 {} 失败", path.display()))?;
     config
         .validate()
         .with_context(|| format!("{} 配置校验失败", path.display()))?;
-    println!("配置有效：{}", path.display());
-    Ok(())
+    if json {
+        print_json(&serde_json::json!({
+            "valid": true,
+            "config_file": path
+        }))
+    } else {
+        println!("配置有效：{}", path.display());
+        Ok(())
+    }
 }
 
 pub async fn edit_config(client: &mut AdminClient, module: Option<&str>) -> Result<()> {
@@ -2329,7 +2510,7 @@ async fn edit_full_config(client: &mut AdminClient) -> Result<()> {
         .await
         .with_context(|| format!("读取 {} 失败", path.display()))?;
     run_editor(&path).await?;
-    if let Err(error) = validate_config(Some(path.to_string_lossy().as_ref())).await {
+    if let Err(error) = validate_config(Some(path.to_string_lossy().as_ref()), false).await {
         kproxy_store::atomic::write_bytes_atomically(&path, &original, Some(0o600)).await?;
         return Err(error.context("配置无效，磁盘文件已回滚"));
     }
@@ -2451,6 +2632,7 @@ pub struct ConfigResetResult {
 pub async fn reset_config(
     client: &mut AdminClient,
     module: Option<&str>,
+    yes: bool,
 ) -> Result<Option<ConfigResetResult>> {
     let module = module.map(resolve_config_module).transpose()?;
     if let Some(module) = module {
@@ -2478,7 +2660,7 @@ pub async fn reset_config(
             )
         },
     );
-    if !crate::commands::confirm(&prompt).await? {
+    if !crate::commands::confirm_unless(yes, &prompt).await? {
         return Ok(None);
     }
 
@@ -3009,7 +3191,7 @@ pub async fn run_model_map(
                         },
                         credits,
                         schedule,
-                        if rule.enabled { "" } else { " [disabled]" }
+                        if rule.enabled { "" } else { " [已停用]" }
                     );
                 }
                 Ok(())
@@ -3064,8 +3246,12 @@ pub async fn run_model_map(
                 Ok(())
             })
             .await?;
-            println!("已添加模型映射规则 {name}");
-            Ok(())
+            if json {
+                print_json(&serde_json::json!({"name": name, "created": true}))
+            } else {
+                println!("已添加模型映射规则 {name}");
+                Ok(())
+            }
         }
         ModelMapCommand::Edit {
             name,
@@ -3087,6 +3273,26 @@ pub async fn run_model_map(
             enable,
             disable,
         } => {
+            if rename.is_none()
+                && kind.is_none()
+                && source_models.is_empty()
+                && target_models.is_empty()
+                && priority.is_none()
+                && weights.is_empty()
+                && !clear_weights
+                && below_credits_percent.is_none()
+                && !clear_credits_threshold
+                && api_key_ids.is_empty()
+                && !clear_api_keys
+                && providers.is_empty()
+                && !clear_providers
+                && service_ids.is_empty()
+                && !clear_services
+                && !enable
+                && !disable
+            {
+                return Err(anyhow!("没有指定修改项；请至少提供一个 edit 选项"));
+            }
             mutate_config_array(client, "model_mapping", |array| {
                 let table = find_named_table_mut(array, &name, "model mapping")?;
                 replace_optional_string(table, "name", rename.as_deref());
@@ -3134,21 +3340,46 @@ pub async fn run_model_map(
                 Ok(())
             })
             .await?;
-            println!("已更新模型映射规则 {name}");
-            Ok(())
+            if json {
+                print_json(&serde_json::json!({
+                    "name": name,
+                    "renamed_to": rename,
+                    "updated": true
+                }))
+            } else {
+                if let Some(rename) = rename {
+                    println!("已更新模型映射规则 {name} -> {rename}");
+                } else {
+                    println!("已更新模型映射规则 {name}");
+                }
+                Ok(())
+            }
         }
-        ModelMapCommand::Delete { name } => {
-            if !crate::commands::confirm(&format!("确认删除模型映射规则 {name}？")).await?
+        ModelMapCommand::Delete { name, yes } => {
+            if !crate::commands::confirm_unless(yes, &format!("确认删除模型映射规则 {name}？"))
+                .await?
             {
-                println!("已取消");
+                if json {
+                    print_json(&serde_json::json!({
+                        "name": name,
+                        "deleted": false,
+                        "cancelled": true
+                    }))?;
+                } else {
+                    println!("已取消");
+                }
                 return Ok(());
             }
             mutate_config_array(client, "model_mapping", |array| {
                 remove_named_value(array, &name, "model mapping")
             })
             .await?;
-            println!("已删除模型映射规则 {name}");
-            Ok(())
+            if json {
+                print_json(&serde_json::json!({"name": name, "deleted": true}))
+            } else {
+                println!("已删除模型映射规则 {name}");
+                Ok(())
+            }
         }
         ModelMapCommand::Test {
             model,
@@ -3194,7 +3425,9 @@ pub async fn run_model_map(
     }
 }
 
-async fn effective_config(client: &mut AdminClient) -> Result<kproxy_core::config::Config> {
+pub(crate) async fn effective_config(
+    client: &mut AdminClient,
+) -> Result<kproxy_core::config::Config> {
     let show: ConfigShowResult = client
         .call(method::CONFIG_SHOW, serde_json::json!({}))
         .await?;

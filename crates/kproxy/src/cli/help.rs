@@ -9,12 +9,14 @@ use crate::{Cli, Command};
 
 pub fn empty_group_path(command: &Command) -> Option<&'static str> {
     match command {
-        Command::Config { command: None }
+        Command::Provider { command: None }
+        | Command::Config { command: None }
         | Command::Account { command: None }
         | Command::ApiKey { command: None }
         | Command::Service { command: None }
         | Command::Alert { command: None }
         | Command::ModelMap { command: None } => Some(match command {
+            Command::Provider { .. } => "provider",
             Command::Config { .. } => "config",
             Command::Account { .. } => "account",
             Command::ApiKey { .. } => "apikey",

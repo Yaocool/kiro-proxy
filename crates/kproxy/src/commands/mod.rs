@@ -10,14 +10,23 @@ pub async fn confirm(prompt: &str) -> Result<bool> {
     use std::io::Write;
     use tokio::io::{AsyncBufReadExt, BufReader};
 
-    print!("{prompt} [y/N] ");
-    let _flush_result = std::io::stdout().flush();
+    eprint!("{prompt} [y/N] ");
+    let _flush_result = std::io::stderr().flush();
     let mut line = String::new();
     BufReader::new(tokio::io::stdin())
         .read_line(&mut line)
         .await
         .context("读取确认输入失败")?;
     Ok(is_confirmation(&line))
+}
+
+/// Skip the prompt only when the caller explicitly opted into non-interactive execution.
+pub async fn confirm_unless(yes: bool, prompt: &str) -> Result<bool> {
+    if yes {
+        Ok(true)
+    } else {
+        confirm(prompt).await
+    }
 }
 
 fn is_confirmation(value: &str) -> bool {

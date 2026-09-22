@@ -1,6 +1,45 @@
 use super::*;
 
 #[test]
+fn pool_overage_update_sets_preserves_and_clears_the_per_account_limit() {
+    let mut root = toml::map::Map::new();
+    apply_pool_overage_update(&mut root, true, OverageLimitUpdate::Set(500.0))
+        .expect("set overage config");
+    let pool = root["pool"].as_table().expect("pool table");
+    assert_eq!(pool["enable_overage"].as_bool(), Some(true));
+    assert_eq!(
+        pool["max_overage_credits_per_account"].as_float(),
+        Some(500.0)
+    );
+
+    apply_pool_overage_update(&mut root, false, OverageLimitUpdate::Preserve)
+        .expect("disable and preserve limit");
+    let pool = root["pool"].as_table().expect("pool table");
+    assert_eq!(pool["enable_overage"].as_bool(), Some(false));
+    assert_eq!(
+        pool["max_overage_credits_per_account"].as_float(),
+        Some(500.0)
+    );
+
+    apply_pool_overage_update(&mut root, true, OverageLimitUpdate::Clear)
+        .expect("clear local limit");
+    let pool = root["pool"].as_table().expect("pool table");
+    assert_eq!(pool["enable_overage"].as_bool(), Some(true));
+    assert!(!pool.contains_key("max_overage_credits_per_account"));
+}
+
+#[test]
+fn pool_overage_update_rejects_invalid_limits_and_malformed_pool_tables() {
+    let mut root = toml::map::Map::new();
+    assert!(apply_pool_overage_update(&mut root, true, OverageLimitUpdate::Set(f64::NAN)).is_err());
+    assert!(apply_pool_overage_update(&mut root, true, OverageLimitUpdate::Set(-1.0)).is_err());
+
+    let mut root = toml::map::Map::new();
+    root.insert("pool".into(), toml::Value::String("invalid".into()));
+    assert!(apply_pool_overage_update(&mut root, true, OverageLimitUpdate::Preserve).is_err());
+}
+
+#[test]
 fn service_tags_normalize_and_use_compatible_toml_shapes() {
     let tags = normalize_service_tags(&[" xx2 ".into(), "xx1".into(), "xx1".into()])
         .expect("normalize tags");
