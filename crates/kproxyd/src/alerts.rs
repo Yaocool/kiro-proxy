@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use kproxy_core::account::{Account, Usage};
 use kproxy_notify::{WebhookEvent, WebhookEventKind};
-use kproxy_pool::{account_credit_state, AccountCreditState};
+use kproxy_pool::{account_credit_state, effective_credit_limit, AccountCreditState};
 
 use crate::state::AppState;
 
@@ -25,7 +25,8 @@ pub async fn sync_quota_incidents(state: &Arc<AppState>) {
     let accounts = state.pool().snapshot().await;
     let config = state.runtime_config_snapshot().pool;
     for account in &accounts {
-        sync_account_credit_incident(state, account, &config);
+        let upstream_exhausted = runtime_quota_exhausted(state, &account.id).await;
+        sync_account_credit_incident(state, account, &config, upstream_exhausted);
     }
     sync_service_quota_inner(state, &accounts).await;
 }
@@ -37,15 +38,25 @@ pub async fn sync_account_quota(state: &Arc<AppState>, account_id: &str) {
         resolve_account_credit_incidents(state, account_id);
         return;
     };
+    let upstream_exhausted = runtime.health() == kproxy_pool::AccountHealth::Exhausted;
     let account = runtime.account.read().await.clone();
     let config = state.runtime_config_snapshot().pool;
-    sync_account_credit_incident(state, &account, &config);
+    sync_account_credit_incident(state, &account, &config, upstream_exhausted);
+}
+
+async fn runtime_quota_exhausted(state: &AppState, account_id: &str) -> bool {
+    state
+        .pool()
+        .get(account_id)
+        .await
+        .is_some_and(|runtime| runtime.health() == kproxy_pool::AccountHealth::Exhausted)
 }
 
 fn sync_account_credit_incident(
     state: &AppState,
     account: &Account,
     config: &kproxy_core::config::PoolConfig,
+    upstream_exhausted: bool,
 ) {
     if !account.enabled {
         resolve_account_credit_incidents(state, &account.id);
@@ -57,7 +68,7 @@ fn sync_account_credit_incident(
         notifier.incident_active(WebhookEventKind::AccountQuotaExhausted, Some(&account.id));
     let protected_active =
         notifier.incident_active(WebhookEventKind::AccountCreditProtected, Some(&account.id));
-    match authoritative_credit_observation(state, account, config) {
+    match authoritative_credit_observation(state, account, config, upstream_exhausted) {
         CreditObservation::Unknown => {}
         CreditObservation::Known {
             state: AccountCreditState::Available,
@@ -106,7 +117,7 @@ fn sync_account_credit_incident(
             state
                 .notifier()
                 .resolve_incident(WebhookEventKind::AccountCreditProtected, Some(&account.id));
-            emit_account_quota(state, account, usage.as_ref());
+            emit_account_quota(state, account, usage.as_ref(), config);
             state.clear_credit_transition(&account.id);
         }
         CreditObservation::Known {
@@ -133,11 +144,24 @@ fn authoritative_credit_observation(
     state: &AppState,
     account: &Account,
     config: &kproxy_core::config::PoolConfig,
+    upstream_exhausted: bool,
 ) -> CreditObservation {
     let authoritative = state.authoritative_usage(&account.id);
-    if account.credit_exhausted {
+    if upstream_exhausted {
+        let exhausted_usage = authoritative.as_ref().and_then(|observation| {
+            let limit = effective_credit_limit(&observation.usage, config);
+            (limit > 0.0 && observation.usage.current >= limit).then(|| observation.usage.clone())
+        });
+        return CreditObservation::Known {
+            state: AccountCreditState::Exhausted,
+            usage: exhausted_usage,
+            generation: authoritative.map(|value| value.generation),
+        };
+    }
+    if account.credit_exhausted && !config.enable_overage {
         let authoritative_exhausted = authoritative.as_ref().is_some_and(|observation| {
-            observation.usage.limit > 0.0 && observation.usage.current >= observation.usage.limit
+            let limit = effective_credit_limit(&observation.usage, config);
+            limit > 0.0 && observation.usage.current >= limit
         });
         return CreditObservation::Known {
             state: AccountCreditState::Exhausted,
@@ -202,10 +226,16 @@ async fn sync_service_quota_inner(state: &Arc<AppState>, accounts: &[Account]) {
             continue;
         }
         has_nonempty_pool = true;
-        let observations = enabled
-            .iter()
-            .map(|account| authoritative_credit_observation(state, account, &config.pool))
-            .collect::<Vec<_>>();
+        let mut observations = Vec::with_capacity(enabled.len());
+        for account in &enabled {
+            let upstream_exhausted = runtime_quota_exhausted(state, &account.id).await;
+            observations.push(authoritative_credit_observation(
+                state,
+                account,
+                &config.pool,
+                upstream_exhausted,
+            ));
+        }
         let all_exhausted = observations.iter().all(|observation| {
             matches!(
                 observation,
@@ -310,9 +340,20 @@ pub fn resolve_token_refresh_failure(state: &AppState, account_id: &str) {
         .resolve_incident(WebhookEventKind::TokenRefreshFailed, Some(account_id));
 }
 
-fn emit_account_quota(state: &AppState, account: &Account, usage: Option<&Usage>) {
+fn emit_account_quota(
+    state: &AppState,
+    account: &Account,
+    usage: Option<&Usage>,
+    config: &kproxy_core::config::PoolConfig,
+) {
     let credit = usage
-        .map(|usage| format!("{:.2} / {:.2} credits", usage.current, usage.limit))
+        .map(|usage| {
+            format!(
+                "{:.2} / {:.2} credits",
+                usage.current,
+                effective_credit_limit(usage, config)
+            )
+        })
         .unwrap_or_else(|| "上游已返回额度耗尽".into());
     let message = format!(
         "- **账号：** `{}`\n\
@@ -348,9 +389,12 @@ fn account_credit_protected_event(
     usage: &Usage,
     config: &kproxy_core::config::PoolConfig,
 ) -> Option<WebhookEvent> {
-    let usage = (usage.limit > 0.0).then_some(usage)?;
-    let remaining = (usage.limit - usage.current).max(0.0);
-    let remaining_percent = (remaining / usage.limit * 100.0).clamp(0.0, 100.0);
+    let limit = effective_credit_limit(usage, config);
+    if limit <= 0.0 {
+        return None;
+    }
+    let remaining = (limit - usage.current).max(0.0);
+    let remaining_percent = (remaining / limit * 100.0).clamp(0.0, 100.0);
     let threshold = format!("剩余额度 ≤ {:.2} credits", config.low_credit_min_remaining);
     let message = format!(
         "- **账号：** `{}`\n\
@@ -362,7 +406,7 @@ fn account_credit_protected_event(
         markdown_code(account.display_name()),
         markdown_code(&account.id),
         usage.current,
-        usage.limit,
+        limit,
         threshold,
     );
     let mut event = WebhookEvent::new(
@@ -412,6 +456,7 @@ mod tests {
             usage: Some(Usage {
                 current,
                 limit,
+                overage_cap: None,
                 percent_used: current / limit * 100.0,
                 next_reset_date: None,
                 updated_at: 1,
@@ -469,20 +514,21 @@ mod tests {
         let (_directory, state) = test_state().await;
         let mut account = account_with_usage(100.0, 100.0);
         assert!(matches!(
-            authoritative_credit_observation(&state, &account, &PoolConfig::default()),
+            authoritative_credit_observation(&state, &account, &PoolConfig::default(), false),
             CreditObservation::Unknown
         ));
 
         let authoritative = Usage {
             current: 97.0,
             limit: 100.0,
+            overage_cap: None,
             percent_used: 97.0,
             next_reset_date: None,
             updated_at: 2,
         };
         state.record_authoritative_usage(&account.id, authoritative.clone());
         assert!(matches!(
-            authoritative_credit_observation(&state, &account, &PoolConfig::default()),
+            authoritative_credit_observation(&state, &account, &PoolConfig::default(), false),
             CreditObservation::Known {
                 state: AccountCreditState::Protected,
                 ..
@@ -491,7 +537,7 @@ mod tests {
 
         account.usage.as_mut().expect("usage").current = 100.0;
         assert!(matches!(
-            authoritative_credit_observation(&state, &account, &PoolConfig::default()),
+            authoritative_credit_observation(&state, &account, &PoolConfig::default(), false),
             CreditObservation::Known {
                 state: AccountCreditState::Protected,
                 ..
@@ -526,6 +572,137 @@ mod tests {
             ),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn overage_alerts_use_the_configured_cap_and_preserve_upstream_exhaustion() {
+        let (_directory, state) = test_state().await;
+        let mut account = account_with_usage(10_000.0, 20_000.0);
+        account.usage.as_mut().expect("usage").overage_cap = Some(10_000.0);
+        account.credit_exhausted = true;
+        let config = PoolConfig {
+            enable_overage: true,
+            max_overage_credits_per_account: Some(500.0),
+            low_credit_min_remaining: 4.0,
+            ..PoolConfig::default()
+        };
+
+        state.record_authoritative_usage(
+            &account.id,
+            account.usage.as_ref().expect("usage").clone(),
+        );
+        assert!(matches!(
+            authoritative_credit_observation(&state, &account, &config, false),
+            CreditObservation::Known {
+                state: AccountCreditState::Available,
+                ..
+            }
+        ));
+
+        let mut near_cap = account.usage.as_ref().expect("usage").clone();
+        near_cap.current = 10_499.0;
+        state.record_authoritative_usage(&account.id, near_cap);
+        assert!(matches!(
+            authoritative_credit_observation(&state, &account, &config, false),
+            CreditObservation::Known {
+                state: AccountCreditState::Available,
+                ..
+            }
+        ));
+
+        let mut at_cap = account.usage.as_ref().expect("usage").clone();
+        at_cap.current = 10_500.0;
+        state.record_authoritative_usage(&account.id, at_cap);
+        assert!(matches!(
+            authoritative_credit_observation(&state, &account, &config, false),
+            CreditObservation::Known {
+                state: AccountCreditState::Exhausted,
+                usage: Some(_),
+                ..
+            }
+        ));
+
+        let mut below_cap = account.usage.as_ref().expect("usage").clone();
+        below_cap.current = 10_000.0;
+        state.record_authoritative_usage(&account.id, below_cap);
+        assert!(matches!(
+            authoritative_credit_observation(&state, &account, &config, true),
+            CreditObservation::Known {
+                state: AccountCreditState::Exhausted,
+                usage: None,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn overage_does_not_false_alarm_at_base_limit_but_reports_upstream_exhaustion() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let paths = kproxy_core::paths::Paths::from_env_values(
+            Some(directory.path().to_str().expect("utf8")),
+            None,
+            None,
+            None,
+        );
+        kproxy_store::bootstrap::ensure_layout(&paths)
+            .await
+            .expect("layout");
+        let mut accounts = AccountStore::load(&paths.accounts_file)
+            .await
+            .expect("accounts");
+        let mut account = account_with_usage(10_000.0, 20_000.0);
+        account.usage.as_mut().expect("usage").overage_cap = Some(10_000.0);
+        accounts.insert(account.clone()).expect("account");
+
+        let mut config = Config::default();
+        config.pool.enable_overage = true;
+        config.pool.max_overage_credits_per_account = Some(500.0);
+        config.proxy_service.push(ProxyServiceConfig {
+            id: "svc_main".into(),
+            name: "main".into(),
+            host: "127.0.0.1".into(),
+            port: 5580,
+            ..ProxyServiceConfig::default()
+        });
+        config.webhook.push(
+            serde_json::from_value(serde_json::json!({
+                "name":"test",
+                "kind":"custom",
+                "url":"http://127.0.0.1:9/alerts",
+                "events":[
+                    WebhookEventKind::AccountQuotaExhausted.as_str(),
+                    WebhookEventKind::ServiceQuotaExhausted.as_str()
+                ]
+            }))
+            .expect("webhook config"),
+        );
+        let state = Arc::new(AppState::new(paths, ConfigHandle::new(config), accounts));
+        state.record_authoritative_usage(
+            &account.id,
+            account.usage.as_ref().expect("usage").clone(),
+        );
+
+        sync_quota_incidents(&state).await;
+        assert!(!state
+            .notifier()
+            .incident_active(WebhookEventKind::AccountQuotaExhausted, Some(&account.id)));
+        assert!(!state
+            .notifier()
+            .incident_active(WebhookEventKind::ServiceQuotaExhausted, None));
+
+        state
+            .pool()
+            .get(&account.id)
+            .await
+            .expect("runtime")
+            .set_health(kproxy_pool::AccountHealth::Exhausted);
+        sync_quota_incidents(&state).await;
+        assert!(state
+            .notifier()
+            .incident_active(WebhookEventKind::AccountQuotaExhausted, Some(&account.id)));
+        assert!(state
+            .notifier()
+            .incident_active(WebhookEventKind::ServiceQuotaExhausted, None));
     }
 
     #[tokio::test]
