@@ -116,6 +116,58 @@ SSO login and credential handling are covered in [account setup](docs/startup-an
 `health` checks daemon liveness; `ready` checks business prerequisites. A real
 generation request additionally verifies the upstream route and consumes quota.
 
+### Kiro overage credits
+
+Inspect or change the policy for the entire Kiro account pool with the account
+command:
+
+```bash
+# Enable overage with a 500-credit maximum for each account
+kproxy account overage enable --max-credits 500
+
+# Show the policy and per-account proxy/Kiro limits
+kproxy account overage
+
+# Refresh Kiro usage before displaying it
+kproxy account overage show --refresh
+
+# Disable overage while retaining the configured maximum
+kproxy account overage disable
+```
+
+`enable` and `disable` update the configuration atomically and reload it.
+`enable` also refreshes Kiro usage by default. Use
+`kproxy account overage enable --kiro-limit` to rely entirely on Kiro's
+reported cap. You can also edit the equivalent settings in the `config.toml`
+shown by `kproxy config path`:
+
+```toml
+[pool]
+enable_overage = true
+max_overage_credits_per_account = 500.0
+```
+
+It is off by default. With it off, plan and bonus credits remain subject to
+low credit protection and exhaustion checks. With it on, the proxy includes
+Kiro's reported overage cap. If `max_overage_credits_per_account` is omitted,
+the proxy retains the original switch behavior and does not pause accounts
+based on its local balance. When set, the maximum applies separately to every
+account: new requests stop once usage reaches the non-overage limit plus the
+smaller of Kiro's overage cap and this setting. The low credit threshold does
+not apply. For example, a 10,000 credit plan with a 10,000 credit Kiro overage
+cap and a 500 credit proxy maximum has an effective limit of 10,500.
+
+The proxy uses the latest known usage when admitting requests, so requests
+already in flight can exceed this maximum. Upstream quota rejections and the
+service daily credit limit still apply. After manually editing TOML, run
+`kproxy config reload`, then `kproxy tasks run status_check` to refresh Kiro's
+overage values. Inspect `kproxy config show pool --effective` and
+`kproxy pool --model claude-sonnet-4.6 --explain`. In `kproxy account list`,
+the quota column shows current usage, the proxy's configured total, and Kiro's
+server total, for example `10000.01/10500.00/20000.00`. The
+`Overage(configured/Kiro)` column shows the per-account proxy maximum and
+Kiro's reported cap together.
+
 ## Connect a client
 
 | Endpoint | Purpose |

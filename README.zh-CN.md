@@ -104,6 +104,36 @@ kproxy ready
 [账号配置](docs/startup-and-debugging.zh-CN.md#4-添加或导入账号)。`health` 检查 daemon 存活，
 `ready` 检查业务前置条件；真实生成还需验证上游路由，并会消耗额度。
 
+### Kiro 超额额度
+
+用账号命令查看或修改整个 Kiro 账号池的 overage 策略：
+
+```bash
+# 开启，并限制每个账号最多使用 500 credits overage
+kproxy account overage enable --max-credits 500
+
+# 查看策略及各账号的代理/Kiro 额度
+kproxy account overage
+
+# 强制刷新 Kiro 额度后查看
+kproxy account overage show --refresh
+
+# 关闭；保留 500 的配置供下次启用
+kproxy account overage disable
+```
+
+`enable` 和 `disable` 会原子更新配置并自动重载；`enable` 默认还会立即刷新 Kiro 额度。若要完全采用 Kiro 返回的上限，使用 `kproxy account overage enable --kiro-limit`。也可以在 `kproxy config path` 显示的 `config.toml` 中手工设置等价配置：
+
+```toml
+[pool]
+enable_overage = true
+max_overage_credits_per_account = 500.0
+```
+
+开关默认关闭。关闭时，账号按套餐及赠送额度接受低额度保护和耗尽检查。开启后，代理计入 Kiro 返回的超额上限；不设置 `max_overage_credits_per_account` 时，沿用原有开关行为，不按本地余额暂停账号。设置后，该值对池中**每个账号分别**生效，代理在账号已用额度达到“非超额额度 + min(Kiro 超额上限, 配置上限)”时停止为它分配新请求，不提前应用低额度保护。例如 Kiro 返回 10000 套餐额度及 10000 超额上限，配置 500 时该账号的代理可用总额度为 10500。
+
+此配置按 Kiro 最近一次返回的用量拦截新请求；已在处理中的请求可能让最终用量超过配置值。Kiro 上游实际拒绝额度请求时仍按上游错误处理；服务每日额度上限仍然生效。手工编辑 TOML 后运行 `kproxy config reload`，再运行 `kproxy tasks run status_check` 刷新 Kiro 返回的 overage 数值。可用 `kproxy config show pool --effective` 和 `kproxy pool --model claude-sonnet-4.6 --explain` 核对调度；`kproxy account list` 的“额度”列按“当前已用/代理配置后总额/Kiro 服务端总额”显示，例如 `10000.01/10500.00/20000.00`，`Overage(配置/Kiro)` 列同时显示每账号本地上限与 Kiro 返回的上限。
+
 ## 接入客户端
 
 | 端点 | 用途 |
