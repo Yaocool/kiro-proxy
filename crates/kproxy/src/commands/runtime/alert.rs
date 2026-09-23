@@ -184,6 +184,7 @@ pub async fn run_alert(client: &mut AdminClient, command: AlertCommand, json: bo
 #[derive(serde::Serialize)]
 struct AlertEventInfo {
     event: &'static str,
+    provider_scope: &'static str,
     condition: &'static str,
 }
 
@@ -191,21 +192,25 @@ fn alert_event_catalog() -> [AlertEventInfo; 4] {
     [
         AlertEventInfo {
             event: AlertEvent::AccountCreditProtected.as_str(),
+            provider_scope: "kiro",
             condition:
                 "overage 关闭时，单个启用账号达到 pool.low_credit_min_remaining 保护阈值并暂停调度；overage 开启时不触发此保护告警。",
         },
         AlertEventInfo {
             event: AlertEvent::AccountQuotaExhausted.as_str(),
+            provider_scope: "kiro",
             condition:
                 "单个启用账号达到代理有效额度上限，或 Kiro 上游实际返回额度耗尽；同一次异常只告警一次，恢复后才允许再次告警。",
         },
         AlertEventInfo {
             event: AlertEvent::ServiceQuotaExhausted.as_str(),
+            provider_scope: "kiro",
             condition:
                 "API 代理服务共享的全部启用账号达到各自有效额度上限或被 Kiro 判定额度耗尽；服务恢复前只告警一次。",
         },
         AlertEventInfo {
             event: AlertEvent::TokenRefreshFailed.as_str(),
+            provider_scope: "kiro",
             condition: "后台或请求触发的 Token 刷新失败；同一账号刷新成功前只告警一次。",
         },
     ]
@@ -218,9 +223,15 @@ pub fn show_alert_events(json: bool) -> Result<()> {
     }
     let rows = events
         .iter()
-        .map(|event| vec![event.event.into(), event.condition.into()])
+        .map(|event| {
+            vec![
+                event.event.into(),
+                event.provider_scope.into(),
+                event.condition.into(),
+            ]
+        })
         .collect::<Vec<_>>();
-    println!("{}", render_table(&["EVENT", "触发条件"], &rows));
+    println!("{}", render_table(&["EVENT", "提供源", "触发条件"], &rows));
     println!("\n多选方式：重复使用 `--event`，或用逗号分隔多个事件。");
     Ok(())
 }

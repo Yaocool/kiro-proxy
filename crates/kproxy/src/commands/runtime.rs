@@ -23,14 +23,16 @@ use crate::ModelMapCommand;
 
 #[derive(Debug, Subcommand)]
 pub enum ServiceCommand {
-    /// 列出 API 代理服务。
-    #[command(after_help = "示例：\n  kproxy service list\n  kproxy --json service list")]
+    /// 列出 Kiro/Copilot API 代理服务。
+    #[command(
+        after_help = "可用 --provider kiro|copilot 筛选允许该来源的服务；省略时显示全部。\n\n示例：\n  kproxy service list --provider kiro\n  kproxy service list --provider copilot"
+    )]
     List {
         /// 只显示允许该提供源的服务；`all` 等同于不筛选。
         #[arg(long)]
         provider: Option<String>,
     },
-    /// 显示单个 API 代理服务详情。
+    /// 显示单个服务的监听、默认来源与允许来源。
     #[command(
         after_help = "示例：\n  kproxy service show main\n  kproxy --json service show svc_abcd"
     )]
@@ -40,7 +42,7 @@ pub enum ServiceCommand {
     },
     /// 创建并启动服务，同时生成首个 API key。
     #[command(
-        after_help = "示例：\n  kproxy service create --name main\n  kproxy service create --name team --host 127.0.0.1 --port 5581 --account-tag xx1 xx2\n  kproxy service create --name compatible --skip-user-agent-check true"
+        after_help = "省略 --provider 时保持 Kiro-only；服务与自动生成的 API key 使用相同来源范围。--account-tag 仅筛选 Kiro 账号。多个服务需使用不同端口。\n\n示例：\n  kproxy service create --name kiro --port 5580 --provider kiro --default-provider kiro\n  kproxy service create --name copilot --port 5581 --provider copilot --default-provider copilot\n  kproxy service create --name unified --port 5582 --provider kiro --provider copilot --default-provider kiro"
     )]
     Create {
         #[arg(long)]
@@ -50,7 +52,7 @@ pub enum ServiceCommand {
         /// 监听端口，范围 1024..=65535。
         #[arg(long, value_parser = parse_service_port)]
         port: Option<u16>,
-        /// 使用一个或多个账号标签的并集作为基础账号池；不指定时使用全局账号池。
+        /// 使用一个或多个 Kiro 账号标签的并集作为基础账号池；不指定时使用全局账号池。
         #[arg(long, num_args = 1.., value_delimiter = ',', value_name = "TAG")]
         account_tag: Vec<String>,
         /// 是否允许该服务的已认证请求跳过客户端 User-Agent 校验。
@@ -76,9 +78,9 @@ pub enum ServiceCommand {
         #[arg(long)]
         default_provider: Option<String>,
     },
-    /// 修改服务名称、监听地址、端口或绑定的 API key。
+    /// 修改服务监听、Kiro/Copilot 来源范围或 API key。
     #[command(
-        after_help = "API key 参数接受 ID 或名称，可重复使用。\n\n示例：\n  kproxy service edit main --host 127.0.0.1 --port 5581\n  kproxy service edit main --add-api-key ci\n  kproxy service edit main --remove-api-key ak_ab12\n  kproxy service edit main --skip-user-agent-check true"
+        after_help = "--provider 替换允许来源；--default-provider 指定无前缀模型请求的默认来源。--account-tag/账号手工绑定只作用于 Kiro，修改标签前需停用服务。API key 参数接受 ID 或名称，可重复使用。\n\n示例：\n  kproxy service edit main --provider kiro --provider copilot --default-provider kiro\n  kproxy service edit main --add-api-key ci\n  kproxy service edit main --skip-user-agent-check true"
     )]
     Edit {
         /// 当前服务 ID 或名称。
@@ -95,10 +97,10 @@ pub enum ServiceCommand {
         /// 设置是否允许该服务的已认证请求跳过客户端 User-Agent 校验。
         #[arg(long, value_name = "BOOL", action = clap::ArgAction::Set)]
         skip_user_agent_check: Option<bool>,
-        /// 修改服务的基础账号标签（可指定多个）；服务必须先停用。
+        /// 修改服务的 Kiro 基础账号标签（可指定多个）；服务必须先停用。
         #[arg(long, num_args = 1.., value_delimiter = ',', value_name = "TAG", conflicts_with = "clear_account_tag")]
         account_tag: Vec<String>,
-        /// 清除基础账号标签并恢复使用全局账号池；服务必须先停用。
+        /// 清除 Kiro 基础账号标签并恢复使用其全局账号池；服务必须先停用。
         #[arg(long)]
         clear_account_tag: bool,
         /// 增加绑定的 API key ID 或名称，可重复或逗号分隔。
@@ -117,19 +119,19 @@ pub enum ServiceCommand {
         #[arg(long)]
         default_provider: Option<String>,
     },
-    /// 启动已停用的 API 代理服务。
+    /// 启动已停用的 Kiro/Copilot API 代理服务。
     #[command(after_help = "示例：\n  kproxy service enable main")]
     Enable {
         /// 服务 ID 或名称。
         service: String,
     },
-    /// 停止并停用 API 代理服务，但保留配置和 API key。
+    /// 停止并停用 Kiro/Copilot API 代理服务，保留配置和 API key。
     #[command(after_help = "示例：\n  kproxy service disable main")]
     Disable {
         /// 服务 ID 或名称。
         service: String,
     },
-    /// 删除并停止服务；一并删除未被其他服务共享的 API key。
+    /// 删除 Kiro/Copilot 服务；级联删除未共享的 API key。
     #[command(
         name = "delete",
         visible_alias = "rm",
@@ -142,7 +144,7 @@ pub enum ServiceCommand {
         #[arg(short = 'y', long)]
         yes: bool,
     },
-    /// 查看服务绑定的 API key；明文需要显式授权输出。
+    /// 查看 Kiro/Copilot 服务绑定的 API key；明文需显式输出。
     #[command(
         name = "apikeys",
         after_help = "示例：\n  kproxy service apikeys main\n  kproxy service apikeys svc_abcd --show-secret"
@@ -154,16 +156,18 @@ pub enum ServiceCommand {
         #[arg(long)]
         show_secret: bool,
     },
-    /// 查看服务的有效账号池。
-    #[command(after_help = "示例：\n  kproxy service accounts main")]
+    /// 查看服务的 Kiro 有效账号池。
+    #[command(
+        after_help = "仅列出 Kiro 账号；Copilot 请用 `kproxy account list --provider copilot` 查看。\n\n示例：\n  kproxy service accounts main"
+    )]
     Accounts {
         /// 服务 ID 或名称。
         service: String,
     },
-    /// 手工向服务账号池加入账号；账号可使用任意标签。
+    /// 手工向服务 Kiro 账号池加入账号；账号可使用任意标签。
     #[command(
         name = "add-account",
-        after_help = "示例：\n  kproxy service add-account main acc_7f3a2b1c\n  kproxy service add-account main user@example.com"
+        after_help = "仅适用于 Kiro 账号；Copilot 账号由 provider 的账号池管理。\n\n示例：\n  kproxy service add-account main acc_7f3a2b1c\n  kproxy service add-account main user@example.com"
     )]
     AddAccount {
         /// 服务 ID 或名称。
@@ -172,10 +176,10 @@ pub enum ServiceCommand {
         #[arg(required = true, num_args = 1.., value_name = "ID_OR_EMAIL")]
         accounts: Vec<String>,
     },
-    /// 从服务账号池排除账号。
+    /// 从服务 Kiro 账号池排除账号。
     #[command(
         name = "remove-account",
-        after_help = "示例：\n  kproxy service remove-account main acc_7f3a2b1c"
+        after_help = "仅适用于 Kiro 账号；Copilot 账号由 provider 的账号池管理。\n\n示例：\n  kproxy service remove-account main acc_7f3a2b1c"
     )]
     RemoveAccount {
         /// 服务 ID 或名称。
@@ -188,9 +192,9 @@ pub enum ServiceCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum ApiKeyCommand {
-    /// 列出全部 API key；默认显示汇总，--detail 增加逐 key 用量。
+    /// 列出 Kiro/Copilot API key；可按来源筛选。
     #[command(
-        after_help = "示例：\n  kproxy apikey list\n  kproxy apikey list --detail\n  kproxy --json apikey list --detail"
+        after_help = "--provider 只显示允许该来源的 key，并仅统计该来源用量；省略时显示全部。\n\n示例：\n  kproxy apikey list --provider kiro\n  kproxy apikey list --provider copilot --detail\n  kproxy --json apikey list --detail"
     )]
     List {
         /// 展示每个 API key 的 token/credits 消耗明细。
@@ -200,7 +204,7 @@ pub enum ApiKeyCommand {
         #[arg(long)]
         provider: Option<String>,
     },
-    /// 显示单个 API key 的配置和累计用量，不显示密钥明文。
+    /// 显示 key 的允许来源、模型和累计用量，不显示明文。
     #[command(
         after_help = "参数接受 API key ID 或名称。\n\n示例：\n  kproxy apikey show ci\n  kproxy --json apikey show ak_ab12"
     )]
@@ -208,7 +212,7 @@ pub enum ApiKeyCommand {
     /// 创建 API key；明文只在创建结果中显示一次。
     #[command(
         visible_alias = "create",
-        after_help = "默认随机生成密钥。使用 --key 可恢复误删的原密钥；注意命令行参数可能进入 shell 历史和进程列表。\n\n示例：\n  kproxy apikey add --name ci\n  kproxy apikey add --name team --credits-limit 100\n  kproxy apikey add --name compatible --skip-user-agent-check true\n  kproxy apikey add --name recovered --key 'sk-original-key'"
+        after_help = "默认随机生成密钥，省略 --provider 时仅允许 Kiro。使用 --key 可恢复误删的原密钥；注意命令行参数可能进入 shell 历史和进程列表。\n\n示例：\n  kproxy apikey add --name kiro-key --provider kiro\n  kproxy apikey add --name copilot-key --provider copilot\n  kproxy apikey add --name unified-key --provider kiro --provider copilot\n  kproxy apikey add --name team --credits-limit 100"
     )]
     Add {
         #[arg(long)]
@@ -239,9 +243,9 @@ pub enum ApiKeyCommand {
         #[arg(long = "model", value_delimiter = ',')]
         models: Vec<String>,
     },
-    /// 修改 API key 配置。
+    /// 修改 API key 的 Kiro/Copilot 来源和模型权限。
     #[command(
-        after_help = "参数接受 API key ID 或名称。\n\n示例：\n  kproxy apikey edit ci --skip-user-agent-check true\n  kproxy apikey edit ci --skip-user-agent-check false"
+        after_help = "--provider 替换允许来源；--clear-providers 恢复 Kiro-only。--model 可使用 provider/model glob；参数接受 key ID 或名称。\n\n示例：\n  kproxy apikey edit ci --provider copilot --model 'copilot/*'\n  kproxy apikey edit ci --provider kiro --provider copilot\n  kproxy apikey edit ci --skip-user-agent-check true"
     )]
     Edit {
         id: String,
@@ -280,9 +284,9 @@ pub enum ApiKeyCommand {
         after_help = "示例：\n  kproxy apikey disable ak_ab12\n  kproxy --json apikey disable ak_ab12"
     )]
     Disable { id: String },
-    /// 设置或清除 API key 的累计 Credits 上限。
+    /// 设置或清除 API key 跨来源共用的累计 Credits 上限。
     #[command(
-        after_help = "参数接受 API key ID 或名称。`--clear` 恢复为不限；`--credits 0` 会阻止任何新消耗。\n\n示例：\n  kproxy apikey limit ci --credits 100\n  kproxy apikey limit ci --clear"
+        after_help = "此上限作用于同一 key 的 Kiro 与 Copilot 累计用量，不按来源分别配置。`--clear` 恢复不限；`--credits 0` 阻止新消耗。\n\n示例：\n  kproxy apikey limit ci --credits 100\n  kproxy apikey limit ci --clear"
     )]
     Limit {
         id: String,
@@ -297,18 +301,18 @@ pub enum ApiKeyCommand {
         #[arg(long)]
         clear: bool,
     },
-    /// 查看 API key 的聚合与分维度用量。
+    /// 查看 API key 的 Kiro/Copilot 聚合与分来源用量。
     #[command(
-        after_help = "示例：\n  kproxy apikey usage ak_ab12\n  kproxy --json apikey usage ak_ab12"
+        after_help = "省略 --provider 时统计全部来源；可按 kiro 或 copilot 限定。\n\n示例：\n  kproxy apikey usage ak_ab12 --provider kiro\n  kproxy apikey usage ak_ab12 --provider copilot"
     )]
     Usage {
         id: String,
         #[arg(long)]
         provider: Option<String>,
     },
-    /// 查看 API key 的最近请求历史。
+    /// 查看 API key 的 Kiro/Copilot 最近请求历史。
     #[command(
-        after_help = "示例：\n  kproxy apikey history ak_ab12\n  kproxy apikey history ak_ab12 --tail 200"
+        after_help = "省略 --provider 时显示全部来源。\n\n示例：\n  kproxy apikey history ak_ab12 --provider kiro\n  kproxy apikey history ak_ab12 --provider copilot --tail 200"
     )]
     History {
         id: String,
@@ -317,7 +321,7 @@ pub enum ApiKeyCommand {
         #[arg(long)]
         provider: Option<String>,
     },
-    /// 清除 API key 的全部累计用量，执行前需确认。
+    /// 清除 API key 在 Kiro/Copilot 的全部累计用量，需确认。
     #[command(
         after_help = "示例：\n  kproxy apikey reset-usage ak_ab12\n\n执行前需输入 y 或 yes 确认。"
     )]
@@ -332,13 +336,13 @@ pub enum ApiKeyCommand {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 pub enum AlertEvent {
-    /// 单个账号触发剩余额度保护并暂停调度。
+    /// Kiro 账号触发剩余额度保护并暂停调度。
     AccountCreditProtected,
-    /// 单个账号额度完全耗尽。
+    /// Kiro 账号额度完全耗尽。
     AccountQuotaExhausted,
-    /// API 代理服务的全部启用账号额度完全耗尽。
+    /// 服务的全部启用 Kiro 账号额度完全耗尽。
     ServiceQuotaExhausted,
-    /// 账号 Token 自动或请求触发刷新失败。
+    /// Kiro 账号 Token 自动或请求触发刷新失败。
     TokenRefreshFailed,
 }
 
@@ -386,10 +390,10 @@ impl AlertPlatform {
 
 #[derive(Debug, Subcommand)]
 pub enum AlertCommand {
-    /// 查看一次性异常告警策略。
+    /// 查看 Kiro 一次性异常告警策略。
     #[command(after_help = "示例：\n  kproxy alert config")]
     Config,
-    /// 列出可订阅事件及其触发条件。
+    /// 列出 Kiro 可订阅事件及其触发条件。
     #[command(after_help = "示例：\n  kproxy alert events\n  kproxy --json alert events")]
     Events,
     /// 列出支持的通知平台及平台专用参数。
@@ -398,7 +402,7 @@ pub enum AlertCommand {
     /// 列出全部告警通知目标。
     #[command(after_help = "示例：\n  kproxy alert list\n  kproxy --json alert list")]
     List,
-    /// 添加告警目标。
+    /// 为 Kiro 异常事件添加告警目标。
     #[command(
         after_help = "`--platform` 表示接收 Webhook 的通知平台；先用 `kproxy alert platforms` 查看平台说明。\n用 `kproxy alert events` 查看事件说明。多选可重复传入 --event，也可使用逗号分隔。\n\n示例：\n  kproxy alert add --name alerts --platform dingtalk --webhook-url 'https://oapi.dingtalk.com/robot/send?access_token=replace-me' --dingtalk-sign 'SEC-replace-me' --event account-credit-protected --event account-quota-exhausted\n  kproxy alert add --name alerts --platform feishu --webhook-url https://example/hook --event account-credit-protected,account-quota-exhausted,service-quota-exhausted"
     )]
@@ -433,7 +437,7 @@ pub enum AlertCommand {
         #[arg(long)]
         custom_template: Option<String>,
     },
-    /// 编辑告警目标。
+    /// 编辑 Kiro 异常事件告警目标。
     #[command(
         after_help = "目标名称既可写成位置参数，也可通过 --name 指定。\n`--event` 会整体替换原订阅；可重复传入或使用逗号分隔。\n\n示例：\n  kproxy alert edit alerts --webhook-url https://example/new-hook\n  kproxy alert edit alerts --dingtalk-sign 'SEC-replace-me'\n  kproxy alert edit --name alerts --event token-refresh-failed --event service-quota-exhausted\n  kproxy alert edit --name alerts --platform feishu"
     )]
@@ -2083,6 +2087,7 @@ struct ConfigModule {
     name: &'static str,
     key: &'static str,
     category: &'static str,
+    scope: &'static str,
     description: &'static str,
     preferred_command: &'static str,
     aliases: &'static [&'static str],
@@ -2093,6 +2098,16 @@ impl ConfigModule {
     fn resettable(&self) -> bool {
         !matches!(self.key, "provider" | "api_key" | "proxy_service")
     }
+
+    fn scope_label(&self) -> &'static str {
+        match self.scope {
+            "global" => "全局",
+            "kiro" => "Kiro",
+            "mixed" => "混合",
+            "provider" => "按来源",
+            _ => unreachable!("unknown config scope"),
+        }
+    }
 }
 
 const CONFIG_MODULES: &[ConfigModule] = &[
@@ -2100,6 +2115,7 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         name: "server",
         key: "server",
         category: "通用",
+        scope: "global",
         description: "API 服务默认监听、准入、连接与 TLS",
         preferred_command: "-",
         aliases: &[],
@@ -2108,7 +2124,8 @@ const CONFIG_MODULES: &[ConfigModule] = &[
     ConfigModule {
         name: "upstream",
         key: "upstream",
-        category: "通用",
+        category: "来源参数",
+        scope: "kiro",
         description: "Kiro 上游请求、重试、超时与连接池",
         preferred_command: "-",
         aliases: &[],
@@ -2117,8 +2134,9 @@ const CONFIG_MODULES: &[ConfigModule] = &[
     ConfigModule {
         name: "pool",
         key: "pool",
-        category: "通用",
-        description: "账号池并发、排队、额度保护与选号",
+        category: "来源参数",
+        scope: "kiro",
+        description: "Kiro 账号池并发、排队、额度保护与选号",
         preferred_command: "-",
         aliases: &[],
         is_array: false,
@@ -2126,8 +2144,9 @@ const CONFIG_MODULES: &[ConfigModule] = &[
     ConfigModule {
         name: "features",
         key: "features",
-        category: "通用",
-        description: "协议转换、工具、缓存与 thinking 开关",
+        category: "来源参数",
+        scope: "kiro",
+        description: "Kiro 协议转换、工具、缓存与 thinking 开关",
         preferred_command: "-",
         aliases: &[],
         is_array: false,
@@ -2135,8 +2154,9 @@ const CONFIG_MODULES: &[ConfigModule] = &[
     ConfigModule {
         name: "models",
         key: "models",
-        category: "通用",
-        description: "动态模型发现与缓存",
+        category: "来源参数",
+        scope: "kiro",
+        description: "Kiro 动态模型发现与缓存；Copilot 在 provider.models 配置",
         preferred_command: "-",
         aliases: &[],
         is_array: false,
@@ -2144,8 +2164,9 @@ const CONFIG_MODULES: &[ConfigModule] = &[
     ConfigModule {
         name: "tasks",
         key: "tasks",
-        category: "通用",
-        description: "后台周期任务间隔",
+        category: "周期任务",
+        scope: "mixed",
+        description: "Kiro token/状态任务与全局统计持久化间隔",
         preferred_command: "-",
         aliases: &[],
         is_array: false,
@@ -2153,8 +2174,9 @@ const CONFIG_MODULES: &[ConfigModule] = &[
     ConfigModule {
         name: "context",
         key: "context",
-        category: "通用",
-        description: "上下文限制、压缩与工具保护",
+        category: "来源参数",
+        scope: "kiro",
+        description: "Kiro 上下文限制、压缩与工具保护",
         preferred_command: "-",
         aliases: &[],
         is_array: false,
@@ -2162,8 +2184,9 @@ const CONFIG_MODULES: &[ConfigModule] = &[
     ConfigModule {
         name: "storage",
         key: "storage",
-        category: "通用",
-        description: "账号与状态持久化参数",
+        category: "来源参数",
+        scope: "kiro",
+        description: "Kiro 账号库存储参数",
         preferred_command: "-",
         aliases: &[],
         is_array: false,
@@ -2172,7 +2195,8 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         name: "notify",
         key: "notify",
         category: "告警",
-        description: "告警阈值、抑制与投递策略",
+        scope: "kiro",
+        description: "Kiro 告警兼容配置",
         preferred_command: "kproxy alert config",
         aliases: &["alert", "alerts"],
         is_array: false,
@@ -2181,6 +2205,7 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         name: "log",
         key: "log",
         category: "通用",
+        scope: "global",
         description: "日志级别、格式、路径与保留策略",
         preferred_command: "-",
         aliases: &["logging"],
@@ -2190,6 +2215,7 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         name: "admin",
         key: "admin",
         category: "通用",
+        scope: "global",
         description: "本地管理面 socket",
         preferred_command: "-",
         aliases: &[],
@@ -2198,8 +2224,9 @@ const CONFIG_MODULES: &[ConfigModule] = &[
     ConfigModule {
         name: "sso",
         key: "sso",
-        category: "通用",
-        description: "企业 SSO 默认入口与区域",
+        category: "来源参数",
+        scope: "kiro",
+        description: "Kiro IAM Identity Center SSO 默认入口",
         preferred_command: "-",
         aliases: &[],
         is_array: false,
@@ -2208,6 +2235,7 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         name: "model-mapping",
         key: "model_mapping",
         category: "规则",
+        scope: "provider",
         description: "按提供源、服务和 API key 生效的模型映射规则",
         preferred_command: "kproxy model-map",
         aliases: &["model-map"],
@@ -2217,7 +2245,8 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         name: "model-thinking-mode",
         key: "model_thinking_mode",
         category: "规则",
-        description: "模型级 thinking 默认开关",
+        scope: "kiro",
+        description: "Kiro 模型级 thinking 默认开关",
         preferred_command: "-",
         aliases: &["thinking"],
         is_array: false,
@@ -2226,7 +2255,8 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         name: "webhook",
         key: "webhook",
         category: "告警",
-        description: "告警投递目标",
+        scope: "kiro",
+        description: "Kiro 异常事件告警投递目标",
         preferred_command: "kproxy alert",
         aliases: &["webhooks"],
         is_array: true,
@@ -2235,7 +2265,8 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         name: "provider",
         key: "provider",
         category: "基础服务",
-        description: "Kiro、Copilot 等模型提供源实例",
+        scope: "provider",
+        description: "Kiro、Copilot 实例及各自驱动设置、模型缓存和路由",
         preferred_command: "kproxy provider",
         aliases: &["providers"],
         is_array: true,
@@ -2244,7 +2275,8 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         name: "api-key",
         key: "api_key",
         category: "基础服务",
-        description: "客户端访问凭据与额度限制",
+        scope: "provider",
+        description: "客户端凭据、来源/模型权限与额度限制",
         preferred_command: "kproxy apikey",
         aliases: &["apikey"],
         is_array: true,
@@ -2253,7 +2285,8 @@ const CONFIG_MODULES: &[ConfigModule] = &[
         name: "proxy-service",
         key: "proxy_service",
         category: "基础服务",
-        description: "代理监听实例及 API key 绑定",
+        scope: "provider",
+        description: "代理监听实例、提供源范围及 API key 绑定",
         preferred_command: "kproxy service",
         aliases: &["service"],
         is_array: true,
@@ -2269,6 +2302,7 @@ pub fn list_config_modules(json: bool) -> Result<()> {
                     "name":module.name,
                     "toml_key":module.key,
                     "category":module.category,
+                    "scope":module.scope,
                     "description":module.description,
                     "preferred_command":(module.preferred_command != "-")
                         .then_some(module.preferred_command),
@@ -2286,6 +2320,7 @@ pub fn list_config_modules(json: bool) -> Result<()> {
             vec![
                 module.name.to_string(),
                 module.category.to_string(),
+                module.scope_label().to_string(),
                 module.description.to_string(),
                 if module.resettable() { "是" } else { "否" }.to_string(),
                 module.preferred_command.to_string(),
@@ -2294,7 +2329,10 @@ pub fn list_config_modules(json: bool) -> Result<()> {
         .collect::<Vec<_>>();
     print!(
         "{}",
-        render_table(&["模块", "类型", "说明", "可重置", "推荐管理命令"], &rows)
+        render_table(
+            &["模块", "类型", "适用来源", "说明", "可重置", "推荐管理命令"],
+            &rows
+        )
     );
     Ok(())
 }
@@ -2628,7 +2666,7 @@ pub struct ConfigResetResult {
     pub needs_restart: Vec<String>,
 }
 
-/// Back up the current configuration, reset one module or all general settings, and reload it.
+/// Back up the configuration, reset one module or all resettable settings, and reload it.
 pub async fn reset_config(
     client: &mut AdminClient,
     module: Option<&str>,
@@ -2650,7 +2688,7 @@ pub async fn reset_config(
     let path = PathBuf::from(paths.config_file);
     let prompt = module.map_or_else(
         || {
-            "确认将通用配置恢复为默认设置？提供源、API key、代理服务和告警配置会保留，模型映射会被清除"
+            "确认将运行配置恢复为默认设置？Kiro 专项与全局参数会重置，提供源、API key、代理服务和告警配置会保留，模型映射会被清除"
                 .to_string()
         },
         |module| {

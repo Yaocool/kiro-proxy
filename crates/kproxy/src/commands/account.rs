@@ -52,9 +52,9 @@ pub enum AccountOverageCommand {
 /// 账号相关子命令。
 #[derive(Debug, Subcommand)]
 pub enum AccountCommand {
-    /// 列出账号。
+    /// 列出 Kiro/Copilot 账号；额度状态仅对 Kiro 有意义。
     #[command(
-        long_about = "列出账号，默认按邮箱排序。\n\n示例：\n  kproxy account list\n  kproxy account list --tag prod --enabled-only\n  kproxy account list --status low_credit\n  kproxy account list --sort credit"
+        long_about = "列出 Kiro、GitHub Copilot 或全部账号，默认按邮箱排序。\n\n示例：\n  kproxy account list --provider kiro\n  kproxy account list --provider copilot\n  kproxy account list --provider all\n  kproxy account list --tag prod --enabled-only"
     )]
     List {
         /// 提供源实例 ID；默认聚合全部提供源。
@@ -69,7 +69,7 @@ pub enum AccountCommand {
         /// 只显示已启用账号。
         #[arg(long)]
         enabled_only: bool,
-        /// 状态过滤：available/low_credit/disabled/exhausted/cooling/banned/refreshing/unavailable。
+        /// 状态过滤；low_credit/exhausted/cooling/banned 等额度状态主要用于 Kiro。
         #[arg(
             long,
             value_parser = [
@@ -84,7 +84,7 @@ pub enum AccountCommand {
             ]
         )]
         status: Option<String>,
-        /// 排序字段：email（默认）/credit/id。
+        /// 排序字段：email（默认）/credit/id；credit 主要用于 Kiro。
         #[arg(long, value_parser = ["email", "credit", "id"])]
         sort: Option<String>,
     },
@@ -98,7 +98,7 @@ pub enum AccountCommand {
     },
     /// 显示单账号详情。
     #[command(
-        long_about = "显示账号详情，不显示 token。\n\n示例：\n  kproxy account show acc_7f3a\n  kproxy account show alice@example.com"
+        long_about = "显示 Kiro 或 GitHub Copilot 账号详情，不显示 token；同名账号可用 --provider 消歧。\n\n示例：\n  kproxy account show acc_7f3a --provider kiro\n  kproxy account show acc_8b2c --provider copilot"
     )]
     Show {
         /// 账号 ID 或邮箱。
@@ -107,9 +107,9 @@ pub enum AccountCommand {
         #[arg(long)]
         provider: Option<String>,
     },
-    /// 通过提供源统一入口添加账号。
+    /// 通过 Device Flow 或 GitHub token 添加 Copilot 账号。
     #[command(
-        after_help = "示例：\n  kproxy account add --provider copilot --auth device-flow\n  printf '%s\\n' \"$GITHUB_TOKEN\" | kproxy account add --provider copilot --token-stdin"
+        after_help = "此命令用于 GitHub Copilot；Kiro 请使用 account add-sso 或 add-api-key。\n\n示例：\n  kproxy account add --provider copilot --auth device-flow\n  printf '%s\\n' \"$GITHUB_TOKEN\" | kproxy account add --provider copilot --token-stdin"
     )]
     Add {
         #[arg(long)]
@@ -123,17 +123,17 @@ pub enum AccountCommand {
         #[arg(long)]
         label: Option<String>,
     },
-    /// 查看账号绑定的 API 代理服务。
+    /// 查看 Kiro 账号绑定的 API 代理服务。
     #[command(
-        long_about = "查看账号当前属于哪些 API 代理服务，并显示全局池、标签或手工绑定来源。\n\n示例：\n  kproxy account services acc_7f3a2b1c\n  kproxy account services alice@example.com"
+        long_about = "查看 Kiro 账号当前属于哪些 API 代理服务，并显示全局池、标签或手工绑定来源。\n\n示例：\n  kproxy account services acc_7f3a2b1c\n  kproxy account services alice@example.com"
     )]
     Services {
         /// 账号 ID 或邮箱。
         id: String,
     },
-    /// 从 JSON 导入现成 token。
+    /// 从 JSON 导入已有 Kiro 凭证。
     #[command(
-        long_about = "导入已有凭证。id、machine_id、created_at 缺失时自动生成；--tag 会合并到本次导入的全部账号。\n\n示例：\n  kproxy account import --file accounts.json --tag team-a\n  cat accounts.json | kproxy account import --stdin --tag team-a --tag prod",
+        long_about = "导入已有 Kiro 凭证。id、machine_id、created_at 缺失时自动生成；--tag 会合并到本次导入的全部账号。GitHub Copilot 请用 account add --provider copilot。\n\n示例：\n  kproxy account import --file accounts.json --tag team-a\n  cat accounts.json | kproxy account import --stdin --tag team-a --tag prod",
         group(clap::ArgGroup::new("import_source").required(true).multiple(false).args(["file", "stdin"]))
     )]
     Import {
@@ -160,9 +160,9 @@ pub enum AccountCommand {
         #[arg(long = "tag", value_delimiter = ',', value_name = "TAG")]
         tags: Vec<String>,
     },
-    /// 导出账号 JSON；默认含凭证，仅应写入受保护位置。
+    /// 导出 Kiro/Copilot 账号 JSON；默认含凭证。
     #[command(
-        after_help = "示例：\n  kproxy --json account export > accounts.json\n  kproxy --json account export --redact"
+        after_help = "省略 --provider 时保持旧版 Kiro 导出格式；Copilot 请显式传入实例 ID。默认包含敏感凭证，仅写入受保护位置。\n\n示例：\n  kproxy --json account export --provider kiro --redact\n  kproxy --json account export --provider copilot --redact\n  kproxy --json account export --provider all --redact"
     )]
     Export {
         /// 隐去 token 与 secret，适合诊断分享。
@@ -172,9 +172,9 @@ pub enum AccountCommand {
         #[arg(long)]
         provider: Option<String>,
     },
-    /// 通过 IAM Identity Center 登录并添加账号。
+    /// 通过 IAM Identity Center SSO 登录并添加 Kiro 账号。
     #[command(
-        after_help = "示例：\n  printf '%s\\n' \"$PASSWORD\" | kproxy account add-sso --email user@example.com --start-url https://example.awsapps.com/start --password-stdin\n  kproxy account add-sso --batch accounts.csv --start-url https://example.awsapps.com/start\n  kproxy account add-sso --batch - --start-url https://example.awsapps.com/start < accounts.csv"
+        after_help = "仅适用于 Kiro 的 IAM Identity Center SSO；GitHub Copilot 请使用 account add --provider copilot --auth device-flow。\n\n示例：\n  printf '%s\\n' \"$PASSWORD\" | kproxy account add-sso --email user@example.com --start-url https://example.awsapps.com/start --password-stdin\n  kproxy account add-sso --batch accounts.csv --start-url https://example.awsapps.com/start"
     )]
     AddSso {
         /// 单账号登录邮箱；需同时使用 --password-stdin。
@@ -206,10 +206,10 @@ pub enum AccountCommand {
         #[arg(long = "tag", value_delimiter = ',', value_name = "TAG")]
         tags: Vec<String>,
     },
-    /// 删除一个或多个账号。
+    /// 删除 Kiro/Copilot 账号；可按来源消歧。
     #[command(
         visible_alias = "delete",
-        long_about = "删除一个或多个账号，整批执行前只需输入一次 y 或 yes 确认。\n\n示例：\n  kproxy account rm acc_7f3a2b1c\n  kproxy account rm user@example.com another@example.com"
+        long_about = "删除一个或多个 Kiro/Copilot 账号，整批执行前只需输入一次 y 或 yes 确认。同名账号用 --provider 或 provider/account_id 消歧。\n\n示例：\n  kproxy account rm acc_7f3a2b1c --provider kiro\n  kproxy account rm acc_8b2c --provider copilot"
     )]
     Rm {
         /// 一个或多个账号 ID/邮箱，以空格分隔。
@@ -222,9 +222,9 @@ pub enum AccountCommand {
         #[arg(short = 'y', long)]
         yes: bool,
     },
-    /// 启用账号。
+    /// 启用 Kiro/Copilot 账号。
     #[command(
-        after_help = "示例：\n  kproxy account enable acc_7f3a2b1c\n  kproxy account enable user@example.com"
+        after_help = "示例：\n  kproxy account enable acc_7f3a2b1c --provider kiro\n  kproxy account enable acc_8b2c --provider copilot"
     )]
     Enable {
         /// 账号 ID 或邮箱。
@@ -232,9 +232,9 @@ pub enum AccountCommand {
         #[arg(long)]
         provider: Option<String>,
     },
-    /// 停用账号。
+    /// 停用 Kiro/Copilot 账号。
     #[command(
-        after_help = "示例：\n  kproxy account disable acc_7f3a2b1c\n  kproxy account disable user@example.com"
+        after_help = "示例：\n  kproxy account disable acc_7f3a2b1c --provider kiro\n  kproxy account disable acc_8b2c --provider copilot"
     )]
     Disable {
         /// 账号 ID 或邮箱。
@@ -242,9 +242,9 @@ pub enum AccountCommand {
         #[arg(long)]
         provider: Option<String>,
     },
-    /// 为一个或多个账号增删标签。
+    /// 为 Kiro/Copilot 账号增删标签；服务标签筛选只作用于 Kiro。
     #[command(
-        long_about = "为一个或多个账号增删标签，可同时添加和移除。批量修改会先校验全部账号；有账号不存在，或需要修改标签的账号已绑定代理服务时，整批不生效。\n\n示例：\n  kproxy account tag acc_7f3a --add prod --add pro\n  kproxy account tag --add test acc_2c36cfad acc_332c7cb2 acc_41c6e3ad\n  kproxy account tag --rm dev acc_7f3a acc_8b2c",
+        long_about = "为 Kiro/Copilot 账号增删标签，可同时添加和移除。Kiro 未指定 --provider 的批量修改会先校验全部账号；Copilot 按账号逐个修改，不能保证整批原子性。service --account-tag 目前只筛选 Kiro 账号，不筛选 Copilot。\n\n示例：\n  kproxy account tag acc_7f3a --provider kiro --add prod\n  kproxy account tag acc_8b2c --provider copilot --add team-a",
         group(clap::ArgGroup::new("tag_change").required(true).multiple(true).args(["add", "remove"]))
     )]
     Tag {
@@ -261,17 +261,17 @@ pub enum AccountCommand {
         #[arg(long)]
         provider: Option<String>,
     },
-    /// 重新生成设备标识。
+    /// 重新生成 Kiro 设备标识；Copilot 不使用 machine_id。
     #[command(
-        long_about = "重新生成 machine_id。仅在怀疑当前组合被标记时使用。\n\n示例：\n  kproxy account regen-machine-id acc_7f3a2b1c\n  kproxy account regen-machine-id user@example.com"
+        long_about = "仅为 Kiro 账号重新生成 machine_id，在怀疑当前组合被标记时使用；Copilot 不使用该设备标识。\n\n示例：\n  kproxy account regen-machine-id acc_7f3a2b1c"
     )]
     RegenMachineId {
         /// 账号 ID 或邮箱。
         id: String,
     },
-    /// 立即刷新账号 token。
+    /// 立即刷新 Kiro/Copilot 账号 token。
     #[command(
-        after_help = "示例：\n  kproxy account refresh acc_7f3a2b1c\n  kproxy account refresh --all",
+        after_help = "--all 省略 --provider 时默认 Kiro；Copilot 请显式指定实例 ID。\n\n示例：\n  kproxy account refresh --provider kiro --all\n  kproxy account refresh --provider copilot --all",
         group(clap::ArgGroup::new("refresh_target").required(true).multiple(false).args(["id", "all"]))
     )]
     Refresh {
@@ -282,9 +282,9 @@ pub enum AccountCommand {
         #[arg(long)]
         provider: Option<String>,
     },
-    /// 探测账号可用端点与模型。
+    /// 探测 Kiro/Copilot 账号可用端点与模型。
     #[command(
-        after_help = "示例：\n  kproxy account probe acc_7f3a2b1c\n  kproxy account probe --all",
+        after_help = "Kiro 会执行真实推理探测；Copilot 刷新账号 token/模型目录，不发起同样的推理请求。\n\n示例：\n  kproxy account probe --provider kiro <ACCOUNT_ID>\n  kproxy account probe --provider copilot <ACCOUNT_ID>\n  kproxy account probe --provider all --all",
         group(clap::ArgGroup::new("probe_target").required(true).multiple(false).args(["id", "all"]))
     )]
     Probe {
@@ -295,9 +295,9 @@ pub enum AccountCommand {
         #[arg(long)]
         provider: Option<String>,
     },
-    /// 清除冷却、封禁与额度耗尽标记。
+    /// 重置 Kiro 账号健康标记或 Copilot 运行错误。
     #[command(
-        after_help = "示例：\n  kproxy account reset-health acc_7f3a2b1c\n  kproxy account reset-health --all",
+        after_help = "Kiro 清除冷却、封禁与额度耗尽标记；Copilot 清除该账号的运行错误状态。\n\n示例：\n  kproxy account reset-health --provider kiro --all\n  kproxy account reset-health --provider copilot <ACCOUNT_ID>",
         group(clap::ArgGroup::new("reset_health_target").required(true).multiple(false).args(["id", "all"]))
     )]
     ResetHealth {
@@ -926,11 +926,8 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             status,
             sort,
         } => {
-            let has_filters = tag.is_some()
-                || status.is_some()
-                || provider_kind.is_some()
-                || enabled_only
-                || provider.as_str() != "all";
+            let has_filters =
+                tag.is_some() || status.is_some() || provider_kind.is_some() || enabled_only;
             let list: ProviderAccountListResult = client
                 .call(
                     method::V2_ACCOUNT_LIST,
@@ -947,11 +944,7 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             if json {
                 print_json(&list)?;
             } else if list.accounts.is_empty() {
-                if has_filters {
-                    println!("没有符合筛选条件的账号。");
-                } else {
-                    println!("暂无账号。用 `kproxy account add --provider <ID>` 添加。");
-                }
+                println!("{}", empty_account_hint(&provider, has_filters));
             } else {
                 print!(
                     "{}",
@@ -1318,6 +1311,18 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
         }
     }
     Ok(())
+}
+
+fn empty_account_hint(provider: &str, filtered: bool) -> String {
+    if filtered {
+        return "没有符合筛选条件的账号。".into();
+    }
+    match provider {
+        "all" => "暂无账号。Kiro 接入见 `kproxy guide kiro`；GitHub Copilot 接入见 `kproxy guide copilot`。".into(),
+        "kiro" => "暂无 Kiro 账号。使用 `kproxy account add-sso` 或 `add-api-key`；详情见 `kproxy guide kiro`。".into(),
+        "copilot" => "暂无 GitHub Copilot 账号。使用 `kproxy account add --provider copilot --auth device-flow`；详情见 `kproxy guide copilot`。".into(),
+        _ => format!("提供源 {provider} 暂无账号。请按该来源的认证方式添加；查看 `kproxy guide provider`。"),
+    }
 }
 
 async fn run_provider_account_batch(
@@ -1844,6 +1849,25 @@ fn display_binding_sources(service: &AccountServiceBinding) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn empty_account_hints_match_provider_auth_flow() {
+        let all = empty_account_hint("all", false);
+        assert!(all.contains("guide kiro"));
+        assert!(all.contains("guide copilot"));
+
+        let kiro = empty_account_hint("kiro", false);
+        assert!(kiro.contains("add-sso"));
+        assert!(!kiro.contains("device-flow"));
+
+        let copilot = empty_account_hint("copilot", false);
+        assert!(copilot.contains("account add --provider copilot --auth device-flow"));
+
+        assert_eq!(
+            empty_account_hint("copilot", true),
+            "没有符合筛选条件的账号。"
+        );
+    }
 
     fn summary(enabled: bool) -> AccountSummary {
         AccountSummary {

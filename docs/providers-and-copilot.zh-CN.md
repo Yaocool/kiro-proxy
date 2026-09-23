@@ -5,6 +5,26 @@
 `id = "kiro"`、`kind = "kiro"`。内置 Kiro 的实例 ID 固定为 `kiro`，Copilot 可以创建多个实例，
 例如 `copilot-personal`、`copilot-team`，各自拥有独立账号文件、token 缓存、并发限制和模型缓存。
 
+## 命令与配置的适用范围
+
+`kproxy guide provider` 按命令列出来源边界；`kproxy config list` 的“适用来源”列按配置模块标注范围。
+全局配置无需为两种来源各建一份。
+
+| 范围 | 命令 | 配置 |
+| --- | --- | --- |
+| 两者共用 | `provider`、`status`、`ready`、大部分 `account` 操作、`pool`、`models`、`model-map`、`service`、`apikey`、`stats`、`logs show/follow` | `[[provider]]`、`[[model_mapping]]`、`[[proxy_service]]`、`[[api_key]]` 通过实例 ID 或允许来源限定 |
+| Kiro 专项 | `account add-sso/add-api-key/import/services/overage/regen-machine-id`、`diagnose`、`subscriptions`、`alert` 的当前事件、`pool --explain` 评分 | `[upstream]`、`[pool]`、`[features]`、`[models]`、`[context]`、`[storage]`、`[sso]`、`[model_thinking_mode]`、当前 `[notify]`/`[[webhook]]` 告警 |
+| Copilot 专项 | `account add --provider <ID> --auth device-flow` 或 `--token-stdin` | 对应 `kind="copilot"` 实例的 `[provider.settings]`、`[provider.pool]`、`[provider.models]`、`[provider.routing]` |
+| 全局 | `health`、`version`、`config` 管理、`logs trace/files/path`、服务进程生命周期 | `[server]`、`[log]`、`[admin]` |
+
+`tasks` 属于混合范围：`token_refresh/status_check/health_recheck` 只操作 Kiro；
+`model_cache_refresh` 可使用 `--provider kiro|copilot`；统计持久化等任务是全局的。
+`pool --provider copilot` 只列出账号和模型支持，不显示 Kiro 的三因子评分；请同时用
+`--model <Copilot 模型 ID>` 覆盖默认的 Kiro 模型名。
+`service accounts/add-account/remove-account` 与 `--account-tag` 目前只作用于 Kiro 账号池；
+Copilot 账号列表请用 `account list --provider <ID>`。
+`model-map --below-credits-percent` 也仅适用于 Kiro。
+
 ## 快速配置 Copilot
 
 先添加 provider。`--setting` 接受 `KEY=TOML_VALUE`，字符串值需要保留 TOML 引号：

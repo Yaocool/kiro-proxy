@@ -435,6 +435,39 @@ fn config_module_catalog_covers_every_top_level_config_section() {
 }
 
 #[test]
+fn config_module_scopes_distinguish_kiro_provider_and_global_settings() {
+    for name in [
+        "upstream",
+        "pool",
+        "features",
+        "models",
+        "context",
+        "storage",
+        "sso",
+        "notify",
+        "webhook",
+        "model-thinking-mode",
+    ] {
+        assert_eq!(resolve_config_module(name).unwrap().scope, "kiro", "{name}");
+    }
+    for name in ["provider", "model-mapping", "api-key", "proxy-service"] {
+        assert_eq!(
+            resolve_config_module(name).unwrap().scope,
+            "provider",
+            "{name}"
+        );
+    }
+    for name in ["server", "log", "admin"] {
+        assert_eq!(
+            resolve_config_module(name).unwrap().scope,
+            "global",
+            "{name}"
+        );
+    }
+    assert_eq!(resolve_config_module("tasks").unwrap().scope, "mixed");
+}
+
+#[test]
 fn config_module_names_accept_cli_names_toml_keys_and_aliases() {
     assert_eq!(
         resolve_config_module("model-mapping")
@@ -500,7 +533,7 @@ fn config_module_edit_changes_only_the_selected_module() {
     assert_eq!(config.pool.max_concurrent_per_account, 7);
     assert_eq!(before["server"], after["server"]);
     assert_eq!(before["features"], after["features"]);
-    assert!(output.contains("# 账号池、排队、额度保护与选号"));
+    assert!(output.contains("# Kiro 账号池、排队、额度保护与选号"));
 }
 
 #[test]
@@ -559,7 +592,7 @@ fn config_module_reset_restores_only_the_selected_module() {
     assert_eq!(reset.pool.max_concurrent_per_account, 50);
     assert_eq!(reset.pool.max_queue_size, defaults.pool.max_queue_size);
     assert_eq!(reset.server.port, 6200);
-    assert!(output.contains("# 账号池、排队、额度保护与选号"));
+    assert!(output.contains("# Kiro 账号池、排队、额度保护与选号"));
 }
 
 #[test]

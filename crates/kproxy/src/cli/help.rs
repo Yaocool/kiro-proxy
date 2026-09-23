@@ -53,7 +53,7 @@ pub fn print_all_commands() {
     root.build();
     println!("kproxy 公开命令：");
     print_children(&root, "", 0);
-    println!("\n使用 `kproxy help <命令路径>` 查看详细参数。");
+    println!("\n使用 `kproxy help <命令路径>` 查看详细参数；`kproxy guide provider` 查看 Kiro/Copilot 命令适用范围。");
 }
 
 pub fn exit_missing_action(path: &str) -> ! {
@@ -123,5 +123,41 @@ mod tests {
         assert!(command_at_path(&["logs".into(), "trace".into()]).is_some());
         assert!(command_at_path(&["apikey".into(), "create".into()]).is_some());
         assert!(command_at_path(&["logs".into(), "missing".into()]).is_none());
+    }
+
+    #[test]
+    fn help_surfaces_both_provider_workflows() {
+        let mut root = Cli::command();
+        let root_help = root.render_long_help().to_string();
+        assert!(root_help.contains("guide kiro"));
+        assert!(root_help.contains("guide copilot"));
+
+        let mut account = command_at_path(&["account".into()]).unwrap();
+        let account_help = account.render_long_help().to_string();
+        assert!(account_help.contains("account add-sso"));
+        assert!(account_help.contains("account add --provider copilot"));
+
+        let mut service_create = command_at_path(&["service".into(), "create".into()]).unwrap();
+        let service_help = service_create.render_long_help().to_string();
+        assert!(service_help.contains("--provider kiro"));
+        assert!(service_help.contains("--provider copilot"));
+    }
+
+    #[test]
+    fn provider_scoped_help_does_not_present_kiro_only_features_as_shared() {
+        for (path, expected) in [
+            (vec!["pool"], "--explain 的评分明细不适用于 Copilot"),
+            (vec!["subscriptions"], "Copilot 返回 supported=false"),
+            (vec!["alert"], "不代表 Copilot"),
+            (vec!["model-map", "add"], "只支持 Kiro"),
+            (vec!["config", "list"], "适用来源"),
+        ] {
+            let path = path.into_iter().map(str::to_owned).collect::<Vec<_>>();
+            let mut command = command_at_path(&path).unwrap();
+            assert!(
+                command.render_long_help().to_string().contains(expected),
+                "missing {expected} in {path:?} help"
+            );
+        }
     }
 }

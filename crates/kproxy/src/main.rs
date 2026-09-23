@@ -19,9 +19,9 @@ use crate::output::{format_relative, format_timestamp, print_json, render_table}
     name = "kproxy",
     version,
     disable_help_subcommand = true,
-    about = "kiro-proxy 管理工具",
-    long_about = "查看服务状态，管理服务生命周期、账号与配置。\n\n示例：\n  kproxy status\n  kproxy restart\n  kproxy account list --tag prod\n  kproxy config show --effective",
-    after_help = "常用查询：status、health、ready、stats、pool、subscriptions\n命令组：account、config、apikey、service、alert、logs、models、model-map、tasks、diagnose\n宿主机操作：restart、stop、uninstall\n帮助与补全：help、guide、completions"
+    about = "Kiro 与 GitHub Copilot 模型代理管理工具",
+    long_about = "查看 Kiro、GitHub Copilot 提供源及服务状态，管理账号、模型、API key 与配置。\n\n示例：\n  kproxy provider list\n  kproxy account list --provider kiro\n  kproxy account list --provider copilot\n  kproxy models list --provider all\n  kproxy guide kiro\n  kproxy guide copilot",
+    after_help = "来源与命令适用范围：guide provider、guide kiro、guide copilot\n常用查询：status、health、ready、stats、pool、subscriptions\n命令组：provider、account、config、apikey、service、alert、logs、models、model-map、tasks、diagnose\n宿主机操作：restart、stop、uninstall\n帮助与补全：help、guide、completions"
 )]
 struct Cli {
     /// 管理面 socket 路径，默认读取配置文件。
@@ -49,17 +49,17 @@ struct TimeRangeArgs {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// 模型提供源实例管理。
+    /// Kiro/Copilot 模型提供源实例管理。
     #[command(
-        after_help = "示例：\n  kproxy provider list\n  kproxy provider show copilot\n  kproxy provider list --provider-kind copilot"
+        after_help = "示例：\n  kproxy provider list\n  kproxy provider show kiro\n  kproxy provider show copilot\n  kproxy provider add --id copilot --kind copilot --setting 'client_id=\"Iv1.xxx\"'\n\n操作说明：kproxy guide provider"
     )]
     Provider {
         #[command(subcommand)]
         command: Option<ProviderCommand>,
     },
-    /// 服务总览。
+    /// Kiro/Copilot 服务总览；可按提供源过滤。
     #[command(
-        after_help = "示例：\n  kproxy status\n  kproxy status --since 30m\n  kproxy status --start 2026-08-27T10:00:00+08:00 --end 2026-08-27T12:00:00+08:00\n  kproxy status --watch"
+        after_help = "示例：\n  kproxy status\n  kproxy status --provider kiro\n  kproxy status --provider copilot\n  kproxy status --since 30m --watch"
     )]
     Status {
         /// 每 2 秒刷新。
@@ -71,17 +71,19 @@ enum Command {
         #[arg(long)]
         provider: Option<String>,
     },
-    /// 供容器和 systemd 使用的健康检查。
+    /// 全局 daemon 健康检查；不代表任一来源的账号可用。
     #[command(after_help = "示例：\n  kproxy health\n  kproxy --json health")]
     Health,
-    /// 检查业务代理是否已具备接收请求的条件。
-    #[command(after_help = "示例：\n  kproxy ready\n  kproxy --json ready")]
+    /// 检查业务代理就绪状态；可按 Kiro/Copilot 提供源过滤。
+    #[command(
+        after_help = "示例：\n  kproxy ready\n  kproxy ready --provider copilot\n  kproxy --json ready"
+    )]
     Ready {
         /// 只检查引用该提供源的服务及账号。
         #[arg(long)]
         provider: Option<String>,
     },
-    /// 显示版本与默认上游端点。
+    /// 显示版本与 Kiro 默认上游端点；Copilot API 地址按账号动态选择。
     #[command(after_help = "示例：\n  kproxy version\n  kproxy --json version")]
     Version,
     /// 重启 kproxyd（Docker 宿主机命令）。
@@ -108,9 +110,9 @@ enum Command {
         #[arg(long, conflicts_with = "keep_backup")]
         delete_backup: bool,
     },
-    /// 配置查看、编辑、重载与重置。
+    /// 配置查看、编辑、重载与重置；模块可按适用来源查看。
     #[command(
-        after_help = "示例：\n  kproxy config list\n  kproxy config show --effective\n  kproxy config validate\n\n操作说明：kproxy guide config"
+        after_help = "`config list` 标明模块的适用来源；Kiro 专项配置与 Copilot 的 [[provider]] 设置不要混用，全局配置仍共用。config show 可能包含凭证，请勿分享原始输出。\n\n示例：\n  kproxy config list\n  kproxy config show pool --effective\n  kproxy config validate\n\n操作说明：kproxy guide config"
     )]
     Config {
         #[command(subcommand)]
@@ -118,15 +120,15 @@ enum Command {
     },
     /// 账号管理。
     #[command(
-        after_help = "示例：\n  kproxy account list\n  kproxy account show user@example.com\n  kproxy account overage\n  kproxy account services user@example.com\n  kproxy account probe --all\n\n操作说明：kproxy guide account 或 kproxy guide sso"
+        after_help = "Kiro：account add-sso / add-api-key；Copilot：account add --provider copilot --auth device-flow。\n\n示例：\n  kproxy account list --provider kiro\n  kproxy account list --provider copilot\n  kproxy account probe --provider copilot <ACCOUNT_ID>\n  kproxy account overage\n\n操作说明：kproxy guide kiro、kproxy guide copilot、kproxy guide account"
     )]
     Account {
         #[command(subcommand)]
         command: Option<crate::commands::account::AccountCommand>,
     },
-    /// 查看账号池调度评分。
+    /// Kiro 查看调度评分；Copilot 查看账号及模型支持。
     #[command(
-        after_help = "示例：\n  kproxy pool --explain\n  kproxy pool --model claude-sonnet-4 --watch"
+        after_help = "Kiro 显示排队、额度与选号评分；Copilot 显示账号认证和模型支持，--explain 的评分明细不适用于 Copilot。默认模型名来自 Kiro，查询 Copilot 时请显式传入 --model。\n\n示例：\n  kproxy pool --provider kiro --model claude-sonnet-4 --explain\n  kproxy pool --provider copilot --model <已授权模型ID> --watch"
     )]
     Pool {
         /// 查看指定提供源的账号池；默认 Kiro。
@@ -138,21 +140,21 @@ enum Command {
         /// 每 2 秒刷新；交互终端中原地更新。
         #[arg(long)]
         watch: bool,
-        /// 显示全部账号、不可调度原因和三因子评分明细。
+        /// 显示 Kiro 账号不可调度原因和三因子评分；Copilot 不提供评分明细。
         #[arg(long)]
         explain: bool,
     },
-    /// 上游网络与账号诊断。
+    /// Kiro 上游网络与真实推理诊断；Copilot 使用 account probe。
     #[command(
-        after_help = "示例：\n  kproxy diagnose all\n  kproxy diagnose endpoints\n  kproxy diagnose account --all\n\n操作说明：kproxy guide diagnose"
+        after_help = "本组为 Kiro 专项诊断。Copilot 请使用 `kproxy account probe --provider copilot <ACCOUNT_ID>`。\n\n示例：\n  kproxy diagnose all\n  kproxy diagnose endpoints\n  kproxy diagnose account --all\n\n操作说明：kproxy guide diagnose"
     )]
     Diagnose {
         #[command(subcommand)]
         command: Option<DiagnoseCommand>,
     },
-    /// 查询上游可用订阅计划。
+    /// 查询 Kiro 订阅计划；Copilot 不提供权威订阅数据。
     #[command(
-        after_help = "示例：\n  kproxy subscriptions\n  kproxy subscriptions --provider all\n  kproxy subscriptions acc_7f3a2b1c --provider kiro"
+        after_help = "仅 Kiro 返回权威订阅计划；Copilot 返回 supported=false。Copilot 账号授权与可用模型请用 account probe/models list 检查。\n\n示例：\n  kproxy subscriptions --provider kiro\n  kproxy subscriptions --provider all\n  kproxy account probe --provider copilot <ACCOUNT_ID>"
     )]
     Subscriptions {
         id: Option<String>,
@@ -160,17 +162,17 @@ enum Command {
         #[arg(long, default_value = "kiro")]
         provider: String,
     },
-    /// 显示或手动运行周期任务。
+    /// 查看或运行 Kiro、Copilot 与全局周期任务。
     #[command(
-        after_help = "示例：\n  kproxy tasks list\n  kproxy tasks run status_check\n\n操作说明：kproxy guide tasks"
+        after_help = "token_refresh/status_check/health_recheck 为 Kiro 专项；model_cache_refresh 可用 --provider kiro|copilot 限定；stats_persist 等为全局任务。\n\n示例：\n  kproxy tasks list\n  kproxy tasks run status_check\n  kproxy tasks run model_cache_refresh --provider copilot\n\n操作说明：kproxy guide tasks"
     )]
     Tasks {
         #[command(subcommand)]
         command: Option<TaskCommand>,
     },
-    /// 显示代理统计。
+    /// 显示 Kiro/Copilot 请求统计；可按提供源过滤。
     #[command(
-        after_help = "示例：\n  kproxy stats --since 1h\n  kproxy stats --start 2026-08-27T10:00:00+08:00 --end 2026-08-27T12:00:00+08:00\n  kproxy stats --detail --by model --recent 20"
+        after_help = "省略 --provider 时聚合 Kiro 与 Copilot；--by provider 可查看来源分组。\n\n示例：\n  kproxy stats --since 1h --provider kiro\n  kproxy stats --since 1h --provider copilot\n  kproxy stats --detail --by provider --recent 20"
     )]
     Stats {
         /// 显示分组和最近请求明细。
@@ -187,53 +189,53 @@ enum Command {
         #[arg(long)]
         provider: Option<String>,
     },
-    /// 查看请求日志，发现 daemon 日志文件及其路径。
+    /// 查看 Kiro/Copilot 请求日志和全局日志文件。
     #[command(
-        after_help = "示例：\n  kproxy logs show --tail 100\n  kproxy logs follow --level error\n  kproxy logs files\n  kproxy logs path\n\n操作说明：kproxy guide logs"
+        after_help = "show/follow 可用 --provider 过滤 Kiro 或 Copilot 请求；trace/files/path 是全局日志操作。\n\n示例：\n  kproxy logs show --provider kiro --tail 100\n  kproxy logs follow --provider copilot --level error\n  kproxy logs files\n\n操作说明：kproxy guide logs"
     )]
     Logs {
         #[command(subcommand)]
         command: Option<LogsCommand>,
     },
-    /// API key 管理。
+    /// Kiro/Copilot API key 及来源权限管理。
     #[command(
         name = "apikey",
-        after_help = "示例：\n  kproxy apikey list\n  kproxy apikey show production\n  kproxy apikey usage production\n\n操作说明：kproxy guide apikey"
+        after_help = "示例：\n  kproxy apikey add --name kiro-key --provider kiro\n  kproxy apikey add --name copilot-key --provider copilot\n  kproxy apikey list --provider copilot\n\n操作说明：kproxy guide apikey"
     )]
     ApiKey {
         #[command(subcommand)]
         command: Option<crate::commands::runtime::ApiKeyCommand>,
     },
-    /// API 代理服务管理。
+    /// Kiro/Copilot API 代理服务管理。
     #[command(
         name = "service",
-        after_help = "示例：\n  kproxy service list\n  kproxy service show main\n  kproxy service create --name main\n\n操作说明：kproxy guide service"
+        after_help = "示例：\n  kproxy service create --name kiro --port 5580 --provider kiro --default-provider kiro\n  kproxy service create --name copilot --port 5581 --provider copilot --default-provider copilot\n  kproxy service list\n\n操作说明：kproxy guide service"
     )]
     Service {
         #[command(subcommand)]
         command: Option<crate::commands::runtime::ServiceCommand>,
     },
-    /// 告警策略与通知目标管理。
+    /// Kiro 额度和 token 刷新告警及通知目标管理。
     #[command(
         name = "alert",
-        after_help = "示例：\n  kproxy alert events\n  kproxy alert list\n  kproxy alert logs\n\n操作说明：kproxy guide alert"
+        after_help = "当前四类账号额度/token 刷新事件来自 Kiro 账号池，不代表 Copilot 授权、席位或额度告警。\n\n示例：\n  kproxy alert events\n  kproxy alert list\n  kproxy alert logs\n\n操作说明：kproxy guide alert"
     )]
     Alert {
         #[command(subcommand)]
         command: Option<crate::commands::runtime::AlertCommand>,
     },
-    /// 显示上游动态模型、输入上下文与输出上限。
+    /// 显示 Kiro/Copilot 动态模型、输入上下文与输出上限。
     #[command(
-        after_help = "示例：\n  kproxy models list\n  kproxy models list --mapped\n  kproxy models list --refresh\n  kproxy models resolve opus5\n\n操作说明：kproxy guide models"
+        after_help = "示例：\n  kproxy models list --provider kiro --refresh\n  kproxy models list --provider copilot --refresh\n  kproxy models list --provider all --mapped\n  kproxy models resolve <MODEL_ID> --provider copilot\n\n操作说明：kproxy guide models"
     )]
     Models {
         #[command(subcommand)]
         command: Option<ModelsCommand>,
     },
-    /// 模型映射规则。
+    /// 按提供源管理 Kiro/Copilot 模型映射规则。
     #[command(
         name = "model-map",
-        after_help = "示例：\n  kproxy model-map list\n  kproxy model-map test opus5\n\n操作说明：kproxy guide model-map"
+        after_help = "add 省略 --provider 时仅作用于 Kiro；edit 省略时保留规则原有范围。--below-credits-percent 仅能用于 Kiro。\n\n示例：\n  kproxy model-map list --provider kiro\n  kproxy model-map list --provider copilot\n  kproxy model-map test <MODEL_ID> --provider copilot\n\n操作说明：kproxy guide model-map"
     )]
     ModelMap {
         #[command(subcommand)]
@@ -253,7 +255,7 @@ enum Command {
     },
     /// 查看原理与操作指南。
     #[command(
-        after_help = "示例：\n  kproxy guide\n  kproxy guide balance\n  kproxy guide docker"
+        after_help = "示例：\n  kproxy guide\n  kproxy guide kiro\n  kproxy guide copilot\n  kproxy guide provider"
     )]
     Guide {
         #[arg(value_enum)]
@@ -299,17 +301,17 @@ impl StatsGroup {
 
 #[derive(Debug, Subcommand)]
 enum ProviderCommand {
-    /// 列出所有提供源实例及运行状态。
+    /// 列出 Kiro/Copilot 实例及运行状态。
     List {
         #[arg(long)]
         provider_kind: Option<String>,
     },
-    /// 显示一个提供源实例。
+    /// 显示 Kiro/Copilot 实例的能力和运行状态（不显示凭证设置）。
     Show { id: String },
     /// 添加一个提供源实例。
     #[command(
         visible_alias = "create",
-        after_help = "示例：\n  kproxy provider add --id copilot --kind copilot --setting client_id='\"Iv1.example\"'\n  kproxy provider add --id copilot-team --kind copilot --setting github_host='\"github.example.com\"'"
+        after_help = "未显式配置 provider 时内置 Kiro；首次添加 Copilot 会保留 Kiro 实例。\n\n示例：\n  kproxy provider add --id copilot --kind copilot --setting 'client_id=\"Iv1.xxx\"'\n  kproxy provider show kiro\n  kproxy provider show copilot"
     )]
     Add {
         #[arg(long)]
@@ -328,6 +330,9 @@ enum ProviderCommand {
         disabled: bool,
     },
     /// 修改提供源实例的驱动设置和路由默认值。
+    #[command(
+        after_help = "--setting 接受 KEY=TOML_VALUE；Copilot OAuth/endpoint 设置属于该 Copilot 实例，不写入 Kiro 的 [sso]/[upstream]。\n\n示例：\n  kproxy provider edit copilot --setting 'client_id=\"Iv1.xxx\"'\n  kproxy provider edit copilot --setting 'api_endpoint_fallback=\"https://api.enterprise.githubcopilot.com\"'\n  kproxy provider edit copilot --max-concurrent-per-account 2"
+    )]
     Edit {
         id: String,
         /// 设置或覆盖驱动设置，格式为 KEY=TOML_VALUE，可重复。
@@ -350,7 +355,7 @@ enum ProviderCommand {
     Enable { id: String },
     /// 停用提供源实例，但保留配置和账号。
     Disable { id: String },
-    /// 删除提供源实例的配置；账号文件保留在数据目录中。
+    /// 删除 Kiro/Copilot 实例配置；账号文件保留在数据目录中。
     #[command(name = "delete", visible_alias = "rm")]
     Delete {
         id: String,
@@ -364,7 +369,7 @@ enum ProviderCommand {
 enum ModelsCommand {
     /// 列出一个或全部提供源发现的模型、输入上下文与输出上限。
     #[command(
-        after_help = "示例：\n  kproxy models list\n  kproxy models list --mapped\n  kproxy models list --provider copilot --refresh"
+        after_help = "示例：\n  kproxy models list --provider kiro --refresh\n  kproxy models list --provider copilot --refresh\n  kproxy models list --provider all --mapped"
     )]
     List {
         /// 同时显示每个模型经过映射规则后的结果。
@@ -382,7 +387,7 @@ enum ModelsCommand {
     },
     /// 查询客户端 model ID 在指定提供源中的映射与最终模型。
     #[command(
-        after_help = "示例：\n  kproxy models resolve opus5\n  kproxy models resolve team-fast --provider copilot --refresh\n  kproxy --json models resolve opus5 --api-key production"
+        after_help = "省略 --provider 时保持 Kiro 解析语义；Copilot 请显式指定实例 ID。\n\n示例：\n  kproxy models resolve opus5 --provider kiro\n  kproxy models resolve team-fast --provider copilot --refresh\n  kproxy --json models resolve opus5 --api-key production"
     )]
     Resolve {
         /// 客户端传入的 model ID。
@@ -462,13 +467,15 @@ impl LogFileLevel {
 
 #[derive(Debug, Subcommand)]
 enum LogsCommand {
-    /// 显示 daemon 内存中的结构化请求日志。
+    /// 显示 Kiro/Copilot 的结构化请求日志。
     #[command(
-        after_help = "示例：\n  kproxy logs show\n  kproxy logs show --tail 200 --account user@example.com"
+        after_help = "省略 --provider 时显示全部来源；可与 --account 组合过滤。\n\n示例：\n  kproxy logs show --provider kiro --tail 200\n  kproxy logs show --provider copilot --tail 200"
     )]
     Show(RequestLogArgs),
-    /// 持续跟踪新的结构化请求日志。
-    #[command(after_help = "示例：\n  kproxy logs follow\n  kproxy logs follow --level error")]
+    /// 持续跟踪 Kiro/Copilot 的结构化请求日志。
+    #[command(
+        after_help = "示例：\n  kproxy logs follow --provider kiro\n  kproxy logs follow --provider copilot --level error"
+    )]
     Follow(RequestLogArgs),
     /// 按 trace ID 跨日期、跨级别查询完整请求链路。
     #[command(
@@ -500,7 +507,7 @@ enum LogsCommand {
 
 #[derive(Debug, Subcommand)]
 enum ModelMapCommand {
-    /// 列出全部映射规则。
+    /// 列出 Kiro/Copilot 模型映射规则。
     #[command(
         after_help = "示例：\n  kproxy model-map list\n  kproxy model-map list --provider copilot\n  kproxy --json model-map list"
     )]
@@ -511,7 +518,7 @@ enum ModelMapCommand {
     },
     /// 添加模型映射规则。
     #[command(
-        after_help = "示例：\n  kproxy model-map add --name low-credit --source 'claude-opus-*' --target claude-sonnet-4 --below-credits-percent 10"
+        after_help = "省略 --provider 时仅作用于 Kiro；--below-credits-percent 只支持 Kiro，不能用于 Copilot。Copilot 目标模型请从 `models list --provider copilot` 的结果选择。\n\n示例：\n  kproxy model-map add --name kiro-low-credit --source 'claude-opus-*' --target claude-sonnet-4 --provider kiro --below-credits-percent 10\n  kproxy model-map add --name copilot-fast --source team-fast --target MODEL_ID_FROM_COPILOT_LIST --provider copilot"
     )]
     Add {
         #[arg(long)]
@@ -530,7 +537,7 @@ enum ModelMapCommand {
         priority: i32,
         #[arg(long = "weight", value_delimiter = ',')]
         weights: Vec<u32>,
-        /// 账号剩余 credits 百分比低于此值时生效。
+        /// Kiro 账号剩余 credits 百分比低于此值时生效；Copilot 不支持。
         #[arg(long, value_parser = parse_percent)]
         below_credits_percent: Option<f64>,
         #[arg(long = "api-key", value_delimiter = ',')]
@@ -544,7 +551,10 @@ enum ModelMapCommand {
         #[arg(long)]
         disabled: bool,
     },
-    /// 编辑模型映射规则。
+    /// 编辑模型映射规则；可用 --provider 替换适用来源。
+    #[command(
+        after_help = "省略 --provider 时保留规则现有来源；--clear-providers 恢复 Kiro-only。额度阈值规则只能作用于 Kiro。\n\n示例：\n  kproxy model-map edit copilot-fast --provider copilot\n  kproxy model-map edit kiro-low-credit --below-credits-percent 8"
+    )]
     Edit {
         /// 当前规则名。
         name: String,
@@ -593,7 +603,7 @@ enum ModelMapCommand {
     },
     /// 测试客户端模型名会命中的规则。
     #[command(
-        after_help = "示例：\n  kproxy model-map test claude-sonnet-4\n  kproxy model-map test claude-opus-4 --remaining-credits-percent 8"
+        after_help = "默认测试 Kiro 规则；Copilot 必须显式传入 --provider copilot，额度百分比条件仅适用于 Kiro。\n\n示例：\n  kproxy model-map test claude-opus-4 --provider kiro --remaining-credits-percent 8\n  kproxy model-map test team-fast --provider copilot"
     )]
     Test {
         model: String,
@@ -612,12 +622,12 @@ enum ModelMapCommand {
 
 #[derive(Debug, Subcommand)]
 enum TaskCommand {
-    /// 显示周期任务及其运行状态。
+    /// 显示 Kiro、跨来源与全局周期任务及其运行状态。
     #[command(after_help = "示例：\n  kproxy tasks list\n  kproxy --json tasks list")]
     List,
     /// 立即运行一个任务。
     #[command(
-        after_help = "示例：\n  kproxy tasks run status_check\n  kproxy tasks run model_cache_refresh --provider copilot\n  kproxy tasks run proxy_service_reconcile"
+        after_help = "token_refresh/status_check/health_recheck 属于 Kiro；model_cache_refresh 支持 --provider kiro|copilot；stats_persist/daily_reset/proxy_service_reconcile 属于全局。其他任务不能使用 --provider。\n\n示例：\n  kproxy tasks run status_check\n  kproxy tasks run model_cache_refresh --provider copilot\n  kproxy tasks run proxy_service_reconcile"
     )]
     Run {
         name: String,
@@ -629,9 +639,9 @@ enum TaskCommand {
 
 #[derive(Debug, Subcommand)]
 enum DiagnoseCommand {
-    /// 检查所有上游端点，并对全部账号发起真实推理诊断。
+    /// 检查 Kiro 上游端点，并对全部 Kiro 账号发起真实推理。
     #[command(
-        after_help = "该命令会对全部账号发起真实推理。\n\n示例：\n  kproxy diagnose all\n  kproxy diagnose all --region us-west-2 --timeout 30s --concurrency 4"
+        after_help = "仅针对 Kiro 端点和账号，会发起真实推理；Copilot 请用 account probe --provider copilot。\n\n示例：\n  kproxy diagnose all\n  kproxy diagnose all --region us-west-2 --timeout 30s --concurrency 4"
     )]
     All {
         /// 上游端点所在区域。
@@ -652,7 +662,7 @@ enum DiagnoseCommand {
         #[arg(long, default_value = "us-east-1")]
         region: String,
     },
-    /// 拉取模型并发一次真实推理验证账号存活。
+    /// 拉取模型并发起一次真实推理，验证 Kiro 账号存活。
     #[command(
         after_help = "示例：\n  kproxy diagnose account acc_7f3a2b1c\n  kproxy diagnose account --all --concurrency 4"
     )]
@@ -723,12 +733,14 @@ fn parse_percent(value: &str) -> std::result::Result<f64, String> {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
-    /// 列出可查看和编辑的配置模块。
-    #[command(after_help = "示例：\n  kproxy config list\n  kproxy --json config list")]
+    /// 列出配置模块及 Kiro/Copilot/全局适用范围。
+    #[command(
+        after_help = "列表中的适用来源用于区分 Kiro 专项、按来源配置和全局配置。\n\n示例：\n  kproxy config list\n  kproxy --json config list"
+    )]
     List,
     /// 显示配置。
     #[command(
-        after_help = "示例：\n  kproxy config show\n  kproxy config show server\n  kproxy config show pool --effective"
+        after_help = "Kiro 专项：upstream/pool/features/models/context/storage/sso 等；Copilot 驱动配置：provider；server/log/admin 等为全局。原始或生效配置可能包含凭证，请勿分享未脱敏输出。\n\n示例：\n  kproxy config list\n  kproxy config show pool --effective\n  kproxy provider show copilot"
     )]
     Show {
         /// 只显示指定模块；使用 `kproxy config list` 查看模块名。
@@ -745,15 +757,15 @@ enum ConfigCommand {
     Reload,
     /// 用 $VISUAL/$EDITOR 编辑完整配置或指定模块，保存后校验并重载。
     #[command(
-        after_help = "示例：\n  kproxy config edit server\n  kproxy config edit pool\n  EDITOR=vim kproxy config edit\n\n不指定模块时编辑完整配置。"
+        after_help = "Kiro 上游与账号池使用 upstream/pool 等模块；Copilot OAuth、endpoint、缓存优先用 provider edit <ID> 修改对应实例。不指定模块时编辑完整配置。\n\n示例：\n  kproxy config edit upstream\n  kproxy config edit pool\n  kproxy provider edit copilot --setting 'client_id=\"Iv1.xxx\"'"
     )]
     Edit {
         /// 只编辑指定模块；使用 `kproxy config list` 查看模块名。
         module: Option<String>,
     },
-    /// 备份配置并重置全部通用配置或指定模块。
+    /// 备份配置并重置指定模块或全部可重置的运行配置。
     #[command(
-        after_help = "示例：\n  kproxy config reset pool\n  kproxy config reset features\n  kproxy config reset\n\n指定模块时只重置该模块；不指定模块时重置全部通用配置，并保留 API key、代理服务和告警配置；原配置自动备份。"
+        after_help = "指定模块时仅重置该模块；pool/features/sso 等属于 Kiro 专项，server/log 等为全局。provider、api-key、proxy-service 不可按模块重置；不指定模块时重置 Kiro 与全局运行参数，保留基础服务和告警配置，但清除模型映射。原配置自动备份。\n\n示例：\n  kproxy config reset pool\n  kproxy config reset sso\n  kproxy config reset"
     )]
     Reset {
         /// 只重置指定模块；使用 `kproxy config list` 查看模块名。
@@ -1011,7 +1023,7 @@ async fn main() -> Result<()> {
                         println!("配置模块 {module} 已恢复为默认设置并重载；其他配置未改动");
                     } else {
                         println!(
-                            "通用配置已恢复为默认设置并重载；API key、代理服务和告警配置已保留"
+                            "运行配置已恢复默认并重载；提供源、API key、代理服务和告警配置已保留，模型映射已清除"
                         );
                     }
                     println!("原配置备份 {}", result.backup_file.display());

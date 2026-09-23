@@ -218,6 +218,45 @@ fn guide_topics_are_validated_as_cli_values() {
 }
 
 #[test]
+fn provider_guidance_and_config_catalog_show_actual_scopes_offline() {
+    let workspace = tempfile::tempdir().expect("tempdir");
+    let guide = run(workspace.path(), &["guide", "provider"]);
+    assert!(guide.status.success(), "{}", stderr(&guide));
+    let guide = stdout(&guide);
+    for expected in ["Kiro 专项", "Copilot 专项", "全局", "guide config"] {
+        assert!(guide.contains(expected), "missing {expected}: {guide}");
+    }
+
+    let catalog = run(workspace.path(), &["--json", "config", "list"]);
+    assert!(catalog.status.success(), "{}", stderr(&catalog));
+    let catalog: serde_json::Value = serde_json::from_str(&stdout(&catalog)).unwrap();
+    let scope = |name: &str| {
+        catalog
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|module| module["name"] == name)
+            .unwrap()["scope"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    assert_eq!(scope("sso"), "kiro");
+    assert_eq!(scope("provider"), "provider");
+    assert_eq!(scope("server"), "global");
+    assert_eq!(scope("tasks"), "mixed");
+
+    let alerts = run(workspace.path(), &["--json", "alert", "events"]);
+    assert!(alerts.status.success(), "{}", stderr(&alerts));
+    let alerts: serde_json::Value = serde_json::from_str(&stdout(&alerts)).unwrap();
+    assert!(alerts
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|event| event["provider_scope"] == "kiro"));
+}
+
+#[test]
 fn diagnose_account_requires_a_target_during_argument_parsing() {
     let workspace = tempfile::tempdir().expect("tempdir");
     std::fs::write(workspace.path().join(".env"), "BROKEN='unterminated\n")
