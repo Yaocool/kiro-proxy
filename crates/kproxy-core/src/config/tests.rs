@@ -305,8 +305,12 @@ fn fully_populated_config() -> Config {
         serde_json::json!(300),
     );
     provider.settings.insert(
+        "api_endpoint_fallback".into(),
+        serde_json::json!("https://api.enterprise.githubcopilot.com"),
+    );
+    provider.settings.insert(
         "allowed_endpoint_hosts".into(),
-        serde_json::json!(["api.githubcopilot.com"]),
+        serde_json::json!(["api.example.ghe.com"]),
     );
     provider
         .settings

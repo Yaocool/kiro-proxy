@@ -56,6 +56,7 @@ pub struct CopilotSettings {
     pub model_max_stale_secs: i64,
     pub allow_insecure_http: bool,
     pub allowed_endpoint_hosts: Vec<String>,
+    pub api_endpoint_fallback: Option<String>,
     pub editor_version: String,
     pub editor_plugin_version: String,
     pub integration_id: String,
@@ -103,6 +104,7 @@ impl CopilotSettings {
                 .unwrap_or(i64::MAX),
             allow_insecure_http: boolean("allow_insecure_http").unwrap_or(false),
             allowed_endpoint_hosts,
+            api_endpoint_fallback: string("api_endpoint_fallback"),
             editor_version: string("editor_version").unwrap_or_else(|| "vscode/1.104.0".into()),
             editor_plugin_version: string("editor_plugin_version")
                 .unwrap_or_else(|| "copilot-chat/0.31.0".into()),
@@ -146,6 +148,9 @@ impl CopilotSettings {
                 ));
             }
         }
+        if let Some(endpoint) = &self.api_endpoint_fallback {
+            self.validate_copilot_endpoint(endpoint)?;
+        }
         for (name, value) in [
             ("editor_version", self.editor_version.as_str()),
             ("editor_plugin_version", self.editor_plugin_version.as_str()),
@@ -157,6 +162,31 @@ impl CopilotSettings {
                     "Copilot settings.{name} is not a valid HTTP header"
                 ))
             })?;
+        }
+        Ok(())
+    }
+
+    fn validate_copilot_endpoint(&self, endpoint: &str) -> Result<(), ProviderError> {
+        let url = Url::parse(endpoint)
+            .map_err(|error| internal_error(format!("invalid Copilot API endpoint: {error}")))?;
+        if url.scheme() != "https" && !(self.allow_insecure_http && url.scheme() == "http") {
+            return Err(internal_error(
+                "Copilot API endpoint must use HTTPS (or an explicit test-only HTTP override)",
+            ));
+        }
+        let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
+        let default_allowed = host == "github.com"
+            || host.ends_with(".github.com")
+            || host.ends_with(".githubcopilot.com")
+            || host.ends_with(".githubusercontent.com");
+        let configured_allowed = self
+            .allowed_endpoint_hosts
+            .iter()
+            .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")));
+        if !default_allowed && !configured_allowed && !self.allow_insecure_http {
+            return Err(internal_error(format!(
+                "Copilot API endpoint host {host} is not allowed"
+            )));
         }
         Ok(())
     }
@@ -1065,8 +1095,9 @@ impl CopilotProvider {
         let endpoint = token
             .endpoints
             .api
+            .or_else(|| self.settings.api_endpoint_fallback.clone())
             .unwrap_or_else(|| DEFAULT_COPILOT_API.into());
-        self.validate_copilot_endpoint(&endpoint)?;
+        self.settings.validate_copilot_endpoint(&endpoint)?;
         if token.token.trim().is_empty() || token.expires_at <= now_secs() {
             return Err(internal_error(
                 "Copilot token exchange returned an empty or expired token",
@@ -1077,36 +1108,6 @@ impl CopilotProvider {
             endpoint,
             expires_at: token.expires_at,
         })
-    }
-
-    fn validate_copilot_endpoint(&self, endpoint: &str) -> Result<(), ProviderError> {
-        let url = Url::parse(endpoint).map_err(|error| {
-            internal_error(format!(
-                "Copilot token returned an invalid API endpoint: {error}"
-            ))
-        })?;
-        if url.scheme() != "https" && !(self.settings.allow_insecure_http && url.scheme() == "http")
-        {
-            return Err(internal_error(
-                "Copilot API endpoint must use HTTPS (or an explicit test-only HTTP override)",
-            ));
-        }
-        let host = url.host_str().unwrap_or_default().to_ascii_lowercase();
-        let default_allowed = host == "github.com"
-            || host.ends_with(".github.com")
-            || host.ends_with(".githubcopilot.com")
-            || host.ends_with(".githubusercontent.com");
-        let configured_allowed = self
-            .settings
-            .allowed_endpoint_hosts
-            .iter()
-            .any(|allowed| host == *allowed || host.ends_with(&format!(".{allowed}")));
-        if !default_allowed && !configured_allowed && !self.settings.allow_insecure_http {
-            return Err(internal_error(format!(
-                "Copilot API endpoint host {host} is not allowed"
-            )));
-        }
-        Ok(())
     }
 
     async fn fetch_models_with_token(
@@ -2274,6 +2275,99 @@ mod tests {
         CopilotSettings::from_config(&config)
             .validate()
             .expect("explicit test-only HTTP override");
+    }
+
+    #[test]
+    fn enterprise_fallback_is_validated_without_blocking_plan_specific_endpoints() {
+        let mut config = ProviderConfig {
+            id: "copilot".into(),
+            kind: "copilot".into(),
+            ..ProviderConfig::default()
+        };
+        config.settings.insert(
+            "api_endpoint_fallback".into(),
+            Value::String("https://api.enterprise.githubcopilot.com".into()),
+        );
+        let settings = CopilotSettings::from_config(&config);
+        settings.validate().expect("Enterprise host is allowed");
+        settings
+            .validate_copilot_endpoint("https://api.business.githubcopilot.com")
+            .expect("the token response can select a different plan-specific host");
+
+        config.settings.insert(
+            "api_endpoint_fallback".into(),
+            Value::String("https://api.enterprise.githubcopilot.com.example.org".into()),
+        );
+        assert!(CopilotSettings::from_config(&config).validate().is_err());
+    }
+
+    #[tokio::test]
+    async fn token_endpoint_takes_priority_over_configured_fallback() {
+        let github = MockServer::start().await;
+        let enterprise = MockServer::start().await;
+        let fallback = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let mut provider = mock_provider(&github, directory.path()).await;
+        provider.settings.api_endpoint_fallback = Some(fallback.uri());
+
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token":"enterprise-token",
+                "expires_at":now_secs() + 3600,
+                "endpoints":{"api":enterprise.uri()}
+            })))
+            .expect(1)
+            .mount(&github)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data":[{"id":"enterprise-model"}]
+            })))
+            .expect(1)
+            .mount(&enterprise)
+            .await;
+
+        let token = provider.exchange_token_value("github-token").await.unwrap();
+        assert_eq!(token.endpoint, enterprise.uri());
+        let models = provider
+            .fetch_models_with_token(&token, None)
+            .await
+            .unwrap();
+        assert_eq!(models[0].id, "enterprise-model");
+        github.verify().await;
+        enterprise.verify().await;
+        assert!(fallback.received_requests().await.unwrap().is_empty());
+
+        github.reset().await;
+        Mock::given(method("GET"))
+            .and(path("/copilot_internal/v2/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token":"enterprise-token",
+                "expires_at":now_secs() + 3600
+            })))
+            .expect(1)
+            .mount(&github)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/models"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data":[{"id":"fallback-model"}]
+            })))
+            .expect(1)
+            .mount(&fallback)
+            .await;
+
+        let token = provider.exchange_token_value("github-token").await.unwrap();
+        assert_eq!(token.endpoint, fallback.uri());
+        let models = provider
+            .fetch_models_with_token(&token, None)
+            .await
+            .unwrap();
+        assert_eq!(models[0].id, "fallback-model");
+        github.verify().await;
+        fallback.verify().await;
     }
 
     #[test]

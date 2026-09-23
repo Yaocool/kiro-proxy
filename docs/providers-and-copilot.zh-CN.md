@@ -36,6 +36,25 @@ HTTPS 与主机名。账号 token、刷新 token 和探测结果保存在
 `$KPROXY_HOME/providers/<provider-id>/accounts.json`，使用原子写入和 `0600` 权限；逐账号模型目录
 持久化到同目录的 `models.json`，成功返回空目录时也会清除旧缓存，失败时只在配置的 stale 窗口内
 使用最后一次成功结果。
+
+GitHub.com 上通过 Azure SSO 登录、并逐用户分配 Copilot Enterprise 席位的场景，不需要单独配置
+Azure SSO URL 或 `account_type`：用户在 Device Flow 的浏览器页面完成组织要求的 SSO，代理按每个
+账号的 token 响应中的 `endpoints.api` 选择 Copilot API 域名。若响应给出
+`*.enterprise.githubcopilot.com`，该域名已在默认允许范围内；即使同一个 provider 下有不同套餐的账号，
+也不会因全局 `account_type` 而把它们固定到同一个域名。如果 token 响应缺少 `endpoints.api`，
+默认回退到 `https://api.githubcopilot.com`。仅当企业网络要求使用套餐专属域名、且响应确实缺少
+该字段时，可以为企业专用 provider 配置回退地址：
+
+```bash
+kproxy provider edit copilot \
+  --setting 'api_endpoint_fallback="https://api.enterprise.githubcopilot.com"'
+```
+
+该配置只在响应缺少 `endpoints.api` 时生效，不覆盖 GitHub 返回的地址。`allowed_endpoint_hosts`
+是额外允许的主机列表，不会限制默认允许的 GitHub Copilot 域名。若账号实际位于独立的
+`*.ghe.com` 数据驻留站点，则需另外配置 GitHub/OAuth 地址及对应的 endpoint 主机；Azure SSO
+本身不代表使用 `ghe.com`。
+
 启用了 expiring user token 的 OAuth 应用可以通过 `client_secret` 设置支持 refresh token 轮换：
 
 ```bash
@@ -43,7 +62,7 @@ kproxy provider edit copilot \
   --setting 'client_secret="replace-me"'
 ```
 
-生产环境不要启用 `allow_insecure_http`。GitHub Enterprise 或自建测试端点可配置
+生产环境不要启用 `allow_insecure_http`。独立的 GitHub Enterprise 站点或自建测试端点可配置
 `github_host`、`github_api_base`、`oauth_base` 和 `allowed_endpoint_hosts`；完整字段和默认值见
 `kproxy config show provider` 或生成的默认配置文件。
 
@@ -196,7 +215,6 @@ enabled = true
 
 [provider.settings]
 client_id = "Iv1.replace-me"
-allowed_endpoint_hosts = ["api.githubcopilot.com"]
 user_agent = "GitHubCopilotChat/0.31.0"
 
 [provider.pool]

@@ -1884,8 +1884,10 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# =====================================
 # oauth_base = "https://github.com"
 # Copilot API token 到期前提前刷新的秒数。
 # api_token_refresh_before_secs = 300
+# token 响应缺少 endpoints.api 时使用的回退地址；Enterprise 专用实例按需配置。
+# api_endpoint_fallback = "https://api.enterprise.githubcopilot.com"
 # 动态 token 返回自定义 Copilot endpoint 时允许的额外主机。
-# allowed_endpoint_hosts = ["api.githubcopilot.com"]
+# allowed_endpoint_hosts = ["api.example.ghe.com"]
 # 仅供本地 mock 测试；生产环境必须保持 false。
 # allow_insecure_http = false
 # 发往 Copilot 的编辑器身份头。
