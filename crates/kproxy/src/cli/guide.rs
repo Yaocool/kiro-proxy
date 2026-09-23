@@ -132,9 +132,9 @@ diagnose all/endpoints、account overage 是 Kiro 专项功能。"#
         }
         "copilot" => {
             r#"GitHub Copilot 接入
-1. 准备已启用 Device Flow 的 GitHub OAuth App Client ID，并配置提供源：
-   kproxy provider add --id copilot --kind copilot --setting 'client_id="Iv1.xxx"'
-   已有实例可用 kproxy provider edit copilot --setting 'client_id="Iv1.xxx"' 更新。
+1. 添加提供源；命令会将默认公开 Client ID 写入配置文件的 [provider.settings]：
+   kproxy provider add --id copilot --kind copilot
+   用 kproxy config path 查看配置文件位置；可直接编辑 client_id，或用 kproxy provider edit copilot --setting 'client_id="Iv1.your-app"' 覆盖。
 2. 添加账号；按提示在浏览器完成 GitHub 登录及组织要求的 SSO：
    kproxy account add --provider copilot --auth device-flow
    CLI 会轮询直到授权和模型探测结束，无需提供用户名密码，也无需另开 kproxy 会话。多个 GitHub 用户可重复此命令，共用同一 Client ID。
@@ -183,7 +183,7 @@ Copilot API 地址优先使用账号 token 返回的 endpoint；仅当缺失且�
 
   注意：`config show` 的原始或生效配置可能包含凭证；请勿直接粘贴输出到日志或工单。
 
-`kproxy config list` 显示每个模块的适用来源，`show <模块> --effective` 查看合并默认值后的配置。修改 Copilot 实例优先用 `kproxy provider edit copilot --setting 'client_id="Iv1.xxx"'`；Kiro SSO 用 `config edit sso`，不是 Copilot 的 Azure SSO URL。`config reset <模块>` 只重置所选模块；不指定模块会重置 Kiro 与全局运行参数、清除模型映射，同时保留提供源、API key、服务和告警。server.host/port 仅是新建服务默认值，已有服务用 service edit 修改；admin.socket 和 TLS 模式切换需重启 daemon。"#
+`kproxy config list` 显示每个模块的适用来源，`show <模块> --effective` 查看合并默认值后的配置。新建 Copilot 实例会在配置文件中写入默认 Client ID；用 `kproxy config path` 定位文件，或在组织要求自有 OAuth App 时用 `kproxy provider edit copilot --setting 'client_id="Iv1.your-app"'` 覆盖。Kiro SSO 用 `config edit sso`，不是 Copilot 的 Azure SSO URL。`config reset <模块>` 只重置所选模块；不指定模块会重置 Kiro 与全局运行参数、清除模型映射，同时保留提供源、API key、服务和告警。server.host/port 仅是新建服务默认值，已有服务用 service edit 修改；admin.socket 和 TLS 模式切换需重启 daemon。"#
         }
         "apikey" => {
             "API key 可用 `--provider kiro`、`--provider copilot` 限定允许来源；add 省略时保持 Kiro-only，重复传入可允许两者，并可用 `--model 'copilot/*'` 限制模型。service create 自动生成的 key 继承服务来源范围。`apikey list/usage/history --provider <ID>` 是查询过滤；`limit` 的累计 credits 上限跨该 key 的来源共用，`reset-usage` 清除全部来源累计用量，不单独按来源重置。`show/edit` 可查看或修改范围；删除需确认。"
@@ -244,6 +244,9 @@ mod tests {
     fn provider_guides_cover_both_auth_flows_and_sso_boundary() {
         assert!(topic_text("kiro").unwrap().contains("account add-sso"));
         assert!(topic_text("copilot").unwrap().contains("device-flow"));
+        assert!(topic_text("copilot")
+            .unwrap()
+            .contains("provider add --id copilot --kind copilot\n"));
         assert!(topic_text("copilot")
             .unwrap()
             .contains("--default-provider copilot"));

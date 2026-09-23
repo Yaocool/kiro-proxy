@@ -27,20 +27,42 @@ Copilot 账号列表请用 `account list --provider <ID>`。
 
 ## 快速配置 Copilot
 
-先添加 provider。`--setting` 接受 `KEY=TOML_VALUE`，字符串值需要保留 TOML 引号：
+先添加 provider。此命令创建一个 Copilot 模型来源实例（账号池、模型发现和路由的配置范围），
+不会添加或授权 GitHub 用户账号。新建实例会将默认公开 OAuth Client ID 写入配置文件；
+用 `kproxy config path` 查看配置文件位置：
 
 ```bash
 kproxy provider add \
   --id copilot \
   --kind copilot \
-  --setting 'client_id="Iv1.replace-me"' \
   --max-concurrent-per-account 2
 
 kproxy provider show copilot
+kproxy config path
 ```
 
-Device Flow 需要 GitHub OAuth 应用的 client ID。也可以跳过 Device Flow，从标准输入导入已有
-GitHub token，避免凭证出现在命令行参数和 shell 历史中：
+新增的实例包含可直接编辑的设置：
+
+```toml
+[[provider]]
+id = "copilot"
+kind = "copilot"
+enabled = true
+
+[provider.settings]
+client_id = "Iv1.b507a08c87ecfe98"
+```
+
+如果企业组织只允许自有 OAuth App，可通过 `--setting 'client_id="Iv1.your-app"'` 覆盖默认值；
+已有实例使用 `kproxy provider edit copilot --setting 'client_id="Iv1.your-app"'`。
+要恢复默认值且仍让它显示在配置文件中，可用
+`kproxy provider edit copilot --setting 'client_id="Iv1.b507a08c87ecfe98"'`。
+旧配置未写 `client_id` 时仍会使用相同的运行时默认值；如需显式显示，也可执行上述命令。
+`--setting` 接受 `KEY=TOML_VALUE`，字符串值需保留 TOML 引号。
+Client ID 与已签发的 OAuth token 关联；如果已有账号通过自有应用登录，不要直接切换或移除该设置，
+否则其 refresh token 可能无法继续轮换，需要重新授权账号。
+
+也可以跳过 Device Flow，从标准输入导入已有 GitHub token，避免凭证出现在命令行参数和 shell 历史中：
 
 ```bash
 kproxy account add --provider copilot --auth device-flow
@@ -75,7 +97,8 @@ kproxy provider edit copilot \
 `*.ghe.com` 数据驻留站点，则需另外配置 GitHub/OAuth 地址及对应的 endpoint 主机；Azure SSO
 本身不代表使用 `ghe.com`。
 
-启用了 expiring user token 的 OAuth 应用可以通过 `client_secret` 设置支持 refresh token 轮换：
+Device Flow 签发的 expiring user token 可使用返回的 refresh token 轮换，GitHub 对该流程不要求
+`client_secret`。只有自有 OAuth 应用确实要求时，才应与其 `client_id` 成对配置：
 
 ```bash
 kproxy provider edit copilot \
@@ -234,7 +257,7 @@ kind = "copilot"
 enabled = true
 
 [provider.settings]
-client_id = "Iv1.replace-me"
+client_id = "Iv1.b507a08c87ecfe98"
 user_agent = "GitHubCopilotChat/0.31.0"
 
 [provider.pool]
@@ -250,6 +273,10 @@ enable_model_fallback = false
 allow_cross_provider_fallback = false
 ```
 
-`client_id` 由部署者提供，项目不内置第三方 OAuth 身份。没有真实 Copilot 账号时可以完成编译、
-配置、mock 协议与持久化测试，但最终上线前仍应使用目标 GitHub 组织的真实账号验证 Device Flow、
-token exchange、模型列表、三种生成协议和流式 usage。
+默认 Client ID 为 `Iv1.b507a08c87ecfe98`，与
+[Alorse/copilot-to-api](https://github.com/Alorse/copilot-to-api#about-the-client-id) 和
+[ericc-ch/copilot-api](https://github.com/ericc-ch/copilot-api/blob/master/src/lib/api-config.ts) 的
+Device Flow 实现一致；它是公开的 OAuth 应用标识，不是用户凭证。企业可能限制第三方 OAuth App，
+此时仍可配置组织批准的 `client_id`。没有真实 Copilot 账号时可以完成编译、配置、mock 协议与持久化测试，
+但最终上线前仍应使用目标 GitHub 组织的真实账号验证 Device Flow、token exchange、模型列表、
+三种生成协议和流式 usage。

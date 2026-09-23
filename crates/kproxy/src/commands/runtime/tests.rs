@@ -79,6 +79,59 @@ fn implicit_kiro_can_be_materialized_for_provider_mutations() {
 }
 
 #[test]
+fn new_copilot_provider_persists_default_client_id_and_merges_overrides() {
+    let mut provider = provider_table("copilot", "copilot", true);
+    let table = provider.as_table_mut().unwrap();
+    assert_eq!(
+        table["settings"]["client_id"].as_str(),
+        Some(DEFAULT_COPILOT_OAUTH_CLIENT_ID)
+    );
+
+    let additional_settings =
+        parse_provider_settings(&["api_endpoint_fallback=\"https://example.ghe.com\"".into()])
+            .unwrap();
+    merge_new_provider_settings(table, &additional_settings).unwrap();
+    assert_eq!(
+        table["settings"]["client_id"].as_str(),
+        Some(DEFAULT_COPILOT_OAUTH_CLIENT_ID)
+    );
+    assert_eq!(
+        table["settings"]["api_endpoint_fallback"].as_str(),
+        Some("https://example.ghe.com")
+    );
+
+    let override_setting = parse_provider_settings(&["client_id=\"Iv1.custom\"".into()]).unwrap();
+    merge_new_provider_settings(table, &override_setting).unwrap();
+    assert_eq!(table["settings"]["client_id"].as_str(), Some("Iv1.custom"));
+
+    let kiro = provider_table("kiro", "kiro", true);
+    assert!(kiro.get("settings").is_none());
+}
+
+#[test]
+fn new_copilot_provider_renders_client_id_in_config_file() {
+    let raw = kproxy_core::config::DEFAULT_CONFIG_TOML;
+    let before = raw.parse::<toml::Value>().unwrap();
+    let mut after = before.clone();
+    after.as_table_mut().unwrap().insert(
+        "provider".into(),
+        toml::Value::Array(vec![
+            provider_table("kiro", "kiro", true),
+            provider_table("copilot", "copilot", true),
+        ]),
+    );
+    let updated =
+        kproxy_store::config_update::render_update_preserving_comments(raw, &before, &after)
+            .unwrap();
+    assert!(updated.contains("client_id = \"Iv1.b507a08c87ecfe98\""));
+    let parsed = updated.parse::<toml::Value>().unwrap();
+    assert_eq!(
+        parsed["provider"][1]["settings"]["client_id"].as_str(),
+        Some(DEFAULT_COPILOT_OAUTH_CLIENT_ID)
+    );
+}
+
+#[test]
 fn deleting_the_only_kiro_provider_cannot_reenable_it_implicitly() {
     let mut providers = vec![provider_table("kiro", "kiro", false)];
 

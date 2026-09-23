@@ -284,9 +284,10 @@ fn fully_populated_config() -> Config {
         routing: ProviderRoutingConfig::default(),
         ..ProviderConfig::default()
     };
-    provider
-        .settings
-        .insert("client_id".into(), serde_json::json!("Iv1.replace-me"));
+    provider.settings.insert(
+        "client_id".into(),
+        serde_json::json!(DEFAULT_COPILOT_OAUTH_CLIENT_ID),
+    );
     provider
         .settings
         .insert("client_secret".into(), serde_json::json!("replace-me"));

@@ -2,6 +2,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use clap::{Subcommand, ValueEnum};
+use kproxy_core::config::DEFAULT_COPILOT_OAUTH_CLIENT_ID;
 use kproxy_core::paths::Paths;
 use kproxy_ipc::protocol::method;
 use kproxy_ipc::protocol::{
@@ -1634,9 +1635,7 @@ pub async fn add_provider(
         }
         let mut value = provider_table(id, kind, !disabled);
         let table = value.as_table_mut().expect("provider table");
-        if !settings.is_empty() {
-            table.insert("settings".into(), toml::Value::Table(settings.clone()));
-        }
+        merge_new_provider_settings(table, &settings)?;
         if let Some(limit) = max_concurrent_per_account {
             let limit = i64::try_from(limit).context("并发上限过大")?;
             table.insert(
@@ -1793,11 +1792,31 @@ pub async fn delete_provider(
 }
 
 fn provider_table(id: &str, kind: &str, enabled: bool) -> toml::Value {
-    toml::Value::Table(toml::map::Map::from_iter([
+    let mut table = toml::map::Map::from_iter([
         ("id".into(), toml::Value::String(id.into())),
         ("kind".into(), toml::Value::String(kind.into())),
         ("enabled".into(), toml::Value::Boolean(enabled)),
-    ]))
+    ]);
+    if kind == "copilot" {
+        table.insert(
+            "settings".into(),
+            toml::Value::Table(toml::map::Map::from_iter([(
+                "client_id".into(),
+                toml::Value::String(DEFAULT_COPILOT_OAUTH_CLIENT_ID.into()),
+            )])),
+        );
+    }
+    toml::Value::Table(table)
+}
+
+fn merge_new_provider_settings(
+    table: &mut toml::map::Map<String, toml::Value>,
+    settings: &toml::map::Map<String, toml::Value>,
+) -> Result<()> {
+    if !settings.is_empty() {
+        ensure_table(table, "settings")?.extend(settings.clone());
+    }
+    Ok(())
 }
 
 fn provider_value_matches(value: &toml::Value, id: &str) -> bool {

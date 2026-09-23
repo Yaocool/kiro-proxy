@@ -7,7 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures::StreamExt;
 use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
-use kproxy_core::config::ProviderConfig;
+use kproxy_core::config::{ProviderConfig, DEFAULT_COPILOT_OAUTH_CLIENT_ID};
 use kproxy_core::provider::{
     CapabilitySupport, ProviderCapabilities, ProviderDescriptor, ProviderId, ProviderModel,
     ProviderProtocol,
@@ -88,7 +88,10 @@ impl CopilotSettings {
             github_api_base: string("github_api_base")
                 .unwrap_or_else(|| "https://api.github.com".into()),
             oauth_base: string("oauth_base").unwrap_or_else(|| "https://github.com".into()),
-            client_id: string("client_id").filter(|value| !value.trim().is_empty()),
+            client_id: config
+                .settings
+                .get("client_id")
+                .map(|value| value.as_str().unwrap_or_default().to_owned()),
             client_secret: string("client_secret").filter(|value| !value.trim().is_empty()),
             refresh_before_secs: number("api_token_refresh_before_secs")
                 .and_then(|value| i64::try_from(value).ok())
@@ -113,7 +116,30 @@ impl CopilotSettings {
         }
     }
 
+    fn oauth_client_id(&self) -> &str {
+        self.client_id
+            .as_deref()
+            .unwrap_or(DEFAULT_COPILOT_OAUTH_CLIENT_ID)
+    }
+
+    fn oauth_client_secret(&self) -> Option<&str> {
+        if self.oauth_client_id() == DEFAULT_COPILOT_OAUTH_CLIENT_ID {
+            None
+        } else {
+            self.client_secret.as_deref()
+        }
+    }
+
     fn validate(&self) -> Result<(), ProviderError> {
+        if self
+            .client_id
+            .as_ref()
+            .is_some_and(|value| value.trim().is_empty() || value.contains(char::is_whitespace))
+        {
+            return Err(internal_error(
+                "Copilot settings.client_id must be a non-empty string without whitespace",
+            ));
+        }
         if self.github_host.trim().is_empty()
             || self.github_host.contains('/')
             || self.github_host.contains(char::is_whitespace)
@@ -649,16 +675,7 @@ impl CopilotProvider {
         &self,
         label: Option<String>,
     ) -> Result<DeviceLoginState, ProviderError> {
-        let client_id = self.settings.client_id.as_deref().ok_or_else(|| {
-            ProviderError::new(
-                ProviderErrorKind::InvalidRequest,
-                StatusCode::BAD_REQUEST,
-                format!(
-                    "provider {} requires settings.client_id for GitHub Device Flow",
-                    self.id
-                ),
-            )
-        })?;
+        let client_id = self.settings.oauth_client_id();
         let url = endpoint_url(&self.settings.oauth_base, "/login/device/code")?;
         let body = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("client_id", client_id)
@@ -739,13 +756,7 @@ impl CopilotProvider {
                 task.state.interval_secs,
             )
         };
-        let client_id = self.settings.client_id.as_deref().ok_or_else(|| {
-            ProviderError::new(
-                ProviderErrorKind::InvalidRequest,
-                StatusCode::BAD_REQUEST,
-                "Device Flow client_id was removed while login was pending",
-            )
-        })?;
+        let client_id = self.settings.oauth_client_id();
         let url = endpoint_url(&self.settings.oauth_base, "/login/oauth/access_token")?;
         let body = url::form_urlencoded::Serializer::new(String::new())
             .append_pair("client_id", client_id)
@@ -1005,19 +1016,13 @@ impl CopilotProvider {
             .github_refresh_token
             .as_deref()
             .ok_or_else(|| internal_error("GitHub refresh token is missing"))?;
-        let client_id = self.settings.client_id.as_deref().ok_or_else(|| {
-            ProviderError::new(
-                ProviderErrorKind::Authentication,
-                StatusCode::UNAUTHORIZED,
-                "GitHub token refresh requires provider settings.client_id",
-            )
-        })?;
+        let client_id = self.settings.oauth_client_id();
         let mut form = vec![
             ("client_id", client_id),
             ("grant_type", "refresh_token"),
             ("refresh_token", refresh_token),
         ];
-        if let Some(client_secret) = self.settings.client_secret.as_deref() {
+        if let Some(client_secret) = self.settings.oauth_client_secret() {
             form.push(("client_secret", client_secret));
         }
         let url = endpoint_url(&self.settings.oauth_base, "/login/oauth/access_token")?;
@@ -1458,7 +1463,7 @@ impl ProviderAdapter for CopilotProvider {
                     ProviderProtocol::OpenAiChat,
                     ProviderProtocol::OpenAiResponses,
                 ],
-                device_flow: self.settings.client_id.is_some(),
+                device_flow: true,
                 token_import: true,
                 model_discovery: true,
                 token_counting: CapabilitySupport::Native,
@@ -2167,9 +2172,6 @@ mod tests {
         }
         config
             .settings
-            .insert("client_id".into(), Value::String("client-id".into()));
-        config
-            .settings
             .insert("allow_insecure_http".into(), Value::Bool(true));
         let accounts_path = directory.join("providers/copilot/accounts.json");
         tokio::fs::create_dir_all(accounts_path.parent().unwrap())
@@ -2222,6 +2224,54 @@ mod tests {
             .expect(1)
             .mount(server)
             .await;
+    }
+
+    #[test]
+    fn settings_default_to_public_client_id_and_preserve_overrides() {
+        let mut config = ProviderConfig {
+            id: "copilot".into(),
+            kind: "copilot".into(),
+            ..ProviderConfig::default()
+        };
+        assert_eq!(
+            CopilotSettings::from_config(&config).oauth_client_id(),
+            DEFAULT_COPILOT_OAUTH_CLIENT_ID
+        );
+
+        config.settings.insert(
+            "client_id".into(),
+            Value::String(DEFAULT_COPILOT_OAUTH_CLIENT_ID.into()),
+        );
+        config.settings.insert(
+            "client_secret".into(),
+            Value::String("custom-secret".into()),
+        );
+        assert_eq!(
+            CopilotSettings::from_config(&config).oauth_client_secret(),
+            None
+        );
+
+        config
+            .settings
+            .insert("client_id".into(), Value::String("custom-client".into()));
+        assert_eq!(
+            CopilotSettings::from_config(&config).oauth_client_id(),
+            "custom-client"
+        );
+        assert_eq!(
+            CopilotSettings::from_config(&config).oauth_client_secret(),
+            Some("custom-secret")
+        );
+
+        config
+            .settings
+            .insert("client_id".into(), Value::String("  ".into()));
+        assert!(CopilotSettings::from_config(&config).validate().is_err());
+
+        config
+            .settings
+            .insert("client_id".into(), Value::Bool(true));
+        assert!(CopilotSettings::from_config(&config).validate().is_err());
     }
 
     #[test]
@@ -2625,6 +2675,7 @@ mod tests {
             .await;
 
         let provider = mock_provider(&server, directory.path()).await;
+        assert!(provider.descriptor().capabilities.device_flow);
         let task = provider
             .start_device_login(Some("device".into()))
             .await
@@ -2635,6 +2686,67 @@ mod tests {
         assert_eq!(completed.status, DeviceLoginStatus::Authorized);
         assert!(completed.account_id.is_some());
         assert_eq!(provider.account_summaries().await.len(), 1);
+        let requests = server.received_requests().await.unwrap();
+        for endpoint in ["/login/device/code", "/login/oauth/access_token"] {
+            let request = requests
+                .iter()
+                .find(|request| request.url.path() == endpoint)
+                .unwrap();
+            let client_id = url::form_urlencoded::parse(&request.body)
+                .find(|(name, _)| name == "client_id")
+                .map(|(_, value)| value.into_owned());
+            assert_eq!(client_id.as_deref(), Some(DEFAULT_COPILOT_OAUTH_CLIENT_ID));
+        }
+    }
+
+    #[tokio::test]
+    async fn github_refresh_uses_default_client_id() {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        mount_account_exchange(&server, "github-token").await;
+        let provider = mock_provider(&server, directory.path()).await;
+        provider
+            .import_token("github-token".into(), None)
+            .await
+            .unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/login/oauth/access_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token":"renewed-token",
+                "refresh_token":"renewed-refresh-token",
+                "expires_in":28800
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut account = provider.accounts.read().await[0].clone();
+        account.credentials.github_refresh_token = Some("refresh-token".into());
+        let token = provider.refresh_github_credentials(&account).await.unwrap();
+        assert_eq!(token, "renewed-token");
+
+        let requests = server.received_requests().await.unwrap();
+        let request = requests
+            .iter()
+            .find(|request| request.url.path() == "/login/oauth/access_token")
+            .unwrap();
+        let fields = url::form_urlencoded::parse(&request.body)
+            .into_owned()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(
+            fields.get("client_id").map(String::as_str),
+            Some(DEFAULT_COPILOT_OAUTH_CLIENT_ID)
+        );
+        assert_eq!(
+            fields.get("grant_type").map(String::as_str),
+            Some("refresh_token")
+        );
+        assert_eq!(
+            fields.get("refresh_token").map(String::as_str),
+            Some("refresh-token")
+        );
+        assert!(!fields.contains_key("client_secret"));
+        server.verify().await;
     }
 
     #[tokio::test]

@@ -51,7 +51,7 @@ struct TimeRangeArgs {
 enum Command {
     /// Kiro/Copilot 模型提供源实例管理。
     #[command(
-        after_help = "示例：\n  kproxy provider list\n  kproxy provider show kiro\n  kproxy provider show copilot\n  kproxy provider add --id copilot --kind copilot --setting 'client_id=\"Iv1.xxx\"'\n\n操作说明：kproxy guide provider"
+        after_help = "示例：\n  kproxy provider list\n  kproxy provider show kiro\n  kproxy provider show copilot\n  kproxy provider add --id copilot --kind copilot\n\n操作说明：kproxy guide provider"
     )]
     Provider {
         #[command(subcommand)]
@@ -311,7 +311,7 @@ enum ProviderCommand {
     /// 添加一个提供源实例。
     #[command(
         visible_alias = "create",
-        after_help = "未显式配置 provider 时内置 Kiro；首次添加 Copilot 会保留 Kiro 实例。\n\n示例：\n  kproxy provider add --id copilot --kind copilot --setting 'client_id=\"Iv1.xxx\"'\n  kproxy provider show kiro\n  kproxy provider show copilot"
+        after_help = "未显式配置 provider 时内置 Kiro；首次添加 Copilot 会保留 Kiro 实例。新建 Copilot 实例会将默认公开 Client ID 写入 [provider.settings]，可在配置文件中修改。\n\n示例：\n  kproxy provider add --id copilot --kind copilot\n  kproxy config path\n  kproxy provider show copilot"
     )]
     Add {
         #[arg(long)]
@@ -331,7 +331,7 @@ enum ProviderCommand {
     },
     /// 修改提供源实例的驱动设置和路由默认值。
     #[command(
-        after_help = "--setting 接受 KEY=TOML_VALUE；Copilot OAuth/endpoint 设置属于该 Copilot 实例，不写入 Kiro 的 [sso]/[upstream]。\n\n示例：\n  kproxy provider edit copilot --setting 'client_id=\"Iv1.xxx\"'\n  kproxy provider edit copilot --setting 'api_endpoint_fallback=\"https://api.enterprise.githubcopilot.com\"'\n  kproxy provider edit copilot --max-concurrent-per-account 2"
+        after_help = "--setting 接受 KEY=TOML_VALUE；Copilot OAuth/endpoint 设置属于该 Copilot 实例，不写入 Kiro 的 [sso]/[upstream]。修改 client_id 后，既有账号可能需要重新授权。\n\n示例：\n  kproxy provider edit copilot --setting 'client_id=\"Iv1.your-app\"'\n  kproxy provider edit copilot --setting 'api_endpoint_fallback=\"https://api.enterprise.githubcopilot.com\"'"
     )]
     Edit {
         id: String,
@@ -757,7 +757,7 @@ enum ConfigCommand {
     Reload,
     /// 用 $VISUAL/$EDITOR 编辑完整配置或指定模块，保存后校验并重载。
     #[command(
-        after_help = "Kiro 上游与账号池使用 upstream/pool 等模块；Copilot OAuth、endpoint、缓存优先用 provider edit <ID> 修改对应实例。不指定模块时编辑完整配置。\n\n示例：\n  kproxy config edit upstream\n  kproxy config edit pool\n  kproxy provider edit copilot --setting 'client_id=\"Iv1.xxx\"'"
+        after_help = "Kiro 上游与账号池使用 upstream/pool 等模块；Copilot OAuth、endpoint、缓存优先用 provider edit <ID> 修改对应实例。不指定模块时编辑完整配置。\n\n示例：\n  kproxy config edit upstream\n  kproxy config edit pool\n  kproxy provider edit copilot --setting 'api_endpoint_fallback=\"https://api.enterprise.githubcopilot.com\"'"
     )]
     Edit {
         /// 只编辑指定模块；使用 `kproxy config list` 查看模块名。

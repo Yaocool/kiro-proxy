@@ -11,6 +11,9 @@ use crate::provider::ProviderId;
 /// Maximum number of immediately loaded tools accepted by the proxy.
 pub const MAX_LOADED_TOOLS: usize = 512;
 
+/// Public OAuth client ID used by the built-in GitHub Copilot Device Flow.
+pub const DEFAULT_COPILOT_OAUTH_CLIENT_ID: &str = "Iv1.b507a08c87ecfe98";
+
 /// 配置校验错误。
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -1874,9 +1877,9 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# =====================================
 # enabled = true
 
 # [provider.settings]
-# GitHub Device Flow 使用的 OAuth client ID；导入现成 token 时可以不配置。
-# client_id = "Iv1.replace-me"
-# OAuth 应用启用 expiring user token 时，刷新可能需要 client secret。
+# 新建 Copilot provider 会写入默认公开 client ID；可在此修改为组织批准的 OAuth App ID。
+# client_id = "Iv1.b507a08c87ecfe98"
+# Device Flow 的 refresh token 通常不需要 client secret；仅自有应用要求时配置。
 # client_secret = "replace-me"
 # GitHub Enterprise 主机标识。
 # github_host = "github.com"
