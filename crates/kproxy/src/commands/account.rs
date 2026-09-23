@@ -109,7 +109,7 @@ pub enum AccountCommand {
     },
     /// 通过 Device Flow 或 GitHub token 添加 Copilot 账号。
     #[command(
-        after_help = "此命令用于 GitHub Copilot；Kiro 请使用 account add-sso 或 add-api-key。\n\n示例：\n  kproxy account add --provider copilot --auth device-flow\n  printf '%s\\n' \"$GITHUB_TOKEN\" | kproxy account add --provider copilot --token-stdin"
+        after_help = "此命令用于 GitHub Copilot；Kiro 请使用 account add-sso 或 add-api-key。Device Flow 会显示 GitHub 授权网址和验证码；即使通过 SSH 在无头服务器执行，也请在自己电脑的无痕/隐私窗口完成授权。服务器无需启动浏览器，CLI 会保持轮询。\n\n示例：\n  kproxy account add --provider copilot --auth device-flow\n  printf '%s\\n' \"$GITHUB_TOKEN\" | kproxy account add --provider copilot --token-stdin"
     )]
     Add {
         #[arg(long)]
@@ -494,11 +494,13 @@ async fn run_provider_login(
     let verification_uri = state["verification_uri"].as_str().unwrap_or("-");
     let user_code = state["user_code"].as_str().unwrap_or("-");
     if json {
-        eprintln!("请打开 {verification_uri} 并输入代码 {user_code}");
+        eprintln!(
+            "请在自己电脑的无痕/隐私窗口打开 {verification_uri}，确认目标 GitHub 账号并输入代码 {user_code}；保持当前终端会话"
+        );
     } else {
-        println!("请打开 {verification_uri}");
-        println!("输入代码 {user_code}");
-        println!("等待 GitHub 授权……");
+        println!("请在自己电脑的无痕/隐私窗口打开 {verification_uri}");
+        println!("确认登录的是要添加的 GitHub 账号，并输入代码 {user_code}");
+        println!("等待 GitHub 授权……请保持当前终端/SSH 会话；服务器无需打开浏览器");
     }
     loop {
         match state["status"].as_str().unwrap_or("failed") {

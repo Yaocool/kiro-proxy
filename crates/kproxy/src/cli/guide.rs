@@ -135,9 +135,9 @@ diagnose all/endpoints、account overage 是 Kiro 专项功能。"#
 1. 添加提供源；命令会将默认公开 Client ID 写入配置文件的 [provider.settings]：
    kproxy provider add --id copilot --kind copilot
    用 kproxy config path 查看配置文件位置；可直接编辑 client_id，或用 kproxy provider edit copilot --setting 'client_id="Iv1.your-app"' 覆盖。
-2. 添加账号；按提示在浏览器完成 GitHub 登录及组织要求的 SSO：
+2. 添加账号；即使命令在 SSH 无头服务器运行，也请在自己电脑的无痕/隐私窗口打开授权网址、输入验证码，并完成 GitHub 登录、组织 SSO 和授权：
    kproxy account add --provider copilot --auth device-flow
-   CLI 会轮询直到授权和模型探测结束，无需提供用户名密码，也无需另开 kproxy 会话。多个 GitHub 用户可重复此命令，共用同一 Client ID。
+   服务器无需浏览器；保持当前终端/SSH 会话，CLI 会轮询直到授权和模型探测结束。无需提供用户名密码，也无需另开 kproxy 会话。多个 GitHub 用户可重复此命令，共用同一 Client ID。
 3. 检查账号和模型：
    kproxy account list --provider copilot
    kproxy account probe --provider copilot <ACCOUNT_ID>
@@ -244,6 +244,8 @@ mod tests {
     fn provider_guides_cover_both_auth_flows_and_sso_boundary() {
         assert!(topic_text("kiro").unwrap().contains("account add-sso"));
         assert!(topic_text("copilot").unwrap().contains("device-flow"));
+        assert!(topic_text("copilot").unwrap().contains("无痕/隐私窗口"));
+        assert!(topic_text("copilot").unwrap().contains("SSH 无头服务器"));
         assert!(topic_text("copilot")
             .unwrap()
             .contains("provider add --id copilot --kind copilot\n"));

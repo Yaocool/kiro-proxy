@@ -72,6 +72,14 @@ printf '%s\n' "$GITHUB_TOKEN" | \
   kproxy account add --provider copilot --token-stdin
 ```
 
+Device Flow 会在终端显示 GitHub 授权网址和验证码，kproxy 不会自动启动浏览器。
+即使 `kproxy account add` 在 SSH 无头服务器或容器中运行，也请在**自己电脑**的无痕/隐私窗口
+打开网址，确认登录的是要添加的 GitHub 用户，输入验证码并完成 Azure SSO/MFA（如组织要求）
+及 OAuth 应用授权。保持远端终端/SSH 会话；原命令会继续轮询，不需要另开 kproxy 会话。
+服务器上的 Kiro Chromium 无痕内核不参与 Copilot Device Flow，也不需要 X11、VNC 或回调端口；
+远端 daemon 仍需能访问 GitHub OAuth/API 和 Copilot API 地址。
+添加多个用户时，请先关闭前一个用户的无痕窗口，避免多个无痕窗口共享同一浏览器会话而选错账号。
+
 Device Flow 会先取得 GitHub 用户 token，再通过
 `GET /copilot_internal/v2/token` 交换短期 Copilot API token。动态返回的 API endpoint 会校验
 HTTPS 与主机名。账号 token、刷新 token 和探测结果保存在
