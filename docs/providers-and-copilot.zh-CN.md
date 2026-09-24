@@ -72,13 +72,112 @@ printf '%s\n' "$GITHUB_TOKEN" | \
   kproxy account add --provider copilot --token-stdin
 ```
 
-Device Flow 会在终端显示 GitHub 授权网址和验证码，kproxy 不会自动启动浏览器。
-即使 `kproxy account add` 在 SSH 无头服务器或容器中运行，也请在**自己电脑**的无痕/隐私窗口
-打开网址，确认登录的是要添加的 GitHub 用户，输入验证码并完成 Azure SSO/MFA（如组织要求）
-及 OAuth 应用授权。保持远端终端/SSH 会话；原命令会继续轮询，不需要另开 kproxy 会话。
-服务器上的 Kiro Chromium 无痕内核不参与 Copilot Device Flow，也不需要 X11、VNC 或回调端口；
-远端 daemon 仍需能访问 GitHub OAuth/API 和 Copilot API 地址。
-添加多个用户时，请先关闭前一个用户的无痕窗口，避免多个无痕窗口共享同一浏览器会话而选错账号。
+`--provider` 是实例 ID：若创建时用了 `--id github-copilot`，后续必须使用
+`--provider github-copilot`；`--kind copilot` 是驱动类型。
+
+不提供浏览器凭证时，Device Flow 会在终端显示授权网址和验证码。用户在自己电脑的
+无痕/隐私窗口登录并授权，CLI 保持轮询。添加多个用户时，关闭上一用户的所有无痕窗口再继续。
+
+### 在远端无头 Chromium 中完成授权
+
+full 镜像或启用了 `sso` feature 的 daemon 可以在服务器上启动独立无痕 Chromium，
+填写账号、进入 Azure SSO、输入 Device Flow 验证码并确认授权。无需本地浏览器、X11、VNC
+或浏览器回调端口。每个登录任务使用临时 profile 和独立 CDP browser context，完成、失败、
+取消或过期后关闭并清理；同时最多运行两个 Copilot 授权浏览器。
+此模式需要同时更新 CLI 和 daemon。新 CLI 遇到旧 daemon 时会报认证方式不支持，
+不会忽略提供的凭证并悄悄退回本地浏览器授权。
+
+交互添加（命令中的 provider ID 按实际配置填写）：
+
+```bash
+kproxy account add --provider github-copilot --auth device-flow --headless
+```
+
+在终端填写完整 GitHub 用户名，选择 Azure SSO、GitHub 密码或两套凭证；密码输入不回显。
+也可以提前传 `--username` / `--sso-username`，其余凭证按提示填写。Docker wrapper 会保留终端，
+无需把密码写在命令行参数中。
+
+CSV 批量添加按顺序逐个完成远端无痕登录，先校验整个文件，遇到账号错误记录后继续，Ctrl-C 终止剩余任务：
+
+```bash
+chmod 600 /secure/copilot.csv
+kproxy account add --provider github-copilot --batch /secure/copilot.csv
+```
+
+```csv
+github_username,github_password,sso_username,sso_password,label
+USER_SHORTCODE,,user@example.com,azure-password,enterprise
+personal-user,github-password,,,personal
+```
+
+仅 `github_username` 是必选列，凭证需提供 `github_password` 或 `sso_username` + `sso_password`。
+还支持可选 `sso_start_url` 列；`--sso-start-url` 会覆盖各行入口，行内 `label` 优先于 `--label`。
+CSV 支持逗号和双引号转义，不支持多行字段；密码中的空格会保留。`--batch -` 从 stdin 读取，
+Docker wrapper 可自动将宿主机 CSV 通过 stdin 传入容器。`--json` 最终输出包含 accounts、errors、
+complete、cancelled 和 skipped 的单个结果，进度输出到 stderr。
+
+Enterprise Managed User 非交互示例：
+
+```bash
+printf '%s\n' "$AZURE_PASSWORD" | kproxy account add \
+  --provider github-copilot --auth device-flow \
+  --username USER_SHORTCODE --sso-username user@example.com --password-stdin
+```
+
+`--username` 必须是完整的 **GitHub 用户名**（EMU 通常包含企业后缀），用于登录及最终账号校验。
+`--sso-username` 是 Azure 登录名，可以与 GitHub 用户名不同。指定它时，stdin 密码只填写到
+微软的 SSO 页面，不会尝试作为 GitHub 密码。普通 GitHub 账号密码登录可省略 `--sso-username`。
+默认直接从 GitHub Device Flow 页面登录，由 GitHub 识别企业用户名并跳转到身份提供商，
+不要求事先配置 Azure SSO URL。
+需要先从组织或企业 SSO 入口登录时，可增加
+`--sso-start-url https://github.com/enterprises/ENTERPRISE/sso`，也支持同源的 `/orgs/ORG/sso`。
+
+GitHub 个人账号和 Azure 各有一套密码时，使用 `--credentials-stdin`，从受保护的文件或程序管道
+输入以下 JSON。不要把密码写进命令参数、provider 配置或版本库：
+
+```json
+{
+  "github_username": "your-github-login",
+  "github_password": "your-github-password",
+  "sso_username": "user@example.com",
+  "sso_password": "your-azure-password",
+  "sso_start_url": "https://github.com/orgs/ORG/sso"
+}
+```
+
+```bash
+kproxy account add --provider github-copilot --auth device-flow \
+  --credentials-stdin < /secure/copilot-login.json
+```
+
+凭证仅在本次登录期间驻留于 daemon 内存，不写入账号文件或普通日志。Azure 页面之外不填写
+Azure 密码；暂不支持的外部联邦身份提供商会明确报错。MFA 推送需要本人在手机批准；需要动态
+验证码时，原命令会显示任务 ID，可在另一个远端终端输入：
+
+```bash
+printf '%s\n' "$MFA_CODE" | kproxy account login-code \
+  --provider github-copilot --task login_TASK_ID --code-stdin
+```
+
+CAPTCHA、Passkey、安全密钥、强制改密和受管设备要求不会被自动跳过。组织策略要求这些步骤时，
+应使用符合要求的登录方式；复制本地浏览器的 header 不能替代身份验证。
+
+若 Azure 显示“无法立即访问此资源”或 `AADSTS53003`，这是条件访问拒绝，不代表密码错误。
+登录任务会停止，避免重复提交密码直到超时。请把错误页的时间、Request ID、Correlation ID
+交给 Entra 管理员，在 **Entra ID → Monitoring & health → Sign-in logs → Conditional Access**
+查看具体失败策略。跳转至 `mysignins.microsoft.com` / `registerMfaMethods` 时，还需检查
+**Register security information** 用户操作相关策略；首次 MFA/安全信息注册须按组织要求完成，
+不会由代理自动绑定或修改验证方式。设备显示 `Unregistered` 只是诊断线索，不能据此判断具体策略。
+是否允许远端无头无痕登录取决于组织的设备、网络、认证强度和应用要求。
+参考：[Microsoft 条件访问排障](https://learn.microsoft.com/en-us/entra/identity/conditional-access/troubleshoot-conditional-access)、
+[安全信息注册策略](https://learn.microsoft.com/en-us/entra/identity/conditional-access/policy-all-users-security-info-registration)。
+
+排查时可在账号添加命令增加 `--capture-headers`。浏览器导航之前即开始记录请求、响应、重定向和
+CDP `requestWillBeSentExtraInfo` / `responseReceivedExtraInfo`，包括实际发送的 Cookie 和其它请求头。
+记录位于服务器 `$KPROXY_HOME/providers/<ID>/login-traces/<任务ID>.headers.jsonl`，目录权限 `0700`、
+文件权限 `0600`。它包含可用的会话凭证，不记录密码表单正文，不进入普通日志；仅在诊断期间开启。
+Cookie、CSRF token、nonce、Origin、Referer 和客户端提示由当前远端浏览器及页面自行生成，
+不把一次本地登录的 header 固定重放到另一会话。
 
 Device Flow 会先取得 GitHub 用户 token，再通过
 `GET /copilot_internal/v2/token` 交换短期 Copilot API token。动态返回的 API endpoint 会校验
@@ -87,8 +186,8 @@ HTTPS 与主机名。账号 token、刷新 token 和探测结果保存在
 持久化到同目录的 `models.json`，成功返回空目录时也会清除旧缓存，失败时只在配置的 stale 窗口内
 使用最后一次成功结果。
 
-GitHub.com 上通过 Azure SSO 登录、并逐用户分配 Copilot Enterprise 席位的场景，不需要单独配置
-Azure SSO URL 或 `account_type`：用户在 Device Flow 的浏览器页面完成组织要求的 SSO，代理按每个
+GitHub.com 上通过 Azure SSO 登录、并逐用户分配 Copilot Enterprise 席位的场景，不需要配置
+`account_type`：Device Flow 的浏览器页面完成组织要求的 SSO 后，代理按每个
 账号的 token 响应中的 `endpoints.api` 选择 Copilot API 域名。若响应给出
 `*.enterprise.githubcopilot.com`，该域名已在默认允许范围内；即使同一个 provider 下有不同套餐的账号，
 也不会因全局 `account_type` 而把它们固定到同一个域名。如果 token 响应缺少 `endpoints.api`，

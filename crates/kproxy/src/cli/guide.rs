@@ -135,9 +135,17 @@ diagnose all/endpoints、account overage 是 Kiro 专项功能。"#
 1. 添加提供源；命令会将默认公开 Client ID 写入配置文件的 [provider.settings]：
    kproxy provider add --id copilot --kind copilot
    用 kproxy config path 查看配置文件位置；可直接编辑 client_id，或用 kproxy provider edit copilot --setting 'client_id="Iv1.your-app"' 覆盖。
-2. 添加账号；即使命令在 SSH 无头服务器运行，也请在自己电脑的无痕/隐私窗口打开授权网址、输入验证码，并完成 GitHub 登录、组织 SSO 和授权：
+2. SSH 无头服务器可用 full 镜像中的 Chromium 自动完成账号登录及 Device Flow：
+   kproxy account add --provider copilot --auth device-flow --headless
+   按提示选择 Azure SSO / GitHub 密码并隐藏输入密码；也支持 CSV 逐个登录：kproxy account add --provider copilot --batch copilot.csv
+   CSV 必须有 github_username 表头，可选 github_password,sso_username,sso_password,sso_start_url,label；GitHub 密码或 Azure SSO 凭证至少提供一套。
+   非交互模式也可从标准输入读取密码：
+   kproxy account add --provider copilot --auth device-flow --username USER_SHORTCODE --sso-username user@example.com --password-stdin
+   --username 填完整 GitHub 用户名；--sso-username 填 Azure 登录名，此时 stdin 密码仅用于 Azure。普通 GitHub 密码登录省略 --sso-username。两套密码不同可用 --credentials-stdin 读取 JSON。密码不保存在账号文件中。
+   未提供浏览器凭证时，仍可在自己电脑的无痕/隐私窗口手动授权：
    kproxy account add --provider copilot --auth device-flow
-   服务器无需浏览器；保持当前终端/SSH 会话，CLI 会轮询直到授权和模型探测结束。无需提供用户名密码，也无需另开 kproxy 会话。多个 GitHub 用户可重复此命令，共用同一 Client ID。
+   --provider 始终填创建实例时的 --id；如果实例叫 github-copilot，上述 --provider 也必须用 github-copilot。远端模式按任务隔离浏览器会话；MFA 推送仍需本人批准，动态验证码用 account login-code 提交。--capture-headers 可在服务器受保护文件中记录完整敏感 header，默认关闭。
+   Azure 条件访问拒绝（如 AADSTS53003）需由 Entra 管理员检查失败策略；安全信息注册需先按组织要求完成，不能复制 header 绕过。
 3. 检查账号和模型：
    kproxy account list --provider copilot
    kproxy account probe --provider copilot <ACCOUNT_ID>
