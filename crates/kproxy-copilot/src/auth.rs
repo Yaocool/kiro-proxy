@@ -32,4 +32,5 @@ pub(crate) struct DeviceLoginTask {
     pub device_code: String,
     pub next_poll_at: i64,
     pub label: Option<String>,
+    pub expected_login: Option<String>,
 }

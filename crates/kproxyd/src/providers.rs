@@ -19,10 +19,13 @@ use tracing::warn;
 
 use crate::stats::ModelCache;
 
+pub(crate) mod browser_login;
+
 pub struct ProviderManager {
     registry: Arc<ProviderRegistry>,
     copilots: RwLock<BTreeMap<ProviderId, CopilotEntry>>,
     kiro_models: Arc<ModelCache>,
+    pub browser_logins: browser_login::BrowserLoginManager,
 }
 
 struct CopilotEntry {
@@ -36,6 +39,7 @@ impl ProviderManager {
             registry: Arc::new(ProviderRegistry::new()),
             copilots: RwLock::new(BTreeMap::new()),
             kiro_models,
+            browser_logins: browser_login::BrowserLoginManager::default(),
         }
     }
 
@@ -115,6 +119,12 @@ impl ProviderManager {
             }
         }
         drop(existing);
+        self.browser_logins.reconcile(
+            &next_copilots
+                .values()
+                .map(|entry| Arc::clone(&entry.runtime))
+                .collect::<Vec<_>>(),
+        );
         *self.copilots.write().await = next_copilots;
         self.registry.replace_all(adapters).await;
         Ok(())

@@ -364,6 +364,11 @@ impl CopilotProvider {
         &self.id
     }
 
+    /// Trusted OAuth origin for browser-side credential entry.
+    pub fn oauth_base(&self) -> &str {
+        &self.settings.oauth_base
+    }
+
     pub async fn account_summaries(&self) -> Vec<CopilotAccountSummary> {
         self.accounts
             .read()
@@ -416,6 +421,7 @@ impl CopilotProvider {
                 token_type: "bearer".into(),
             },
             label,
+            None,
         )
         .await
     }
@@ -424,8 +430,16 @@ impl CopilotProvider {
         &self,
         credentials: CopilotCredentials,
         label: Option<String>,
+        expected_login: Option<&str>,
     ) -> Result<CopilotAccountSummary, ProviderError> {
         let user = self.github_user(&credentials.github_access_token).await?;
+        if expected_login.is_some_and(|expected| !user.login.eq_ignore_ascii_case(expected)) {
+            return Err(ProviderError::new(
+                ProviderErrorKind::Authentication,
+                StatusCode::UNAUTHORIZED,
+                "authorized GitHub user does not match the requested browser-login username",
+            ));
+        }
         let exchanged = self
             .exchange_token_value(&credentials.github_access_token)
             .await?;
@@ -675,6 +689,14 @@ impl CopilotProvider {
         &self,
         label: Option<String>,
     ) -> Result<DeviceLoginState, ProviderError> {
+        self.start_device_login_for_user(label, None).await
+    }
+
+    pub async fn start_device_login_for_user(
+        &self,
+        label: Option<String>,
+        expected_login: Option<String>,
+    ) -> Result<DeviceLoginState, ProviderError> {
         let client_id = self.settings.oauth_client_id();
         let url = endpoint_url(&self.settings.oauth_base, "/login/device/code")?;
         let body = url::form_urlencoded::Serializer::new(String::new())
@@ -684,6 +706,7 @@ impl CopilotProvider {
         let response = self
             .http
             .post(url)
+            .timeout(Duration::from_secs(30))
             .header("accept", "application/json")
             .header("content-type", "application/x-www-form-urlencoded")
             .header("user-agent", &self.settings.user_agent)
@@ -719,6 +742,7 @@ impl CopilotProvider {
                 device_code: issued.device_code,
                 next_poll_at: now,
                 label,
+                expected_login,
             },
         );
         Ok(state)
@@ -754,6 +778,7 @@ impl CopilotProvider {
                 task.device_code.clone(),
                 task.label.clone(),
                 task.state.interval_secs,
+                task.expected_login.clone(),
             )
         };
         let client_id = self.settings.oauth_client_id();
@@ -766,6 +791,7 @@ impl CopilotProvider {
         let response = self
             .http
             .post(url)
+            .timeout(Duration::from_secs(30))
             .header("accept", "application/json")
             .header("content-type", "application/x-www-form-urlencoded")
             .header("user-agent", &self.settings.user_agent)
@@ -794,7 +820,10 @@ impl CopilotProvider {
                     .map(|seconds| now.saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX))),
                 token_type: token.token_type.unwrap_or_else(|| "bearer".into()),
             };
-            match self.import_credentials(credentials, snapshot.1).await {
+            match self
+                .import_credentials(credentials, snapshot.1, snapshot.3.as_deref())
+                .await
+            {
                 Ok(account) => {
                     let mut tasks = self.device_logins.lock().await;
                     let task = tasks.get_mut(task_id).ok_or_else(|| {
@@ -933,6 +962,7 @@ impl CopilotProvider {
         let response = self
             .http
             .get(url)
+            .timeout(Duration::from_secs(30))
             .header("accept", "application/vnd.github+json")
             .header("authorization", format!("Bearer {token}"))
             .header("x-github-api-version", "2022-11-28")
@@ -1091,6 +1121,7 @@ impl CopilotProvider {
         let response = self
             .http
             .get(url)
+            .timeout(Duration::from_secs(30))
             .headers(headers)
             .send()
             .await
@@ -1124,6 +1155,7 @@ impl CopilotProvider {
         let response = self
             .http
             .get(url)
+            .timeout(Duration::from_secs(30))
             .headers(self.upstream_headers(
                 &token.token,
                 None,
@@ -2677,7 +2709,7 @@ mod tests {
         let provider = mock_provider(&server, directory.path()).await;
         assert!(provider.descriptor().capabilities.device_flow);
         let task = provider
-            .start_device_login(Some("device".into()))
+            .start_device_login_for_user(Some("device".into()), Some("Octocat".into()))
             .await
             .unwrap();
         assert_eq!(task.status, DeviceLoginStatus::Pending);
@@ -2685,6 +2717,14 @@ mod tests {
         let completed = provider.poll_device_login(&task.id).await.unwrap();
         assert_eq!(completed.status, DeviceLoginStatus::Authorized);
         assert!(completed.account_id.is_some());
+        assert_eq!(provider.account_summaries().await.len(), 1);
+        let mismatch = provider
+            .start_device_login_for_user(None, Some("another-user".into()))
+            .await
+            .unwrap();
+        let rejected = provider.poll_device_login(&mismatch.id).await.unwrap();
+        assert_eq!(rejected.status, DeviceLoginStatus::Failed);
+        assert!(rejected.error.unwrap().contains("does not match"));
         assert_eq!(provider.account_summaries().await.len(), 1);
         let requests = server.received_requests().await.unwrap();
         for endpoint in ["/login/device/code", "/login/oauth/access_token"] {

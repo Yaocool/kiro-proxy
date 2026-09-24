@@ -1,7 +1,7 @@
 //! IAM Identity Center authorization-code + PKCE login.
 
 #[cfg(feature = "sso")]
-mod browser;
+pub(crate) mod browser;
 
 #[cfg(feature = "sso")]
 use std::time::{Duration, SystemTime, UNIX_EPOCH};

@@ -26,6 +26,8 @@ pub mod method {
     pub const V2_LOGIN_STATUS: &str = "v2.login.status";
     /// Cancel an interactive login task.
     pub const V2_LOGIN_CANCEL: &str = "v2.login.cancel";
+    /// Supply a one-time code to a remote authorization browser.
+    pub const V2_LOGIN_SUBMIT_CODE: &str = "v2.login.submitCode";
     /// Enable or disable a provider-neutral account.
     pub const V2_ACCOUNT_SET_ENABLED: &str = "v2.account.setEnabled";
     /// Remove a provider-neutral account.
@@ -136,6 +138,7 @@ pub mod method {
         V2_LOGIN_START,
         V2_LOGIN_STATUS,
         V2_LOGIN_CANCEL,
+        V2_LOGIN_SUBMIT_CODE,
         V2_ACCOUNT_SET_ENABLED,
         V2_ACCOUNT_REMOVE,
         V2_ACCOUNT_REFRESH,
@@ -958,6 +961,42 @@ pub struct AccountImportResult {
     pub skipped: Vec<String>,
 }
 
+/// Ephemeral credentials for a daemon-side Copilot authorization browser.
+/// Passwords belong to their named origin and are never persisted with accounts.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CopilotBrowserCredentials {
+    pub github_username: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github_password: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sso_username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sso_password: Option<String>,
+    /// Optional organization/enterprise SSO entry point on the GitHub origin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sso_start_url: Option<String>,
+}
+
+impl std::fmt::Debug for CopilotBrowserCredentials {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CopilotBrowserCredentials")
+            .field("github_username", &self.github_username)
+            .field(
+                "github_password",
+                &self.github_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("sso_username", &self.sso_username)
+            .field(
+                "sso_password",
+                &self.sso_password.as_ref().map(|_| "<redacted>"),
+            )
+            .field("sso_start_url", &self.sso_start_url)
+            .finish()
+    }
+}
+
 /// `account.addSso` 参数。
 #[derive(Clone, Serialize, Deserialize)]
 pub struct AccountAddSsoParams {
@@ -1071,6 +1110,24 @@ pub struct AccountListParams {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_browser_credentials_do_not_expose_passwords_in_debug() {
+        let credentials = CopilotBrowserCredentials {
+            github_username: "octocat".into(),
+            github_password: Some("github-secret".into()),
+            sso_username: Some("user@example.com".into()),
+            sso_password: Some("azure-secret".into()),
+            sso_start_url: None,
+        };
+        let debug = format!("{credentials:?}");
+        assert!(!debug.contains("github-secret"));
+        assert!(!debug.contains("azure-secret"));
+        assert!(debug.contains("<redacted>"));
+        let encoded = serde_json::to_value(&credentials).unwrap();
+        assert_eq!(encoded["github_password"], "github-secret");
+        assert_eq!(encoded["sso_password"], "azure-secret");
+    }
 
     #[test]
     fn request_and_responses_have_flat_exclusive_shapes() {

@@ -123,6 +123,36 @@ fn expect_ok(response: Response) -> serde_json::Value {
 }
 
 #[tokio::test]
+async fn remote_copilot_login_rejects_missing_or_malformed_credentials_without_echoing_secrets() {
+    let (_directory, state) = state_with(vec![]).await;
+    for (method, params, expected) in [
+        (
+            method::V2_LOGIN_START,
+            serde_json::json!({"provider":"github-copilot","auth":"device-flow-headless"}),
+            "requires browser credentials",
+        ),
+        (
+            method::V2_LOGIN_START,
+            serde_json::json!({"provider":"github-copilot","auth":"device-flow-headless","browser":{"github_username":"octocat","github_password":{"secret":"never-echo-this"}}}),
+            "invalid provider login parameters",
+        ),
+        (
+            method::V2_LOGIN_SUBMIT_CODE,
+            serde_json::json!({"provider":"github-copilot","task_id":"login_test","code":{"secret":"never-echo-this"}}),
+            "invalid login task",
+        ),
+    ] {
+        let response = dispatch(&state, Request::new(1, method, params)).await;
+        let Response::Err { error, .. } = response else {
+            panic!("expected remote login parameter error");
+        };
+        assert_eq!(error.code, 400);
+        assert!(error.message.contains(expected));
+        assert!(!error.message.contains("never-echo-this"));
+    }
+}
+
+#[tokio::test]
 async fn status_reports_counts_and_empty_hint() {
     let mut protected = sample_account("acc_00000003", "protected@example.com", true);
     protected.usage = Some(Usage {

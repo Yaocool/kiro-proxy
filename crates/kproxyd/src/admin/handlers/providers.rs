@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use kproxy_core::provider::{ProviderDescriptor, ProviderId, ALL_PROVIDERS};
 use kproxy_ipc::protocol::{
-    ProviderAccountListResult, ProviderAccountSummary, ProviderModelListResult, ProviderSelector,
-    RpcError,
+    CopilotBrowserCredentials, ProviderAccountListResult, ProviderAccountSummary,
+    ProviderModelListResult, ProviderSelector, RpcError,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -16,6 +16,7 @@ pub(super) async fn handle_capabilities(state: &Arc<AppState>) -> Handled {
     let descriptors = state.providers.descriptors().await;
     to_value(json!({
         "schema_version": 2,
+        "copilot_headless_device_flow": cfg!(feature = "sso"),
         "rpc_versions": [1, 2],
         "provider_kinds": descriptors.iter().map(|provider| provider.kind.as_str()).collect::<BTreeSet<_>>(),
         "features": [
@@ -258,28 +259,79 @@ pub(super) async fn handle_login_start(state: &Arc<AppState>, params: Value) -> 
         #[serde(default = "default_device_auth")]
         auth: String,
         label: Option<String>,
+        browser: Option<CopilotBrowserCredentials>,
+        #[serde(default)]
+        capture_headers: bool,
     }
     fn default_device_auth() -> String {
         "device-flow".into()
     }
-    let params: Params = parse_params(params)?;
-    if params.auth != "device-flow" {
+    let params: Params = parse_params(params).map_err(|_| {
+        RpcError::bad_params("invalid provider login parameters or browser credential fields")
+    })?;
+    if !matches!(params.auth.as_str(), "device-flow" | "device-flow-headless") {
         return Err(RpcError::bad_params(format!(
             "provider login auth {} is unsupported",
             params.auth
         )));
     }
+    if params.auth == "device-flow-headless" && params.browser.is_none() {
+        return Err(RpcError::bad_params(
+            "remote Device Flow requires browser credentials",
+        ));
+    }
+    if params.capture_headers && params.browser.is_none() {
+        return Err(RpcError::bad_params(
+            "capture_headers requires remote browser credentials",
+        ));
+    }
+    if let Some(credentials) = &params.browser {
+        crate::providers::browser_login::BrowserLoginManager::validate(credentials)?;
+    }
     let runtime = copilot_runtime(state, &params.provider).await?;
-    to_value(
-        runtime
-            .start_device_login(params.label)
-            .await
-            .map_err(provider_rpc_error)?,
-    )
+    let issued = runtime
+        .start_device_login_for_user(
+            params.label,
+            params
+                .browser
+                .as_ref()
+                .map(|credentials| credentials.github_username.clone()),
+        )
+        .await
+        .map_err(provider_rpc_error)?;
+    if let Some(credentials) = params.browser {
+        let trace_path = params.capture_headers.then(|| {
+            state
+                .paths
+                .data_dir
+                .join("providers")
+                .join(runtime.id().as_str())
+                .join("login-traces")
+                .join(format!("{}.headers.jsonl", issued.id))
+        });
+        match state.providers.browser_logins.start(
+            Arc::clone(&runtime),
+            issued.clone(),
+            credentials,
+            trace_path,
+            &state.shutdown,
+        ) {
+            Ok(value) => to_value(value),
+            Err(error) => {
+                let _ = runtime.cancel_device_login(&issued.id).await;
+                Err(error)
+            }
+        }
+    } else {
+        to_value(issued)
+    }
 }
 
 pub(super) async fn handle_login_status(state: &Arc<AppState>, params: Value) -> Handled {
     let (provider, task_id) = parse_login_task(params)?;
+    if let Some(result) = state.providers.browser_logins.status(&provider, &task_id) {
+        return to_value(result);
+    }
     let runtime = copilot_runtime(state, &provider).await?;
     to_value(
         runtime
@@ -291,6 +343,9 @@ pub(super) async fn handle_login_status(state: &Arc<AppState>, params: Value) ->
 
 pub(super) async fn handle_login_cancel(state: &Arc<AppState>, params: Value) -> Handled {
     let (provider, task_id) = parse_login_task(params)?;
+    if let Some(result) = state.providers.browser_logins.cancel(&provider, &task_id) {
+        return to_value(result);
+    }
     let runtime = copilot_runtime(state, &provider).await?;
     to_value(
         runtime
@@ -298,6 +353,22 @@ pub(super) async fn handle_login_cancel(state: &Arc<AppState>, params: Value) ->
             .await
             .map_err(provider_rpc_error)?,
     )
+}
+
+pub(super) async fn handle_login_submit_code(state: &Arc<AppState>, params: Value) -> Handled {
+    #[derive(Deserialize)]
+    struct Params {
+        provider: String,
+        task_id: String,
+        code: String,
+    }
+    let params: Params = parse_params(params)
+        .map_err(|_| RpcError::bad_params("invalid login task or one-time code parameters"))?;
+    state
+        .providers
+        .browser_logins
+        .submit_code(&params.provider, &params.task_id, params.code)?;
+    to_value(json!({"submitted":true}))
 }
 
 pub(super) async fn handle_account_set_enabled(state: &Arc<AppState>, params: Value) -> Handled {

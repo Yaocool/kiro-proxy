@@ -55,6 +55,9 @@ pub async fn dispatch(state: &Arc<AppState>, request: Request) -> Response {
         method::V2_LOGIN_START => providers::handle_login_start(state, request.params).await,
         method::V2_LOGIN_STATUS => providers::handle_login_status(state, request.params).await,
         method::V2_LOGIN_CANCEL => providers::handle_login_cancel(state, request.params).await,
+        method::V2_LOGIN_SUBMIT_CODE => {
+            providers::handle_login_submit_code(state, request.params).await
+        }
         method::V2_ACCOUNT_SET_ENABLED => {
             providers::handle_account_set_enabled(state, request.params).await
         }

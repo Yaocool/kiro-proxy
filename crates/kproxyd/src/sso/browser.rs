@@ -10,8 +10,9 @@ use tokio_util::sync::CancellationToken;
 /// Owns Chromium and the two background drivers needed during login.
 pub struct BrowserSession {
     browser: Browser,
+    page: Page,
     handler: JoinHandle<()>,
-    injector: JoinHandle<()>,
+    injector: Option<JoinHandle<()>>,
     cancel: CancellationToken,
     profile_dir: Option<TempDir>,
 }
@@ -23,6 +24,18 @@ impl BrowserSession {
         password: &str,
         headful: bool,
     ) -> Result<Self> {
+        let mut session = Self::launch_page(authorize_url, headful).await?;
+        session.injector = Some(spawn_injector(
+            session.page.clone(),
+            email,
+            password,
+            session.cancel.clone(),
+        )?);
+        Ok(session)
+    }
+
+    /// Launch an isolated browser for an authorization flow driven by its caller.
+    pub async fn launch_page(authorize_url: &str, headful: bool) -> Result<Self> {
         // Chromiumoxide otherwise reuses /tmp/chromiumoxide-runner. A unique
         // profile prevents concurrent or sequential SSO logins from inheriting
         // another account's browser process, cookies, or local storage.
@@ -68,21 +81,27 @@ impl BrowserSession {
                 return Err(error).context("unable to create an incognito Chromium page");
             }
         };
-        tracing::info!(headful, "Chromium SSO browser launched");
+        tracing::info!(headful, "isolated Chromium authorization browser launched");
         let cancel = CancellationToken::new();
-        let injector = spawn_injector(page, email, password, cancel.clone())?;
         Ok(Self {
             browser,
+            page,
             handler,
-            injector,
+            injector: None,
             cancel,
             profile_dir: Some(profile_dir),
         })
     }
 
+    pub fn page(&self) -> &Page {
+        &self.page
+    }
+
     pub async fn close(&mut self) {
         self.cancel.cancel();
-        self.injector.abort();
+        if let Some(injector) = self.injector.take() {
+            injector.abort();
+        }
         if let Err(error) = self.browser.quit_incognito_context().await {
             tracing::warn!(%error, "unable to dispose Chromium incognito context");
         }
@@ -129,7 +148,9 @@ fn isolated_profile_dir() -> Result<TempDir> {
 impl Drop for BrowserSession {
     fn drop(&mut self) {
         self.cancel.cancel();
-        self.injector.abort();
+        if let Some(injector) = self.injector.take() {
+            injector.abort();
+        }
         self.handler.abort();
     }
 }
