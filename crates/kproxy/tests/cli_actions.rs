@@ -95,6 +95,157 @@ fn assert_success(output: &std::process::Output) {
     );
 }
 
+async fn run_with_secret_input(
+    args: &[&str],
+    input: &str,
+    result: Value,
+) -> (std::process::Output, Request) {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("admin.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        let (read, mut write) = stream.into_split();
+        let raw = BufReader::new(read)
+            .lines()
+            .next_line()
+            .await
+            .unwrap()
+            .unwrap();
+        let request: Request = decode_line(&raw).unwrap();
+        write
+            .write_all(
+                encode_line(&Response::ok(request.id, result))
+                    .unwrap()
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        request
+    });
+    let mut process = Command::new(env!("CARGO_BIN_EXE_kproxy"))
+        .args(["--json", "--socket"])
+        .arg(&socket)
+        .args(args)
+        .env_remove("KPROXY_ADMIN_SOCKET")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = process.stdin.take().unwrap();
+    stdin.write_all(input.as_bytes()).await.unwrap();
+    stdin.shutdown().await.unwrap();
+    drop(stdin);
+    let output = tokio::time::timeout(Duration::from_secs(5), process.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    let request = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .unwrap()
+        .unwrap();
+    (output, request)
+}
+
+#[tokio::test]
+async fn remote_copilot_login_uses_the_instance_id_and_keeps_origin_credentials_separate() {
+    let (output, request) = run_with_secret_input(
+        &[
+            "account",
+            "add",
+            "--provider",
+            "github-copilot",
+            "--auth",
+            "device-flow",
+            "--username",
+            "developer_company",
+            "--sso-username",
+            "developer@example.com",
+            "--password-stdin",
+            "--capture-headers",
+        ],
+        "private-azure-password\n",
+        json!({
+            "id":"login_test","status":"authorized","account_id":"acc_test",
+            "browser":{"mode":"headless","stage":"finished","message":"远端授权完成"}
+        }),
+    )
+    .await;
+    assert_success(&output);
+    assert_eq!(request.method, method::V2_LOGIN_START);
+    assert_eq!(request.params["provider"], "github-copilot");
+    assert_eq!(request.params["auth"], "device-flow-headless");
+    assert_eq!(
+        request.params["browser"]["github_username"],
+        "developer_company"
+    );
+    assert!(request.params["browser"].get("github_password").is_none());
+    assert_eq!(
+        request.params["browser"]["sso_password"],
+        "private-azure-password"
+    );
+    assert_eq!(request.params["capture_headers"], true);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stdout.contains("private-azure-password"));
+    assert!(!stderr.contains("private-azure-password"));
+    assert!(stderr.contains("无需打开本地浏览器"));
+    assert!(!stderr.contains("请在自己电脑"));
+    let final_state: Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(final_state["status"], "authorized");
+}
+
+#[tokio::test]
+async fn copilot_csv_batch_uses_remote_browser_credentials_and_returns_one_json_result() {
+    let (output, request) = run_with_secret_input(
+        &["account", "add", "--provider", "github-copilot", "--batch", "-"],
+        "github_username,sso_username,sso_password,label\ndeveloper_company,developer@example.com,private-azure-password,team\n",
+        json!({"id":"login_test","status":"authorized","account_id":"acc_test"}),
+    ).await;
+    assert_success(&output);
+    assert_eq!(request.method, method::V2_LOGIN_START);
+    assert_eq!(request.params["auth"], "device-flow-headless");
+    assert_eq!(request.params["provider"], "github-copilot");
+    assert_eq!(
+        request.params["browser"]["github_username"],
+        "developer_company"
+    );
+    assert_eq!(
+        request.params["browser"]["sso_password"],
+        "private-azure-password"
+    );
+    assert_eq!(request.params["label"], "team");
+    assert!(request.params["browser"].get("github_password").is_none());
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("private-azure-password"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("private-azure-password"));
+    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(result["accounts"].as_array().unwrap().len(), 1);
+    assert_eq!(result["complete"], true);
+}
+
+#[tokio::test]
+async fn remote_copilot_mfa_code_stays_out_of_command_arguments_and_output() {
+    let (output, request) = run_with_secret_input(
+        &[
+            "account",
+            "login-code",
+            "--provider",
+            "github-copilot",
+            "--task",
+            "login_test",
+            "--code-stdin",
+        ],
+        "123456\n",
+        json!({"submitted":true}),
+    )
+    .await;
+    assert_success(&output);
+    assert_eq!(request.method, method::V2_LOGIN_SUBMIT_CODE);
+    assert_eq!(request.params["code"], "123456");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains("123456"));
+}
+
 #[tokio::test]
 async fn explicit_list_actions_use_the_existing_methods() {
     let (tasks, requests) = run(&["tasks", "list"], vec![json!([])]).await;

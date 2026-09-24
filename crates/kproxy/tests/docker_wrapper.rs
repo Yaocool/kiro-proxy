@@ -189,6 +189,28 @@ fn public_sso_batch_files_are_streamed_from_the_host() {
 }
 
 #[test]
+fn copilot_batch_files_are_streamed_from_the_host() {
+    let (output, calls, stdin) = run_wrapper(
+        "running",
+        &[
+            "account",
+            "add",
+            "--provider",
+            "github-copilot",
+            "--batch",
+            "__HOST_BATCH__",
+        ],
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(
+        calls.contains("exec -i -e KPROXY_WRAPPER_BATCH_STDIN=1"),
+        "{calls}"
+    );
+    assert!(!calls.contains("alice@example.com,secret"));
+    assert_eq!(stdin, "email,password\nalice@example.com,secret\n");
+}
+
+#[test]
 fn sso_batch_help_does_not_inspect_the_host_path() {
     let (output, calls, stdin) =
         run_wrapper("running", &["account", "add-sso", "--batch", ".", "--help"]);

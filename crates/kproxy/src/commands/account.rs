@@ -6,12 +6,14 @@ use kproxy_core::account::Account;
 use kproxy_core::ids::{new_account_id, new_machine_id};
 use kproxy_ipc::protocol::{
     method, AccountImportResult, AccountServiceBinding, AccountServicesResult, AccountSummary,
-    AccountTagBatchResult, AccountTagResult, ConfigShowResult, ProviderAccountListResult,
-    ProviderAccountSummary,
+    AccountTagBatchResult, AccountTagResult, ConfigShowResult, CopilotBrowserCredentials,
+    ProviderAccountListResult, ProviderAccountSummary,
 };
 
 use crate::client::AdminClient;
 use crate::output::{print_json, render_table};
+
+mod copilot_input;
 
 /// Kiro 账号池 overage 配置。
 #[derive(Debug, Subcommand)]
@@ -109,19 +111,55 @@ pub enum AccountCommand {
     },
     /// 通过 Device Flow 或 GitHub token 添加 Copilot 账号。
     #[command(
-        after_help = "此命令用于 GitHub Copilot；Kiro 请使用 account add-sso 或 add-api-key。Device Flow 会显示 GitHub 授权网址和验证码；即使通过 SSH 在无头服务器执行，也请在自己电脑的无痕/隐私窗口完成授权。服务器无需启动浏览器，CLI 会保持轮询。\n\n示例：\n  kproxy account add --provider copilot --auth device-flow\n  printf '%s\\n' \"$GITHUB_TOKEN\" | kproxy account add --provider copilot --token-stdin"
+        after_help = "--provider 填 provider add --id 创建的实例 ID。--headless 交互填写账号并隐藏输入密码；--batch 从 CSV 逐个登录。提供浏览器凭证时，由远端 daemon 的独立无痕 Chromium 完成 Device Flow；--sso-username 表示标准输入的密码仅用于 Azure SSO。未提供浏览器凭证时，仍可在本地无痕窗口手动授权。Kiro 请使用 account add-sso。\n\n示例：\n  kproxy account add --provider github-copilot --auth device-flow --headless\n  kproxy account add --provider github-copilot --batch copilot.csv\n  kproxy account add --provider github-copilot --auth device-flow --username USER_SHORTCODE --sso-username user@example.com --password-stdin\n  kproxy account add --provider github-copilot --auth device-flow --credentials-stdin < login.json\n  kproxy account add --provider github-copilot --auth device-flow\n  printf '%s\\n' \"$GITHUB_TOKEN\" | kproxy account add --provider github-copilot --token-stdin\n\nCSV 表头：github_username,github_password,sso_username,sso_password,sso_start_url,label；仅 github_username 为必选列，密码需提供 GitHub 或 Azure SSO 其中一套。",
+        group(clap::ArgGroup::new("browser_credentials").args(["username", "credentials_stdin", "headless", "batch"]).multiple(true))
     )]
     Add {
+        /// 提供源实例 ID，例如 github-copilot；不是驱动 kind。
         #[arg(long)]
         provider: String,
         /// 认证方式；Copilot 当前支持 device-flow。
-        #[arg(long)]
+        #[arg(long, value_parser = ["device-flow"])]
         auth: Option<String>,
         /// 从标准输入读取 GitHub token 并显式导入。
-        #[arg(long, conflicts_with = "auth")]
+        #[arg(long, conflicts_with_all = ["auth", "browser_credentials", "capture_headers"])]
         token_stdin: bool,
+        /// 在远端无痕浏览器登录的 GitHub 用户名。
+        #[arg(long, conflicts_with_all = ["credentials_stdin", "batch"])]
+        username: Option<String>,
+        /// 从标准输入读取一行密码；指定 --sso-username 时仅发送给 Azure。
+        #[arg(long, requires = "username", conflicts_with_all = ["headless", "credentials_stdin", "batch"])]
+        password_stdin: bool,
+        /// Azure SSO 登录名，可与 GitHub 用户名不同。
+        #[arg(long, requires = "browser_credentials", conflicts_with_all = ["credentials_stdin", "batch"])]
+        sso_username: Option<String>,
+        /// 交互填写账号并隐藏输入密码，由远端无痕浏览器登录。
+        #[arg(long, conflicts_with_all = ["password_stdin", "credentials_stdin", "batch"])]
+        headless: bool,
+        /// 从 CSV 逐个进行远端无痕登录；使用 - 从标准输入读取。
+        #[arg(long, value_name = "CSV", conflicts_with_all = ["username", "password_stdin", "sso_username", "credentials_stdin", "headless"])]
+        batch: Option<String>,
+        /// GitHub 组织或企业的 HTTPS SSO 入口。
+        #[arg(long, requires = "browser_credentials")]
+        sso_start_url: Option<String>,
+        /// 从标准输入读取 GitHub/Azure 浏览器凭证 JSON；仅用于本次登录。
+        #[arg(long, conflicts_with_all = ["username", "password_stdin", "sso_username"])]
+        credentials_stdin: bool,
+        /// 在服务器受保护文件中记录完整请求/响应 header（含会话凭证）。
+        #[arg(long, requires = "browser_credentials")]
+        capture_headers: bool,
         #[arg(long)]
         label: Option<String>,
+    },
+    /// 向正在运行的远端 Copilot 浏览器提交 MFA 验证码。
+    LoginCode {
+        #[arg(long)]
+        provider: String,
+        #[arg(long)]
+        task: String,
+        /// 从标准输入读取一行验证码。
+        #[arg(long, required = true)]
+        code_stdin: bool,
     },
     /// 查看 Kiro 账号绑定的 API 代理服务。
     #[command(
@@ -474,26 +512,61 @@ fn print_provider_detail(account: &ProviderAccountSummary) {
     }
 }
 
+#[derive(Debug)]
+struct ProviderLoginCancelled;
+
+impl std::fmt::Display for ProviderLoginCancelled {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("登录已取消")
+    }
+}
+
+impl std::error::Error for ProviderLoginCancelled {}
+
+fn print_provider_login(state: &serde_json::Value, provider: &str, json: bool) -> Result<()> {
+    if json {
+        print_json(state)
+    } else {
+        println!(
+            "授权完成，已添加 {}/{}",
+            provider,
+            state["account_id"].as_str().unwrap_or("-")
+        );
+        Ok(())
+    }
+}
+
 async fn run_provider_login(
     client: &mut AdminClient,
     provider: &str,
     auth: &str,
     label: Option<&str>,
+    browser: Option<CopilotBrowserCredentials>,
+    capture_headers: bool,
     json: bool,
-) -> Result<()> {
-    let mut state: serde_json::Value = client
-        .call(
-            method::V2_LOGIN_START,
-            serde_json::json!({"provider":provider,"auth":auth,"label":label}),
-        )
-        .await?;
+) -> Result<serde_json::Value> {
+    let headless = browser.is_some();
+    let auth = if headless {
+        "device-flow-headless"
+    } else {
+        auth
+    };
+    let mut params = serde_json::json!({"provider":provider,"auth":auth,"label":label});
+    if let Some(browser) = browser {
+        params["browser"] = serde_json::to_value(browser)?;
+        params["capture_headers"] = capture_headers.into();
+    }
+    let mut state: serde_json::Value = client.call(method::V2_LOGIN_START, params).await?;
     let task_id = state["id"]
         .as_str()
         .ok_or_else(|| anyhow!("daemon 返回的登录任务缺少 id"))?
         .to_owned();
     let verification_uri = state["verification_uri"].as_str().unwrap_or("-");
     let user_code = state["user_code"].as_str().unwrap_or("-");
-    if json {
+    if headless {
+        eprintln!("远端无痕 Chromium 正在登录 GitHub/Azure 并完成 Device Flow；任务 {task_id}");
+        eprintln!("无需打开本地浏览器。请保持当前命令运行。");
+    } else if json {
         eprintln!(
             "请在自己电脑的无痕/隐私窗口打开 {verification_uri}，确认目标 GitHub 账号并输入代码 {user_code}；保持当前终端会话"
         );
@@ -502,20 +575,23 @@ async fn run_provider_login(
         println!("确认登录的是要添加的 GitHub 账号，并输入代码 {user_code}");
         println!("等待 GitHub 授权……请保持当前终端/SSH 会话；服务器无需打开浏览器");
     }
+    let mut last_browser_progress = String::new();
     loop {
-        match state["status"].as_str().unwrap_or("failed") {
-            "authorized" => {
-                if json {
-                    print_json(&state)?;
-                } else {
-                    println!(
-                        "授权完成，已添加 {}/{}",
-                        provider,
-                        state["account_id"].as_str().unwrap_or("-")
-                    );
+        if let Some(progress) = state.get("browser") {
+            let stage = progress["stage"].as_str().unwrap_or("");
+            let progress_key = format!("{stage}:{}", progress["message"].as_str().unwrap_or(""));
+            if progress_key != last_browser_progress {
+                if let Some(message) = progress["message"].as_str() {
+                    eprintln!("{message}");
                 }
-                return Ok(());
+                if stage == "mfa_code" {
+                    eprintln!("在另一终端提交验证码：kproxy account login-code --provider {provider} --task {task_id} --code-stdin");
+                }
+                last_browser_progress = progress_key;
             }
+        }
+        match state["status"].as_str().unwrap_or("failed") {
+            "authorized" => return Ok(state),
             "pending" => {}
             status => {
                 return Err(anyhow!(
@@ -528,11 +604,11 @@ async fn run_provider_login(
         tokio::select! {
             result = tokio::signal::ctrl_c() => {
                 result?;
-                let _: serde_json::Value = client.call(
+                let _ = client.call::<serde_json::Value>(
                     method::V2_LOGIN_CANCEL,
                     serde_json::json!({"provider":provider,"task_id":task_id}),
-                ).await?;
-                return Err(anyhow!("登录已取消"));
+                ).await;
+                return Err(ProviderLoginCancelled.into());
             }
             _ = tokio::time::sleep(std::time::Duration::from_secs(interval)) => {}
         }
@@ -543,6 +619,72 @@ async fn run_provider_login(
             )
             .await?;
     }
+}
+
+async fn run_copilot_batch(
+    client: &mut AdminClient,
+    provider: &str,
+    rows: Vec<copilot_input::CsvLogin>,
+    label: Option<&str>,
+    sso_start_url: Option<&str>,
+    capture_headers: bool,
+    json: bool,
+) -> Result<()> {
+    let mut successes = Vec::new();
+    let mut failures = Vec::new();
+    let mut cancelled = false;
+    let count = rows.len();
+    for (index, mut row) in rows.into_iter().enumerate() {
+        if let Some(url) = sso_start_url {
+            row.credentials.sso_start_url = Some(url.to_owned());
+        }
+        let username = row.credentials.github_username.clone();
+        eprintln!(
+            "[{}/{}] 正在添加 GitHub Copilot 账号 {username}",
+            index + 1,
+            count
+        );
+        match run_provider_login(
+            client,
+            provider,
+            "device-flow",
+            row.label.as_deref().or(label),
+            Some(row.credentials),
+            capture_headers,
+            json,
+        )
+        .await
+        {
+            Ok(state) => {
+                if !json {
+                    print_provider_login(&state, provider, false)?;
+                }
+                successes.push(state);
+            }
+            Err(error) => {
+                cancelled = error.is::<ProviderLoginCancelled>();
+                eprintln!("{username}: {error}");
+                failures.push(serde_json::json!({"username":username,"error":error.to_string()}));
+                if cancelled {
+                    break;
+                }
+            }
+        }
+    }
+    if json {
+        print_json(&serde_json::json!({
+            "accounts":successes,"errors":failures,
+            "complete":failures.is_empty(),"cancelled":cancelled,
+            "skipped":count - successes.len() - failures.len(),
+        }))?;
+    }
+    if cancelled {
+        return Err(ProviderLoginCancelled.into());
+    }
+    if !failures.is_empty() {
+        return Err(anyhow!("{} 个 Copilot 账号登录失败", failures.len()));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -991,6 +1133,14 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
             provider,
             auth,
             token_stdin,
+            username,
+            password_stdin,
+            sso_username,
+            headless,
+            batch,
+            sso_start_url,
+            credentials_stdin,
+            capture_headers,
             label,
         } => {
             if token_stdin {
@@ -1015,15 +1165,79 @@ pub async fn run(client: &mut AdminClient, command: AccountCommand, json: bool) 
                         result["login"].as_str().unwrap_or("-")
                     );
                 }
+            } else if let Some(file) = batch {
+                // Validate the entire input before starting any OAuth task.
+                let raw = read_sso_batch_source(&file).await?;
+                let rows = copilot_input::parse_csv(&raw)?;
+                run_copilot_batch(
+                    client,
+                    &provider,
+                    rows,
+                    label.as_deref(),
+                    sso_start_url.as_deref(),
+                    capture_headers,
+                    json,
+                )
+                .await?;
             } else {
-                run_provider_login(
+                let browser = if credentials_stdin {
+                    let raw = read_import_source(None, true).await?;
+                    let mut credentials: CopilotBrowserCredentials = serde_json::from_str(&raw)
+                        .map_err(|_| anyhow!("浏览器凭证 JSON 无效，请检查字段名和类型"))?;
+                    if sso_start_url.is_some() {
+                        credentials.sso_start_url = sso_start_url;
+                    }
+                    Some(credentials)
+                } else if password_stdin {
+                    let username =
+                        username.ok_or_else(|| anyhow!("--password-stdin 需要 --username"))?;
+                    let password = read_password_line().await?;
+                    let (github_password, sso_password) = if sso_username.is_some() {
+                        (None, Some(password))
+                    } else {
+                        (Some(password), None)
+                    };
+                    Some(CopilotBrowserCredentials {
+                        github_username: username,
+                        github_password,
+                        sso_username,
+                        sso_password,
+                        sso_start_url,
+                    })
+                } else if headless || username.is_some() {
+                    Some(copilot_input::prompt(username, sso_username, sso_start_url).await?)
+                } else {
+                    None
+                };
+                let state = run_provider_login(
                     client,
                     &provider,
                     auth.as_deref().unwrap_or("device-flow"),
                     label.as_deref(),
+                    browser,
+                    capture_headers,
                     json,
                 )
                 .await?;
+                print_provider_login(&state, &provider, json)?;
+            }
+        }
+        AccountCommand::LoginCode {
+            provider,
+            task,
+            code_stdin: _,
+        } => {
+            let code = read_password_line().await?;
+            let result: serde_json::Value = client
+                .call(
+                    method::V2_LOGIN_SUBMIT_CODE,
+                    serde_json::json!({"provider":provider,"task_id":task,"code":code}),
+                )
+                .await?;
+            if json {
+                print_json(&result)?;
+            } else {
+                println!("验证码已交给远端浏览器；请在原登录命令查看结果");
             }
         }
         AccountCommand::Services { id } => {

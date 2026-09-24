@@ -514,11 +514,11 @@ for argument in "$@"; do
 done
 export KPROXY_WRAPPER_HOST_DATA_DIR
 
-# A host path is not visible inside an already-running container. For SSO CSV
+# A host path is not visible inside an already-running container. For account CSV
 # imports, stream a readable host file through stdin and tell the container CLI
 # to consume that stream. Container paths continue to work when no host file
 # with the supplied name exists.
-is_sso_batch=0
+is_account_batch=0
 top_level_command=""
 account_command=""
 expect_socket_value=0
@@ -539,12 +539,14 @@ for argument in "$@"; do
     break
   fi
 done
-if [ "$top_level_command" = "account" ] && [ "$account_command" = "add-sso" ]; then
-  is_sso_batch=1
+if [ "$top_level_command" = "account" ]; then
+  case "$account_command" in
+    add-sso|add) is_account_batch=1 ;;
+  esac
 fi
 
 host_batch_file=""
-if [ "$is_sso_batch" -eq 1 ] && [ "$help_requested" -eq 0 ]; then
+if [ "$is_account_batch" -eq 1 ] && [ "$help_requested" -eq 0 ]; then
   expect_batch_file=0
   for argument in "$@"; do
     if [ "$expect_batch_file" -eq 1 ]; then

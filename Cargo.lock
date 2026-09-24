@@ -1090,6 +1090,7 @@ dependencies = [
  "kproxy-kiro",
  "kproxy-store",
  "kproxy-translate",
+ "libc",
  "rand 0.8.5",
  "serde",
  "serde_json",
